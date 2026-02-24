@@ -420,7 +420,7 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 
 ## Integration Testing
 
-Validated on 6 GPU models across 2 cloud providers (TensorDock, Lambda Labs):
+Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azure):
 
 Stack tracing is on by default. GPU-measured overhead: **0.4-0.6%** (within noise).
 
