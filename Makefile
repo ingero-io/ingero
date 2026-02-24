@@ -112,7 +112,7 @@ gpu-validate:
 # Sync code to GPU VM and run full integration tests (one-shot)
 # Runs make generate && make build first to regenerate eBPF objects for the VM's kernel
 gpu-test: gpu-sync
-	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-integration-test.sh'
+	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
 # Transfer logs from GPU VM to local logs/<date>/ directory
 gpu-logs:
@@ -122,9 +122,6 @@ gpu-logs:
 	PORT=$$(jq -r .ssh_port $(REPO_ROOT)/.tensordock-vm.json 2>/dev/null); \
 	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then echo "No VM deployed."; exit 1; fi; \
 	echo "Transferring logs to logs/$$DATE..."; \
-	scp -P $$PORT -o StrictHostKeyChecking=no \
-		user@$$IP:~/workspace/ingero/integration-test-report.log \
-		logs/$$DATE/ 2>/dev/null || true; \
 	scp -P $$PORT -o StrictHostKeyChecking=no \
 		"user@$$IP:~/workspace/ingero/logs/*.log" \
 		"user@$$IP:~/workspace/ingero/logs/*.json" \
@@ -163,7 +160,7 @@ lambda-validate:
 # Sync code to Lambda Labs VM and run full integration tests (one-shot)
 # Runs make generate && make build first to regenerate eBPF objects for the VM's kernel
 lambda-test: lambda-sync
-	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-integration-test.sh'
+	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
 # Transfer logs from Lambda Labs VM to local logs/<date>/ directory
 lambda-logs:
@@ -172,9 +169,6 @@ lambda-logs:
 	IP=$$(jq -r .ip $(REPO_ROOT)/.lambdalabs-vm.json 2>/dev/null); \
 	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then echo "No Lambda instance deployed."; exit 1; fi; \
 	echo "Transferring logs to logs/$$DATE..."; \
-	scp -o StrictHostKeyChecking=no \
-		ubuntu@$$IP:~/workspace/ingero/integration-test-report.log \
-		logs/$$DATE/ 2>/dev/null || true; \
 	scp -o StrictHostKeyChecking=no \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.log" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.json" \
