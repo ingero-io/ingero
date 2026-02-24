@@ -46,6 +46,75 @@ func TestParseELFSymbols_SystemLib(t *testing.T) {
 	}
 }
 
+func TestFindSymbolByName_FunctionSymbol(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ELF parsing requires Linux")
+	}
+
+	// Use libc — always available on Linux.
+	out, err := exec.Command("sh", "-c", "ldd /bin/ls | grep libc | awk '{print $3}'").Output()
+	if err != nil || len(out) == 0 {
+		t.Skip("could not find libc.so via ldd")
+	}
+	libcPath := string(out[:len(out)-1])
+
+	// "malloc" is a well-known STT_FUNC symbol in libc.
+	value, pie, _, found := FindSymbolByName(libcPath, "malloc")
+	if !found {
+		t.Fatal("FindSymbolByName: malloc not found in libc")
+	}
+	if value == 0 {
+		t.Error("FindSymbolByName: malloc has value 0")
+	}
+	t.Logf("FindSymbolByName(libc, malloc): value=0x%x, PIE=%v", value, pie)
+}
+
+func TestFindSymbolByName_NotFound(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ELF parsing requires Linux")
+	}
+
+	out, err := exec.Command("sh", "-c", "ldd /bin/ls | grep libc | awk '{print $3}'").Output()
+	if err != nil || len(out) == 0 {
+		t.Skip("could not find libc.so via ldd")
+	}
+	libcPath := string(out[:len(out)-1])
+
+	_, _, _, found := FindSymbolByName(libcPath, "__nonexistent_symbol_xyz_12345__")
+	if found {
+		t.Error("FindSymbolByName: should not find nonexistent symbol")
+	}
+}
+
+func TestFindSymbolByName_InvalidPath(t *testing.T) {
+	_, _, _, found := FindSymbolByName("/nonexistent/path/libfoo.so", "anything")
+	if found {
+		t.Error("FindSymbolByName: should return found=false for invalid path")
+	}
+}
+
+func TestFindSymbolByName_PIEDetection(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ELF parsing requires Linux")
+	}
+
+	// libc.so is ET_DYN (PIE/shared library).
+	out, err := exec.Command("sh", "-c", "ldd /bin/ls | grep libc | awk '{print $3}'").Output()
+	if err != nil || len(out) == 0 {
+		t.Skip("could not find libc.so via ldd")
+	}
+	libcPath := string(out[:len(out)-1])
+
+	_, pie, _, found := FindSymbolByName(libcPath, "malloc")
+	if !found {
+		t.Skip("malloc not found")
+	}
+	// libc.so should be ET_DYN (PIE=true).
+	if !pie {
+		t.Error("expected libc.so to be PIE (ET_DYN)")
+	}
+}
+
 func TestELFSymbols_Lookup(t *testing.T) {
 	// Create a synthetic symbol table for testing.
 	elfs := &ELFSymbols{

@@ -35,7 +35,13 @@ func DetectPython(pid uint32) *PythonInfo {
 }
 
 // detectPythonFromRegions scans map regions for a Python interpreter.
+// Prefers libpython (shared library) over the python binary, since the
+// shared library has the full symbol table including _PyRuntime.
+// If no libpython is found, returns the binary path as fallback (covers
+// statically-linked Python like Ubuntu's /usr/bin/python3.10).
 func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
+	var fallback *PythonInfo
+
 	for _, r := range regions {
 		if r.Path == "" {
 			continue
@@ -50,8 +56,6 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 		minor := 0
 		fmt.Sscanf(matches[2], "%d", &minor)
 
-		// Prefer libpython (shared library) over the binary.
-		// Shared library has the full symbol table.
 		isLib := strings.Contains(r.Path, "libpython")
 
 		info := &PythonInfo{
@@ -62,15 +66,16 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 		}
 
 		if isLib {
-			return info // Found libpython — this is the best match.
+			return info // libpython found — best match, return immediately.
 		}
 
-		// Continue looking for libpython, but keep the binary as fallback.
-		// (Some Python builds are statically linked.)
-		return info
+		// Binary match — keep as fallback, continue scanning for libpython.
+		if fallback == nil {
+			fallback = info
+		}
 	}
 
-	return nil
+	return fallback
 }
 
 // IsSupportedVersion returns true if we have hardcoded offsets for this version.

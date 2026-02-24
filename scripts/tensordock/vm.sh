@@ -455,6 +455,7 @@ cmd_deploy() {
         "grep -q /usr/local/go/bin /home/user/.bashrc || echo \"export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:\\$HOME/go/bin:\\$HOME/.local/bin:\\$PATH\" >> /home/user/.bashrc",
         "sudo -u user pip3 install --quiet torch torchvision numpy --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -3 || true",
         "sudo -u user pip3 install --quiet transformers datasets diffusers accelerate 2>&1 | tail -3 || true",
+        "apt-get install -y -qq libpython3.10-dbg 2>/dev/null || apt-get install -y -qq libpython3.12-dbg 2>/dev/null || true",
         "chown -R user:user /home/user/workspace",
         "echo \"Cloud-init complete: $(date)\" > /home/user/workspace/cloud-init-done.txt"
     ]')

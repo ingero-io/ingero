@@ -133,61 +133,40 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 }
 
 // findPyRuntimeAddr locates the _PyRuntime symbol in the process's memory.
+//
+// _PyRuntime is a global data object (STT_OBJECT in ELF), not a function.
+// ParseELFSymbols() only keeps STT_FUNC symbols (for stack resolution), so
+// it can never find _PyRuntime. We use FindSymbolByName() which searches
+// all symbol types.
 func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
-	// Parse /proc/[pid]/maps to find libpython's load address.
-	regions, err := ParseProcMaps(pid)
+	// Look up _PyRuntime by name — searches STT_FUNC, STT_OBJECT, STT_NOTYPE.
+	symValue, pie, baseVA, found := FindSymbolByName(info.LibPath, "_PyRuntime")
+	if !found {
+		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", info.LibPath)
+	}
+
+	// Parse /proc/[pid]/maps to find the library's load address.
+	// _PyRuntime lives in .data (read-write), so we search all regions
+	// for this path, not just executable ones.
+	regions, err := parseMapsFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return 0, err
 	}
 
-	// Find the region containing the Python library.
-	var pyRegion *MapRegion
+	// Find the first region for this library path.
 	for i := range regions {
-		if regions[i].Path == info.LibPath && regions[i].IsExecutable() {
-			pyRegion = &regions[i]
-			break
-		}
-	}
-	if pyRegion == nil {
-		return 0, fmt.Errorf("libpython region not found for PID %d", pid)
-	}
-
-	// Parse ELF symbols from libpython.
-	elfs, err := ParseELFSymbols(info.LibPath)
-	if err != nil {
-		return 0, err
-	}
-
-	// Find _PyRuntime symbol.
-	for _, sym := range elfs.Symbols {
-		if sym.Name == "_PyRuntime" {
+		if regions[i].Path == info.LibPath {
 			// Calculate the runtime address in process memory.
 			// For PIE/shared libs: addr = region.Start - region.Offset + sym.Value - baseVA
-			addr := pyRegion.Start - pyRegion.Offset + sym.Value
-			if elfs.PIE {
-				addr -= elfs.BaseVA
+			addr := regions[i].Start - regions[i].Offset + symValue
+			if pie {
+				addr -= baseVA
 			}
 			return addr, nil
 		}
 	}
 
-	// _PyRuntime might be in .data, not .text. Search all regions.
-	allRegions, _ := parseMapsFile(fmt.Sprintf("/proc/%d/maps", pid))
-	for i := range allRegions {
-		if allRegions[i].Path == info.LibPath {
-			for _, sym := range elfs.Symbols {
-				if sym.Name == "_PyRuntime" {
-					addr := allRegions[i].Start - allRegions[i].Offset + sym.Value
-					if elfs.PIE {
-						addr -= elfs.BaseVA
-					}
-					return addr, nil
-				}
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("_PyRuntime symbol not found in %s", info.LibPath)
+	return 0, fmt.Errorf("library region not found for %s in PID %d", info.LibPath, pid)
 }
 
 // findThreadState walks the PyThreadState linked list to find the one matching tid.
