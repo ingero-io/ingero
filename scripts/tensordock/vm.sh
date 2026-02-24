@@ -15,6 +15,7 @@
 #   ./scripts/tensordock/vm.sh start     # Start a stopped VM
 #   ./scripts/tensordock/vm.sh stop      # Stop VM (reduces billing, preserves data)
 #   ./scripts/tensordock/vm.sh destroy   # Delete VM permanently (fully stops billing)
+#   ./scripts/tensordock/vm.sh destroy <id>  # Destroy by instance ID (for orphaned VMs)
 #   ./scripts/tensordock/vm.sh status    # Show VM status
 #   ./scripts/tensordock/vm.sh ssh       # SSH into the VM
 #   ./scripts/tensordock/vm.sh info      # Show connection details and cost info
@@ -747,34 +748,67 @@ cmd_stop() {
 cmd_destroy() {
     print_header "Destroying Ingero GPU VM"
 
-    if ! load_state; then
-        print_error "No VM found. Nothing to destroy."
-        exit 1
-    fi
+    local target_id="${1:-}"
 
-    load_token
+    if [[ -n "$target_id" ]]; then
+        # Destroy by explicit instance ID (for orphaned VMs not in state file).
+        load_token
 
-    print_error "WARNING: This will permanently delete the VM and all its data!"
-    print_info "Instance: ${STATE_INSTANCE_ID}"
-    print_info "IP: ${STATE_IP}:${STATE_SSH_PORT}"
-    echo ""
-    if [[ "$FORCE_MODE" != "true" ]]; then
-        read -p "Type 'destroy' to confirm: " confirm
-        if [[ "$confirm" != "destroy" ]]; then
-            print_info "Cancelled."
-            exit 0
+        print_error "WARNING: This will permanently delete VM ${target_id} and all its data!"
+        echo ""
+        if [[ "$FORCE_MODE" != "true" ]]; then
+            read -p "Type 'destroy' to confirm: " confirm
+            if [[ "$confirm" != "destroy" ]]; then
+                print_info "Cancelled."
+                exit 0
+            fi
+        else
+            print_info "Auto-confirmed (--force)"
+        fi
+
+        print_info "Deleting VM: ${target_id}..."
+        api_request DELETE "/instances/${target_id}" > /dev/null
+
+        # If the destroyed VM matches our state file, clean up state too.
+        if load_state 2>/dev/null && [[ "${STATE_INSTANCE_ID}" == "${target_id}" ]]; then
+            remove_ssh_config
+            clear_state
+            print_success "VM destroyed. State and SSH config cleaned up."
+        else
+            print_success "VM ${target_id} destroyed."
         fi
     else
-        print_info "Auto-confirmed (--force)"
+        # Destroy the VM tracked in the state file.
+        if ! load_state; then
+            print_error "No VM found. Nothing to destroy."
+            print_info "To destroy by ID: $0 destroy <instance-id>"
+            exit 1
+        fi
+
+        load_token
+
+        print_error "WARNING: This will permanently delete the VM and all its data!"
+        print_info "Instance: ${STATE_INSTANCE_ID}"
+        print_info "IP: ${STATE_IP}:${STATE_SSH_PORT}"
+        echo ""
+        if [[ "$FORCE_MODE" != "true" ]]; then
+            read -p "Type 'destroy' to confirm: " confirm
+            if [[ "$confirm" != "destroy" ]]; then
+                print_info "Cancelled."
+                exit 0
+            fi
+        else
+            print_info "Auto-confirmed (--force)"
+        fi
+
+        print_info "Deleting VM: ${STATE_INSTANCE_ID}..."
+        api_request DELETE "/instances/${STATE_INSTANCE_ID}" > /dev/null
+
+        remove_ssh_config
+        clear_state
+
+        print_success "VM destroyed. State and SSH config cleaned up."
     fi
-
-    print_info "Deleting VM: ${STATE_INSTANCE_ID}..."
-    api_request DELETE "/instances/${STATE_INSTANCE_ID}" > /dev/null
-
-    remove_ssh_config
-    clear_state
-
-    print_success "VM destroyed. State and SSH config cleaned up."
 }
 
 cmd_status() {
@@ -916,7 +950,8 @@ main() {
             echo "  deploy    Create and provision a new TensorDock GPU VM"
             echo "  start     Start a stopped VM (resumes billing)"
             echo "  stop      Stop a running VM (reduces billing, preserves data)"
-            echo "  destroy   Permanently delete the VM (fully stops billing)"
+            echo "  destroy [id]  Permanently delete the VM (fully stops billing)"
+            echo "                If [id] given, destroys that instance (for orphaned VMs)"
             echo "  status    Show current VM status"
             echo "  ssh       Open SSH session to the VM"
             echo "  info      Show connection details and cost info"
