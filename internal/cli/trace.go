@@ -23,6 +23,7 @@ import (
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/symtab"
 	"github.com/ingero-io/ingero/internal/sysinfo"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -215,6 +216,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// Step 4c: Open SQLite store (recording is on by default).
 	var eventStore *store.Store
+	var sessionID int64
 	if traceRecord {
 		dbPath := store.DefaultDBPath()
 		s, err := store.New(dbPath)
@@ -223,7 +225,36 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 		eventStore = s
 		debugf("recording to %s", dbPath)
+
+		// Record session metadata (GPU model, driver, CPU, OS, etc.).
+		// These are ~1ms reads at startup — no overhead concern.
+		kernelVer, _ := discover.KernelVersion()
+		session := store.Session{
+			StartedAt: time.Now(),
+			GPUModel:  discover.CheckGPUModel().Value,
+			GPUDriver: discover.CheckNVIDIA().Value,
+			CPUModel:  discover.CPUModel(),
+			CPUCores:  discover.CPUCores(),
+			MemTotal:  sysinfo.MemTotalMB(),
+			Kernel:    kernelVer,
+			OSRelease: discover.OSRelease(),
+			CUDAVer:   discover.CUDAVersion(),
+			PythonVer: discover.PythonVersion(),
+			IngeroVer: version.String(),
+			PIDFilter: formatPIDFilter(targetPIDs),
+			Flags:     formatTraceFlags(),
+		}
+		sessionID, err = eventStore.StartSession(session)
+		if err != nil {
+			debugf("failed to record session: %v", err)
+		} else {
+			debugf("session %d started", sessionID)
+		}
+
 		defer func() {
+			if sessionID > 0 {
+				eventStore.StopSession(sessionID, time.Now())
+			}
 			eventStore.Close()
 			fmt.Fprintf(os.Stderr, "  Recorded events to %s\n", dbPath)
 		}()
@@ -1118,6 +1149,44 @@ func debugLogStack(evt *events.Event) {
 			debugf("  [%d] 0x%x (%s)", i, f.IP, f.File)
 		}
 	}
+}
+
+// formatPIDFilter formats target PIDs as a comma-separated string for session metadata.
+// Returns "" if no PID filter (tracing all processes).
+func formatPIDFilter(pids []int) string {
+	if len(pids) == 0 {
+		return ""
+	}
+	parts := make([]string, len(pids))
+	for i, p := range pids {
+		parts[i] = fmt.Sprintf("%d", p)
+	}
+	return strings.Join(parts, ",")
+}
+
+// formatTraceFlags returns a comma-separated string of active trace flags.
+// E.g. "stack,record,json,debug".
+func formatTraceFlags() string {
+	var flags []string
+	if traceStack {
+		flags = append(flags, "stack")
+	}
+	if traceRecord {
+		flags = append(flags, "record")
+	}
+	if traceJSON {
+		flags = append(flags, "json")
+	}
+	if debugMode {
+		flags = append(flags, "debug")
+	}
+	if traceOTLP != "" {
+		flags = append(flags, "otlp")
+	}
+	if traceProm != "" {
+		flags = append(flags, "prometheus")
+	}
+	return strings.Join(flags, ",")
 }
 
 // chainsToStored converts correlate.CausalChain slice to store.StoredChain slice.
