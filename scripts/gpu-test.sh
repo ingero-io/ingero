@@ -1291,7 +1291,7 @@ conn.close()
 
     SCHEMA_OK=0
     SCHEMA_MISSING=""
-    for table in events causal_chains system_snapshots sources ops schema_info; do
+    for table in events causal_chains system_snapshots sources ops schema_info sessions; do
         if grep -qi "$table" logs/db-schema.txt 2>/dev/null; then
             SCHEMA_OK=$((SCHEMA_OK + 1))
         else
@@ -1299,10 +1299,10 @@ conn.close()
         fi
     done
 
-    if [[ "$SCHEMA_OK" -eq 6 ]]; then
-        record "PASS" "T21: DB schema" "all 6 tables present"
+    if [[ "$SCHEMA_OK" -eq 7 ]]; then
+        record "PASS" "T21: DB schema" "all 7 tables present"
     else
-        record "FAIL" "T21: DB schema" "${SCHEMA_OK}/6 tables, missing:${SCHEMA_MISSING}"
+        record "FAIL" "T21: DB schema" "${SCHEMA_OK}/7 tables, missing:${SCHEMA_MISSING}"
     fi
 else
     record "FAIL" "T21: DB schema" "ingero.db not found"

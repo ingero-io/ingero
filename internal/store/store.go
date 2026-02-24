@@ -560,11 +560,12 @@ func (s *Store) flushBatch(batch []events.Event) {
 	tx.Commit()
 }
 
-// pruneOld deletes events and system snapshots older than the retention period.
+// pruneOld deletes events, system snapshots, and sessions older than the retention period.
 func (s *Store) pruneOld() {
 	cutoff := time.Now().Add(-s.retention).UnixNano()
 	s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
 	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
+	s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
 }
 
 // appendPIDFilter appends a PID filter clause to a SQL query.
