@@ -93,10 +93,11 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// If --user specified (or defaulted from SUDO_USER), resolve ALL PIDs.
-	// Skip when no CUDA processes are running (pre-attach mode: library found
-	// on disk but no processes yet — probes fire for any process that loads it).
-	if traceUser != "" && len(targetPIDs) > 0 {
+	// If --user specified (or defaulted from SUDO_USER), resolve ALL PIDs
+	// for that user. Skip when:
+	//   - --pid was explicitly set (explicit PIDs take precedence over --user)
+	//   - no CUDA processes running (pre-attach mode: probes fire for any process)
+	if traceUser != "" && len(tracePIDs) == 0 && len(targetPIDs) > 0 {
 		pids, err := resolvePIDsForUser(traceUser)
 		if err != nil {
 			return fmt.Errorf("resolving user %q: %w", traceUser, err)
@@ -107,7 +108,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		targetPIDs = pids
 		processNames = resolveProcessNames(pids)
 		fmt.Fprintf(os.Stderr, "  User %q: tracing %d CUDA process(es)\n", traceUser, len(pids))
-	} else if traceUser != "" {
+	} else if traceUser != "" && len(tracePIDs) == 0 {
 		pids, _ := resolvePIDsForUser(traceUser)
 		if len(pids) > 0 {
 			targetPIDs = pids
