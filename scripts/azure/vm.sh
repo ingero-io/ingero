@@ -324,6 +324,8 @@ runcmd:
   # PyTorch + ML deps
   - sudo -u azureuser pip3 install --quiet torch torchvision numpy --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -3 || true
   - sudo -u azureuser pip3 install --quiet transformers datasets diffusers accelerate 2>&1 | tail -3 || true
+  # Python debug symbols for DWARF-based CPython frame extraction
+  - apt-get install -y -qq libpython3.10-dbg 2>/dev/null || apt-get install -y -qq libpython3.12-dbg 2>/dev/null || true
   # Workspace
   - mkdir -p /home/azureuser/workspace
   - chown -R azureuser:azureuser /home/azureuser/workspace

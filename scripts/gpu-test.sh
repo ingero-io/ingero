@@ -52,6 +52,10 @@ cd "$(dirname "$0")/.." || { echo "Cannot find ingero directory"; exit 1; }
 INGERO_DIR="$(pwd)"
 mkdir -p logs
 
+# Per-run temp directory — avoids /tmp permission conflicts from previous runs
+# owned by different users (e.g., root from sudo).
+TEST_TMP=$(mktemp -d /tmp/ingero_test_XXXXXX)
+
 ts()   { date -u '+%Y-%m-%d %H:%M:%S'; }
 log()  { echo -e "$(ts) ${GREEN}[INFO]${NC}  $1"; }
 warn() { echo -e "$(ts) ${YELLOW}[WARN]${NC}  $1"; }
@@ -92,6 +96,7 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    rm -rf "${TEST_TMP:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -427,13 +432,13 @@ if stack_events:
         fi = f.get('file','')
         ip = f.get('ip','')
         print(f'  FRAME: ip={ip} sym={sym} file={fi}')
-" > /tmp/stack_analysis.txt 2>&1
+" > $TEST_TMP/stack_analysis.txt 2>&1
 
-cat /tmp/stack_analysis.txt
-STACK_TOTAL=$(grep 'STACK_TOTAL=' /tmp/stack_analysis.txt | cut -d= -f2)
-STACK_WITH=$(grep 'STACK_WITH_STACK=' /tmp/stack_analysis.txt | cut -d= -f2)
-STACK_PCT=$(grep 'STACK_PCT=' /tmp/stack_analysis.txt | cut -d= -f2)
-STACK_RESOLVED=$(grep 'STACK_RESOLVED=' /tmp/stack_analysis.txt | cut -d= -f2)
+cat $TEST_TMP/stack_analysis.txt
+STACK_TOTAL=$(grep 'STACK_TOTAL=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
+STACK_WITH=$(grep 'STACK_WITH_STACK=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
+STACK_PCT=$(grep 'STACK_PCT=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
+STACK_RESOLVED=$(grep 'STACK_RESOLVED=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
 
 if [[ "${STACK_TOTAL:-0}" -gt 100 && "${STACK_WITH:-0}" -gt 0 ]]; then
     record "PASS" "T10: --stack native" "${STACK_WITH}/${STACK_TOTAL} events with stack (${STACK_PCT}%), ${STACK_RESOLVED} resolved symbols"
@@ -454,7 +459,7 @@ fi
 # Test 11: CPython frame extraction
 _test_start=$SECONDS
 log "Test 11: --stack CPython frames"
-cat > /tmp/ingero_pytest.py << 'PYEOF'
+cat > $TEST_TMP/pytest.py << 'PYEOF'
 import torch
 import time
 import os
@@ -481,7 +486,7 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-python3 /tmp/ingero_pytest.py &
+python3 $TEST_TMP/pytest.py &
 PY_PID=$!
 cleanup_pids+=("$PY_PID")
 sleep 3
@@ -511,11 +516,11 @@ for e in stack_events[:20]:
     for f in e['stack']:
         if f.get('py_file'):
             print(f'  PY_FRAME: {f[\"py_file\"]}:{f.get(\"py_line\",\"?\")} in {f.get(\"py_func\",\"?\")}()')
-" > /tmp/pystack_analysis.txt 2>&1
+" > $TEST_TMP/pystack_analysis.txt 2>&1
 
-cat /tmp/pystack_analysis.txt
-PY_WITH_PYFRAMES=$(grep 'PY_WITH_PYFRAMES=' /tmp/pystack_analysis.txt | cut -d= -f2)
-PY_TOTAL=$(grep 'PY_TOTAL=' /tmp/pystack_analysis.txt | cut -d= -f2)
+cat $TEST_TMP/pystack_analysis.txt
+PY_WITH_PYFRAMES=$(grep 'PY_WITH_PYFRAMES=' $TEST_TMP/pystack_analysis.txt | cut -d= -f2)
+PY_TOTAL=$(grep 'PY_TOTAL=' $TEST_TMP/pystack_analysis.txt | cut -d= -f2)
 DEBUG_STACK_LINES=$(grep -c '\[DEBUG\].*stack' logs/stack-python.log 2>/dev/null || echo "0")
 
 # Check DWARF offset discovery diagnostics from --debug output.
@@ -602,7 +607,7 @@ sudo fuser -k 4318/tcp 2>/dev/null || true
 sleep 1
 
 # Start mock OTLP receiver
-cat > /tmp/otlp_receiver.py << 'OTLPEOF'
+cat > $TEST_TMP/otlp_receiver.py << OTLPEOF
 import http.server
 import json
 import sys
@@ -639,9 +644,9 @@ server = http.server.HTTPServer(('0.0.0.0', 4318), OTLPHandler)
 
 def shutdown_handler(signum, frame):
     # Write received payloads to file
-    with open('/tmp/otlp_received.json', 'w') as f:
+    with open('$TEST_TMP/otlp_received.json', 'w') as f:
         json.dump(received, f, indent=2, default=str)
-    print(f"OTLP receiver: wrote {len(received)} payloads to /tmp/otlp_received.json", flush=True)
+    print(f"OTLP receiver: wrote {len(received)} payloads to $TEST_TMP/otlp_received.json", flush=True)
     server.shutdown()
     sys.exit(0)
 
@@ -659,7 +664,7 @@ print("OTLP receiver listening on :4318", flush=True)
 server.serve_forever()
 OTLPEOF
 
-python3 /tmp/otlp_receiver.py > logs/otlp-receipt.log 2>&1 &
+python3 $TEST_TMP/otlp_receiver.py > logs/otlp-receipt.log 2>&1 &
 OTLP_PID=$!
 cleanup_pids+=("$OTLP_PID")
 sleep 1
@@ -676,11 +681,11 @@ kill "$OTLP_PID" 2>/dev/null || true
 sleep 2
 
 # Analyze received payloads
-if [ -f /tmp/otlp_received.json ]; then
-    cp /tmp/otlp_received.json logs/otlp-payload.json
+if [ -f $TEST_TMP/otlp_received.json ]; then
+    cp $TEST_TMP/otlp_received.json logs/otlp-payload.json
     python3 -c "
 import json
-data = json.load(open('/tmp/otlp_received.json'))
+data = json.load(open('$TEST_TMP/otlp_received.json'))
 print(f'OTLP_RECEIVED={len(data)}')
 if data:
     entry = data[0]
@@ -696,12 +701,12 @@ if data:
     for name in sorted(metrics_found):
         print(f'OTLP_METRIC={name}')
     print(f'OTLP_METRIC_COUNT={len(metrics_found)}')
-" > /tmp/otlp_analysis.txt 2>&1
-    cat /tmp/otlp_analysis.txt
+" > $TEST_TMP/otlp_analysis.txt 2>&1
+    cat $TEST_TMP/otlp_analysis.txt
 
-    OTLP_RECEIVED=$(grep 'OTLP_RECEIVED=' /tmp/otlp_analysis.txt | cut -d= -f2)
-    OTLP_PATH=$(grep 'OTLP_PATH=' /tmp/otlp_analysis.txt | cut -d= -f2)
-    OTLP_CT=$(grep 'OTLP_CT=' /tmp/otlp_analysis.txt | cut -d= -f2)
+    OTLP_RECEIVED=$(grep 'OTLP_RECEIVED=' $TEST_TMP/otlp_analysis.txt | cut -d= -f2)
+    OTLP_PATH=$(grep 'OTLP_PATH=' $TEST_TMP/otlp_analysis.txt | cut -d= -f2)
+    OTLP_CT=$(grep 'OTLP_CT=' $TEST_TMP/otlp_analysis.txt | cut -d= -f2)
 
     if [[ "${OTLP_RECEIVED:-0}" -gt 0 ]]; then
         record "PASS" "T14a: OTLP received" "${OTLP_RECEIVED} pushes received"
@@ -723,14 +728,14 @@ if data:
 
     # Check expected metrics
     for metric in "system.cpu.utilization" "gpu.cuda.operation.duration" "ingero.anomaly.count"; do
-        if grep -q "OTLP_METRIC=$metric" /tmp/otlp_analysis.txt 2>/dev/null; then
+        if grep -q "OTLP_METRIC=$metric" $TEST_TMP/otlp_analysis.txt 2>/dev/null; then
             record "PASS" "T14d: OTLP metric: $metric" "present"
         else
             record "FAIL" "T14d: OTLP metric: $metric" "missing"
         fi
     done
 else
-    record "FAIL" "T14: OTLP received" "no /tmp/otlp_received.json (receiver died?)"
+    record "FAIL" "T14: OTLP received" "no $TEST_TMP/otlp_received.json (receiver died?)"
 fi
 
 # Test 15: OTLP debug logging
@@ -772,7 +777,7 @@ log "Test 17: trace + --otlp combined (stacks on by default)"
 # Restart OTLP receiver (kill any leftover)
 sudo fuser -k 4318/tcp 2>/dev/null || true
 sleep 1
-python3 /tmp/otlp_receiver.py > logs/otlp-combined-receipt.log 2>&1 &
+python3 $TEST_TMP/otlp_receiver.py > logs/otlp-combined-receipt.log 2>&1 &
 OTLP_PID2=$!
 cleanup_pids+=("$OTLP_PID2")
 sleep 1
@@ -1338,9 +1343,9 @@ _PYTORCH_VER=$(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torc
 _GO_VER=$(go version 2>/dev/null | awk '{print $3}')
 
 # Write test results to temp file, one line per result
-: > /tmp/ingero_test_results.txt
+: > $TEST_TMP/test_results.txt
 for entry in "${TEST_RESULTS[@]}"; do
-    echo "$entry" >> /tmp/ingero_test_results.txt
+    echo "$entry" >> $TEST_TMP/test_results.txt
 done
 
 SCRIPT_DURATION="$SCRIPT_DURATION" \
@@ -1351,7 +1356,7 @@ SCRIPT_DURATION="$SCRIPT_DURATION" \
 import json, sys, os
 from datetime import datetime, timezone
 
-results_file = '/tmp/ingero_test_results.txt'
+results_file = '$TEST_TMP/test_results.txt'
 tests = []
 with open(results_file) as f:
     for line in f:

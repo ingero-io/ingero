@@ -499,6 +499,9 @@ grep -q /usr/local/go/bin /home/ubuntu/.bashrc || \
 sudo -u ubuntu pip3 install --quiet torch torchvision numpy --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -3 || true
 sudo -u ubuntu pip3 install --quiet transformers datasets diffusers accelerate 2>&1 | tail -3 || true
 
+# Python debug symbols for DWARF-based CPython frame extraction
+apt-get install -y -qq libpython3.10-dbg 2>/dev/null || apt-get install -y -qq libpython3.12-dbg 2>/dev/null || true
+
 # Ensure workspace ownership (may have been created by root during package installs)
 chown -R ubuntu:ubuntu /home/ubuntu/workspace
 

@@ -66,6 +66,58 @@ func TestDetectPythonFromRegions(t *testing.T) {
 	}
 }
 
+func TestDetectPythonFromRegions_PrefersLibpython(t *testing.T) {
+	// When both the python binary and libpython appear in maps,
+	// libpython should be preferred (it has the full symbol table).
+	regions := []MapRegion{
+		{Start: 0x550000, End: 0x551000, Perms: "r-xp", Path: "/usr/bin/python3.10"},
+		{Start: 0x7f0000, End: 0x7f1000, Perms: "r-xp", Path: "/home/user/miniconda3/lib/libpython3.10.so.1.0"},
+	}
+
+	info := detectPythonFromRegions(regions)
+	if info == nil {
+		t.Fatal("expected non-nil PythonInfo")
+	}
+	if info.LibPath != "/home/user/miniconda3/lib/libpython3.10.so.1.0" {
+		t.Errorf("expected libpython path, got %q", info.LibPath)
+	}
+}
+
+func TestDetectPythonFromRegions_FallbackToBinary(t *testing.T) {
+	// When only the python binary appears (no libpython — statically linked),
+	// the binary path should be returned as fallback.
+	regions := []MapRegion{
+		{Start: 0x550000, End: 0x551000, Perms: "r-xp", Path: "/usr/bin/python3.10"},
+		{Start: 0x7f0000, End: 0x7f1000, Perms: "r-xp", Path: "/usr/lib/libcudart.so.12"},
+	}
+
+	info := detectPythonFromRegions(regions)
+	if info == nil {
+		t.Fatal("expected non-nil PythonInfo")
+	}
+	if info.LibPath != "/usr/bin/python3.10" {
+		t.Errorf("expected binary path as fallback, got %q", info.LibPath)
+	}
+}
+
+func TestDetectPythonFromRegions_BinaryBeforeLibpython(t *testing.T) {
+	// Binary appears first in maps, but libpython appears later.
+	// Should still prefer libpython.
+	regions := []MapRegion{
+		{Start: 0x400000, End: 0x401000, Perms: "r-xp", Path: "/usr/bin/python3.12"},
+		{Start: 0x500000, End: 0x501000, Perms: "r-xp", Path: "/usr/lib/libc.so.6"},
+		{Start: 0x7f0000, End: 0x7f1000, Perms: "r-xp", Path: "/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0"},
+	}
+
+	info := detectPythonFromRegions(regions)
+	if info == nil {
+		t.Fatal("expected non-nil PythonInfo")
+	}
+	if info.LibPath != "/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0" {
+		t.Errorf("expected libpython path, got %q", info.LibPath)
+	}
+}
+
 func TestPythonInfo_IsSupportedVersion(t *testing.T) {
 	tests := []struct {
 		minor int
