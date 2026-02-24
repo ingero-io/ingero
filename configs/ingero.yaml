@@ -1,0 +1,51 @@
+# Ingero GPU Observability Agent - Default Configuration
+
+# Agent settings
+agent:
+  # Overhead target: adaptive sampling adjusts to stay under this
+  max_overhead_percent: 2.0
+  # Log level: debug, info, warn, error
+  log_level: info
+
+# Probe configuration
+probes:
+  cuda:
+    enabled: true
+    # Path to libcudart.so (auto-detected if empty)
+    library_path: ""
+  nvidia:
+    enabled: true
+    # Requires kprobe support for nvidia.ko
+  host:
+    enabled: true
+    # Tracepoints: sched_switch, sched_wakeup, mm_page_alloc, oom_kill
+    tracepoints:
+      - sched_switch
+      - sched_wakeup
+      - mm_page_alloc
+
+# Storage
+store:
+  # SQLite database path
+  path: /var/lib/ingero/ingero.db
+  # Rolling retention window
+  retention_days: 7
+
+# MCP server
+mcp:
+  enabled: true
+  # Transport: stdio or http
+  transport: stdio
+
+# OTLP export (optional, disabled by default)
+otlp:
+  enabled: false
+  endpoint: ""
+  protocol: grpc
+  insecure: true
+  export_interval: 10s
+
+# Prometheus /metrics endpoint (optional, disabled by default)
+prometheus:
+  enabled: false
+  listen: ":9090"
