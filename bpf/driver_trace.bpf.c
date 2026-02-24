@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+//
+// driver_trace.bpf.c — eBPF uprobes for CUDA Driver API tracing (libcuda.so)
+//
+// The CUDA Driver API (cuLaunchKernel, cuMemcpy*, cuCtxSynchronize) is called
+// directly by cuBLAS, cuDNN, and other NVIDIA libraries — bypassing the CUDA
+// Runtime API (libcudart.so). Without these probes, kernel launches from
+// optimized math libraries are invisible.
+//
+// Uses the same struct cuda_event output format as cuda_trace.bpf.c, with
+// hdr.source = EVENT_SRC_DRIVER to distinguish the source.
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include "common.bpf.h"
+
+// Ring buffer for sending driver events to userspace (separate from CUDA runtime).
+// 2MB: with --stack (576-byte events), ~3,640 events buffer. Without --stack
+// (56-byte events), ~37,400 events. cuBLAS can fire 17K+ launches/sec.
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 2 * 1024 * 1024);
+} driver_events SEC(".maps");
+
+// Runtime configuration map — Go writes config, eBPF reads it.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ingero_config);
+} driver_config_map SEC(".maps");
+
+// Per-thread entry state for driver API calls.
+struct driver_entry_state {
+	__u64 timestamp_ns;
+	__u8  op;
+	__u8  _pad[7];
+	__u64 arg0;
+	__u64 arg1;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);
+	__type(value, struct driver_entry_state);
+} driver_entry_map SEC(".maps");
+
+// ---- Helpers ----
+
+static __always_inline void driver_save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg1)
+{
+	struct driver_entry_state state = {};
+	state.timestamp_ns = bpf_ktime_get_ns();
+	state.op = op;
+	state.arg0 = arg0;
+	state.arg1 = arg1;
+
+	bpf_map_update_elem(&driver_entry_map, &tid, &state, BPF_ANY);
+}
+
+static __always_inline void driver_emit_event(struct pt_regs *ctx,
+					      __u32 pid, __u32 tid,
+					      struct driver_entry_state *entry,
+					      __s32 return_code)
+{
+	__u64 now = bpf_ktime_get_ns();
+
+	// Check if stack capture is enabled.
+	__u32 key = 0;
+	struct ingero_config *cfg = bpf_map_lookup_elem(&driver_config_map, &key);
+	if (cfg && cfg->capture_stack) {
+		struct cuda_event_stack *sevt;
+		sevt = bpf_ringbuf_reserve(&driver_events, sizeof(*sevt), 0);
+		if (!sevt)
+			return;
+
+		sevt->hdr.timestamp_ns = entry->timestamp_ns;
+		sevt->hdr.pid = pid;
+		sevt->hdr.tid = tid;
+		sevt->hdr.source = EVENT_SRC_DRIVER;
+		sevt->hdr.op = entry->op;
+		sevt->hdr._pad = 0;
+		sevt->duration_ns = now - entry->timestamp_ns;
+		sevt->arg0 = entry->arg0;
+		sevt->arg1 = entry->arg1;
+		sevt->return_code = return_code;
+		sevt->gpu_id = 0;
+
+		long stack_bytes = bpf_get_stack(ctx, sevt->stack_ips,
+						 sizeof(sevt->stack_ips),
+						 BPF_F_USER_STACK);
+		if (stack_bytes > 0)
+			sevt->stack_depth = (__u16)(stack_bytes / 8);
+		else
+			sevt->stack_depth = 0;
+
+		sevt->_stack_pad[0] = 0;
+		sevt->_stack_pad[1] = 0;
+		sevt->_stack_pad[2] = 0;
+
+		bpf_ringbuf_submit(sevt, 0);
+		return;
+	}
+
+	struct cuda_event *evt;
+	evt = bpf_ringbuf_reserve(&driver_events, sizeof(*evt), 0);
+	if (!evt)
+		return;
+
+	evt->hdr.timestamp_ns = entry->timestamp_ns;
+	evt->hdr.pid = pid;
+	evt->hdr.tid = tid;
+	evt->hdr.source = EVENT_SRC_DRIVER;
+	evt->hdr.op = entry->op;
+	evt->hdr._pad = 0;
+	evt->duration_ns = now - entry->timestamp_ns;
+	evt->arg0 = entry->arg0;
+	evt->arg1 = entry->arg1;
+	evt->return_code = return_code;
+	evt->gpu_id = 0;
+
+	bpf_ringbuf_submit(evt, 0);
+}
+
+// ---- cuLaunchKernel ----
+// CUresult cuLaunchKernel(CUfunction f, ...)
+// arg0 = function handle
+
+SEC("uprobe/cuLaunchKernel")
+int uprobe_cu_launch_kernel(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 func_handle = (__u64)PT_REGS_PARM1(ctx);
+
+	driver_save_entry(tid, DRIVER_OP_LAUNCH_KERNEL, func_handle, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuLaunchKernel")
+int uretprobe_cu_launch_kernel(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
+// ---- cuMemcpy ----
+// CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
+// arg0 = ByteCount (param 3)
+
+SEC("uprobe/cuMemcpy")
+int uprobe_cu_memcpy(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 byte_count = (__u64)PT_REGS_PARM3(ctx);
+
+	driver_save_entry(tid, DRIVER_OP_MEMCPY, byte_count, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuMemcpy")
+int uretprobe_cu_memcpy(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
+// ---- cuMemcpyAsync ----
+// CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream)
+// arg0 = ByteCount (param 3)
+
+SEC("uprobe/cuMemcpyAsync")
+int uprobe_cu_memcpy_async(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 byte_count = (__u64)PT_REGS_PARM3(ctx);
+
+	driver_save_entry(tid, DRIVER_OP_MEMCPY_ASYNC, byte_count, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuMemcpyAsync")
+int uretprobe_cu_memcpy_async(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
+// ---- cuCtxSynchronize ----
+// CUresult cuCtxSynchronize(void)
+// No args.
+
+SEC("uprobe/cuCtxSynchronize")
+int uprobe_cu_ctx_sync(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+
+	driver_save_entry(tid, DRIVER_OP_CTX_SYNC, 0, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuCtxSynchronize")
+int uretprobe_cu_ctx_sync(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
+// ---- cuMemAlloc_v2 ----
+// CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
+// arg0 = bytesize (param 2)
+
+SEC("uprobe/cuMemAlloc_v2")
+int uprobe_cu_mem_alloc(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 bytesize = (__u64)PT_REGS_PARM2(ctx);
+
+	driver_save_entry(tid, DRIVER_OP_MEM_ALLOC, bytesize, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuMemAlloc_v2")
+int uretprobe_cu_mem_alloc(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
+// Force BTF emission for struct cuda_event (reused for driver events).
+const struct cuda_event *_unused_driver_event_force_btf __attribute__((unused));
+const struct cuda_event_stack *_unused_driver_event_stack_force_btf __attribute__((unused));
+const struct ingero_config *_unused_driver_config_force_btf __attribute__((unused));
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";

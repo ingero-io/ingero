@@ -1,0 +1,15 @@
+# Prometheus config for Ingero OTEL quickstart.
+# Scrapes Alloy's Prometheus endpoint for Ingero metrics.
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: ingero
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+    # If running Ingero with --prometheus :9090 directly:
+    # - targets: ['host.docker.internal:9090']
+
+  - job_name: alloy
+    static_configs:
+      - targets: ['alloy:12345']

@@ -1,0 +1,1096 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/ingero-io/ingero/internal/correlate"
+	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/ebpf/cuda"
+	"github.com/ingero-io/ingero/internal/ebpf/driver"
+	"github.com/ingero-io/ingero/internal/ebpf/host"
+	"github.com/ingero-io/ingero/internal/export"
+	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/internal/store"
+	"github.com/ingero-io/ingero/internal/symtab"
+	"github.com/ingero-io/ingero/internal/sysinfo"
+	"github.com/ingero-io/ingero/pkg/events"
+)
+
+// Flag variables for the trace command.
+var (
+	tracePID      int
+	traceUser     string
+	traceDuration time.Duration
+	traceJSON     bool
+	traceVerbose  bool
+	traceOTLP     string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
+	traceProm     string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
+	traceRecord   bool   // Record events to SQLite (default true).
+	traceStack    bool   // Capture userspace stack traces per event.
+)
+
+var traceCmd = &cobra.Command{
+	Use:   "trace",
+	Short: "Live CUDA event stream with stats and anomaly detection",
+	Long: `Attach eBPF uprobes to CUDA runtime (libcudart.so) and stream events
+in real time. Shows per-operation latency percentiles (p50/p95/p99),
+time-fraction breakdown (% of wall clock per operation), and flags
+periodic spikes and statistical anomalies.
+
+Auto-detects running CUDA processes. Use --pid to target a specific process.
+
+Requires root privileges (sudo) for eBPF probe attachment.`,
+
+	RunE: traceRunE,
+}
+
+func init() {
+	traceCmd.Flags().IntVarP(&tracePID, "pid", "p", 0, "target a specific process ID (0 = auto-detect)")
+	traceCmd.Flags().StringVarP(&traceUser, "user", "u", "", "trace all CUDA processes owned by this user")
+	traceCmd.Flags().DurationVarP(&traceDuration, "duration", "d", 0, "stop after duration (e.g., 30s, 5m). 0 = run until Ctrl+C")
+	traceCmd.Flags().BoolVar(&traceJSON, "json", false, "output events as JSON lines (for piping to jq, scripts, MCP)")
+	traceCmd.Flags().BoolVarP(&traceVerbose, "verbose", "v", false, "show verbose table output (extra columns in TUI mode)")
+	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (e.g., localhost:4317). Disabled by default.")
+	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default.")
+	traceCmd.Flags().BoolVar(&traceRecord, "record", true, "record events to SQLite (default true, use --record=false to disable)")
+	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
+
+	rootCmd.AddCommand(traceCmd)
+}
+
+// ---------------------------------------------------------------------------
+// Main trace logic
+// ---------------------------------------------------------------------------
+
+func traceRunE(cmd *cobra.Command, args []string) error {
+	// Step 1: Resolve target — find libcudart.so and optional PID.
+	libPath, targetPID, processName, err := resolveTarget(tracePID)
+	if err != nil {
+		return err
+	}
+	debugf("target resolved: lib=%s pid=%d name=%q", libPath, targetPID, processName)
+
+	// If --user not explicitly set, default to SUDO_USER so that
+	// "sudo ingero trace" traces the invoking user's processes, not root's.
+	// SUDO_USER is set by sudo(8) to the original user who ran sudo.
+	if traceUser == "" && tracePID == 0 {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			traceUser = sudoUser
+		}
+	}
+
+	// If --user specified (or defaulted from SUDO_USER), resolve to PIDs.
+	// Skip when targetPID==0 (pre-attach mode: library found on disk but no
+	// CUDA processes running yet). In that mode probes fire for any process
+	// that loads the library, so requiring a running PID would be wrong.
+	if traceUser != "" && targetPID != 0 {
+		pids, err := resolvePIDsForUser(traceUser)
+		if err != nil {
+			return fmt.Errorf("resolving user %q: %w", traceUser, err)
+		}
+		if len(pids) == 0 {
+			return fmt.Errorf("no CUDA processes found for user %q", traceUser)
+		}
+		targetPID = pids[0]
+		fmt.Fprintf(os.Stderr, "  User %q: found %d CUDA process(es), tracing PID %d\n", traceUser, len(pids), targetPID)
+	} else if traceUser != "" {
+		pids, _ := resolvePIDsForUser(traceUser)
+		if len(pids) > 0 {
+			targetPID = pids[0]
+			fmt.Fprintf(os.Stderr, "  User %q: found %d CUDA process(es), tracing PID %d\n", traceUser, len(pids), targetPID)
+		} else {
+			fmt.Fprintf(os.Stderr, "  User %q: no CUDA processes yet — probes will trace all processes\n", traceUser)
+		}
+	}
+
+	// Step 2: Create CUDA tracer and attach eBPF uprobes.
+	var cudaOpts []cuda.Option
+	if traceStack {
+		cudaOpts = append(cudaOpts, cuda.WithStackCapture(true))
+	}
+	cudaTracer := cuda.New(libPath, cudaOpts...)
+	if err := cudaTracer.Attach(); err != nil {
+		return fmt.Errorf("attaching CUDA probes: %w", err)
+	}
+	defer cudaTracer.Close()
+	debugf("CUDA tracer: %d probes attached to %s", cudaTracer.ProbeCount(), libPath)
+
+	// Step 3: Create host tracer (non-fatal — graceful degradation).
+	// Always attach host tracepoints. When targetPID is 0 (all processes),
+	// the BPF target_pids map starts empty — PIDs are added dynamically
+	// as CUDA events arrive. This ensures host correlation works even
+	// without --pid.
+	var hostTracer *host.Tracer
+	hostProbeCount := 0
+	{
+		ht := host.New(uint32(targetPID))
+		if err := ht.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: host tracepoints unavailable: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  Continuing with CUDA-only mode.\n\n")
+			debugf("host tracer: attach failed: %v", err)
+		} else {
+			hostTracer = ht
+			hostProbeCount = 4 // sched_switch, sched_wakeup, mm_page_alloc, oom_kill
+			if targetPID > 0 {
+				debugf("host tracer: %d probes attached (pid=%d)", hostProbeCount, targetPID)
+			} else {
+				debugf("host tracer: %d probes attached (dynamic PID tracking)", hostProbeCount)
+			}
+		}
+	}
+	if hostTracer != nil {
+		defer hostTracer.Close()
+	}
+
+	// Step 3b: Create driver API tracer (non-fatal — not all systems have libcuda.so).
+	var driverTracer *driver.Tracer
+	driverProbeCount := 0
+	if libcudaPath, err := discover.FindLibCUDA(); err == nil {
+		debugf("libcuda.so found at %s", libcudaPath)
+		var driverOpts []driver.Option
+		if traceStack {
+			driverOpts = append(driverOpts, driver.WithStackCapture(true))
+		}
+		dt := driver.New(libcudaPath, driverOpts...)
+		if err := dt.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: driver API tracing unavailable: %v\n", err)
+			debugf("driver tracer: attach failed: %v", err)
+		} else {
+			driverTracer = dt
+			driverProbeCount = dt.ProbeCount()
+			debugf("driver tracer: %d probes attached to %s", driverProbeCount, libcudaPath)
+		}
+	} else {
+		debugf("libcuda.so not found: %v", err)
+	}
+	if driverTracer != nil {
+		defer driverTracer.Close()
+	}
+
+	// Step 4: Create stats collector and correlation engine.
+	collector := stats.New()
+	corr := correlate.New()
+
+	// Step 4b: Create OTEL exporters (disabled by default).
+	var otlpExporter *export.OTLPExporter
+	if traceOTLP != "" {
+		otlpExporter = export.NewOTLP(export.OTLPConfig{
+			Endpoint: traceOTLP,
+			Insecure: true, // Default to insecure for localhost development.
+			DebugLog: debugf,
+		})
+		debugf("OTLP: configured endpoint=%s", traceOTLP)
+	}
+
+	var promSrv *export.PrometheusServer
+	if traceProm != "" {
+		promSrv = export.NewPrometheus(traceProm)
+	}
+
+	// Step 4c: Open SQLite store (recording is on by default).
+	var eventStore *store.Store
+	if traceRecord {
+		dbPath := store.DefaultDBPath()
+		s, err := store.New(dbPath)
+		if err != nil {
+			return fmt.Errorf("opening database for recording: %w", err)
+		}
+		eventStore = s
+		debugf("recording to %s", dbPath)
+		defer func() {
+			eventStore.Close()
+			fmt.Fprintf(os.Stderr, "  Recorded events to %s\n", dbPath)
+		}()
+	}
+
+	// Step 4d: Create symbol resolver if --stack is set.
+	var resolver *symtab.Resolver
+	if traceStack {
+		if debugMode {
+			symtab.SetDebugLog(debugf)
+		}
+		resolver = symtab.NewResolver()
+	}
+
+	// Step 5: Set up graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if traceDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, traceDuration)
+		defer cancel()
+	}
+
+	// Step 6: Print header.
+	printTraceHeader(libPath, targetPID, processName, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount)
+
+	// Step 7: Launch tracers and merge event channels.
+	go cudaTracer.Run(ctx)
+	if hostTracer != nil {
+		go hostTracer.Run(ctx)
+	}
+	if driverTracer != nil {
+		go driverTracer.Run(ctx)
+	}
+
+	// Start SQLite writer if recording.
+	if eventStore != nil {
+		go eventStore.Run(ctx)
+	}
+
+	// Fan-in: merge all event channels into one.
+	merged := mergeAllEventChannels(ctx, cudaTracer.Events(), hostTracer, driverTracer)
+
+	// Start Prometheus server if configured.
+	if promSrv != nil {
+		go promSrv.Start(ctx)
+	}
+
+	// Start OTLP exporter if configured.
+	if otlpExporter != nil {
+		go otlpExporter.Start(ctx)
+	}
+
+	// Snapshot callback for exporters (OTLP, Prometheus).
+	// Called every 1s from the table/JSON mode tickers.
+	// OTLP push is rate-limited: only every ExportInterval seconds (default 10s).
+	// Only created when at least one exporter is configured, to avoid spinning
+	// a sysinfo.Collector goroutine (reading /proc every second) for nothing.
+	var onSnapshot func(*stats.Snapshot)
+	if promSrv != nil || otlpExporter != nil {
+		var otlpPushCount int
+		onSnapshot = func(snap *stats.Snapshot) {
+			if promSrv != nil {
+				promSrv.UpdateSnapshot(snap)
+			}
+			if otlpExporter != nil {
+				otlpPushCount++
+				if otlpPushCount%otlpExporter.Interval() == 0 {
+					if err := otlpExporter.Push(snap); err != nil {
+						debugf("OTLP: push error: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	// Combined dropped count from all tracers.
+	droppedFn := func() uint64 {
+		d := cudaTracer.Dropped()
+		if hostTracer != nil {
+			d += hostTracer.Dropped()
+		}
+		if driverTracer != nil {
+			d += driverTracer.Dropped()
+		}
+		return d
+	}
+
+	// Dynamic PID tracking: when tracing all processes (pid=0), we add
+	// PIDs to the host tracer's BPF map as we discover them from CUDA events.
+	// This ensures host correlation works without --pid.
+	trackedPIDs := make(map[uint32]bool)
+	if targetPID > 0 {
+		trackedPIDs[uint32(targetPID)] = true
+	}
+	trackPID := func(pid uint32) {
+		if hostTracer == nil || pid == 0 {
+			return
+		}
+		if !trackedPIDs[pid] {
+			trackedPIDs[pid] = true
+			hostTracer.SetTargetPID(pid)
+			debugf("host tracer: dynamically added PID %d", pid)
+		}
+	}
+
+	// Step 8: Run the event loop.
+	// trackPID is passed as onFork — called for both fork children and
+	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
+	if traceJSON {
+		return runJSONMode(ctx, merged, collector, targetPID, eventStore, resolver, onSnapshot, trackPID)
+	}
+	return runTableMode(ctx, merged, collector, targetPID, droppedFn, onSnapshot, eventStore, corr, resolver, trackPID)
+}
+
+// mergeAllEventChannels creates a single channel that receives events from
+// all active tracers (CUDA runtime, host, and optionally driver).
+func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, hostTracer *host.Tracer, driverTracer *driver.Tracer) <-chan events.Event {
+	// Collect all active channels.
+	channels := []<-chan events.Event{cudaCh}
+	if hostTracer != nil {
+		channels = append(channels, hostTracer.Events())
+	}
+	if driverTracer != nil {
+		channels = append(channels, driverTracer.Events())
+	}
+
+	if len(channels) == 1 {
+		return cudaCh
+	}
+
+	merged := make(chan events.Event, 8192)
+
+	// Launch one goroutine per source channel that forwards events to merged.
+	// Use sync.WaitGroup to safely close merged when all sources complete.
+	var wg sync.WaitGroup
+	for _, ch := range channels {
+		ch := ch // capture loop variable
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for evt := range ch {
+				select {
+				case merged <- evt:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Close merged when all source goroutines complete.
+	go func() {
+		wg.Wait()
+		close(merged)
+	}()
+
+	return merged
+}
+
+// ---------------------------------------------------------------------------
+// Target resolution
+// ---------------------------------------------------------------------------
+
+// resolveTarget finds the libcudart.so path and optional target process.
+//
+// Resolution order:
+//  1. If --pid is specified: scan that process's /proc/<pid>/maps
+//  2. If auto-detect: scan all processes for CUDA, use the first match
+//  3. Fallback: search filesystem for libcudart.so (attach to library,
+//     probes fire for ANY process that loads it)
+//
+// Returns (libPath, pid, processName, error). pid=0 means "all processes".
+func resolveTarget(pid int) (string, int, string, error) {
+	if pid != 0 {
+		// User specified a PID — find its libcudart.so.
+		procs, err := discover.FindCUDAProcesses()
+		if err != nil {
+			return "", 0, "", fmt.Errorf("scanning for CUDA processes: %w", err)
+		}
+
+		for _, p := range procs {
+			if p.PID == pid {
+				return p.LibCUDAPath, p.PID, p.Name, nil
+			}
+		}
+
+		return "", 0, "", fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
+	}
+
+	// Auto-detect: find any CUDA process.
+	procs, err := discover.FindCUDAProcesses()
+	if err != nil {
+		return "", 0, "", fmt.Errorf("scanning for CUDA processes: %w", err)
+	}
+
+	if len(procs) > 0 {
+		p := procs[0]
+		if len(procs) > 1 {
+			fmt.Fprintf(os.Stderr, "  Note: %d CUDA processes found, tracing PID %d (%s). Use --pid to choose.\n",
+				len(procs), p.PID, p.Name)
+		}
+		return p.LibCUDAPath, p.PID, p.Name, nil
+	}
+
+	// No running CUDA processes — attach to library on disk.
+	// Probes fire when any process later loads it.
+	libPath, err := discover.FindLibCUDART()
+	if err != nil {
+		return "", 0, "", fmt.Errorf(
+			"no CUDA processes found and libcudart.so not found.\n"+
+				"  Start a GPU workload first, or install CUDA toolkit.\n"+
+				"  Run 'ingero check' for detailed diagnostics")
+	}
+
+	fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPath)
+	fmt.Fprintf(os.Stderr, "  Probes will fire when a CUDA workload starts.\n\n")
+	return libPath, 0, "", nil
+}
+
+// ---------------------------------------------------------------------------
+// Table mode — live-updating stats display
+// ---------------------------------------------------------------------------
+
+// runTableMode consumes events and refreshes a stats table every second.
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, targetPID int, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, onFork ...func(uint32)) error {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Track how many lines we printed for cursor-up overwriting.
+	linesDrawn := 0
+
+	// Periodic debug throughput counter.
+	var debugEventCount uint64
+	var debugTickerCh <-chan time.Time
+	if debugMode {
+		dt := time.NewTicker(10 * time.Second)
+		defer dt.Stop()
+		debugTickerCh = dt.C
+	}
+
+	// System context collector (CPU/mem/load from /proc).
+	sysColl := sysinfo.New()
+	sysColl.Start()
+	defer sysColl.Stop()
+
+	// Helper to attach system context and get causal chains.
+	updateSysCtx := func() {
+		if corr == nil {
+			return
+		}
+		sys := sysColl.Snapshot()
+		corr.SetSystemSnapshot(&correlate.SystemContext{
+			CPUPercent: sys.CPUPercent,
+			MemUsedPct: sys.MemUsedPct,
+			MemAvailMB: sys.MemAvailMB,
+			SwapUsedMB: sys.SwapUsedMB,
+			LoadAvg1:   sys.LoadAvg1,
+			Timestamp:  sys.Timestamp,
+		})
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			updateSysCtx()
+			snap := collector.Snapshot()
+			attachSysSnapshot(snap, sysColl)
+			var corrs []correlate.Correlation
+			var chains []correlate.CausalChain
+			if corr != nil {
+				corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
+				chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+			}
+			renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+			return nil
+
+		case evt, ok := <-eventCh:
+			if !ok {
+				updateSysCtx()
+				snap := collector.Snapshot()
+				attachSysSnapshot(snap, sysColl)
+				var corrs []correlate.Correlation
+				var chains []correlate.CausalChain
+				if corr != nil {
+					corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
+					chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+				}
+				renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+				return nil
+			}
+
+			if targetPID != 0 && int(evt.PID) != targetPID {
+				continue
+			}
+
+			// Resolve stack symbols if enabled.
+			if resolver != nil && len(evt.Stack) > 0 {
+				resolver.ResolveStack(&evt)
+				debugLogStack(&evt)
+			}
+
+			collector.Record(evt)
+			debugEventCount++
+
+			if eventStore != nil {
+				eventStore.Record(evt)
+			}
+
+			// Dynamic PID tracking: register CUDA/driver event PIDs with
+			// the host tracer so it collects host events for those processes.
+			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
+				onFork[0](evt.PID)
+			}
+
+			if corr != nil && evt.Source == events.SourceHost {
+				corr.RecordHost(evt)
+			}
+
+			// Dynamic PID tracking: when a target process forks, auto-add child.
+			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
+				childPID := uint32(evt.Args[1])
+				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {
+					onFork[0](childPID)
+				}
+			}
+
+		case <-ticker.C:
+			updateSysCtx()
+			// Record system snapshot for post-hoc causal chain replay.
+			if eventStore != nil {
+				sys := sysColl.Snapshot()
+				eventStore.RecordSnapshot(store.SystemSnapshot{
+					Timestamp:  sys.Timestamp,
+					CPUPercent: sys.CPUPercent,
+					MemUsedPct: sys.MemUsedPct,
+					MemAvailMB: sys.MemAvailMB,
+					SwapUsedMB: sys.SwapUsedMB,
+					LoadAvg1:   sys.LoadAvg1,
+				})
+			}
+			snap := collector.Snapshot()
+			attachSysSnapshot(snap, sysColl)
+			if onSnapshot != nil {
+				onSnapshot(snap)
+			}
+			if snap.TotalEvents > 0 || snap.System != nil {
+				var corrs []correlate.Correlation
+				var chains []correlate.CausalChain
+				if corr != nil {
+					corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
+					chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+				}
+				if eventStore != nil && len(chains) > 0 {
+					eventStore.RecordChains(chainsToStored(chains))
+				}
+				renderTable(snap, droppedFn(), &linesDrawn, false, corrs, chains)
+			}
+
+		case <-debugTickerCh:
+			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d, dropped=%d",
+				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents, droppedFn())
+			debugEventCount = 0
+		}
+	}
+}
+
+// attachSysSnapshot copies the sysinfo snapshot into the stats snapshot.
+func attachSysSnapshot(snap *stats.Snapshot, sysColl *sysinfo.Collector) {
+	sys := sysColl.Snapshot()
+	snap.System = &stats.SystemSnapshot{
+		CPUPercent: sys.CPUPercent,
+		MemUsedPct: sys.MemUsedPct,
+		MemAvailMB: sys.MemAvailMB,
+		MemTotalMB: sys.MemTotalMB,
+		SwapUsedMB: sys.SwapUsedMB,
+		LoadAvg1:   sys.LoadAvg1,
+		LoadAvg5:   sys.LoadAvg5,
+		PageFaults: sys.PageFaults,
+	}
+}
+
+// renderOpsSection writes a titled stats table section for a set of ops.
+func renderOpsSection(b *strings.Builder, lines *int, title string, ops []stats.OpStats) {
+	// Section title.
+	fmt.Fprintf(b, "  %s\033[K\n", title)
+	*lines++
+
+	// Table header.
+	fmt.Fprintf(b, "  %-20s %8s %10s %10s %10s %10s %7s %8s\033[K\n",
+		"OPERATION", "COUNT", "P50", "P95", "P99", "MAX", "WALL%", "SPIKES")
+	*lines++
+
+	// Separator.
+	fmt.Fprintf(b, "  %s\033[K\n", strings.Repeat("-", 87))
+	*lines++
+
+	// One row per operation.
+	for _, op := range ops {
+		spikeIndicator := ""
+		if op.AnomalyCount > 0 {
+			spikeIndicator = "!"
+		}
+
+		fmt.Fprintf(b, "  %-20s %8d %10s %10s %10s %10s %6.1f%% %7d%s\033[K\n",
+			op.Op,
+			op.Count,
+			formatDuration(op.P50),
+			formatDuration(op.P95),
+			formatDuration(op.P99),
+			formatDuration(op.Max),
+			op.TimeFraction*100,
+			op.AnomalyCount,
+			spikeIndicator,
+		)
+		*lines++
+	}
+
+	if len(ops) == 0 {
+		fmt.Fprintf(b, "  (no events yet)\033[K\n")
+		*lines++
+	}
+}
+
+// renderBar renders an ASCII bar chart: [████████░░░░░░░░░░░░] 47%
+func renderBar(value, max float64, width int) string {
+	if max <= 0 {
+		max = 100
+	}
+	pct := value / max
+	if pct > 1 {
+		pct = 1
+	}
+	filled := int(pct * float64(width))
+	empty := width - filled
+
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
+
+	// Flag if abnormal.
+	flag := ""
+	if value > 90 {
+		flag = " [!]"
+	}
+
+	return fmt.Sprintf("[%s] %.0f%%%s", bar, value, flag)
+}
+
+// renderSystemLine renders the one-line system context with ASCII bars.
+func renderSystemLine(b *strings.Builder, lines *int, sys *stats.SystemSnapshot) {
+	if sys == nil {
+		return
+	}
+
+	cpuBar := renderBar(sys.CPUPercent, 100, 20)
+	memBar := renderBar(sys.MemUsedPct, 100, 20)
+
+	line := fmt.Sprintf("  System: CPU %s | Mem %s (%d MB free) | Load %.1f",
+		cpuBar, memBar, sys.MemAvailMB, sys.LoadAvg1)
+	if sys.SwapUsedMB > 0 {
+		line += fmt.Sprintf(" | Swap %d MB [!]", sys.SwapUsedMB)
+	}
+	fmt.Fprintf(b, "%s\033[K\n", line)
+	*lines++
+
+	// Separator after system line.
+	fmt.Fprintf(b, "\033[K\n")
+	*lines++
+}
+
+func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
+	var b strings.Builder
+
+	// Move cursor up to overwrite previous output.
+	if *linesDrawn > 0 {
+		fmt.Fprintf(&b, "\033[%dA", *linesDrawn)
+	}
+
+	lines := 0
+
+	// Section 1: System Context (one line with ASCII bars).
+	renderSystemLine(&b, &lines, snap.System)
+
+	// Split ops by Source for three-section display.
+	var cudaOps, driverOps, hostOps []stats.OpStats
+	for _, op := range snap.Ops {
+		switch op.Source {
+		case events.SourceHost:
+			hostOps = append(hostOps, op)
+		case events.SourceDriver:
+			driverOps = append(driverOps, op)
+		default:
+			cudaOps = append(cudaOps, op)
+		}
+	}
+
+	// Section 2: CUDA Runtime API table.
+	renderOpsSection(&b, &lines, "CUDA Runtime API", cudaOps)
+
+	// Section 3: CUDA Driver API table (if any driver events present).
+	if len(driverOps) > 0 {
+		fmt.Fprintf(&b, "\033[K\n")
+		lines++
+		renderOpsSection(&b, &lines, "CUDA Driver API", driverOps)
+	}
+
+	// Section 4: Host context table (if any host events present).
+	if len(hostOps) > 0 {
+		fmt.Fprintf(&b, "\033[K\n")
+		lines++
+		renderOpsSection(&b, &lines, "Host Context", hostOps)
+	}
+
+	// Empty line.
+	fmt.Fprintf(&b, "\033[K\n")
+	lines++
+
+	// Summary line.
+	summary := fmt.Sprintf("  Wall: %s | Events: %d | Anomalies: %d",
+		formatDuration(snap.WallClock), snap.TotalEvents, snap.AnomalyEvents)
+	if dropped > 0 {
+		summary += fmt.Sprintf(" | Dropped: %d", dropped)
+	}
+	fmt.Fprintf(&b, "%s\033[K\n", summary)
+	lines++
+
+	// Spike patterns.
+	for _, op := range snap.Ops {
+		if op.SpikePattern != "" {
+			fmt.Fprintf(&b, "  Pattern: %s spikes %s\033[K\n", op.Op, op.SpikePattern)
+			lines++
+		}
+	}
+
+	// Correlation annotations (v0.2).
+	if len(correlations) > 0 {
+		for _, c := range correlations {
+			fmt.Fprintf(&b, "  >> %s\033[K\n", c.String())
+			lines++
+		}
+	}
+
+	// Causal chain annotations (v0.3).
+	if len(chains) > 0 {
+		for _, chainList := range chains {
+			for _, ch := range chainList {
+				fmt.Fprintf(&b, "  [%s] %s\033[K\n", ch.Severity, ch.Summary)
+				lines++
+			}
+		}
+	}
+
+	if final {
+		fmt.Fprintf(&b, "\n  Done.\n")
+	}
+
+	// Write everything at once (reduces flicker).
+	fmt.Fprint(os.Stdout, b.String())
+	*linesDrawn = lines
+}
+
+// ---------------------------------------------------------------------------
+// JSON mode — streaming JSON lines (JSONL)
+// ---------------------------------------------------------------------------
+
+// jsonStackFrame is the JSON-serializable stack frame.
+type jsonStackFrame struct {
+	IP     string `json:"ip"`
+	Symbol string `json:"symbol,omitempty"`
+	File   string `json:"file,omitempty"`
+	Line   int    `json:"line,omitempty"`
+	PyFile string `json:"py_file,omitempty"`
+	PyFunc string `json:"py_func,omitempty"`
+	PyLine int    `json:"py_line,omitempty"`
+}
+
+type jsonEvent struct {
+	Timestamp  string           `json:"timestamp"`
+	PID        uint32           `json:"pid"`
+	TID        uint32           `json:"tid"`
+	Source     string           `json:"source"`
+	Op         string           `json:"op"`
+	DurationNs int64            `json:"duration_ns"`
+	Duration   string           `json:"duration"`
+	GPUID      uint32           `json:"gpu_id"`
+	Args       [2]uint64        `json:"args"`
+	ReturnCode int32            `json:"return_code"`
+	Anomaly    bool             `json:"anomaly"`
+	Stack      []jsonStackFrame `json:"stack,omitempty"`
+}
+
+// runJSONMode streams events as newline-delimited JSON (JSONL).
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, targetPID int, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), onFork ...func(uint32)) error {
+	enc := json.NewEncoder(os.Stdout)
+
+	// Periodic debug throughput counter (same as runTableMode).
+	var debugEventCount uint64
+	var debugTickerCh <-chan time.Time
+	if debugMode {
+		dt := time.NewTicker(10 * time.Second)
+		defer dt.Stop()
+		debugTickerCh = dt.C
+	}
+
+	// System context collector — needed for exporter snapshots and for
+	// recording system snapshots to SQLite (post-hoc causal chain replay).
+	var sysColl *sysinfo.Collector
+	if onSnapshot != nil || eventStore != nil {
+		sysColl = sysinfo.New()
+		sysColl.Start()
+		defer sysColl.Stop()
+	}
+
+	// Periodic snapshot for exporters (OTLP, Prometheus) — every 1s, same as table mode.
+	snapTicker := time.NewTicker(1 * time.Second)
+	defer snapTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case <-snapTicker.C:
+			if onSnapshot != nil {
+				snap := collector.Snapshot()
+				attachSysSnapshot(snap, sysColl)
+				onSnapshot(snap)
+			}
+			// Record system snapshot for post-hoc causal chain replay.
+			if eventStore != nil && sysColl != nil {
+				sys := sysColl.Snapshot()
+				eventStore.RecordSnapshot(store.SystemSnapshot{
+					Timestamp:  sys.Timestamp,
+					CPUPercent: sys.CPUPercent,
+					MemUsedPct: sys.MemUsedPct,
+					MemAvailMB: sys.MemAvailMB,
+					SwapUsedMB: sys.SwapUsedMB,
+					LoadAvg1:   sys.LoadAvg1,
+				})
+			}
+
+		case evt, ok := <-eventCh:
+			if !ok {
+				return nil
+			}
+
+			// PID filter.
+			if targetPID != 0 && int(evt.PID) != targetPID {
+				continue
+			}
+
+			// Resolve stack symbols if enabled.
+			if resolver != nil && len(evt.Stack) > 0 {
+				resolver.ResolveStack(&evt)
+				debugLogStack(&evt)
+			}
+
+			collector.Record(evt)
+			debugEventCount++
+
+			if eventStore != nil {
+				eventStore.Record(evt)
+			}
+
+			// Dynamic PID tracking: register CUDA/driver event PIDs with
+			// the host tracer so it collects host events for those processes.
+			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
+				onFork[0](evt.PID)
+			}
+
+			// Dynamic PID tracking: when a target process forks, auto-add child.
+			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
+				childPID := uint32(evt.Args[1])
+				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {
+					onFork[0](childPID)
+				}
+			}
+
+			je := jsonEvent{
+				Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
+				PID:        evt.PID,
+				TID:        evt.TID,
+				Source:     evt.Source.String(),
+				Op:         evt.OpName(),
+				DurationNs: evt.Duration.Nanoseconds(),
+				Duration:   formatDuration(evt.Duration),
+				GPUID:      evt.GPUID,
+				Args:       evt.Args,
+				ReturnCode: evt.RetCode,
+				Anomaly:    collector.IsAnomaly(evt),
+			}
+
+			// Include stack trace if present.
+			if len(evt.Stack) > 0 {
+				je.Stack = make([]jsonStackFrame, len(evt.Stack))
+				for i, f := range evt.Stack {
+					je.Stack[i] = jsonStackFrame{
+						IP:     fmt.Sprintf("0x%x", f.IP),
+						Symbol: f.SymbolName,
+						File:   f.File,
+						Line:   f.Line,
+						PyFile: f.PyFile,
+						PyFunc: f.PyFunc,
+						PyLine: f.PyLine,
+					}
+				}
+			}
+
+			if err := enc.Encode(je); err != nil {
+				return fmt.Errorf("writing JSON: %w", err)
+			}
+
+		case <-debugTickerCh:
+			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d",
+				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents)
+			debugEventCount = 0
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+// printTraceHeader prints the initial banner with target info.
+//
+// When --json mode is active, the header is written to STDERR to avoid
+// contaminating the JSON stream on stdout. This was a known bug through v0.4
+// where the ASCII header mixed with JSONL output, breaking jq, MCP consumers,
+// and any tool expecting valid JSONL on stdout.
+func printTraceHeader(libPath string, pid int, processName string, cudaProbeCount int, hostProbeCount int, driverProbeCount int) {
+	// In JSON mode, redirect header to stderr so stdout is clean JSONL.
+	w := os.Stdout
+	if traceJSON {
+		w = os.Stderr
+	}
+
+	fmt.Fprintln(w, "Ingero Trace — Live CUDA Event Stream")
+	fmt.Fprintln(w)
+
+	if pid != 0 {
+		fmt.Fprintf(w, "  Target: PID %d (%s)\n", pid, processName)
+	} else {
+		fmt.Fprintln(w, "  Target: all CUDA processes")
+	}
+
+	fmt.Fprintf(w, "  Library: %s\n", libPath)
+	fmt.Fprintf(w, "  CUDA probes: %d attached\n", cudaProbeCount)
+	if driverProbeCount > 0 {
+		fmt.Fprintf(w, "  Driver probes: %d attached\n", driverProbeCount)
+	}
+	if hostProbeCount > 0 {
+		fmt.Fprintf(w, "  Host probes: %d attached\n", hostProbeCount)
+	}
+
+	if !traceRecord {
+		fmt.Fprintln(w, "  Recording: disabled (--record=false)")
+	} else {
+		fmt.Fprintf(w, "  Recording: %s\n", store.DefaultDBPath())
+	}
+	if traceStack {
+		fmt.Fprintln(w, "  Stack traces: enabled")
+	}
+	if traceOTLP != "" {
+		fmt.Fprintf(w, "  OTLP: %s\n", traceOTLP)
+	}
+
+	if traceDuration > 0 {
+		fmt.Fprintf(w, "  Duration: %s\n", traceDuration)
+	} else {
+		fmt.Fprintln(w, "  Duration: until Ctrl+C")
+	}
+
+	fmt.Fprintln(w)
+}
+
+// formatDuration formats a duration with 1-2 significant digits per unit tier.
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "0"
+	}
+
+	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		us := float64(d.Nanoseconds()) / 1000.0
+		if us < 10 {
+			return fmt.Sprintf("%.1fus", us)
+		}
+		return fmt.Sprintf("%.0fus", us)
+	case d < time.Second:
+		ms := float64(d.Nanoseconds()) / 1e6
+		if ms < 10 {
+			return fmt.Sprintf("%.1fms", ms)
+		}
+		return fmt.Sprintf("%.0fms", ms)
+	case d < time.Minute:
+		s := d.Seconds()
+		if s < 10 {
+			return fmt.Sprintf("%.1fs", s)
+		}
+		return fmt.Sprintf("%.0fs", s)
+	default:
+		return d.Truncate(time.Second).String()
+	}
+}
+
+// debugLogStack logs a resolved stack trace to stderr when --debug is enabled.
+// Only logs the first event with stacks (to avoid flooding), then periodically.
+var debugStackLogCount uint64
+
+func debugLogStack(evt *events.Event) {
+	if !debugMode || len(evt.Stack) == 0 {
+		return
+	}
+
+	// Log the first 3 events with stacks, then every 1000th.
+	debugStackLogCount++
+	if debugStackLogCount > 3 && debugStackLogCount%1000 != 0 {
+		return
+	}
+
+	debugf("stack trace for %s (PID %d, TID %d, %d frames):",
+		evt.OpName(), evt.PID, evt.TID, len(evt.Stack))
+	for i, f := range evt.Stack {
+		if f.PyFile != "" {
+			debugf("  [%d] [Python] %s:%d in %s()", i, f.PyFile, f.PyLine, f.PyFunc)
+		} else if f.SymbolName != "" {
+			debugf("  [%d] %s (%s)", i, f.SymbolName, f.File)
+		} else if f.IP != 0 {
+			debugf("  [%d] 0x%x (%s)", i, f.IP, f.File)
+		}
+	}
+}
+
+// chainsToStored converts correlate.CausalChain slice to store.StoredChain slice.
+func chainsToStored(chains []correlate.CausalChain) []store.StoredChain {
+	now := time.Now()
+	out := make([]store.StoredChain, len(chains))
+	for i, ch := range chains {
+		tl := make([]store.TimelineEntry, len(ch.Timeline))
+		for j, te := range ch.Timeline {
+			tl[j] = store.TimelineEntry{
+				Layer:      te.Layer,
+				Op:         te.Op,
+				Detail:     te.Detail,
+				DurationUS: int64(te.Duration / time.Microsecond),
+			}
+		}
+		// Parse tail ratio from summary (format: "op p99=Xms (Y.Zx p50)").
+		// Use separate scan variables — Sscanf partial match on OOM chains
+		// ("OOM killer...") would overwrite cudaOp with "OOM".
+		var scanOp, scanDur string
+		var tailRatio float64
+		fmt.Sscanf(ch.Summary, "%s p99=%s (%fx", &scanOp, &scanDur, &tailRatio)
+
+		// Extract CUDA op and p99 from timeline (last entry is the symptom).
+		var cudaOp string
+		var p99us, p50us int64
+		if len(ch.Timeline) > 0 {
+			last := ch.Timeline[len(ch.Timeline)-1]
+			cudaOp = last.Op
+			p99us = int64(last.Duration / time.Microsecond)
+		}
+		if tailRatio > 0 && p99us > 0 {
+			p50us = int64(float64(p99us) / tailRatio)
+		}
+
+		out[i] = store.StoredChain{
+			ID:              ch.ID,
+			DetectedAt:      now,
+			Severity:        ch.Severity,
+			Summary:         ch.Summary,
+			RootCause:       ch.RootCause,
+			Explanation:     ch.Explanation,
+			Recommendations: ch.Recommendations,
+			CUDAOp:          cudaOp,
+			CUDAP99us:       p99us,
+			CUDAP50us:       p50us,
+			TailRatio:       tailRatio,
+			Timeline:        tl,
+		}
+	}
+	return out
+}
