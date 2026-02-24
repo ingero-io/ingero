@@ -34,8 +34,11 @@ func symDebugf(format string, args ...any) {
 //  1. Build ID: read .note.gnu.build-id → /usr/lib/debug/.build-id/XX/XXXX.debug
 //  2. Debuglink: read .gnu_debuglink → search dir/, dir/.debug/, /usr/lib/debug/dir/
 //  3. Inline: check if libPath itself has .debug_info (unstripped, e.g. conda builds)
-//  4. Debug build: try libpythonX.Yd.so (Ubuntu's -dbg package includes full DWARF
-//     with identical struct layouts to the release build)
+//  4. Debug build: try libpythonX.Yd.so (Ubuntu's -dbg package includes full DWARF).
+//     Since CPython 3.8, Py_DEBUG no longer implies Py_TRACE_REFS, so the debug
+//     build's struct layouts match the release build (no _PyObject_HEAD_EXTRA).
+//     This is the most reliable fallback on Ubuntu when -dbgsym packages aren't
+//     available from ddebs.ubuntu.com.
 //
 // Returns "" with nil error if no debug info is found (caller should fall back).
 func FindDebugFile(libPath string) (string, error) {
@@ -47,26 +50,31 @@ func FindDebugFile(libPath string) (string, error) {
 
 	// Strategy 1: Build ID lookup.
 	if path, err := findByBuildID(f); err == nil && path != "" {
+		symDebugf("found debug file via build-id: %s", path)
 		return path, nil
 	}
 
 	// Strategy 2: .gnu_debuglink lookup.
 	if path, err := findByDebuglink(f, libPath); err == nil && path != "" {
+		symDebugf("found debug file via debuglink: %s", path)
 		return path, nil
 	}
 
 	// Strategy 3: Check if the binary itself has DWARF sections.
 	if hasInlineDWARF(f) {
+		symDebugf("found inline DWARF in %s", libPath)
 		return libPath, nil
 	}
 
 	// Strategy 4: Try the debug build library (libpythonX.Yd.so).
 	// Ubuntu's libpython3.X-dbg package installs a debug build with full DWARF.
-	// Struct layouts are identical to the release build — only assertions differ.
+	// Since CPython 3.8, Py_DEBUG no longer implies Py_TRACE_REFS, so struct
+	// layouts match the release build (verified on Ubuntu 22.04 with offsetof).
 	if path := findDebugBuildLib(libPath); path != "" {
 		return path, nil
 	}
 
+	symDebugf("no DWARF debug info found for %s (install libpython3.X-dbgsym or libpython3.X-dbg)", libPath)
 	return "", nil
 }
 
@@ -194,8 +202,8 @@ func findByDebuglink(f *elf.File, libPath string) (string, error) {
 // findDebugBuildLib checks for a debug build of libpython (libpythonX.Yd.so).
 //
 // On Ubuntu, `apt install libpython3.10-dbg` installs libpython3.10d.so with
-// full DWARF debug info. The struct layouts are identical to the release build
-// (same source, same configure flags, just compiled with Py_DEBUG).
+// full DWARF debug info. Since CPython 3.8, Py_DEBUG no longer implies
+// Py_TRACE_REFS, so struct layouts match the release build.
 //
 // Handles two input patterns:
 //
@@ -214,7 +222,6 @@ func findDebugBuildLib(libPath string) string {
 	}
 
 	// Case 2: python3.X or python3.10 binary (statically linked)
-	// Extract version from binary name to search for libpython3.Xd.so
 	if ver := extractPythonVersionFromBinary(base); ver != "" {
 		return findDebugBuildFromBinary(ver)
 	}
@@ -222,8 +229,6 @@ func findDebugBuildLib(libPath string) string {
 	return ""
 }
 
-// findDebugBuildFromLib handles the shared library case:
-// libpython3.10.so.1.0 → libpython3.10d.so.1.0
 func findDebugBuildFromLib(libPath, base string) string {
 	dir := filepath.Dir(libPath)
 	const prefix = "libpython"
@@ -254,13 +259,10 @@ func findDebugBuildFromLib(libPath, base string) string {
 	return findFirstDWARFLib(candidates)
 }
 
-// findDebugBuildFromBinary handles the statically-linked binary case:
-// /usr/bin/python3.10 → search for libpython3.10d.so in standard paths
 func findDebugBuildFromBinary(ver string) string {
 	const prefix = "libpython"
 	debugLib := prefix + ver + "d.so"
 
-	// Standard library search paths on Ubuntu/Debian
 	dirs := []string{
 		"/usr/lib/x86_64-linux-gnu",
 		"/lib/x86_64-linux-gnu",
@@ -270,7 +272,6 @@ func findDebugBuildFromBinary(ver string) string {
 
 	var candidates []string
 	for _, dir := range dirs {
-		// Try versioned .so first, then base .so
 		candidates = append(candidates,
 			filepath.Join(dir, debugLib+".1.0"),
 			filepath.Join(dir, debugLib),
@@ -280,17 +281,15 @@ func findDebugBuildFromBinary(ver string) string {
 	return findFirstDWARFLib(candidates)
 }
 
-// extractPythonVersionFromBinary extracts "3.10" from "python3.10".
 func extractPythonVersionFromBinary(base string) string {
 	const prefix = "python"
-	if len(base) < len(prefix)+3 { // need "python3.X" minimum
+	if len(base) < len(prefix)+3 {
 		return ""
 	}
 	if base[:len(prefix)] != prefix {
 		return ""
 	}
-	ver := base[len(prefix):] // "3.10"
-	// Sanity: must start with digit, contain a dot
+	ver := base[len(prefix):]
 	if len(ver) < 3 || ver[0] < '0' || ver[0] > '9' {
 		return ""
 	}
@@ -306,7 +305,6 @@ func extractPythonVersionFromBinary(base string) string {
 	return ver
 }
 
-// findFirstDWARFLib checks candidate paths and returns the first one with DWARF.
 func findFirstDWARFLib(candidates []string) string {
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err != nil {
@@ -581,6 +579,9 @@ func BuildPyOffsetsFromDWARF(debugPath string, minor int) (*PyOffsets, error) {
 	}
 	if off, ok := tstateOffsets["thread_id"]; ok {
 		offsets.TstateThreadID = uint64(off)
+	}
+	if off, ok := tstateOffsets["native_thread_id"]; ok {
+		offsets.TstateNativeThreadID = uint64(off)
 	}
 
 	// Frame pointer field is version-dependent:

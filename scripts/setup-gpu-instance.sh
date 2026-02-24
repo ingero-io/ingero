@@ -433,25 +433,29 @@ else
 fi
 
 # Install Python debug symbols for DWARF-based CPython offset discovery.
-# This enables Ingero to extract real struct offsets from libpython rather than
-# relying on hardcoded upstream offsets (which differ on distro-patched builds).
+# Priority: -dbgsym (release debug symbols, best) → -dbg (debug build DWARF, good fallback).
+# Since CPython 3.8, Py_DEBUG no longer implies Py_TRACE_REFS, so -dbg struct
+# layouts match the release build. Both provide correct DWARF offsets.
 print_info "Installing libpython debug symbols for DWARF offset discovery..."
 PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "")
 if [ -n "$PY_MINOR" ]; then
-    # Try dbgsym first (from ddebs.ubuntu.com), then fallback to -dbg.
-    if sudo apt install -y -qq "libpython3.${PY_MINOR}-dbg" 2>/dev/null; then
-        print_success "libpython3.${PY_MINOR}-dbg installed (DWARF offsets available)"
+    DWARF_INSTALLED=false
+    # Try dbgsym first (release debug symbols, ideal).
+    if ! apt-cache policy 2>/dev/null | grep -q ddebs; then
+        print_info "Enabling ddebs repository for debug symbol packages..."
+        echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null 2>&1
+        echo "deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ddebs.list >/dev/null 2>&1
+        sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F2EDC64DC5AEE1F6B9C621F0C8CAB6595FDFF622 2>/dev/null || true
+        sudo apt update -qq 2>/dev/null
+    fi
+    if sudo apt install -y -qq "libpython3.${PY_MINOR}-dbgsym" 2>/dev/null; then
+        print_success "libpython3.${PY_MINOR}-dbgsym installed (release DWARF offsets available)"
+        DWARF_INSTALLED=true
     else
-        print_info "Trying dbgsym from ddebs repository..."
-        # Enable ddebs (Ubuntu debug symbol packages) if not already.
-        if ! apt-cache policy 2>/dev/null | grep -q ddebs; then
-            echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null 2>&1
-            echo "deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ddebs.list >/dev/null 2>&1
-            sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F2EDC64DC5AEE1F6B9C621F0C8CAB6595FDFF622 2>/dev/null || true
-            sudo apt update -qq 2>/dev/null
-        fi
-        if sudo apt install -y -qq "libpython3.${PY_MINOR}-dbgsym" 2>/dev/null; then
-            print_success "libpython3.${PY_MINOR}-dbgsym installed (DWARF offsets available)"
+        # Fallback: -dbg (debug build with DWARF — same struct layouts since CPython 3.8).
+        if sudo apt install -y -qq "libpython3.${PY_MINOR}-dbg" 2>/dev/null; then
+            print_success "libpython3.${PY_MINOR}-dbg installed (DWARF offsets via debug build)"
+            DWARF_INSTALLED=true
         else
             print_warn "Could not install libpython debug symbols. T11 will use hardcoded offsets."
         fi
