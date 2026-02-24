@@ -244,9 +244,9 @@ func runSyntheticScenario(ctx context.Context, s *synth.Scenario, loop bool) err
 
 	var err error
 	if demoJSON {
-		err = runJSONMode(ctx, ch, collector, 0, nil, nil, nil)
+		err = runJSONMode(ctx, ch, collector, nil, nil, nil, nil)
 	} else {
-		err = runTableMode(ctx, ch, collector, 0, noDrops, nil, nil, correlator, nil)
+		err = runTableMode(ctx, ch, collector, 0, nil, noDrops, nil, nil, correlator, nil)
 	}
 
 	if !demoJSON {
@@ -471,10 +471,15 @@ func runGPUScenario(ctx context.Context, s *synth.Scenario) error {
 	// Step 7: Run display loop.
 	traceVerbose = demoVerbose
 
+	// Build PID filter for the single workload PID.
+	var demoPIDFilter map[uint32]bool
+	if targetPID > 0 {
+		demoPIDFilter = map[uint32]bool{uint32(targetPID): true}
+	}
 	if demoJSON {
-		runJSONMode(workloadCtx, merged, collector, targetPID, nil, resolver, nil, trackPID)
+		runJSONMode(workloadCtx, merged, collector, demoPIDFilter, nil, resolver, nil, trackPID)
 	} else {
-		runTableMode(workloadCtx, merged, collector, targetPID, droppedFn, nil, nil, corr, resolver, trackPID)
+		runTableMode(workloadCtx, merged, collector, uint32(targetPID), demoPIDFilter, droppedFn, nil, nil, corr, resolver, trackPID)
 	}
 
 	// Print insight after the table.

@@ -17,7 +17,7 @@ import (
 
 var (
 	querySince  time.Duration
-	queryPID    int
+	queryPIDs   []int
 	queryOp     string
 	queryJSON   bool
 	queryLimit  int
@@ -39,7 +39,7 @@ Examples:
 
 func init() {
 	queryCmd.Flags().DurationVar(&querySince, "since", 1*time.Hour, "query events from the last duration (e.g., 30m, 1h, 24h)")
-	queryCmd.Flags().IntVarP(&queryPID, "pid", "p", 0, "filter by process ID (0 = all)")
+	queryCmd.Flags().IntSliceVarP(&queryPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	queryCmd.Flags().StringVar(&queryOp, "op", "", "filter by operation name (e.g., cudaMemcpy, sched_switch)")
 	queryCmd.Flags().BoolVar(&queryJSON, "json", false, "output as JSON")
 	queryCmd.Flags().IntVar(&queryLimit, "limit", 0, "max results (0 = 10000)")
@@ -49,7 +49,7 @@ func init() {
 
 func queryRunE(cmd *cobra.Command, args []string) error {
 	dbPath := store.DefaultDBPath()
-	debugf("query: db=%s since=%s pid=%d op=%q limit=%d", dbPath, querySince, queryPID, queryOp, queryLimit)
+	debugf("query: db=%s since=%s pids=%v op=%q limit=%d", dbPath, querySince, queryPIDs, queryOp, queryLimit)
 
 	s, err := store.New(dbPath)
 	if err != nil {
@@ -60,7 +60,7 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	// Build query params.
 	params := store.QueryParams{
 		Since: querySince,
-		PID:   uint32(queryPID),
+		PIDs:  toUint32Slice(queryPIDs),
 		Limit: queryLimit,
 	}
 
@@ -201,8 +201,14 @@ func queryOutputTable(evts []events.Event, params store.QueryParams) error {
 	snap := collector.Snapshot()
 
 	fmt.Printf("  Query: last %s", params.Since)
-	if params.PID > 0 {
-		fmt.Printf(" | PID %d", params.PID)
+	if len(params.PIDs) == 1 {
+		fmt.Printf(" | PID %d", params.PIDs[0])
+	} else if len(params.PIDs) > 1 {
+		pidStrs := make([]string, len(params.PIDs))
+		for i, p := range params.PIDs {
+			pidStrs[i] = fmt.Sprintf("%d", p)
+		}
+		fmt.Printf(" | PIDs %s", strings.Join(pidStrs, ","))
 	}
 	fmt.Printf(" | %d events\n\n", len(evts))
 

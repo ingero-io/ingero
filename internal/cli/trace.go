@@ -28,7 +28,7 @@ import (
 
 // Flag variables for the trace command.
 var (
-	tracePID      int
+	tracePIDs     []int
 	traceUser     string
 	traceDuration time.Duration
 	traceJSON     bool
@@ -55,7 +55,7 @@ Requires root privileges (sudo) for eBPF probe attachment.`,
 }
 
 func init() {
-	traceCmd.Flags().IntVarP(&tracePID, "pid", "p", 0, "target a specific process ID (0 = auto-detect)")
+	traceCmd.Flags().IntSliceVarP(&tracePIDs, "pid", "p", nil, "target process ID(s), comma-separated (default: all CUDA processes for current user)")
 	traceCmd.Flags().StringVarP(&traceUser, "user", "u", "", "trace all CUDA processes owned by this user")
 	traceCmd.Flags().DurationVarP(&traceDuration, "duration", "d", 0, "stop after duration (e.g., 30s, 5m). 0 = run until Ctrl+C")
 	traceCmd.Flags().BoolVar(&traceJSON, "json", false, "output events as JSON lines (for piping to jq, scripts, MCP)")
@@ -73,27 +73,30 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func traceRunE(cmd *cobra.Command, args []string) error {
-	// Step 1: Resolve target — find libcudart.so and optional PID.
-	libPath, targetPID, processName, err := resolveTarget(tracePID)
+	// Step 1: Resolve targets — find libcudart.so and target PIDs.
+	//
+	// Three modes:
+	//   --pid 123,456   → trace exactly those PIDs
+	//   --user bob      → trace all CUDA PIDs owned by bob
+	//   (default)       → trace all CUDA PIDs owned by SUDO_USER (invoking user)
+	libPath, targetPIDs, processNames, err := resolveTargets(tracePIDs)
 	if err != nil {
 		return err
 	}
-	debugf("target resolved: lib=%s pid=%d name=%q", libPath, targetPID, processName)
+	debugf("targets resolved: lib=%s pids=%v names=%v", libPath, targetPIDs, processNames)
 
-	// If --user not explicitly set, default to SUDO_USER so that
-	// "sudo ingero trace" traces the invoking user's processes, not root's.
-	// SUDO_USER is set by sudo(8) to the original user who ran sudo.
-	if traceUser == "" && tracePID == 0 {
+	// If --user not explicitly set and no --pid given, default to SUDO_USER
+	// so that "sudo ingero trace" traces the invoking user's processes, not root's.
+	if traceUser == "" && len(tracePIDs) == 0 {
 		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
 			traceUser = sudoUser
 		}
 	}
 
-	// If --user specified (or defaulted from SUDO_USER), resolve to PIDs.
-	// Skip when targetPID==0 (pre-attach mode: library found on disk but no
-	// CUDA processes running yet). In that mode probes fire for any process
-	// that loads the library, so requiring a running PID would be wrong.
-	if traceUser != "" && targetPID != 0 {
+	// If --user specified (or defaulted from SUDO_USER), resolve ALL PIDs.
+	// Skip when no CUDA processes are running (pre-attach mode: library found
+	// on disk but no processes yet — probes fire for any process that loads it).
+	if traceUser != "" && len(targetPIDs) > 0 {
 		pids, err := resolvePIDsForUser(traceUser)
 		if err != nil {
 			return fmt.Errorf("resolving user %q: %w", traceUser, err)
@@ -101,17 +104,22 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		if len(pids) == 0 {
 			return fmt.Errorf("no CUDA processes found for user %q", traceUser)
 		}
-		targetPID = pids[0]
-		fmt.Fprintf(os.Stderr, "  User %q: found %d CUDA process(es), tracing PID %d\n", traceUser, len(pids), targetPID)
+		targetPIDs = pids
+		processNames = resolveProcessNames(pids)
+		fmt.Fprintf(os.Stderr, "  User %q: tracing %d CUDA process(es)\n", traceUser, len(pids))
 	} else if traceUser != "" {
 		pids, _ := resolvePIDsForUser(traceUser)
 		if len(pids) > 0 {
-			targetPID = pids[0]
-			fmt.Fprintf(os.Stderr, "  User %q: found %d CUDA process(es), tracing PID %d\n", traceUser, len(pids), targetPID)
+			targetPIDs = pids
+			processNames = resolveProcessNames(pids)
+			fmt.Fprintf(os.Stderr, "  User %q: tracing %d CUDA process(es)\n", traceUser, len(pids))
 		} else {
 			fmt.Fprintf(os.Stderr, "  User %q: no CUDA processes yet — probes will trace all processes\n", traceUser)
 		}
 	}
+
+	// Build PID filter for event loop (nil = accept all).
+	pidFilter := pidSetFromInts(targetPIDs)
 
 	// Step 2: Create CUDA tracer and attach eBPF uprobes.
 	var cudaOpts []cuda.Option
@@ -126,14 +134,15 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	debugf("CUDA tracer: %d probes attached to %s", cudaTracer.ProbeCount(), libPath)
 
 	// Step 3: Create host tracer (non-fatal — graceful degradation).
-	// Always attach host tracepoints. When targetPID is 0 (all processes),
-	// the BPF target_pids map starts empty — PIDs are added dynamically
-	// as CUDA events arrive. This ensures host correlation works even
-	// without --pid.
+	// Always attach host tracepoints. When no PIDs are targeted, the BPF
+	// target_pids map starts empty — PIDs are added dynamically as CUDA
+	// events arrive. This ensures host correlation works even without --pid.
 	var hostTracer *host.Tracer
 	hostProbeCount := 0
 	{
-		ht := host.New(uint32(targetPID))
+		// Seed with first PID (host.New takes one initial PID, 0 = none).
+		initialPID := singlePIDOrZero(targetPIDs)
+		ht := host.New(uint32(initialPID))
 		if err := ht.Attach(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: host tracepoints unavailable: %v\n", err)
 			fmt.Fprintf(os.Stderr, "  Continuing with CUDA-only mode.\n\n")
@@ -141,8 +150,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		} else {
 			hostTracer = ht
 			hostProbeCount = 4 // sched_switch, sched_wakeup, mm_page_alloc, oom_kill
-			if targetPID > 0 {
-				debugf("host tracer: %d probes attached (pid=%d)", hostProbeCount, targetPID)
+			// Seed all target PIDs into the BPF map.
+			for _, pid := range targetPIDs {
+				if pid > 0 {
+					ht.SetTargetPID(uint32(pid))
+				}
+			}
+			if len(targetPIDs) > 0 {
+				debugf("host tracer: %d probes attached (%d target PIDs)", hostProbeCount, len(targetPIDs))
 			} else {
 				debugf("host tracer: %d probes attached (dynamic PID tracking)", hostProbeCount)
 			}
@@ -233,7 +248,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPID, processName, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount)
+	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount)
 
 	// Step 7: Launch tracers and merge event channels.
 	go cudaTracer.Run(ctx)
@@ -297,13 +312,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		return d
 	}
 
-	// Dynamic PID tracking: when tracing all processes (pid=0), we add
+	// Dynamic PID tracking: when tracing all processes (no --pid), we add
 	// PIDs to the host tracer's BPF map as we discover them from CUDA events.
 	// This ensures host correlation works without --pid.
 	trackedPIDs := make(map[uint32]bool)
-	if targetPID > 0 {
-		trackedPIDs[uint32(targetPID)] = true
+	for _, pid := range targetPIDs {
+		if pid > 0 {
+			trackedPIDs[uint32(pid)] = true
+		}
 	}
+
+	// Correlator PID: single PID for single-process, 0 for multi/all (aggregate).
+	corrPID := singlePIDOrZero(targetPIDs)
 	trackPID := func(pid uint32) {
 		if hostTracer == nil || pid == 0 {
 			return
@@ -319,9 +339,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, targetPID, eventStore, resolver, onSnapshot, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, targetPID, droppedFn, onSnapshot, eventStore, corr, resolver, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, trackPID)
 }
 
 // mergeAllEventChannels creates a single channel that receives events from
@@ -373,52 +393,66 @@ func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, host
 // Target resolution
 // ---------------------------------------------------------------------------
 
-// resolveTarget finds the libcudart.so path and optional target process.
+// resolveTargets finds the libcudart.so path and target processes.
 //
 // Resolution order:
-//  1. If --pid is specified: scan that process's /proc/<pid>/maps
-//  2. If auto-detect: scan all processes for CUDA, use the first match
+//  1. If --pid is specified: validate each PID in FindCUDAProcesses(), return lib from first
+//  2. If auto-detect: return ALL found CUDA processes (not just the first)
 //  3. Fallback: search filesystem for libcudart.so (attach to library,
 //     probes fire for ANY process that loads it)
 //
-// Returns (libPath, pid, processName, error). pid=0 means "all processes".
-func resolveTarget(pid int) (string, int, string, error) {
-	if pid != 0 {
-		// User specified a PID — find its libcudart.so.
+// Returns (libPath, pids, processNames, error). Empty pids means "all processes".
+func resolveTargets(pids []int) (string, []int, []string, error) {
+	if len(pids) > 0 {
+		// User specified PID(s) — find their libcudart.so.
 		procs, err := discover.FindCUDAProcesses()
 		if err != nil {
-			return "", 0, "", fmt.Errorf("scanning for CUDA processes: %w", err)
+			return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 		}
 
+		procMap := make(map[int]discover.CUDAProcess)
 		for _, p := range procs {
-			if p.PID == pid {
-				return p.LibCUDAPath, p.PID, p.Name, nil
-			}
+			procMap[p.PID] = p
 		}
 
-		return "", 0, "", fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
+		var libPath string
+		var resolvedPIDs []int
+		var names []string
+		for _, pid := range pids {
+			p, ok := procMap[pid]
+			if !ok {
+				return "", nil, nil, fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
+			}
+			if libPath == "" {
+				libPath = p.LibCUDAPath
+			}
+			resolvedPIDs = append(resolvedPIDs, p.PID)
+			names = append(names, p.Name)
+		}
+		return libPath, resolvedPIDs, names, nil
 	}
 
-	// Auto-detect: find any CUDA process.
+	// Auto-detect: find ALL CUDA processes.
 	procs, err := discover.FindCUDAProcesses()
 	if err != nil {
-		return "", 0, "", fmt.Errorf("scanning for CUDA processes: %w", err)
+		return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 	}
 
 	if len(procs) > 0 {
-		p := procs[0]
-		if len(procs) > 1 {
-			fmt.Fprintf(os.Stderr, "  Note: %d CUDA processes found, tracing PID %d (%s). Use --pid to choose.\n",
-				len(procs), p.PID, p.Name)
+		var resolvedPIDs []int
+		var names []string
+		for _, p := range procs {
+			resolvedPIDs = append(resolvedPIDs, p.PID)
+			names = append(names, p.Name)
 		}
-		return p.LibCUDAPath, p.PID, p.Name, nil
+		return procs[0].LibCUDAPath, resolvedPIDs, names, nil
 	}
 
 	// No running CUDA processes — attach to library on disk.
 	// Probes fire when any process later loads it.
 	libPath, err := discover.FindLibCUDART()
 	if err != nil {
-		return "", 0, "", fmt.Errorf(
+		return "", nil, nil, fmt.Errorf(
 			"no CUDA processes found and libcudart.so not found.\n"+
 				"  Start a GPU workload first, or install CUDA toolkit.\n"+
 				"  Run 'ingero check' for detailed diagnostics")
@@ -426,7 +460,24 @@ func resolveTarget(pid int) (string, int, string, error) {
 
 	fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPath)
 	fmt.Fprintf(os.Stderr, "  Probes will fire when a CUDA workload starts.\n\n")
-	return libPath, 0, "", nil
+	return libPath, nil, nil, nil
+}
+
+// resolveProcessNames looks up names for a list of PIDs via FindCUDAProcesses.
+func resolveProcessNames(pids []int) []string {
+	procs, err := discover.FindCUDAProcesses()
+	if err != nil {
+		return make([]string, len(pids))
+	}
+	procMap := make(map[int]string)
+	for _, p := range procs {
+		procMap[p.PID] = p.Name
+	}
+	names := make([]string, len(pids))
+	for i, pid := range pids {
+		names[i] = procMap[pid]
+	}
+	return names
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +485,9 @@ func resolveTarget(pid int) (string, int, string, error) {
 // ---------------------------------------------------------------------------
 
 // runTableMode consumes events and refreshes a stats table every second.
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, targetPID int, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, onFork ...func(uint32)) error {
+// corrPID is the correlator PID (single PID or 0 for aggregate).
+// pidFilter is the event-loop filter (nil = accept all).
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -480,8 +533,8 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			var corrs []correlate.Correlation
 			var chains []correlate.CausalChain
 			if corr != nil {
-				corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
-				chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+				corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
+				chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 			}
 			renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
 			return nil
@@ -494,14 +547,15 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				var corrs []correlate.Correlation
 				var chains []correlate.CausalChain
 				if corr != nil {
-					corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
-					chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
+					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}
 				renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
 				return nil
 			}
 
-			if targetPID != 0 && int(evt.PID) != targetPID {
+			// PID filter: nil = accept all, non-nil = only listed PIDs.
+			if pidFilter != nil && !pidFilter[evt.PID] {
 				continue
 			}
 
@@ -559,8 +613,8 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				var corrs []correlate.Correlation
 				var chains []correlate.CausalChain
 				if corr != nil {
-					corrs = corr.SnapshotCorrelations(snap.Ops, uint32(targetPID))
-					chains = corr.SnapshotCausalChains(snap.Ops, uint32(targetPID))
+					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
+					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}
 				if eventStore != nil && len(chains) > 0 {
 					eventStore.RecordChains(chainsToStored(chains))
@@ -800,7 +854,8 @@ type jsonEvent struct {
 }
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, targetPID int, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), onFork ...func(uint32)) error {
+// pidFilter is the event-loop filter (nil = accept all).
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -854,8 +909,8 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				return nil
 			}
 
-			// PID filter.
-			if targetPID != 0 && int(evt.PID) != targetPID {
+			// PID filter: nil = accept all, non-nil = only listed PIDs.
+			if pidFilter != nil && !pidFilter[evt.PID] {
 				continue
 			}
 
@@ -938,7 +993,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 // contaminating the JSON stream on stdout. This was a known bug through v0.4
 // where the ASCII header mixed with JSONL output, breaking jq, MCP consumers,
 // and any tool expecting valid JSONL on stdout.
-func printTraceHeader(libPath string, pid int, processName string, cudaProbeCount int, hostProbeCount int, driverProbeCount int) {
+func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int) {
 	// In JSON mode, redirect header to stderr so stdout is clean JSONL.
 	w := os.Stdout
 	if traceJSON {
@@ -948,10 +1003,30 @@ func printTraceHeader(libPath string, pid int, processName string, cudaProbeCoun
 	fmt.Fprintln(w, "Ingero Trace — Live CUDA Event Stream")
 	fmt.Fprintln(w)
 
-	if pid != 0 {
-		fmt.Fprintf(w, "  Target: PID %d (%s)\n", pid, processName)
-	} else {
+	switch len(pids) {
+	case 0:
 		fmt.Fprintln(w, "  Target: all CUDA processes")
+	case 1:
+		name := ""
+		if len(processNames) > 0 {
+			name = processNames[0]
+		}
+		fmt.Fprintf(w, "  Target: PID %d (%s)\n", pids[0], name)
+	default:
+		// Multi-PID: "Target: 3 processes [1234 (python3), 5678 (worker), ...]"
+		parts := make([]string, len(pids))
+		for i, pid := range pids {
+			name := ""
+			if i < len(processNames) {
+				name = processNames[i]
+			}
+			if name != "" {
+				parts[i] = fmt.Sprintf("%d (%s)", pid, name)
+			} else {
+				parts[i] = fmt.Sprintf("%d", pid)
+			}
+		}
+		fmt.Fprintf(w, "  Target: %d processes [%s]\n", len(pids), strings.Join(parts, ", "))
 	}
 
 	fmt.Fprintf(w, "  Library: %s\n", libPath)
