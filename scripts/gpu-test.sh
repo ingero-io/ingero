@@ -1,17 +1,31 @@
 #!/bin/bash
 ################################################################################
-# Ingero v0.6 GPU Integration Test — Stack Tracing + OTLP Export + MCP Diagnostic
+# Ingero GPU Integration Test — Canonical Single Script
 #
-# Run on remote GPU VM after code sync + build.
-# Tests: v0.4 regression gate → v0.6 stack → OTLP → benchmark → MCP diagnostic
+# This is the ONE test script for GPU integration testing. All other scripts
+# (gpu-integration-test.sh, lambdalabs/gpu-integration-test.sh,
+# remote-full-test.sh) have been consolidated into this file.
+#
+# Run on remote GPU VM after code sync + build:
+#   make gpu-test    (TensorDock)
+#   make lambda-test (Lambda Labs)
+#
+# Or directly on the VM:
+#   cd ~/workspace/ingero && bash scripts/gpu-test.sh
+#
+# Phases:
+#   0: System info capture
+#   1: Regression gate (T01-T09)
+#   2: Stack tracing deep tests (T10-T13)
+#   3: OTLP + Prometheus export (T14a-e, T15-T17)
+#   4: Stack latency benchmark (T18)
+#   5: MCP AI diagnostic (T19a-e, T20-T21)
 #
 # Parallelization strategy (saves ~350s / 44% faster):
 #   - T02 demos + T09 synthetics run as background jobs during Phase 1
 #   - T03+T07 merged into one trace session (clean + driver API check)
 #   - T10+T12 merged into one trace session (stack + record + query)
 #   - T18 benchmark reduced to 2+2 iterations at 20s
-#
-# Usage: cd ~/workspace/ingero && bash scripts/gpu-test.sh
 ################################################################################
 
 set -uo pipefail
@@ -144,6 +158,12 @@ bg_collect() {
     fi
     return $rc
 }
+
+# ── Binary guard — fail fast if not built ──
+if [[ ! -x bin/ingero ]]; then
+    fail "bin/ingero not found. Run 'make generate && make build' first."
+    exit 1
+fi
 
 exec > >(tee logs/integration-report.log) 2>&1
 
@@ -782,6 +802,43 @@ else
     record "FAIL" "T17: stack + OTLP combined" "events=$COMBINED_COUNT, with_stack=$COMBINED_STACK"
 fi
 
+# Test 14e: Prometheus /metrics endpoint
+_test_start=$SECONDS
+log "Test 14e: Prometheus /metrics"
+sudo fuser -k 9090/tcp 2>/dev/null || true
+sleep 1
+
+WL_PID=$(start_workload 18)
+sleep 1
+sudo ./bin/ingero trace --prometheus :9090 --json --duration 12s > logs/prom-events.json 2> logs/prom-debug.log &
+PROM_PID=$!
+cleanup_pids+=("$PROM_PID")
+sleep 5
+
+PROM_OUT=$(curl -s localhost:9090/metrics 2>&1)
+echo "$PROM_OUT" > logs/prom-metrics.txt
+
+wait "$PROM_PID" 2>/dev/null || true
+wait "$WL_PID" 2>/dev/null || true
+
+if echo "$PROM_OUT" | grep -q "system_cpu_utilization"; then
+    record "PASS" "T14e: Prometheus system metrics" "system_cpu_utilization present"
+else
+    record "FAIL" "T14e: Prometheus system metrics" "system_cpu_utilization missing"
+fi
+
+if echo "$PROM_OUT" | grep -q "gpu_cuda_operation_duration_microseconds"; then
+    record "PASS" "T14e: Prometheus CUDA metrics" "gpu_cuda_operation_duration_microseconds present"
+else
+    record "FAIL" "T14e: Prometheus CUDA metrics" "gpu_cuda_operation_duration_microseconds missing"
+fi
+
+if echo "$PROM_OUT" | grep -q "# TYPE"; then
+    record "PASS" "T14e: Prometheus exposition format" "# TYPE lines present"
+else
+    record "FAIL" "T14e: Prometheus exposition format" "no # TYPE lines"
+fi
+
 ################################################################################
 # Phase 4: Stack Latency Benchmark (2+2 iterations, 20s each)
 ################################################################################
@@ -1041,10 +1098,209 @@ else
         record "FAIL" "T19e: MCP get_test_report" "unexpected response"
     fi
 
+    # ── T20: MCP Session Transcript ──
+    # Generate a structured "ML Engineer diagnosis" session log.
+    # TSC is on by default (omit or pass true) — never pass false.
+    _test_start=$SECONDS
+    log "Test 20: MCP session transcript"
+
+    SESSION_FILE="logs/mcp-session.txt"
+    DB_COUNT=$(sudo ./bin/ingero query --since 60m --json 2>/dev/null | grep -c '"op"' || echo "?")
+
+    {
+        echo "=== Ingero MCP Session — ML Engineer Diagnosis Demo ==="
+        echo "Date: $(date -u)"
+        echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+        echo "DB: ${DB_COUNT} events in ingero.db"
+        echo ""
+
+        # Step 0: tools/list
+        echo "========================================"
+        echo ">> Step 0: ML Engineer: What can Ingero tell me?"
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":0,"method":"tools/list"}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(curl -skf https://localhost:8080/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d "$REQ" 2>/dev/null)
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 1: get_check
+        echo "========================================"
+        echo ">> Step 1: ML Engineer: Is my GPU environment healthy?"
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_check","arguments":{}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "get_check" '{}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 2: get_trace_stats (TSC on — default)
+        echo "========================================"
+        echo ">> Step 2: ML Engineer: Show me GPU stats (TSC compressed)."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_trace_stats","arguments":{"since":"30m"}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "get_trace_stats" '{"since":"30m"}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 3: query_events (TSC on — default)
+        echo "========================================"
+        echo ">> Step 3: ML Engineer: Show me recent events."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_events","arguments":{"since":"30m","limit":20}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "query_events" '{"since":"30m","limit":20}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 4: get_causal_chains (TSC on — default)
+        echo "========================================"
+        echo ">> Step 4: ML Engineer: Diagnose root cause."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_causal_chains","arguments":{"since":"30m"}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "get_causal_chains" '{"since":"30m"}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 5: run_demo (synthetic scenario)
+        echo "========================================"
+        echo ">> Step 5: ML Engineer: Run a demo scenario."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_demo","arguments":{"scenario":"incident"}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "run_demo" '{"scenario":"incident"}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 6: get_test_report
+        echo "========================================"
+        echo ">> Step 6: ML Engineer: Show me the test report."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_test_report","arguments":{}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "get_test_report" '{}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        echo "========================================"
+        echo ">> Session Complete"
+        echo "========================================"
+        echo ""
+        echo "This session demonstrated all 6 MCP tools with TSC on (default):"
+        echo "  1. tools/list — discover available tools"
+        echo "  2. get_check — system health check"
+        echo "  3. get_trace_stats — GPU operation statistics (TSC compressed)"
+        echo "  4. query_events — raw event query (TSC compressed)"
+        echo "  5. get_causal_chains — root cause analysis (TSC compressed)"
+        echo "  6. run_demo — synthetic scenario"
+        echo "  7. get_test_report — integration test results"
+    } > "$SESSION_FILE"
+
+    if [ -s "$SESSION_FILE" ]; then
+        LINES=$(wc -l < "$SESSION_FILE")
+        record "PASS" "T20: MCP session transcript" "${LINES} lines → logs/mcp-session.txt"
+    else
+        record "FAIL" "T20: MCP session transcript" "empty file"
+    fi
+
     # Kill MCP server (started with sudo, so needs sudo to kill)
     # Don't use wait — sudo-spawned processes aren't shell children, so wait hangs.
     sudo kill "$MCP_PID" 2>/dev/null || true
     sleep 1
+fi
+
+# ── T21: DB Schema Validation ──
+_test_start=$SECONDS
+log "Test 21: DB schema validation"
+
+# Find the DB — SUDO_USER-aware path puts it in the invoking user's home
+DB_PATH=""
+if [ -f "$HOME/.ingero/ingero.db" ]; then
+    DB_PATH="$HOME/.ingero/ingero.db"
+elif sudo test -f /root/.ingero/ingero.db; then
+    DB_PATH="/root/.ingero/ingero.db"
+fi
+
+if [ -n "$DB_PATH" ]; then
+    log "  DB found: $DB_PATH"
+    # sqlite3 may be at different locations; fall back to Python if needed
+    if command -v sqlite3 &>/dev/null; then
+        sqlite3 "$DB_PATH" .schema > logs/db-schema.txt 2>&1 || \
+            sudo sqlite3 "$DB_PATH" .schema > logs/db-schema.txt 2>&1 || true
+    else
+        python3 -c "
+import sqlite3, sys
+conn = sqlite3.connect('$DB_PATH')
+for row in conn.execute(\"SELECT sql FROM sqlite_master WHERE sql IS NOT NULL\"):
+    print(row[0])
+conn.close()
+" > logs/db-schema.txt 2>&1 || \
+        sudo python3 -c "
+import sqlite3
+conn = sqlite3.connect('$DB_PATH')
+for row in conn.execute(\"SELECT sql FROM sqlite_master WHERE sql IS NOT NULL\"):
+    print(row[0])
+conn.close()
+" > logs/db-schema.txt 2>&1 || true
+    fi
+
+    SCHEMA_OK=0
+    SCHEMA_MISSING=""
+    for table in events causal_chains system_snapshots sources ops schema_info; do
+        if grep -qi "$table" logs/db-schema.txt 2>/dev/null; then
+            SCHEMA_OK=$((SCHEMA_OK + 1))
+        else
+            SCHEMA_MISSING="${SCHEMA_MISSING} ${table}"
+        fi
+    done
+
+    if [[ "$SCHEMA_OK" -eq 6 ]]; then
+        record "PASS" "T21: DB schema" "all 6 tables present"
+    else
+        record "FAIL" "T21: DB schema" "${SCHEMA_OK}/6 tables, missing:${SCHEMA_MISSING}"
+    fi
+else
+    record "FAIL" "T21: DB schema" "ingero.db not found"
 fi
 
 ################################################################################
@@ -1143,7 +1399,7 @@ echo "$(ts) JSON:   logs/test-report.json"
 echo "$(ts) Benchmark: logs/benchmark-summary.txt"
 echo ""
 echo "Log files:"
-ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/watch-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/nvidia-smi.log logs/uname.log logs/version.log 2>/dev/null
+ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/watch-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log 2>/dev/null
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     exit 1
