@@ -126,10 +126,14 @@ check_prerequisites() {
     local missing=()
 
     if ! command -v az &>/dev/null; then
-        print_error "Azure CLI (az) not installed."
-        print_info "Install: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
-        print_info "Then:    az login"
-        exit 1
+        print_warn "Azure CLI (az) not installed. Installing..."
+        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        if ! command -v az &>/dev/null; then
+            print_error "Azure CLI installation failed."
+            print_info "Manual install: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+            exit 1
+        fi
+        print_success "Azure CLI installed: $(az version --query '\"azure-cli\"' -o tsv)"
     fi
 
     if ! command -v jq &>/dev/null; then missing+=("jq"); fi
