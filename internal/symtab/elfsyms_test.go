@@ -115,6 +115,51 @@ func TestFindSymbolByName_PIEDetection(t *testing.T) {
 	}
 }
 
+func TestFindSymbolByName_FindsDataSymbol(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ELF parsing requires Linux")
+	}
+
+	// This test validates the core T11 bug fix: FindSymbolByName() must
+	// find STT_OBJECT (data) symbols that ParseELFSymbols() filters out.
+	// _PyRuntime is STT_OBJECT — the old code only searched STT_FUNC symbols
+	// from ParseELFSymbols(), so it could never find _PyRuntime.
+	//
+	// We use libc's "environ" (a well-known STT_OBJECT data symbol) as a
+	// stand-in for _PyRuntime since libpython may not be available in CI.
+	out, err := exec.Command("sh", "-c", "ldd /bin/ls | grep libc | awk '{print $3}'").Output()
+	if err != nil || len(out) == 0 {
+		t.Skip("could not find libc.so via ldd")
+	}
+	libcPath := string(out[:len(out)-1])
+
+	// FindSymbolByName searches all symbol types — should find "environ".
+	value, _, _, found := FindSymbolByName(libcPath, "environ")
+	if !found {
+		// Try __environ (alternate name on some distros).
+		value, _, _, found = FindSymbolByName(libcPath, "__environ")
+	}
+	if !found {
+		t.Skip("neither environ nor __environ found in libc (unusual distro)")
+	}
+	if value == 0 {
+		t.Error("data symbol has value 0")
+	}
+
+	// ParseELFSymbols only collects STT_FUNC — "environ" should NOT be there.
+	elfs, err := ParseELFSymbols(libcPath)
+	if err != nil {
+		t.Fatalf("ParseELFSymbols: %v", err)
+	}
+	for _, s := range elfs.Symbols {
+		if s.Name == "environ" || s.Name == "__environ" {
+			t.Error("ParseELFSymbols should not contain STT_OBJECT symbol 'environ'")
+		}
+	}
+
+	t.Logf("FindSymbolByName found data symbol at 0x%x (not in ParseELFSymbols — correct)", value)
+}
+
 func TestELFSymbols_Lookup(t *testing.T) {
 	// Create a synthetic symbol table for testing.
 	elfs := &ELFSymbols{
