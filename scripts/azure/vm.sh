@@ -60,7 +60,7 @@ print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 
 # Azure defaults
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-ingero-gpu-rg}"
-AZURE_REGION="${AZURE_REGION:-eastus}"
+AZURE_REGION="${AZURE_REGION:-eastus2}"
 AZURE_VM_NAME="${AZURE_VM_NAME:-ingero-gpu-dev}"
 AZURE_SSH_USER="${AZURE_SSH_USER:-azureuser}"
 AZURE_IMAGE="${AZURE_IMAGE:-Canonical:ubuntu-24_04-lts:server:latest}"
@@ -150,6 +150,26 @@ check_prerequisites() {
         print_error "Azure CLI not logged in."
         print_info "Run: az login"
         exit 1
+    fi
+
+    # Ensure Microsoft.Compute resource provider is registered.
+    # New subscriptions often have it unregistered, causing empty quota
+    # responses and opaque VM creation failures.
+    local compute_state
+    compute_state=$(az provider show --namespace Microsoft.Compute --query registrationState -o tsv 2>/dev/null || echo "Unknown")
+    if [[ "$compute_state" != "Registered" ]]; then
+        print_info "Registering Microsoft.Compute provider (state: $compute_state)..."
+        az provider register --namespace Microsoft.Compute 2>/dev/null || true
+        for i in $(seq 1 30); do
+            compute_state=$(az provider show --namespace Microsoft.Compute --query registrationState -o tsv 2>/dev/null || echo "Unknown")
+            if [[ "$compute_state" == "Registered" ]]; then break; fi
+            sleep 5
+        done
+        if [[ "$compute_state" == "Registered" ]]; then
+            print_success "Microsoft.Compute provider registered"
+        else
+            print_warn "Microsoft.Compute registration still in progress ($compute_state). VM creation may fail."
+        fi
     fi
 
     load_subscription
@@ -428,8 +448,9 @@ cmd_deploy() {
         print_info "Region: ${AZURE_REGION}"
         print_info ""
         print_info "Common fix: Request GPU quota increase in Azure Portal:"
-        print_info "  Portal -> Subscriptions -> Usage + quotas"
-        print_info "  Search for NC/ND families, request vCPU increase"
+        print_info "  https://portal.azure.com/#view/Microsoft_Azure_Capacity/QuotaMenuBlade/~/myQuotas"
+        print_info "  Filter: Provider=Microsoft.Compute, Region=${AZURE_REGION}"
+        print_info "  Search 'NCASv3_T4', request increase to 4 vCPUs (for 1x T4 VM)"
         print_info ""
         print_info "Or try a different region: AZURE_REGION=westus2 $0 deploy"
         # Clean up empty resource group
