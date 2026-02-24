@@ -64,7 +64,10 @@ func (r *Resolver) ResolveStack(evt *events.Event) {
 
 	// Attempt Python frame extraction.
 	if r.pyWalker != nil {
-		pyFrames, _ := r.pyWalker.WalkPythonFrames(evt.PID, evt.TID)
+		pyFrames, err := r.pyWalker.WalkPythonFrames(evt.PID, evt.TID)
+		if err != nil {
+			symDebugf("Python frame walk failed for PID %d TID %d: %v", evt.PID, evt.TID, err)
+		}
 		if len(pyFrames) > 0 {
 			// Merge Python frames into the stack. Insert them before the
 			// first native frame that's inside libpython (the eval loop).

@@ -28,9 +28,10 @@ type PyOffsets struct {
 	InterpTstateHead uint64 // PyInterpreterState.tstate_head (3.10) or .threads.head (3.12)
 
 	// PyThreadState offsets
-	TstateNext       uint64 // PyThreadState.next
-	TstateThreadID   uint64 // PyThreadState.thread_id (OS thread ID)
-	TstateFrame      uint64 // PyThreadState.frame (3.10) or .cframe (3.11) or .current_frame (3.12)
+	TstateNext           uint64 // PyThreadState.next
+	TstateThreadID       uint64 // PyThreadState.thread_id (pthread_self(), NOT kernel TID)
+	TstateNativeThreadID uint64 // PyThreadState.native_thread_id (gettid(), kernel TID — 3.8+)
+	TstateFrame          uint64 // PyThreadState.frame (3.10) or .cframe (3.11) or .current_frame (3.12)
 
 	// For 3.11: cframe → current_frame
 	CframeCurrentFrame uint64 // _PyCFrame.current_frame (3.11 only, 0 for others)
@@ -106,6 +107,7 @@ func logOffsetComparison(dwarf *PyOffsets, minor int) {
 		{"InterpTstateHead", dwarf.InterpTstateHead, hardcoded.InterpTstateHead},
 		{"TstateNext", dwarf.TstateNext, hardcoded.TstateNext},
 		{"TstateThreadID", dwarf.TstateThreadID, hardcoded.TstateThreadID},
+		{"TstateNativeThreadID", dwarf.TstateNativeThreadID, hardcoded.TstateNativeThreadID},
 		{"TstateFrame", dwarf.TstateFrame, hardcoded.TstateFrame},
 		{"CframeCurrentFrame", dwarf.CframeCurrentFrame, hardcoded.CframeCurrentFrame},
 		{"FrameBack", dwarf.FrameBack, hardcoded.FrameBack},
@@ -166,9 +168,10 @@ func pyOffsets310() *PyOffsets {
 
 		InterpTstateHead: 8, // PyInterpreterState.tstate_head
 
-		TstateNext:     8,   // PyThreadState.next
-		TstateThreadID: 176, // PyThreadState.thread_id
-		TstateFrame:    24,  // PyThreadState.frame (PyFrameObject*)
+		TstateNext:           8,   // PyThreadState.next
+		TstateThreadID:       176, // PyThreadState.thread_id (pthread_self)
+		TstateNativeThreadID: 184, // PyThreadState.native_thread_id (gettid, 3.8+)
+		TstateFrame:          24,  // PyThreadState.frame (PyFrameObject*)
 
 		CframeCurrentFrame: 0, // Not used in 3.10
 
@@ -181,7 +184,7 @@ func pyOffsets310() *PyOffsets {
 
 		UnicodeLength: 16, // PyASCIIObject.length
 		UnicodeData:   48, // Compact ASCII data offset
-		UnicodeState:  20, // PyASCIIObject.state
+		UnicodeState:  32, // PyASCIIObject.state (after length:8 + hash:8)
 
 		NewStyleFrames: false,
 	}
@@ -200,9 +203,10 @@ func pyOffsets311() *PyOffsets {
 
 		InterpTstateHead: 8,
 
-		TstateNext:       8,
-		TstateThreadID:   176,
-		TstateFrame:      40, // PyThreadState.cframe (_PyCFrame*)
+		TstateNext:           8,
+		TstateThreadID:       176, // pthread_self
+		TstateNativeThreadID: 184, // gettid (3.8+)
+		TstateFrame:          40,  // PyThreadState.cframe (_PyCFrame*)
 
 		CframeCurrentFrame: 0, // _PyCFrame.current_frame (offset 0)
 
@@ -234,9 +238,10 @@ func pyOffsets312() *PyOffsets {
 
 		InterpTstateHead: 16, // PyInterpreterState.threads.head
 
-		TstateNext:       8,
-		TstateThreadID:   184, // Slightly different in 3.12
-		TstateFrame:      56,  // PyThreadState.current_frame (_PyInterpreterFrame* direct)
+		TstateNext:           8,
+		TstateThreadID:       184, // pthread_self (shifted in 3.12)
+		TstateNativeThreadID: 192, // gettid (3.8+)
+		TstateFrame:          56,  // PyThreadState.current_frame (_PyInterpreterFrame* direct)
 
 		CframeCurrentFrame: 0, // Not used in 3.12 (direct pointer)
 

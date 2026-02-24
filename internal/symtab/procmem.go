@@ -109,9 +109,13 @@ func (m *ProcMem) ReadPyUnicodeString(addr uint64, offsets *PyOffsets, maxLen in
 	}
 
 	// Check if compact ASCII (most common for source filenames).
-	// State bits: ascii=bit5, compact=bit4 (varies by version, but this works for 3.10-3.12)
-	isASCII := (state>>5)&1 == 1
-	isCompact := (state>>4)&1 == 1
+	// CPython PyASCIIObject.state bitfield layout (3.10-3.12, GCC little-endian):
+	//   interned:2  (bits 0-1)
+	//   kind:3      (bits 2-4)
+	//   compact:1   (bit 5)
+	//   ascii:1     (bit 6)
+	isCompact := (state>>5)&1 == 1
+	isASCII := (state>>6)&1 == 1
 
 	if isASCII && isCompact {
 		// Compact ASCII: data is inline at a fixed offset from the object start.

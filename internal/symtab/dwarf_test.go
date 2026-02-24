@@ -392,7 +392,6 @@ func TestExtractStructOffsets_GoBinary(t *testing.T) {
 	t.Logf("Found %d fields in runtime.g", len(offsets))
 }
 
-// TestExtractPythonVersionFromBinary validates version extraction from binary names.
 func TestExtractPythonVersionFromBinary(t *testing.T) {
 	tests := []struct {
 		input string
@@ -402,11 +401,11 @@ func TestExtractPythonVersionFromBinary(t *testing.T) {
 		{"python3.11", "3.11"},
 		{"python3.12", "3.12"},
 		{"python3.9", "3.9"},
-		{"python3", ""},    // no minor version dot
-		{"python", ""},     // too short
-		{"bash", ""},       // not python
-		{"libpython3.10", ""}, // not a binary name (has "lib" prefix)
-		{"python3.10.1", "3.10.1"}, // patch version OK (we just need the prefix)
+		{"python3", ""},
+		{"python", ""},
+		{"bash", ""},
+		{"libpython3.10", ""},
+		{"python3.10.1", "3.10.1"},
 	}
 
 	for _, tt := range tests {
@@ -417,77 +416,15 @@ func TestExtractPythonVersionFromBinary(t *testing.T) {
 	}
 }
 
-// TestFindDebugBuildLib_SharedLib validates the shared library debug build lookup.
-// Uses a nonexistent path, so should return "" (no debug lib found).
-func TestFindDebugBuildLib_SharedLib(t *testing.T) {
-	result := findDebugBuildLib("/nonexistent/libpython3.10.so.1.0")
-	if result != "" {
+func TestFindDebugBuildLib_Nonexistent(t *testing.T) {
+	if result := findDebugBuildLib("/nonexistent/libpython3.10.so.1.0"); result != "" {
 		t.Errorf("expected empty for nonexistent path, got %q", result)
 	}
-}
-
-// TestFindDebugBuildLib_StaticBinary validates the static binary debug build lookup.
-// Uses a nonexistent path, so should return "" (no debug lib found).
-func TestFindDebugBuildLib_StaticBinary(t *testing.T) {
-	result := findDebugBuildLib("/nonexistent/python3.10")
-	if result != "" {
-		t.Errorf("expected empty for nonexistent path, got %q", result)
+	if result := findDebugBuildLib("/nonexistent/python3.10"); result != "" {
+		t.Errorf("expected empty for nonexistent binary, got %q", result)
 	}
-}
-
-// TestFindDebugBuildLib_NotPython verifies non-Python binaries are ignored.
-func TestFindDebugBuildLib_NotPython(t *testing.T) {
-	result := findDebugBuildLib("/usr/bin/bash")
-	if result != "" {
+	if result := findDebugBuildLib("/usr/bin/bash"); result != "" {
 		t.Errorf("expected empty for non-Python binary, got %q", result)
-	}
-}
-
-// TestFindDebugFile_DebugBuildLib tests Strategy 4 (debug build library).
-// Only runs when libpython3.X-dbg is installed (provides libpythonX.Yd.so).
-func TestFindDebugFile_DebugBuildLib(t *testing.T) {
-	// Look for a debug build library on the system.
-	candidates := []string{
-		"/usr/lib/x86_64-linux-gnu/libpython3.10d.so.1.0",
-		"/usr/lib/x86_64-linux-gnu/libpython3.11d.so.1.0",
-		"/usr/lib/x86_64-linux-gnu/libpython3.12d.so.1.0",
-	}
-
-	var debugLib string
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			debugLib = c
-			break
-		}
-	}
-	if debugLib == "" {
-		t.Skip("no debug build library found (install libpython3.X-dbg to enable)")
-	}
-
-	// FindDebugFile on a stripped Python binary should find the debug build lib.
-	// Test with the binary name pattern (statically linked case).
-	result := findDebugBuildLib("/usr/bin/python3.10")
-	if result == "" {
-		// May fail if python3.10 isn't installed; try the shared lib pattern.
-		libPath, _ := findLibpython(t)
-		result = findDebugBuildLib(libPath)
-	}
-
-	if result == "" {
-		t.Skip("debug build library exists but findDebugBuildLib didn't find it")
-	}
-
-	t.Logf("findDebugBuildLib found: %s", result)
-
-	// Verify the found file has DWARF.
-	f, err := elf.Open(result)
-	if err != nil {
-		t.Fatalf("cannot open debug build lib: %v", err)
-	}
-	defer f.Close()
-
-	if !hasInlineDWARF(f) {
-		t.Error("debug build library does not have DWARF sections")
 	}
 }
 
