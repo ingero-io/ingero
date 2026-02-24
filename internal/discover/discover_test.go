@@ -142,6 +142,34 @@ func TestInt8sToString(t *testing.T) {
 	}
 }
 
+func TestCPUModel(t *testing.T) {
+	model := CPUModel()
+	if model == "" {
+		t.Skip("/proc/cpuinfo not available or empty")
+	}
+	// Sanity: should contain some alphanumeric characters.
+	if len(model) < 3 {
+		t.Errorf("CPUModel() = %q — suspiciously short", model)
+	}
+}
+
+func TestCPUCores(t *testing.T) {
+	cores := CPUCores()
+	if cores <= 0 {
+		t.Errorf("CPUCores() = %d, expected > 0", cores)
+	}
+}
+
+func TestOSRelease(t *testing.T) {
+	release := OSRelease()
+	if release == "" {
+		t.Skip("/etc/os-release not available")
+	}
+	if len(release) < 3 {
+		t.Errorf("OSRelease() = %q — suspiciously short", release)
+	}
+}
+
 func TestCUDAProcessString(t *testing.T) {
 	p := CUDAProcess{
 		PID:         12345,

@@ -440,6 +440,162 @@ func TestQuerySinglePIDBackwardCompat(t *testing.T) {
 	<-done
 }
 
+func TestStartAndStopSession(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	startTime := time.Now()
+	sess := Session{
+		StartedAt: startTime,
+		GPUModel:  "NVIDIA GeForce RTX 4090 (24564 MiB)",
+		GPUDriver: "580.126.09",
+		CPUModel:  "AMD EPYC 7713 64-Core Processor",
+		CPUCores:  64,
+		MemTotal:  131072,
+		Kernel:    "5.15.0-100-generic",
+		OSRelease: "Ubuntu 22.04.5 LTS",
+		CUDAVer:   "12.4",
+		PythonVer: "3.10.12",
+		IngeroVer: "dev (commit: abc123, built: 2026-02-24)",
+		PIDFilter: "32574,32575",
+		Flags:     "stack,record,json",
+	}
+
+	id, err := s.StartSession(sess)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	if id <= 0 {
+		t.Fatalf("expected positive session ID, got %d", id)
+	}
+
+	// Verify the session was inserted with stopped_at = 0.
+	sessions, err := s.QuerySessions(1 * time.Minute)
+	if err != nil {
+		t.Fatalf("QuerySessions failed: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+
+	got := sessions[0]
+	if got.ID != id {
+		t.Errorf("ID = %d, want %d", got.ID, id)
+	}
+	if got.GPUModel != sess.GPUModel {
+		t.Errorf("GPUModel = %q, want %q", got.GPUModel, sess.GPUModel)
+	}
+	if got.GPUDriver != sess.GPUDriver {
+		t.Errorf("GPUDriver = %q, want %q", got.GPUDriver, sess.GPUDriver)
+	}
+	if got.CPUModel != sess.CPUModel {
+		t.Errorf("CPUModel = %q, want %q", got.CPUModel, sess.CPUModel)
+	}
+	if got.CPUCores != sess.CPUCores {
+		t.Errorf("CPUCores = %d, want %d", got.CPUCores, sess.CPUCores)
+	}
+	if got.MemTotal != sess.MemTotal {
+		t.Errorf("MemTotal = %d, want %d", got.MemTotal, sess.MemTotal)
+	}
+	if got.Kernel != sess.Kernel {
+		t.Errorf("Kernel = %q, want %q", got.Kernel, sess.Kernel)
+	}
+	if got.OSRelease != sess.OSRelease {
+		t.Errorf("OSRelease = %q, want %q", got.OSRelease, sess.OSRelease)
+	}
+	if got.CUDAVer != sess.CUDAVer {
+		t.Errorf("CUDAVer = %q, want %q", got.CUDAVer, sess.CUDAVer)
+	}
+	if got.PythonVer != sess.PythonVer {
+		t.Errorf("PythonVer = %q, want %q", got.PythonVer, sess.PythonVer)
+	}
+	if got.IngeroVer != sess.IngeroVer {
+		t.Errorf("IngeroVer = %q, want %q", got.IngeroVer, sess.IngeroVer)
+	}
+	if got.PIDFilter != sess.PIDFilter {
+		t.Errorf("PIDFilter = %q, want %q", got.PIDFilter, sess.PIDFilter)
+	}
+	if got.Flags != sess.Flags {
+		t.Errorf("Flags = %q, want %q", got.Flags, sess.Flags)
+	}
+	if !got.StoppedAt.IsZero() {
+		t.Errorf("StoppedAt should be zero (still running), got %v", got.StoppedAt)
+	}
+
+	// Stop the session.
+	stopTime := time.Now()
+	if err := s.StopSession(id, stopTime); err != nil {
+		t.Fatalf("StopSession failed: %v", err)
+	}
+
+	// Verify stopped_at was updated.
+	sessions, err = s.QuerySessions(1 * time.Minute)
+	if err != nil {
+		t.Fatalf("QuerySessions after stop failed: %v", err)
+	}
+	if sessions[0].StoppedAt.IsZero() {
+		t.Error("StoppedAt should be non-zero after StopSession")
+	}
+}
+
+func TestQuerySessions(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	// Insert two sessions.
+	s1 := Session{
+		StartedAt: time.Now().Add(-2 * time.Minute),
+		GPUModel:  "RTX 4090",
+		IngeroVer: "v0.6",
+	}
+	s2 := Session{
+		StartedAt: time.Now().Add(-30 * time.Second),
+		GPUModel:  "A100",
+		IngeroVer: "v0.6",
+	}
+
+	_, err = s.StartSession(s1)
+	if err != nil {
+		t.Fatalf("StartSession(s1) failed: %v", err)
+	}
+	_, err = s.StartSession(s2)
+	if err != nil {
+		t.Fatalf("StartSession(s2) failed: %v", err)
+	}
+
+	// Query all sessions.
+	all, err := s.QuerySessions(5 * time.Minute)
+	if err != nil {
+		t.Fatalf("QuerySessions(5m) failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(all))
+	}
+
+	// Results are DESC order, so most recent first.
+	if all[0].GPUModel != "A100" {
+		t.Errorf("first session should be A100 (most recent), got %q", all[0].GPUModel)
+	}
+
+	// Query with tight since — should only get the recent one.
+	recent, err := s.QuerySessions(1 * time.Minute)
+	if err != nil {
+		t.Fatalf("QuerySessions(1m) failed: %v", err)
+	}
+	if len(recent) != 1 {
+		t.Fatalf("expected 1 recent session, got %d", len(recent))
+	}
+	if recent[0].GPUModel != "A100" {
+		t.Errorf("recent session should be A100, got %q", recent[0].GPUModel)
+	}
+}
+
 func TestBatchFlush(t *testing.T) {
 	s, err := New(":memory:")
 	if err != nil {

@@ -269,6 +269,91 @@ func CheckGPUModel() CheckResult {
 	}
 }
 
+// CPUModel reads the CPU model name from /proc/cpuinfo.
+// Returns e.g. "AMD EPYC 7713 64-Core Processor". Empty string on failure.
+func CPUModel() string {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "model name") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+// CPUCores returns the number of online logical CPU cores.
+// Counts "processor" lines in /proc/cpuinfo.
+func CPUCores() int {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "processor") {
+			count++
+		}
+	}
+	return count
+}
+
+// OSRelease reads the OS pretty name from /etc/os-release.
+// Returns e.g. "Ubuntu 22.04.5 LTS". Empty string on failure.
+func OSRelease() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "PRETTY_NAME=") {
+			val := strings.TrimPrefix(line, "PRETTY_NAME=")
+			return strings.Trim(val, "\"")
+		}
+	}
+	return ""
+}
+
+// CUDAVersion queries nvidia-smi for the CUDA version string.
+// Parses "CUDA Version: 12.4" from the nvidia-smi banner output.
+// Returns e.g. "12.4". Empty string if nvidia-smi unavailable.
+func CUDAVersion() string {
+	out, err := exec.Command("nvidia-smi").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.Index(line, "CUDA Version:"); idx >= 0 {
+			part := strings.TrimSpace(line[idx+len("CUDA Version:"):])
+			fields := strings.Fields(part)
+			if len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+	return ""
+}
+
+// PythonVersion runs "python3 --version" and returns e.g. "3.10.12".
+// Empty string if python3 not found.
+func PythonVersion() string {
+	out, err := exec.Command("python3", "--version").Output()
+	if err != nil {
+		return ""
+	}
+	// Output is "Python 3.10.12\n"
+	s := strings.TrimSpace(string(out))
+	if strings.HasPrefix(s, "Python ") {
+		return strings.TrimPrefix(s, "Python ")
+	}
+	return s
+}
+
 // RunAllChecks executes all system readiness checks and returns them in order.
 func RunAllChecks() []CheckResult {
 	checks := []func() CheckResult{

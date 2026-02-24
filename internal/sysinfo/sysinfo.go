@@ -311,6 +311,26 @@ func (c *Collector) readPageFaults() (int64, error) {
 	return 0, fmt.Errorf("pgmajfault not found in %s", c.procVmstat)
 }
 
+// MemTotalMB returns total system RAM in MB (one-shot read of /proc/meminfo).
+// This is a package-level convenience for callers that need a single value
+// without starting the polling Collector.
+func MemTotalMB() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemTotal:") {
+			return parseKBValue(line) / 1024
+		}
+	}
+	return 0
+}
+
 // ReadOnce performs a single poll and returns the snapshot.
 // Useful for testing or one-shot reads. Requires two calls to get CPU delta.
 func (c *Collector) ReadOnce() SystemSnapshot {

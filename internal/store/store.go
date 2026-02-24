@@ -89,6 +89,27 @@ CREATE TABLE IF NOT EXISTS system_snapshots (
 CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON system_snapshots(timestamp);
 `
 
+const sessionsSchema = `
+CREATE TABLE IF NOT EXISTS sessions (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	started_at INTEGER NOT NULL,
+	stopped_at INTEGER NOT NULL DEFAULT 0,
+	gpu_model  TEXT NOT NULL DEFAULT '',
+	gpu_driver TEXT NOT NULL DEFAULT '',
+	cpu_model  TEXT NOT NULL DEFAULT '',
+	cpu_cores  INTEGER NOT NULL DEFAULT 0,
+	mem_total  INTEGER NOT NULL DEFAULT 0,
+	kernel     TEXT NOT NULL DEFAULT '',
+	os_release TEXT NOT NULL DEFAULT '',
+	cuda_ver   TEXT NOT NULL DEFAULT '',
+	python_ver TEXT NOT NULL DEFAULT '',
+	ingero_ver TEXT NOT NULL DEFAULT '',
+	pid_filter TEXT NOT NULL DEFAULT '',
+	flags      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+`
+
 // lookupSchema creates static reference tables that make the DB self-describing.
 // Any SQL client can JOIN against these to get human-readable names.
 //
@@ -192,6 +213,7 @@ func populateLookupTables(db *sql.DB) {
 		{"stack_ips_note", "JSON array of hex instruction pointers, e.g. [\"0x7f1234\",\"0x7f5678\"]. Empty if --stack not used."},
 		{"example_query", "SELECT e.id, s.name AS source, o.name AS op, e.duration/1000 AS dur_us, e.pid FROM events e JOIN sources s ON e.source = s.id JOIN ops o ON e.source = o.source_id AND e.op = o.op_id ORDER BY e.timestamp DESC LIMIT 20"},
 		{"system_snapshots_note", "System metrics sampled every 1s during recording. Replay with correlator for post-hoc causal chain analysis."},
+		{"sessions_note", "One row per 'ingero trace' invocation. Correlate with events via time range."},
 	}
 	for _, kv := range info {
 		tx.Exec("INSERT INTO schema_info (key, value) VALUES (?, ?)", kv.k, kv.v)
@@ -236,6 +258,27 @@ type SystemSnapshot struct {
 	MemAvailMB int64
 	SwapUsedMB int64
 	LoadAvg1   float64
+}
+
+// Session records hardware/software metadata for a single 'ingero trace' run.
+// One row per trace invocation. Events are correlated by time range
+// (WHERE timestamp BETWEEN started_at AND stopped_at), not by FK.
+type Session struct {
+	ID        int64
+	StartedAt time.Time
+	StoppedAt time.Time // zero value = still running
+	GPUModel  string
+	GPUDriver string
+	CPUModel  string
+	CPUCores  int
+	MemTotal  int64 // MB
+	Kernel    string
+	OSRelease string
+	CUDAVer   string
+	PythonVer string
+	IngeroVer string
+	PIDFilter string
+	Flags     string
 }
 
 // DefaultDBPath returns the default database path (~/.ingero/ingero.db).
@@ -388,6 +431,12 @@ func New(dbPath string) (*Store, error) {
 	if _, err := db.Exec(snapshotsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating system_snapshots table: %w", err)
+	}
+
+	// Create sessions table (one row per 'ingero trace' invocation).
+	if _, err := db.Exec(sessionsSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating sessions table: %w", err)
 	}
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -988,6 +1037,81 @@ func (s *Store) QuerySnapshots(q QueryParams) ([]SystemSnapshot, error) {
 		}
 		snap.Timestamp = time.Unix(0, tsNanos)
 		result = append(result, snap)
+	}
+	return result, rows.Err()
+}
+
+// StartSession inserts a new session row and returns the auto-increment ID.
+// Called at the beginning of 'ingero trace' to record HW/SW context.
+func (s *Store) StartSession(sess Session) (int64, error) {
+	result, err := s.db.Exec(`INSERT INTO sessions
+		(started_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total,
+		 kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.StartedAt.UnixNano(),
+		sess.GPUModel, sess.GPUDriver,
+		sess.CPUModel, sess.CPUCores, sess.MemTotal,
+		sess.Kernel, sess.OSRelease,
+		sess.CUDAVer, sess.PythonVer, sess.IngeroVer,
+		sess.PIDFilter, sess.Flags,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("inserting session: %w", err)
+	}
+	return result.LastInsertId()
+}
+
+// StopSession updates a session's stopped_at timestamp.
+// Called when 'ingero trace' exits (deferred).
+func (s *Store) StopSession(id int64, stoppedAt time.Time) error {
+	_, err := s.db.Exec("UPDATE sessions SET stopped_at = ? WHERE id = ?",
+		stoppedAt.UnixNano(), id)
+	if err != nil {
+		return fmt.Errorf("stopping session %d: %w", id, err)
+	}
+	return nil
+}
+
+// QuerySessions retrieves sessions, optionally filtered by time range.
+func (s *Store) QuerySessions(since time.Duration) ([]Session, error) {
+	query := `SELECT id, started_at, stopped_at, gpu_model, gpu_driver,
+		cpu_model, cpu_cores, mem_total, kernel, os_release,
+		cuda_ver, python_ver, ingero_ver, pid_filter, flags
+		FROM sessions`
+	var args []interface{}
+
+	if since > 0 {
+		query += " WHERE started_at >= ?"
+		args = append(args, time.Now().Add(-since).UnixNano())
+	}
+	query += " ORDER BY started_at DESC"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var result []Session
+	for rows.Next() {
+		var (
+			sess              Session
+			startNanos        int64
+			stopNanos         int64
+		)
+		if err := rows.Scan(&sess.ID, &startNanos, &stopNanos,
+			&sess.GPUModel, &sess.GPUDriver,
+			&sess.CPUModel, &sess.CPUCores, &sess.MemTotal,
+			&sess.Kernel, &sess.OSRelease,
+			&sess.CUDAVer, &sess.PythonVer, &sess.IngeroVer,
+			&sess.PIDFilter, &sess.Flags); err != nil {
+			return nil, fmt.Errorf("scanning session row: %w", err)
+		}
+		sess.StartedAt = time.Unix(0, startNanos)
+		if stopNanos > 0 {
+			sess.StoppedAt = time.Unix(0, stopNanos)
+		}
+		result = append(result, sess)
 	}
 	return result, rows.Err()
 }
