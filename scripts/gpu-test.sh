@@ -315,10 +315,10 @@ else
     record "FAIL" "T05: record + query" "query returned 0 events"
 fi
 
-# Test 6: explain (DB-only, no sudo needed)
+# Test 6: explain (reads from root's DB since trace runs as sudo)
 _test_start=$SECONDS
 log "Test 6: explain --since 180s"
-EXPLAIN_OUT=$(./bin/ingero explain --debug --since 180s 2>&1)
+EXPLAIN_OUT=$(sudo ./bin/ingero explain --debug --since 180s 2>&1)
 if echo "$EXPLAIN_OUT" | grep -q "INCIDENT REPORT"; then
     record "PASS" "T06: explain" "incident report generated"
 else
@@ -328,7 +328,7 @@ fi
 # Test 8: GPU demo incident
 _test_start=$SECONDS
 log "Test 8: demo incident (GPU mode)"
-sudo ./bin/ingero demo incident --json > logs/demo-gpu-incident.json 2> logs/demo-gpu-incident.log
+timeout 120s sudo ./bin/ingero demo incident --json > logs/demo-gpu-incident.json 2> logs/demo-gpu-incident.log
 GPU_DEMO_COUNT=$(count_events logs/demo-gpu-incident.json)
 if [[ "$GPU_DEMO_COUNT" -gt 100 ]]; then
     record "PASS" "T08: GPU demo incident" "$GPU_DEMO_COUNT events"
@@ -576,8 +576,8 @@ sudo ./bin/ingero trace --duration 25s > /dev/null 2> logs/trace-contention.log
 wait "$CONTENTION_PID" 2>/dev/null || true
 [ -n "${STRESS_PID:-}" ] && wait "$STRESS_PID" 2>/dev/null || true
 
-# Now explain the stored data (no sudo needed).
-./bin/ingero explain --debug --since 60s > logs/explain-chain.log 2>&1
+# Explain the stored data (needs sudo to read root's DB).
+sudo ./bin/ingero explain --debug --since 60s > logs/explain-chain.log 2>&1
 if grep -q "causal chain(s) found" logs/explain-chain.log 2>/dev/null; then
     CHAIN_COUNT=$(grep -o '[0-9]* causal chain' logs/explain-chain.log | head -1 | awk '{print $1}')
     record "PASS" "T13: explain chain detection" "${CHAIN_COUNT} chain(s) detected under contention"
