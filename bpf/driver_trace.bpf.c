@@ -17,11 +17,12 @@
 #include "common.bpf.h"
 
 // Ring buffer for sending driver events to userspace (separate from CUDA runtime).
-// 2MB: with --stack (576-byte events), ~3,640 events buffer. Without --stack
-// (56-byte events), ~37,400 events. cuBLAS can fire 17K+ launches/sec.
+// 8MB: with --stack (576-byte events), ~14,500 events buffer. Without --stack
+// (56-byte events), ~149,000 events. cuBLAS can fire 17K+ launches/sec.
+// Increased from 2MB after H100 testing showed 3.5% stack coverage at high rates.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 2 * 1024 * 1024);
+	__uint(max_entries, 8 * 1024 * 1024);
 } driver_events SEC(".maps");
 
 // Runtime configuration map — Go writes config, eBPF reads it.
@@ -75,7 +76,7 @@ static __always_inline void driver_emit_event(struct pt_regs *ctx,
 		struct cuda_event_stack *sevt;
 		sevt = bpf_ringbuf_reserve(&driver_events, sizeof(*sevt), 0);
 		if (!sevt)
-			return;
+			goto fallback; /* ring full → emit base event without stack */
 
 		sevt->hdr.timestamp_ns = entry->timestamp_ns;
 		sevt->hdr.pid = pid;
@@ -105,6 +106,7 @@ static __always_inline void driver_emit_event(struct pt_regs *ctx,
 		return;
 	}
 
+fallback:;
 	struct cuda_event *evt;
 	evt = bpf_ringbuf_reserve(&driver_events, sizeof(*evt), 0);
 	if (!evt)

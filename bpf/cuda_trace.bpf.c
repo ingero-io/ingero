@@ -9,12 +9,13 @@
 #include "common.bpf.h"
 
 // Ring buffer for sending events to userspace.
-// 2MB: with --stack, events are 576 bytes; at 7,500 events/sec
-// ~3,640 stack events fit (485ms buffer). Without --stack (56 bytes),
-// ~37,400 events fit (5s buffer).
+// 8MB: with --stack, events are 576 bytes; at 49K events/sec
+// ~14,500 stack events fit (~296ms buffer). Without --stack (56 bytes),
+// ~149,000 events fit (~3s buffer). Increased from 2MB after H100
+// testing showed 3.5% stack coverage at high event rates.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 2 * 1024 * 1024);
+	__uint(max_entries, 8 * 1024 * 1024);
 } events SEC(".maps");
 
 // Runtime configuration — Go writes config, eBPF reads it.
@@ -72,7 +73,7 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 		struct cuda_event_stack *sevt;
 		sevt = bpf_ringbuf_reserve(&events, sizeof(*sevt), 0);
 		if (!sevt)
-			return;
+			goto fallback; /* ring full → emit base event without stack */
 
 		sevt->hdr.timestamp_ns = entry->timestamp_ns;
 		sevt->hdr.pid = pid;
@@ -102,6 +103,7 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 		return;
 	}
 
+fallback:;
 	struct cuda_event *evt;
 	evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
 	if (!evt)
