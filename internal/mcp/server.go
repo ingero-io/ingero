@@ -300,7 +300,8 @@ func (s *Server) registerTools() {
 	// Tool 3: query_events
 	type queryInput struct {
 		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 5m, 1h. Default: 1h"`
-		PID   int    `json:"pid,omitempty" jsonschema:"filter by process ID. 0 = all"`
+		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
+		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
 		Op    string `json:"op,omitempty" jsonschema:"filter by operation name, e.g. cudaMemcpy, sched_switch"`
 		Limit int    `json:"limit,omitempty" jsonschema:"max results. Default: 100"`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
@@ -332,8 +333,19 @@ func (s *Server) registerTools() {
 
 		params := store.QueryParams{
 			Since: since,
-			PID:   uint32(input.PID),
 			Limit: limit,
+		}
+		// PIDs takes precedence over deprecated PID field.
+		if len(input.PIDs) > 0 {
+			pids := make([]uint32, 0, len(input.PIDs))
+			for _, p := range input.PIDs {
+				if p > 0 {
+					pids = append(pids, uint32(p))
+				}
+			}
+			params.PIDs = pids
+		} else if input.PID > 0 {
+			params.PID = uint32(input.PID)
 		}
 
 		richEvts, err := s.store.QueryRich(params)
@@ -353,7 +365,8 @@ func (s *Server) registerTools() {
 	// Tool 4: get_causal_chains — returns active causal chains with severity.
 	type chainsInput struct {
 		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m. Default: 1m"`
-		PID   int    `json:"pid,omitempty" jsonschema:"filter by process ID. 0 = all"`
+		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
+		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
@@ -376,7 +389,26 @@ func (s *Server) registerTools() {
 			}, struct{}{}, nil
 		}
 
-		evts, err := s.store.Query(store.QueryParams{Since: since, PID: uint32(input.PID)})
+		// Build query params. PIDs takes precedence over deprecated PID.
+		qparams := store.QueryParams{Since: since}
+		var corrPID uint32
+		if len(input.PIDs) > 0 {
+			pids := make([]uint32, 0, len(input.PIDs))
+			for _, p := range input.PIDs {
+				if p > 0 {
+					pids = append(pids, uint32(p))
+				}
+			}
+			qparams.PIDs = pids
+			if len(pids) == 1 {
+				corrPID = pids[0]
+			}
+		} else if input.PID > 0 {
+			qparams.PID = uint32(input.PID)
+			corrPID = uint32(input.PID)
+		}
+
+		evts, err := s.store.Query(qparams)
 		if err != nil {
 			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
 		}
@@ -413,7 +445,7 @@ func (s *Server) registerTools() {
 		// chains at 1-second boundaries. Preserves temporal dynamics so
 		// baseline→anomaly transitions produce high tail ratios (matching
 		// live trace behavior). Single-pass replay averages them away.
-		chains := correlate.ReplayEventsForChains(evts, collector, corr, uint32(input.PID))
+		chains := correlate.ReplayEventsForChains(evts, collector, corr, corrPID)
 		tsc := input.TSC == nil || *input.TSC
 		text := formatCausalChains(chains, tsc)
 

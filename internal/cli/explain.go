@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	explainPID    int
+	explainPIDs   []int
 	explainSince  time.Duration
 	explainFrom   string
 	explainTo     string
@@ -51,7 +51,7 @@ Reads from the SQLite database populated by 'ingero trace'. No root needed.
 }
 
 func init() {
-	explainCmd.Flags().IntVarP(&explainPID, "pid", "p", 0, "filter by process ID (0 = all)")
+	explainCmd.Flags().IntSliceVarP(&explainPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	explainCmd.Flags().DurationVar(&explainSince, "since", 5*time.Minute, "analyze events from the last duration")
 	explainCmd.Flags().StringVar(&explainFrom, "from", "", "start time (e.g., '2026-02-20 15:40' or '15:40')")
 	explainCmd.Flags().StringVar(&explainTo, "to", "", "end time (e.g., '2026-02-20 15:45' or '15:45')")
@@ -104,9 +104,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 		params.Since = explainSince
 	}
 
-	if explainPID > 0 {
-		params.PID = uint32(explainPID)
-	}
+	params.PIDs = toUint32Slice(explainPIDs)
 
 	evts, err := s.Query(params)
 	if err != nil {
@@ -155,7 +153,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 
 	// Incremental replay with 1-second windowed chain detection.
 	// Preserves temporal dynamics (baseline→anomaly transition).
-	chains := correlate.ReplayEventsForChains(evts, collector, corr, uint32(explainPID))
+	chains := correlate.ReplayEventsForChains(evts, collector, corr, singlePIDOrZero(explainPIDs))
 	snap := collector.Snapshot()
 
 	debugf("explain: %d events → %d causal chains", len(evts), len(chains))
@@ -163,7 +161,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	if explainJSON {
 		return renderChainsJSON(chains)
 	}
-	renderIncidentReport(chains, snap, nil, procCache, uint32(explainPID))
+	renderIncidentReport(chains, snap, nil, procCache, toUint32Slice(explainPIDs))
 	return nil
 }
 
@@ -238,7 +236,7 @@ func renderStoredChainsJSON(chains []store.StoredChain) error {
 }
 
 // renderIncidentReport prints a human-readable incident report with causal chains.
-func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, sys *sysinfo.SystemSnapshot, procCache *discover.ProcCache, pid uint32) {
+func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, sys *sysinfo.SystemSnapshot, procCache *discover.ProcCache, pids []uint32) {
 	var b strings.Builder
 
 	// Header.
@@ -286,8 +284,14 @@ func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, 
 	}
 
 	// Process info.
-	if pid > 0 {
-		b.WriteString(fmt.Sprintf("  Process: %s\n", procCache.FormatPID(pid)))
+	if len(pids) == 1 {
+		b.WriteString(fmt.Sprintf("  Process: %s\n", procCache.FormatPID(pids[0])))
+	} else if len(pids) > 1 {
+		parts := make([]string, len(pids))
+		for i, p := range pids {
+			parts[i] = procCache.FormatPID(p)
+		}
+		b.WriteString(fmt.Sprintf("  Processes: %s\n", strings.Join(parts, ", ")))
 	}
 
 	b.WriteString("\n")

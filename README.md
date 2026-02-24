@@ -163,19 +163,24 @@ All checks passed — ready to trace!
 Live event stream with rolling stats, system context, and anomaly detection. Events are recorded to SQLite by default (use `--record=false` to disable).
 
 ```bash
-sudo ingero trace                      # auto-detect CUDA processes (traces current user, stacks on, recording on)
-sudo ingero trace --pid 4821           # trace specific process
-sudo ingero trace --user bob           # trace CUDA processes owned by a different user
-sudo ingero trace --record=false       # disable SQLite recording
-sudo ingero trace --duration 60s       # stop after 60 seconds
-sudo ingero trace --json               # JSON output (pipe to jq)
-sudo ingero trace --verbose            # show individual events
-sudo ingero trace --stack=false        # disable stack traces (saves ~0.4-0.6% overhead)
-sudo ingero trace --prometheus :9090   # expose Prometheus /metrics endpoint
-sudo ingero trace --otlp localhost:4318 # push metrics via OTLP
+sudo ingero trace                           # auto-detect all CUDA processes for current user
+sudo ingero trace --pid 4821               # trace specific process
+sudo ingero trace --pid 4821,5032          # trace multiple specific processes
+sudo ingero trace --user bob               # trace all CUDA processes owned by bob
+sudo ingero trace --record=false           # disable SQLite recording
+sudo ingero trace --duration 60s           # stop after 60 seconds
+sudo ingero trace --json                   # JSON output (pipe to jq)
+sudo ingero trace --verbose                # show individual events
+sudo ingero trace --stack=false            # disable stack traces (saves ~0.4-0.6% overhead)
+sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
+sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 ```
 
-`--user` defaults to the invoking user (via `SUDO_USER`). Use `--user root` to trace root-owned CUDA processes, or `--user bob` to trace another user's.
+**Process targeting:**
+- **Default** (no flags): traces all CUDA processes owned by the invoking user (via `SUDO_USER`). On single-user boxes, this means all CUDA processes.
+- **`--pid`**: target specific process(es), comma-separated (e.g., `--pid 1234,5678`).
+- **`--user`**: target all CUDA processes owned by a specific user (`--user bob`, `--user root`).
+- **Dynamic child tracking**: fork events auto-enroll child PIDs for host correlation.
 
 The trace display shows four sections:
 1. **System Context** — CPU, memory, load, swap with ASCII bar charts (green/yellow/red)
@@ -191,7 +196,8 @@ Analyze recorded events from SQLite and produce an incident report with causal c
 ingero explain                         # analyze last 5 minutes
 ingero explain --since 1h             # last hour
 ingero explain --last 100             # last 100 events
-ingero explain --pid 4821             # filter by process
+ingero explain --pid 4821             # filter by specific process
+ingero explain --pid 4821,5032        # filter by multiple processes
 ingero explain --chains               # show stored causal chains (no re-analysis)
 ingero explain --json                 # JSON output for pipelines
 ingero explain --from "15:40" --to "15:45"  # absolute time range
@@ -216,6 +222,8 @@ Query stored events by time range, PID, and operation type.
 
 ```bash
 sudo ingero query --since 1h
+sudo ingero query --since 1h --pid 4821
+sudo ingero query --since 1h --pid 4821,5032
 sudo ingero query --since 30m --op cudaMemcpy --json
 ```
 

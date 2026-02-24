@@ -313,6 +313,133 @@ func TestRecordAndQuerySnapshots(t *testing.T) {
 	}
 }
 
+func TestQueryByMultiplePIDs(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Record events for PIDs 100, 200, 300.
+	for _, pid := range []uint32{100, 200, 300} {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.PID = pid
+		s.Record(evt)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Query PIDs 100 and 300 — PID 200 should be excluded.
+	result, err := s.Query(QueryParams{
+		Since: 1 * time.Minute,
+		PIDs:  []uint32{100, 300},
+	})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 events for PIDs 100,300, got %d", len(result))
+	}
+	for _, evt := range result {
+		if evt.PID == 200 {
+			t.Errorf("PID 200 should have been excluded")
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+func TestQueryByMultiplePIDsRich(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	for _, pid := range []uint32{100, 200, 300} {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.PID = pid
+		s.Record(evt)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	result, err := s.QueryRich(QueryParams{
+		Since: 1 * time.Minute,
+		PIDs:  []uint32{100, 300},
+	})
+	if err != nil {
+		t.Fatalf("QueryRich failed: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 events for PIDs 100,300, got %d", len(result))
+	}
+	for _, evt := range result {
+		if evt.PID == 200 {
+			t.Errorf("PID 200 should have been excluded")
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+func TestQuerySinglePIDBackwardCompat(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	for _, pid := range []uint32{100, 200} {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.PID = pid
+		s.Record(evt)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Use old PID field (not PIDs) — backward compat for MCP.
+	result, err := s.Query(QueryParams{
+		Since: 1 * time.Minute,
+		PID:   100,
+	})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 event for PID 100, got %d", len(result))
+	}
+	if result[0].PID != 100 {
+		t.Errorf("expected PID 100, got %d", result[0].PID)
+	}
+
+	cancel()
+	<-done
+}
+
 func TestBatchFlush(t *testing.T) {
 	s, err := New(":memory:")
 	if err != nil {

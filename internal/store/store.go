@@ -220,7 +220,8 @@ type QueryParams struct {
 	Since  time.Duration // events from the last N duration
 	From   time.Time     // events after this time (overrides Since if set)
 	To     time.Time     // events before this time
-	PID    uint32        // filter by PID (0 = all)
+	PID    uint32        // filter by single PID (0 = all). Deprecated: use PIDs.
+	PIDs   []uint32      // filter by multiple PIDs (empty = all). Takes precedence over PID.
 	Source uint8         // filter by source (0 = all)
 	Op     uint8         // filter by op (0 = all, only used if Source > 0)
 	Limit  int           // max results (0 = 10000)
@@ -517,6 +518,31 @@ func (s *Store) pruneOld() {
 	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
 }
 
+// appendPIDFilter appends a PID filter clause to a SQL query.
+// Uses PIDs if set, falls back to deprecated PID field for backward compat.
+// colPrefix is "" for unqualified column or "e." for table-qualified queries.
+//
+// Go idiom: variadic args via append — each placeholder "?" gets its own
+// parameterized value, preventing SQL injection even with user-supplied PIDs.
+func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix string) (string, []interface{}) {
+	pids := q.PIDs
+	if len(pids) == 0 && q.PID > 0 {
+		pids = []uint32{q.PID} // backward compat
+	}
+	if len(pids) == 1 {
+		query += fmt.Sprintf(" AND %spid = ?", colPrefix)
+		args = append(args, pids[0])
+	} else if len(pids) > 1 {
+		placeholders := make([]string, len(pids))
+		for i, p := range pids {
+			placeholders[i] = "?"
+			args = append(args, p)
+		}
+		query += fmt.Sprintf(" AND %spid IN (%s)", colPrefix, strings.Join(placeholders, ","))
+	}
+	return query, args
+}
+
 // Query retrieves events matching the given parameters.
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := "SELECT timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_ips FROM events WHERE 1=1"
@@ -536,11 +562,8 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 		args = append(args, q.To.UnixNano())
 	}
 
-	// PID filter.
-	if q.PID > 0 {
-		query += " AND pid = ?"
-		args = append(args, q.PID)
-	}
+	// PID filter (single or multi).
+	query, args = appendPIDFilter(query, args, q, "")
 
 	// Source filter.
 	if q.Source > 0 {
@@ -649,10 +672,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		query += " AND e.timestamp <= ?"
 		args = append(args, q.To.UnixNano())
 	}
-	if q.PID > 0 {
-		query += " AND e.pid = ?"
-		args = append(args, q.PID)
-	}
+	query, args = appendPIDFilter(query, args, q, "e.")
 	if q.Source > 0 {
 		query += " AND e.source = ?"
 		args = append(args, q.Source)
