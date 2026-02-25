@@ -474,12 +474,17 @@ Ingero is the only tool that traces the **full causal chain from host scheduler 
 
 ## What's Next
 
-- GPU-internal profiling (SM stalls, SASS, warp divergence)
-- HTTP/gRPC inference serving tracing (vLLM, Triton)
+**v0.7 — K8s Ready:**
+- Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod/namespace)
 - Noisy neighbor detection (per-cgroup scheduler latency)
-- Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod name)
+- Helm chart + DaemonSet deployment
+- Auto-discover GPU pods on node
+- GPU device ↔ pod mapping
+
+**v0.8 — K8s Insights:**
+- HTTP/gRPC inference serving tracing (vLLM, Triton)
+- Pod lifecycle correlation (eviction, OOM-kill, restart)
 - Block I/O tracing (block_rq_issue/complete)
-- DNS monitoring
 
 ## FAQ
 
