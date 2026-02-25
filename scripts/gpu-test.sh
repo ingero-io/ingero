@@ -20,6 +20,7 @@
 #   3: OTLP + Prometheus export (T14a-e, T15-T17)
 #   4: Stack latency benchmark (T18)
 #   5: MCP AI diagnostic (T19a-e, T20-T21)
+#   6: ML engineer investigation (T22a-T22g)
 #
 # Parallelization strategy (saves ~350s / 44% faster):
 #   - T02 demos + T09 synthetics run as background jobs during Phase 1
@@ -1330,6 +1331,37 @@ else
 fi
 
 ################################################################################
+# Phase 6: ML Engineer Investigation (T22a-T22g)
+################################################################################
+header "Phase 6: ML Engineer Investigation"
+
+_test_start=$SECONDS
+log "Running ML investigation scenario (ResNet-50 + stress-ng + MCP)..."
+
+ML_OUTPUT=$(bash scripts/ml-investigation.sh 2>&1)
+ML_EXIT=$?
+
+# Display the script's output (it has its own formatting)
+echo "$ML_OUTPUT" | grep -v '^ML_RESULT|'
+
+# Ingest structured results from ml-investigation.sh
+ML_INGESTED=0
+while IFS='|' read -r tid name status detail dur; do
+    record "$status" "$name" "$detail"
+    ML_INGESTED=$((ML_INGESTED + 1))
+done < <(echo "$ML_OUTPUT" | grep '^ML_RESULT|' | sed 's/^ML_RESULT|//')
+
+if [[ "$ML_INGESTED" -eq 0 ]]; then
+    if [[ "$ML_EXIT" -ne 0 ]]; then
+        record "FAIL" "T22a: ML investigation" "script failed (exit $ML_EXIT)"
+    else
+        record "FAIL" "T22a: ML investigation" "no structured results returned"
+    fi
+fi
+
+log "ML investigation: ingested $ML_INGESTED test results"
+
+################################################################################
 # Final Report
 ################################################################################
 header "v0.6 Integration Test Report"
@@ -1425,7 +1457,7 @@ echo "$(ts) JSON:   logs/test-report.json"
 echo "$(ts) Benchmark: logs/benchmark-summary.txt"
 echo ""
 echo "Log files:"
-ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/trace-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log 2>/dev/null
+ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/trace-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log logs/ml-*.{json,log} logs/ml-investigation-report.md 2>/dev/null
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     exit 1
