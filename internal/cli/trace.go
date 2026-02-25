@@ -252,8 +252,13 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 
 		defer func() {
+			// Wait for the batch writer goroutine to finish flushing
+			// before writing session metadata or closing the DB.
+			eventStore.WaitDone()
 			if sessionID > 0 {
-				eventStore.StopSession(sessionID, time.Now())
+				if err := eventStore.StopSession(sessionID, time.Now()); err != nil {
+					debugf("failed to stop session: %v", err)
+				}
 			}
 			eventStore.Close()
 			fmt.Fprintf(os.Stderr, "  Recorded events to %s\n", dbPath)

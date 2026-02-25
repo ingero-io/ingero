@@ -405,6 +405,14 @@ total = len(events)
 with_stack = len(stack_events)
 pct = (with_stack / total * 100) if total > 0 else 0
 
+# Per-source breakdown (HOST events are kernel tracepoints — no userspace stacks by design)
+cuda_driver = [e for e in events if e.get('source') in ('cuda', 'driver')]
+cuda_driver_with = [e for e in cuda_driver if e.get('stack')]
+host = [e for e in events if e.get('source') == 'host']
+cd_pct = (len(cuda_driver_with) / len(cuda_driver) * 100) if cuda_driver else 0
+print(f'STACK_CUDA_DRIVER={len(cuda_driver_with)}/{len(cuda_driver)} ({cd_pct:.0f}%)')
+print(f'STACK_HOST={len(host)} (no userspace stacks by design)')
+
 # Check for resolved symbols
 resolved = 0
 has_hex_ip = 0
@@ -977,17 +985,30 @@ print(f"  With --stack:    ~576 bytes/event (struct + 64 stack frames × 8 bytes
 print(f"  Ratio: ~10.3x more data per event")
 print()
 
-# Stack coverage
-stack_events_total = 0
-stack_events_with = 0
+# Stack coverage (per-source: HOST tracepoints have no userspace stacks by design)
+stack_all = 0
+stack_with = 0
+stack_cuda_driver = 0
+stack_cuda_driver_with = 0
+stack_host = 0
 for i in range(1, 3):
     for e in parse_events(f'logs/bench-stack-{i}.json'):
-        stack_events_total += 1
-        if e.get('stack'):
-            stack_events_with += 1
-if stack_events_total > 0:
-    pct = stack_events_with / stack_events_total * 100
-    print(f"Stack coverage: {stack_events_with}/{stack_events_total} events ({pct:.1f}%)")
+        stack_all += 1
+        has = bool(e.get('stack'))
+        if has:
+            stack_with += 1
+        src = e.get('source', '')
+        if src in ('cuda', 'driver'):
+            stack_cuda_driver += 1
+            if has:
+                stack_cuda_driver_with += 1
+        elif src == 'host':
+            stack_host += 1
+if stack_all > 0:
+    cd_pct = (stack_cuda_driver_with / stack_cuda_driver * 100) if stack_cuda_driver else 0
+    print(f"Stack coverage: {stack_with}/{stack_all} events ({stack_with/stack_all*100:.1f}% overall)")
+    print(f"  CUDA+DRIVER: {stack_cuda_driver_with}/{stack_cuda_driver} ({cd_pct:.1f}%)")
+    print(f"  HOST:        {stack_host} events (kernel tracepoints, no userspace stacks)")
 
 print()
 print("=" * 70)

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -232,6 +233,8 @@ type Store struct {
 	insertCh   chan events.Event
 	snapshotCh chan SystemSnapshot
 	retention  time.Duration
+	runDone    chan struct{} // closed when Run() exits
+	runActive  atomic.Bool  // true once Run() is called
 
 	mu      sync.Mutex
 	closed  bool
@@ -452,9 +455,22 @@ func New(dbPath string) (*Store, error) {
 		insertCh:   make(chan events.Event, DefaultBatchSize*2),
 		snapshotCh: make(chan SystemSnapshot, 64), // 1 snapshot/sec, 64 = ~1 min buffer
 		retention:  DefaultRetention,
+		runDone:    make(chan struct{}),
 	}
 
 	return s, nil
+}
+
+// WaitDone blocks until Run() has finished its final flush and returned.
+// Call this after ctx cancellation but before StopSession/Close to ensure
+// all pending batch writes are committed. Safe to call if Run() was never
+// started (returns immediately) — this avoids deadlocks in query/explain/MCP
+// code paths that use Store without Run().
+func (s *Store) WaitDone() {
+	if !s.runActive.Load() {
+		return
+	}
+	<-s.runDone
 }
 
 // Record enqueues an event for async writing. Non-blocking — drops if buffer full.
@@ -467,7 +483,12 @@ func (s *Store) Record(evt events.Event) {
 }
 
 // Run starts the background flush and prune loops. Blocks until ctx is cancelled.
+// Callers should use WaitDone() to wait for Run to finish before calling
+// StopSession or Close, to avoid racing with the final batch flush.
 func (s *Store) Run(ctx context.Context) {
+	s.runActive.Store(true)
+	defer close(s.runDone)
+
 	flushTicker := time.NewTicker(DefaultFlushInterval)
 	defer flushTicker.Stop()
 
