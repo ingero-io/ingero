@@ -23,6 +23,7 @@ import (
 )
 
 var (
+	explainDBPath string
 	explainPIDs   []int
 	explainSince  time.Duration
 	explainFrom   string
@@ -51,6 +52,7 @@ Reads from the SQLite database populated by 'ingero trace'. No root needed.
 }
 
 func init() {
+	explainCmd.Flags().StringVar(&explainDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	explainCmd.Flags().IntSliceVarP(&explainPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	explainCmd.Flags().DurationVar(&explainSince, "since", 5*time.Minute, "analyze events from the last duration")
 	explainCmd.Flags().StringVar(&explainFrom, "from", "", "start time (e.g., '2026-02-20 15:40' or '15:40')")
@@ -62,6 +64,13 @@ func init() {
 	rootCmd.AddCommand(explainCmd)
 }
 
+func resolveExplainDB() string {
+	if explainDBPath != "" {
+		return explainDBPath
+	}
+	return store.DefaultDBPath()
+}
+
 func explainRunE(cmd *cobra.Command, args []string) error {
 	// --chains mode: show pre-computed causal chains from DB.
 	if explainChains {
@@ -69,15 +78,16 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open DB.
-	s, err := store.New(store.DefaultDBPath())
+	s, err := store.New(resolveExplainDB())
 	if err != nil {
 		return fmt.Errorf("opening database: %w\n\nHint: run 'ingero trace' first to collect events", err)
 	}
 	defer s.Close()
 
-	// Build query params.
+	// Build query params. Unlimited scan — explain needs all events
+	// in the time range for accurate anomaly detection.
 	params := store.QueryParams{
-		Limit: 100000,
+		Limit: -1,
 	}
 
 	if explainLast > 0 {
@@ -168,7 +178,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 // explainStoredChains renders pre-computed causal chains from the DB
 // without re-analyzing events.
 func explainStoredChains() error {
-	s, err := store.New(store.DefaultDBPath())
+	s, err := store.New(resolveExplainDB())
 	if err != nil {
 		return fmt.Errorf("opening database: %w\n\nHint: run 'ingero trace' first to collect events", err)
 	}

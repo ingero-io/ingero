@@ -249,7 +249,7 @@ type QueryParams struct {
 	PIDs   []uint32      // filter by multiple PIDs (empty = all). Takes precedence over PID.
 	Source uint8         // filter by source (0 = all)
 	Op     uint8         // filter by op (0 = all, only used if Source > 0)
-	Limit  int           // max results (0 = 10000)
+	Limit  int           // max results (0 = 10000, -1 = unlimited)
 }
 
 // SystemSnapshot holds system metrics for a single point in time.
@@ -654,12 +654,15 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	// to return chronological order.
 	query += " ORDER BY timestamp DESC"
 
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 10000
+	// Limit: 0 = default 10K, -1 = unlimited, >0 = explicit.
+	if q.Limit >= 0 {
+		limit := q.Limit
+		if limit == 0 {
+			limit = 10000
+		}
+		query += " LIMIT ?"
+		args = append(args, limit)
 	}
-	query += " LIMIT ?"
-	args = append(args, limit)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -756,12 +759,15 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 
 	query += " ORDER BY e.timestamp DESC"
 
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 10000
+	// Limit: 0 = default 10K, -1 = unlimited, >0 = explicit.
+	if q.Limit >= 0 {
+		limit := q.Limit
+		if limit == 0 {
+			limit = 10000
+		}
+		query += " LIMIT ?"
+		args = append(args, limit)
 	}
-	query += " LIMIT ?"
-	args = append(args, limit)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {

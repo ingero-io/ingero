@@ -16,6 +16,7 @@ import (
 )
 
 var (
+	queryDBPath string
 	querySince  time.Duration
 	queryPIDs   []int
 	queryOp     string
@@ -38,6 +39,7 @@ Examples:
 }
 
 func init() {
+	queryCmd.Flags().StringVar(&queryDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	queryCmd.Flags().DurationVar(&querySince, "since", 1*time.Hour, "query events from the last duration (e.g., 30m, 1h, 24h)")
 	queryCmd.Flags().IntSliceVarP(&queryPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	queryCmd.Flags().StringVar(&queryOp, "op", "", "filter by operation name (e.g., cudaMemcpy, sched_switch)")
@@ -48,7 +50,10 @@ func init() {
 }
 
 func queryRunE(cmd *cobra.Command, args []string) error {
-	dbPath := store.DefaultDBPath()
+	dbPath := queryDBPath
+	if dbPath == "" {
+		dbPath = store.DefaultDBPath()
+	}
 	debugf("query: db=%s since=%s pids=%v op=%q limit=%d", dbPath, querySince, queryPIDs, queryOp, queryLimit)
 
 	s, err := store.New(dbPath)
@@ -66,7 +71,7 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 
 	// Resolve op name to Source+Op code.
 	if queryOp != "" {
-		source, op, ok := resolveOpName(queryOp)
+		source, op, ok := events.ResolveOp(queryOp)
 		if ok {
 			params.Source = uint8(source)
 			params.Op = op
@@ -83,59 +88,6 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 		return queryOutputJSON(evts)
 	}
 	return queryOutputTable(evts, params)
-}
-
-// resolveOpName maps a human-readable op name to its Source and Op code.
-func resolveOpName(name string) (events.Source, uint8, bool) {
-	name = strings.ToLower(name)
-
-	// CUDA ops.
-	cudaOps := map[string]events.CUDAOp{
-		"cudamalloc":       events.CUDAMalloc,
-		"cudafree":         events.CUDAFree,
-		"cudalaunchkernel": events.CUDALaunchKernel,
-		"cudamemcpy":       events.CUDAMemcpy,
-		"cudastreamsync":   events.CUDAStreamSync,
-		"cudadevicesync":   events.CUDADeviceSync,
-	}
-	for k, v := range cudaOps {
-		if name == k {
-			return events.SourceCUDA, uint8(v), true
-		}
-	}
-
-	// Driver ops.
-	driverOps := map[string]events.DriverOp{
-		"culaunchkernel":   events.DriverLaunchKernel,
-		"cumemcpy":         events.DriverMemcpy,
-		"cumemcpyasync":    events.DriverMemcpyAsync,
-		"cuctxsynchronize": events.DriverCtxSync,
-		"cumemallocv2":     events.DriverMemAlloc,
-		"cumemalloc":       events.DriverMemAlloc,
-	}
-	for k, v := range driverOps {
-		if name == k {
-			return events.SourceDriver, uint8(v), true
-		}
-	}
-
-	// Host ops.
-	hostOps := map[string]events.HostOp{
-		"sched_switch":  events.HostSchedSwitch,
-		"sched_wakeup":  events.HostSchedWakeup,
-		"mm_page_alloc": events.HostPageAlloc,
-		"oom_kill":      events.HostOOMKill,
-		"process_exec":  events.HostProcessExec,
-		"process_exit":  events.HostProcessExit,
-		"process_fork":  events.HostProcessFork,
-	}
-	for k, v := range hostOps {
-		if name == k {
-			return events.SourceHost, uint8(v), true
-		}
-	}
-
-	return 0, 0, false
 }
 
 func queryOutputJSON(evts []events.Event) error {

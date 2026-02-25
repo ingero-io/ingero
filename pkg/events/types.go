@@ -3,6 +3,7 @@ package events
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -174,6 +175,61 @@ func (e Event) OpName() string {
 	default:
 		return fmt.Sprintf("op(%d)", e.Op)
 	}
+}
+
+// ResolveOp maps a human-readable operation name (e.g., "cudaMemcpy",
+// "sched_switch", "cuLaunchKernel") to its Source and Op code. The name
+// is matched case-insensitively. Returns false if the name is unknown.
+func ResolveOp(name string) (Source, uint8, bool) {
+	lower := strings.ToLower(name)
+
+	// CUDA Runtime ops.
+	cudaOps := map[string]CUDAOp{
+		"cudamalloc":       CUDAMalloc,
+		"cudafree":         CUDAFree,
+		"cudalaunchkernel": CUDALaunchKernel,
+		"cudamemcpy":       CUDAMemcpy,
+		"cudastreamsync":   CUDAStreamSync,
+		"cudadevicesync":   CUDADeviceSync,
+	}
+	for k, v := range cudaOps {
+		if lower == k {
+			return SourceCUDA, uint8(v), true
+		}
+	}
+
+	// CUDA Driver ops.
+	driverOps := map[string]DriverOp{
+		"culaunchkernel":   DriverLaunchKernel,
+		"cumemcpy":         DriverMemcpy,
+		"cumemcpyasync":    DriverMemcpyAsync,
+		"cuctxsynchronize": DriverCtxSync,
+		"cumemallocv2":     DriverMemAlloc,
+		"cumemalloc":       DriverMemAlloc,
+	}
+	for k, v := range driverOps {
+		if lower == k {
+			return SourceDriver, uint8(v), true
+		}
+	}
+
+	// Host ops.
+	hostOps := map[string]HostOp{
+		"sched_switch":  HostSchedSwitch,
+		"sched_wakeup":  HostSchedWakeup,
+		"mm_page_alloc": HostPageAlloc,
+		"oom_kill":      HostOOMKill,
+		"process_exec":  HostProcessExec,
+		"process_exit":  HostProcessExit,
+		"process_fork":  HostProcessFork,
+	}
+	for k, v := range hostOps {
+		if lower == k {
+			return SourceHost, uint8(v), true
+		}
+	}
+
+	return 0, 0, false
 }
 
 // StackFrame represents a single frame in a userspace stack trace.
