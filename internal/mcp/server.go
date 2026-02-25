@@ -1,10 +1,11 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes six tools to AI agents:
+// The MCP server exposes seven tools to AI agents:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
 //   - get_trace_stats: Get recent CUDA/host stats from the SQLite database
 //   - query_events: Query stored events with filters
 //   - get_causal_chains: Analyze events and return causal chains with severity
+//   - get_sessions: Query trace session metadata (GPU, CPU, driver, OS, versions)
 //   - run_demo: Run a synthetic demo scenario
 //   - get_test_report: Return the GPU integration test report (JSON)
 //
@@ -465,7 +466,51 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 5: run_demo — runs a synthetic scenario and returns results.
+	// Tool 5: get_sessions — query trace session metadata.
+	type sessionsInput struct {
+		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1h, 24h, 7d. Default: 24h. Use 0 for all sessions."`
+		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+	}
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name:        "get_sessions",
+		Description: "Query trace session metadata: GPU model, driver, CPU, memory, kernel, OS, CUDA/Python/Ingero versions, PID filter, and trace flags. Each session represents one 'ingero trace' invocation. Use this to understand what hardware and software context a trace was recorded on.",
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sessionsInput) (*gomcp.CallToolResult, struct{}, error) {
+		if s.store == nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
+				},
+			}, struct{}{}, nil
+		}
+
+		since := 24 * time.Hour
+		if input.Since != "" {
+			// Support "0" for all sessions.
+			if input.Since == "0" {
+				since = 0
+			} else {
+				d, err := time.ParseDuration(input.Since)
+				if err == nil {
+					since = d
+				}
+			}
+		}
+
+		sessions, err := s.store.QuerySessions(since)
+		if err != nil {
+			return nil, struct{}{}, fmt.Errorf("querying sessions: %w", err)
+		}
+
+		tsc := input.TSC == nil || *input.TSC
+		text := formatSessions(sessions, tsc)
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: text},
+			},
+		}, struct{}{}, nil
+	})
+
+	// Tool 6: run_demo — runs a synthetic scenario and returns results.
 	type runDemoInput struct {
 		Scenario string `json:"scenario,omitempty" jsonschema:"scenario name: incident, cold-start, memcpy-bottleneck, periodic-spike, cpu-contention, gpu-steal"`
 	}
@@ -511,7 +556,7 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 6: get_test_report — returns the JSON test report from gpu-test.sh.
+	// Tool 7: get_test_report — returns the JSON test report from gpu-test.sh.
 	type testReportInput struct {
 		TSC *bool `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
 	}
@@ -748,4 +793,75 @@ func formatEventList(evts []store.RichEvent, since time.Duration, tsc bool) stri
 
 	data, _ := json.MarshalIndent(output, "", "  ")
 	return string(data)
+}
+
+func formatSessions(sessions []store.Session, tsc bool) string {
+	if len(sessions) == 0 {
+		return "No trace sessions found. Run 'ingero trace' to create a session."
+	}
+
+	if tsc {
+		var out []map[string]interface{}
+		for _, sess := range sessions {
+			m := TSCMap(true,
+				"id", sess.ID,
+				"started", sess.StartedAt.Format("2006-01-02 15:04:05"),
+				"gpu", sess.GPUModel,
+				"driver", sess.GPUDriver,
+				"cpu", sess.CPUModel,
+				"cores", sess.CPUCores,
+				"mem_mb", sess.MemTotal,
+				"kernel", sess.Kernel,
+				"os", sess.OSRelease,
+				"cuda", sess.CUDAVer,
+				"python", sess.PythonVer,
+				"ingero", sess.IngeroVer,
+			)
+			if !sess.StoppedAt.IsZero() {
+				dur := sess.StoppedAt.Sub(sess.StartedAt)
+				m["dur"] = fmt.Sprintf("%.0fs", dur.Seconds())
+			} else {
+				m["dur"] = "running"
+			}
+			if sess.PIDFilter != "" {
+				m["pids"] = sess.PIDFilter
+			}
+			if sess.Flags != "" {
+				m["flags"] = sess.Flags
+			}
+			out = append(out, m)
+		}
+		data, _ := json.Marshal(out)
+		return string(data)
+	}
+
+	// Verbose text format.
+	result := fmt.Sprintf("%d trace session(s):\n\n", len(sessions))
+	for _, sess := range sessions {
+		result += fmt.Sprintf("Session #%d\n", sess.ID)
+		result += fmt.Sprintf("  Started:    %s\n", sess.StartedAt.Format(time.RFC3339))
+		if !sess.StoppedAt.IsZero() {
+			dur := sess.StoppedAt.Sub(sess.StartedAt)
+			result += fmt.Sprintf("  Stopped:    %s (duration: %s)\n", sess.StoppedAt.Format(time.RFC3339), dur.Round(time.Second))
+		} else {
+			result += "  Stopped:    (still running)\n"
+		}
+		result += fmt.Sprintf("  GPU:        %s\n", sess.GPUModel)
+		result += fmt.Sprintf("  Driver:     %s\n", sess.GPUDriver)
+		result += fmt.Sprintf("  CPU:        %s (%d cores)\n", sess.CPUModel, sess.CPUCores)
+		result += fmt.Sprintf("  Memory:     %d MB\n", sess.MemTotal)
+		result += fmt.Sprintf("  Kernel:     %s\n", sess.Kernel)
+		result += fmt.Sprintf("  OS:         %s\n", sess.OSRelease)
+		result += fmt.Sprintf("  CUDA:       %s\n", sess.CUDAVer)
+		result += fmt.Sprintf("  Python:     %s\n", sess.PythonVer)
+		result += fmt.Sprintf("  Ingero:     %s\n", sess.IngeroVer)
+		if sess.PIDFilter != "" {
+			result += fmt.Sprintf("  PID filter: %s\n", sess.PIDFilter)
+		}
+		if sess.Flags != "" {
+			result += fmt.Sprintf("  Flags:      %s\n", sess.Flags)
+		}
+		result += "\n"
+	}
+	return result
 }
