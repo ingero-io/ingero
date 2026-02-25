@@ -100,8 +100,9 @@ func FindLibCUDART() (string, error) {
 		// Versioned CUDA installs (e.g., CUDA 12.2)
 		"/usr/local/cuda-12/lib64",
 		"/usr/local/cuda-11/lib64",
-		// Ubuntu/Debian package
+		// Ubuntu/Debian package — architecture-specific multiarch paths
 		"/usr/lib/x86_64-linux-gnu",
+		"/usr/lib/aarch64-linux-gnu",
 		// Conda environments
 		"/opt/conda/lib",
 		// Generic
@@ -195,6 +196,7 @@ func findLibInDir(dir string) (string, error) {
 func FindLibCUDA() (string, error) {
 	searchPaths := []string{
 		"/usr/lib/x86_64-linux-gnu",
+		"/usr/lib/aarch64-linux-gnu",
 		"/usr/local/cuda/lib64",
 		"/usr/local/cuda/compat",
 		"/usr/lib64",
