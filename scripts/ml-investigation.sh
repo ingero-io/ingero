@@ -90,7 +90,7 @@ cleanup() {
     done
 
     if [[ -n "$ML_DB" ]]; then
-        rm -f "${ML_DB}" 2>/dev/null || true
+        rm -f "${ML_DB}" "${ML_DB}-wal" "${ML_DB}-shm" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
