@@ -122,13 +122,13 @@ CREATE TABLE IF NOT EXISTS process_names (
 
 // aggregatesSchema stores per-minute, per-op aggregates for events that were
 // NOT individually stored (selective storage). This preserves accurate counts
-// and latency distributions while reducing DB size by ~33x.
+// and latency distributions while reducing DB size significantly.
 //
-// Why aggregates? At 24K events/sec (A100), the DB grows to 8 GB/hour. 97% of
-// events are noise (consistent cuLaunchKernel, mm_page_alloc). Only ~3% have
-// investigation value (sched_switch, sync anomalies, process lifecycle).
-// Selective storage keeps the interesting events individually and summarizes
-// the rest in minute-granularity buckets.
+// Why aggregates? At 24K events/sec (A100), the DB grows to 8 GB/hour. Most
+// events are bulk ops (cuLaunchKernel, sched_wakeup) with no investigation
+// value. Chain-critical events (sched_switch, mm_page_alloc, sync ops,
+// process lifecycle, anomalies) are stored individually. The rest are
+// summarized in minute-granularity buckets.
 const aggregatesSchema = `
 CREATE TABLE IF NOT EXISTS event_aggregates (
 	bucket   INTEGER NOT NULL,  -- minute-truncated unix nanos
