@@ -74,17 +74,21 @@ record() {
 cleanup_pids=()
 ML_DB=""
 cleanup() {
-    for pid in "${cleanup_pids[@]}"; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
-    # Kill MCP server (may have been started with sudo).
-    # Guard: only kill if ML_DB is set, otherwise pattern matches ALL mcp processes.
+    # Kill sudo-spawned processes FIRST (pkill -f) — kill+wait on the sudo
+    # wrapper PID can deadlock because sudo doesn't forward SIGTERM to children.
     if [[ -n "$ML_DB" ]]; then
         sudo pkill -f "ingero mcp.*${ML_DB}" 2>/dev/null || true
     fi
-    # Kill stress-ng (started with sudo)
     sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
+
+    # Now kill and reap background jobs
+    for pid in "${cleanup_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${cleanup_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
     if [[ -n "$ML_DB" ]]; then
         rm -f "${ML_DB}" 2>/dev/null || true
     fi
@@ -153,8 +157,10 @@ sleep 1
 echo -e "$(ts)   Training PID: $TRAIN_PID | stress-ng PID: $STRESS_PID"
 echo -e "$(ts)   Tracing ${TRACE_DURATION}s to $ML_DB..."
 
-# Trace with separate DB (isolate from main test DB)
-sudo ./bin/ingero trace --db "$ML_DB" --duration ${TRACE_DURATION}s \
+# Trace with separate DB (isolate from main test DB).
+# Use --record-all so every event is individually queryable (Q2-Q3 need
+# per-event cuLaunchKernel and cudaStreamSync latencies, not just aggregates).
+sudo ./bin/ingero trace --db "$ML_DB" --record-all --duration ${TRACE_DURATION}s \
     --json > logs/ml-trace.json 2> logs/ml-trace.log
 TRACE_EXIT=$?
 
