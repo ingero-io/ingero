@@ -29,15 +29,16 @@ import (
 
 // Flag variables for the trace command.
 var (
-	tracePIDs     []int
-	traceUser     string
-	traceDuration time.Duration
-	traceJSON     bool
-	traceVerbose  bool
-	traceOTLP     string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
-	traceProm     string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
-	traceRecord   bool   // Record events to SQLite (default true).
-	traceStack    bool   // Capture userspace stack traces per event.
+	tracePIDs      []int
+	traceUser      string
+	traceDuration  time.Duration
+	traceJSON      bool
+	traceVerbose   bool
+	traceOTLP      string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
+	traceProm      string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
+	traceRecord    bool   // Record events to SQLite (default true).
+	traceRecordAll bool   // Store every event (disable selective storage).
+	traceStack     bool   // Capture userspace stack traces per event.
 )
 
 var traceCmd = &cobra.Command{
@@ -64,6 +65,7 @@ func init() {
 	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (e.g., localhost:4317). Disabled by default.")
 	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default.")
 	traceCmd.Flags().BoolVar(&traceRecord, "record", true, "record events to SQLite (default true, use --record=false to disable)")
+	traceCmd.Flags().BoolVar(&traceRecordAll, "record-all", false, "store every event individually (disables selective storage, larger DB)")
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
 
 	rootCmd.AddCommand(traceCmd)
@@ -215,6 +217,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 4c: Open SQLite store (recording is on by default).
+	if !traceRecord && traceRecordAll {
+		fmt.Fprintf(os.Stderr, "  Warning: --record-all ignored because --record=false\n")
+	}
 	var eventStore *store.Store
 	var sessionID int64
 	if traceRecord {
@@ -392,6 +397,184 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, trackPID)
 }
 
+// ---------------------------------------------------------------------------
+// Selective storage — store only investigation-valuable events, aggregate rest
+// ---------------------------------------------------------------------------
+
+// aggKey identifies a minute-bucket for aggregation.
+// Events that shouldStore() rejects are counted here instead of stored individually.
+type aggKey struct {
+	Bucket int64  // minute-truncated unix nanos
+	Source uint8
+	Op     uint8
+	PID    uint32
+}
+
+// aggValue accumulates stats for one aggKey.
+type aggValue struct {
+	Count  int64
+	Stored int64
+	SumDur int64
+	MinDur int64
+	MaxDur int64
+}
+
+// shouldStore decides whether an individual event should be persisted to SQLite.
+// Events that return false are only counted in the aggregate table.
+//
+// The filtering happens AFTER stats/correlator see the event — only SQLite
+// persistence is filtered. This preserves full accuracy for live anomaly
+// detection and causal chain analysis.
+//
+// Decision hierarchy (first match wins):
+//  1. --record-all mode → always store
+//  2. Bootstrap (first 10s of session) → store (builds baseline in DB)
+//  3. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
+//  4. sched_switch → store (causal chain critical)
+//  5. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
+//  6. Anomalous (duration > 3x p50) → store (the interesting stuff)
+//  7. Everything else → aggregate only (cuLaunchKernel, mm_page_alloc, etc.)
+func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool, collector *stats.Collector) bool {
+	if recordAll {
+		return true
+	}
+
+	// Bootstrap: first 10 seconds — store everything to build DB baseline.
+	if time.Since(sessionStart) < 10*time.Second {
+		return true
+	}
+
+	// Process lifecycle events are always stored (rare, high investigation value).
+	if evt.Source == events.SourceHost {
+		switch events.HostOp(evt.Op) {
+		case events.HostProcessExec, events.HostProcessExit, events.HostProcessFork, events.HostOOMKill:
+			return true
+		case events.HostSchedSwitch:
+			// sched_switch is causal chain critical — always store.
+			return true
+		}
+	}
+
+	// Sync ops are always stored (latency symptoms, investigation targets).
+	if evt.Source == events.SourceCUDA {
+		switch events.CUDAOp(evt.Op) {
+		case events.CUDAStreamSync, events.CUDADeviceSync:
+			return true
+		}
+	}
+	if evt.Source == events.SourceDriver && events.DriverOp(evt.Op) == events.DriverCtxSync {
+		return true
+	}
+
+	// Anomalous events (duration > 3x p50) are always stored.
+	if collector.IsAnomaly(evt) {
+		return true
+	}
+
+	// Everything else: aggregate only.
+	return false
+}
+
+// truncateMinute truncates a time to the start of its minute as unix nanos.
+func truncateMinute(t time.Time) int64 {
+	return t.Truncate(time.Minute).UnixNano()
+}
+
+// flushAggregates converts the in-memory aggregate map into store.Aggregate
+// slice and writes them to SQLite. Only flushes buckets older than the current
+// minute (completed buckets).
+func flushAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store, now time.Time) {
+	if eventStore == nil || len(aggs) == 0 {
+		return
+	}
+
+	currentBucket := truncateMinute(now)
+	var batch []store.Aggregate
+
+	for k, v := range aggs {
+		// Only flush completed minute-buckets (not the current one).
+		if k.Bucket >= currentBucket {
+			continue
+		}
+		batch = append(batch, store.Aggregate{
+			Bucket: k.Bucket,
+			Source: k.Source,
+			Op:     k.Op,
+			PID:    k.PID,
+			Count:  v.Count,
+			Stored: v.Stored,
+			SumDur: v.SumDur,
+			MinDur: v.MinDur,
+			MaxDur: v.MaxDur,
+		})
+		delete(aggs, k)
+	}
+
+	if len(batch) > 0 {
+		eventStore.RecordAggregates(batch)
+	}
+}
+
+// flushAllAggregates flushes ALL aggregate buckets (including current minute).
+// Called at shutdown to ensure no data is lost.
+func flushAllAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store) {
+	if eventStore == nil || len(aggs) == 0 {
+		return
+	}
+
+	batch := make([]store.Aggregate, 0, len(aggs))
+	for k, v := range aggs {
+		batch = append(batch, store.Aggregate{
+			Bucket: k.Bucket,
+			Source: k.Source,
+			Op:     k.Op,
+			PID:    k.PID,
+			Count:  v.Count,
+			Stored: v.Stored,
+			SumDur: v.SumDur,
+			MinDur: v.MinDur,
+			MaxDur: v.MaxDur,
+		})
+	}
+
+	eventStore.RecordAggregates(batch)
+}
+
+// recordAggregate updates the in-memory aggregate for an event.
+// Called for every event regardless of whether it's individually stored.
+// The 'stored' flag indicates whether the event was also written to the events table.
+func recordAggregate(aggs map[aggKey]*aggValue, evt events.Event, stored bool) {
+	key := aggKey{
+		Bucket: truncateMinute(evt.Timestamp),
+		Source: uint8(evt.Source),
+		Op:     evt.Op,
+		PID:    evt.PID,
+	}
+
+	durNanos := int64(evt.Duration)
+
+	v, ok := aggs[key]
+	if !ok {
+		v = &aggValue{
+			MinDur: durNanos,
+			MaxDur: durNanos,
+		}
+		aggs[key] = v
+	}
+
+	v.Count++
+	v.SumDur += durNanos
+	if durNanos < v.MinDur {
+		v.MinDur = durNanos
+	}
+	if durNanos > v.MaxDur {
+		v.MaxDur = durNanos
+	}
+	if stored {
+		v.Stored++
+	}
+}
+
 // mergeAllEventChannels creates a single channel that receives events from
 // all active tracers (CUDA runtime, host, and optionally driver).
 func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, hostTracer *host.Tracer, driverTracer *driver.Tracer) <-chan events.Event {
@@ -544,12 +727,17 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 
 	// Periodic debug throughput counter.
 	var debugEventCount uint64
+	var storedEventCount uint64
 	var debugTickerCh <-chan time.Time
 	if debugMode {
 		dt := time.NewTicker(10 * time.Second)
 		defer dt.Stop()
 		debugTickerCh = dt.C
 	}
+
+	// Selective storage: aggregate map for events not individually stored.
+	sessionStart := time.Now()
+	aggs := make(map[aggKey]*aggValue)
 
 	// System context collector (CPU/mem/load from /proc).
 	sysColl := sysinfo.New()
@@ -575,6 +763,16 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 	for {
 		select {
 		case <-ctx.Done():
+			// Flush remaining aggregates at shutdown.
+			flushAllAggregates(aggs, eventStore)
+			if eventStore != nil {
+				totalEvents := collector.Snapshot().TotalEvents
+				if totalEvents > 0 {
+					debugf("selective storage: %d/%d events stored individually (%.0f%% reduction)",
+						storedEventCount, totalEvents,
+						float64(uint64(totalEvents)-storedEventCount)/float64(totalEvents)*100)
+				}
+			}
 			updateSysCtx()
 			snap := collector.Snapshot()
 			attachSysSnapshot(snap, sysColl)
@@ -589,6 +787,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 
 		case evt, ok := <-eventCh:
 			if !ok {
+				flushAllAggregates(aggs, eventStore)
 				updateSysCtx()
 				snap := collector.Snapshot()
 				attachSysSnapshot(snap, sysColl)
@@ -613,11 +812,18 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				debugLogStack(&evt)
 			}
 
+			// Stats and correlator see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
 
+			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
-				eventStore.Record(evt)
+				stored := shouldStore(evt, sessionStart, traceRecordAll, collector)
+				if stored {
+					eventStore.Record(evt)
+					storedEventCount++
+				}
+				recordAggregate(aggs, evt, stored)
 			}
 
 			// Dynamic PID tracking: register CUDA/driver event PIDs with
@@ -652,6 +858,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					LoadAvg1:   sys.LoadAvg1,
 				})
 			}
+			// Flush completed minute-buckets to SQLite.
+			flushAggregates(aggs, eventStore, time.Now())
+
 			snap := collector.Snapshot()
 			attachSysSnapshot(snap, sysColl)
 			if onSnapshot != nil {
@@ -671,8 +880,8 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			}
 
 		case <-debugTickerCh:
-			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d, dropped=%d",
-				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents, droppedFn())
+			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d, stored=%d, dropped=%d",
+				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents, storedEventCount, droppedFn())
 			debugEventCount = 0
 		}
 	}
@@ -915,6 +1124,10 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 		debugTickerCh = dt.C
 	}
 
+	// Selective storage: aggregate map for events not individually stored.
+	sessionStart := time.Now()
+	aggs := make(map[aggKey]*aggValue)
+
 	// System context collector — needed for exporter snapshots and for
 	// recording system snapshots to SQLite (post-hoc causal chain replay).
 	var sysColl *sysinfo.Collector
@@ -931,6 +1144,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 	for {
 		select {
 		case <-ctx.Done():
+			flushAllAggregates(aggs, eventStore)
 			return nil
 
 		case <-snapTicker.C:
@@ -951,9 +1165,12 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 					LoadAvg1:   sys.LoadAvg1,
 				})
 			}
+			// Flush completed minute-buckets to SQLite.
+			flushAggregates(aggs, eventStore, time.Now())
 
 		case evt, ok := <-eventCh:
 			if !ok {
+				flushAllAggregates(aggs, eventStore)
 				return nil
 			}
 
@@ -968,11 +1185,17 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				debugLogStack(&evt)
 			}
 
+			// Stats see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
 
+			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
-				eventStore.Record(evt)
+				stored := shouldStore(evt, sessionStart, traceRecordAll, collector)
+				if stored {
+					eventStore.Record(evt)
+				}
+				recordAggregate(aggs, evt, stored)
 			}
 
 			// Dynamic PID tracking: register CUDA/driver event PIDs with
@@ -1088,8 +1311,10 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 
 	if !traceRecord {
 		fmt.Fprintln(w, "  Recording: disabled (--record=false)")
+	} else if traceRecordAll {
+		fmt.Fprintf(w, "  Recording: %s (all events)\n", store.DefaultDBPath())
 	} else {
-		fmt.Fprintf(w, "  Recording: %s\n", store.DefaultDBPath())
+		fmt.Fprintf(w, "  Recording: %s (selective — anomalies, sync, sched, lifecycle)\n", store.DefaultDBPath())
 	}
 	if traceStack {
 		fmt.Fprintln(w, "  Stack traces: enabled")
@@ -1188,7 +1413,11 @@ func formatTraceFlags() string {
 		flags = append(flags, "stack")
 	}
 	if traceRecord {
-		flags = append(flags, "record")
+		if traceRecordAll {
+			flags = append(flags, "record-all")
+		} else {
+			flags = append(flags, "record")
+		}
 	}
 	if traceJSON {
 		flags = append(flags, "json")

@@ -289,7 +289,10 @@ func (s *Server) registerTools() {
 		if s.store != nil {
 			opDescs = s.store.OpDescriptions()
 		}
-		text := formatStatsSnapshot(snap, since, len(evts), tsc, opDescs)
+
+		// Query aggregate totals for accurate counts (selective storage).
+		aggTotals, _ := s.store.QueryAggregateTotals(store.QueryParams{Since: since})
+		text := formatStatsSnapshot(snap, since, len(evts), tsc, opDescs, &aggTotals)
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
@@ -671,7 +674,13 @@ func formatCheckResults(checks []discover.CheckResult) string {
 	return result
 }
 
-func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount int, tsc bool, opDescs map[string]string) string {
+func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount int, tsc bool, opDescs map[string]string, aggTotals ...*store.AggregateTotals) string {
+	// Extract aggregate totals if provided.
+	var agg *store.AggregateTotals
+	if len(aggTotals) > 0 && aggTotals[0] != nil && aggTotals[0].TotalEvents > 0 {
+		agg = aggTotals[0]
+	}
+
 	if tsc {
 		// Compact TSC JSON for AI consumption (~60% fewer tokens).
 		var ops []map[string]interface{}
@@ -691,12 +700,22 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 			if op.SpikePattern != "" {
 				m["pat"] = op.SpikePattern
 			}
+			// Add total count from aggregates if available (selective storage).
+			if agg != nil {
+				if total, ok := agg.ByOp[op.Op]; ok && total > int64(op.Count) {
+					m["total"] = total
+				}
+			}
 			ops = append(ops, m)
 		}
 		result := map[string]interface{}{
-			TSCKey("count", true):  eventCount,
-			"since":               since.String(),
-			"ops":                  ops,
+			TSCKey("count", true): eventCount,
+			"since":              since.String(),
+			"ops":                ops,
+		}
+		if agg != nil {
+			result["total_events"] = agg.TotalEvents
+			result["stored_events"] = agg.StoredEvents
 		}
 		if snap.System != nil {
 			result["sys"] = TSCMap(true,
@@ -711,7 +730,12 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 	}
 
 	// Verbose text format for human consumption.
-	result := fmt.Sprintf("Stats for last %s (%d events):\n\n", since, eventCount)
+	var result string
+	if agg != nil {
+		result = fmt.Sprintf("Stats for last %s (%d stored of %d total events):\n\n", since, eventCount, agg.TotalEvents)
+	} else {
+		result = fmt.Sprintf("Stats for last %s (%d events):\n\n", since, eventCount)
+	}
 
 	for _, op := range snap.Ops {
 		source := "CUDA"
@@ -725,8 +749,13 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 		if desc := opDescs[op.Op]; desc != "" {
 			result += fmt.Sprintf(" (%s)", desc)
 		}
-		result += fmt.Sprintf(": count=%d p50=%s p95=%s p99=%s max=%s wall=%.1f%%",
-			op.Count,
+		result += fmt.Sprintf(": count=%d", op.Count)
+		if agg != nil {
+			if total, ok := agg.ByOp[op.Op]; ok && total > int64(op.Count) {
+				result += fmt.Sprintf(" (%d total)", total)
+			}
+		}
+		result += fmt.Sprintf(" p50=%s p95=%s p99=%s max=%s wall=%.1f%%",
 			op.P50, op.P95, op.P99, op.Max,
 			op.TimeFraction*100)
 		if op.AnomalyCount > 0 {

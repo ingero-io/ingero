@@ -82,12 +82,15 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("querying events: %w", err)
 	}
-	debugf("query: returned %d events", len(evts))
+
+	// Query aggregate totals for accurate event counts (selective storage).
+	aggTotals, _ := s.QueryAggregateTotals(params)
+	debugf("query: returned %d stored events (aggregates: %d total)", len(evts), aggTotals.TotalEvents)
 
 	if queryJSON {
 		return queryOutputJSON(evts)
 	}
-	return queryOutputTable(evts, params)
+	return queryOutputTable(evts, params, &aggTotals)
 }
 
 func queryOutputJSON(evts []events.Event) error {
@@ -137,7 +140,7 @@ func queryOutputJSON(evts []events.Event) error {
 	return enc.Encode(output)
 }
 
-func queryOutputTable(evts []events.Event, params store.QueryParams) error {
+func queryOutputTable(evts []events.Event, params store.QueryParams, aggTotals ...*store.AggregateTotals) error {
 	if len(evts) == 0 {
 		fmt.Println("  No events found.")
 		fmt.Printf("  Database: %s\n", store.DefaultDBPath())
@@ -162,7 +165,12 @@ func queryOutputTable(evts []events.Event, params store.QueryParams) error {
 		}
 		fmt.Printf(" | PIDs %s", strings.Join(pidStrs, ","))
 	}
-	fmt.Printf(" | %d events\n\n", len(evts))
+	// Show aggregate totals if selective storage was active.
+	if len(aggTotals) > 0 && aggTotals[0] != nil && aggTotals[0].TotalEvents > 0 {
+		fmt.Printf(" | %d events (%d total, selective storage)\n\n", len(evts), aggTotals[0].TotalEvents)
+	} else {
+		fmt.Printf(" | %d events\n\n", len(evts))
+	}
 
 	// Print stats table.
 	var b strings.Builder
