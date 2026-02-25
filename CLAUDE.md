@@ -34,7 +34,7 @@ tests/              Integration tests and GPU workloads
 
 ## Architectural Constraints (CRITICAL)
 
-* **eBPF uprobes, not CUPTI or bpftime.** We trace CUDA calls via standard Linux kernel uprobes on `libcudart.so` and `libcuda.so`. Evaluated alternatives: NVIDIA's CUPTI (per-process injection, 5-30% overhead, single-subscriber limit — unsuitable for production) and eunomia-bpf's bpftime userspace eBPF runtime (promising lower overhead but immature, limited verifier support, extra deployment dependency). Kernel uprobes are the production-proven choice: zero dependencies, <2% overhead, works on any 5.15+ kernel.
+* **eBPF uprobes, not CUPTI.** We trace CUDA calls via standard Linux kernel uprobes on `libcudart.so` and `libcuda.so`. Evaluated alternative: NVIDIA's CUPTI (per-process injection, 5-30% overhead, single-subscriber limit — unsuitable for production). Kernel uprobes are the production-proven choice: zero dependencies, <2% overhead, works on any 5.15+ kernel.
 * **eBPF verifier.** Code in `bpf/` executes in the Linux kernel. It must pass the strict eBPF verifier: no unbounded loops, explicit memory bound checks, no sleeping.
 * **Fully open-source, split license.** Ingero is 100% FOSS, following the same dual-license pattern used by Cilium, Falco, and most eBPF projects (GPL required by the kernel's BPF subsystem).
     * `bpf/` (kernel-space): `GPL-2.0 OR BSD-3-Clause` — every C file MUST have `// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause` on line 1.
