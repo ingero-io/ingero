@@ -758,6 +758,9 @@ func formatEventList(evts []store.RichEvent, since time.Duration, tsc bool) stri
 				"op", evt.OpName,
 				"dur_us", evt.Duration.Microseconds(),
 			)
+			if evt.ProcessName != "" {
+				m[TSCKey("process_name", true)] = evt.ProcessName
+			}
 			if evt.OpDesc != "" {
 				m["d"] = evt.OpDesc
 			}
@@ -769,25 +772,27 @@ func formatEventList(evts []store.RichEvent, since time.Duration, tsc bool) stri
 
 	// Verbose JSON — full field names, enriched with lookup table descriptions.
 	type jsonEvt struct {
-		Timestamp  string `json:"timestamp"`
-		PID        uint32 `json:"pid"`
-		Source     string `json:"source"`
-		SourceDesc string `json:"source_desc"`
-		Op         string `json:"op"`
-		OpDesc     string `json:"op_desc"`
-		DurationUs int64  `json:"duration_us"`
+		Timestamp   string `json:"timestamp"`
+		PID         uint32 `json:"pid"`
+		ProcessName string `json:"process_name,omitempty"`
+		Source      string `json:"source"`
+		SourceDesc  string `json:"source_desc"`
+		Op          string `json:"op"`
+		OpDesc      string `json:"op_desc"`
+		DurationUs  int64  `json:"duration_us"`
 	}
 
 	var output []jsonEvt
 	for _, evt := range evts {
 		output = append(output, jsonEvt{
-			Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
-			PID:        evt.PID,
-			Source:     evt.SourceName,
-			SourceDesc: evt.SourceDesc,
-			Op:         evt.OpName,
-			OpDesc:     evt.OpDesc,
-			DurationUs: evt.Duration.Microseconds(),
+			Timestamp:   evt.Timestamp.Format(time.RFC3339Nano),
+			PID:         evt.PID,
+			ProcessName: evt.ProcessName,
+			Source:      evt.SourceName,
+			SourceDesc:  evt.SourceDesc,
+			Op:          evt.OpName,
+			OpDesc:      evt.OpDesc,
+			DurationUs:  evt.Duration.Microseconds(),
 		})
 	}
 
