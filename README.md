@@ -21,8 +21,6 @@ Ingero uses eBPF to trace GPU workloads at three layers, reads system metrics fr
 3. **Host tracepoints** — traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
 4. **System context** — reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
 
-**Why eBPF uprobes?** We evaluated NVIDIA CUPTI (5-30% overhead, single-subscriber, per-process injection) and bpftime (userspace eBPF runtime — promising but immature, extra deployment dependency). Standard kernel uprobes won: zero dependencies, <2% overhead, works on any Linux 5.15+ kernel.
-
 The **causal engine** correlates events across layers by timestamp and PID to produce automated root cause analysis with severity ranking and fix recommendations.
 
 ```
@@ -128,7 +126,7 @@ alias ingero='sudo ./bin/ingero'
 - Linux kernel 5.15+ with BTF (`CONFIG_DEBUG_INFO_BTF=y`)
 - NVIDIA driver 550+ with CUDA 11.x, 12.x, or 13.x
 - Root / `CAP_BPF` + `CAP_PERFMON` (eBPF requires elevated privileges)
-- Tested on: RTX 3090, RTX 3090 Ti, RTX 4090, A10, A100 SXM4, H100 PCIe
+- Tested on: GH200, H100, A100, A10, RTX 4090, RTX 3090 (x86_64 and aarch64)
 
 ## Commands
 
@@ -248,6 +246,7 @@ sudo ingero mcp --http :8080      # HTTPS/TLS 1.3 (self-signed cert)
 | `get_trace_stats` | CUDA + host statistics with p50/p95/p99 latency |
 | `query_events` | Query stored events by time range, PID, operation |
 | `get_causal_chains` | Causal chains with severity ranking and root cause |
+| `get_sessions` | Trace session metadata (GPU, CPU, driver, OS, versions) |
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
 
@@ -308,46 +307,52 @@ sudo ingero trace --stack=false        # disable stacks if needed
 For Python workloads (PyTorch, TensorFlow, etc.), Ingero extracts **CPython frame information** directly from process memory. When a native frame is inside libpython's eval loop, the corresponding Python source frames are injected into the stack:
 
 ```
-[Python] train.py:47 in forward()
-[Python] model.py:123 in Linear.__call__()
-[Native] torch::autograd::Engine::execute+0x1a3c (libtorch_cuda.so)
-[Native] cudaMalloc+0x1f (libcudart.so.12)
+[Python] train.py:8 in train_step()
+[Python] train.py:13 in main()
+[Python] train.py:1 in <module>()
+[Native] cublasLtSSSMatmul+0x1d4 (libcublasLt.so.12)
+[Native] cublasSgemm_v2+0xa6 (libcublas.so.12)
+[Native] (libtorch_cuda.so)
 ```
 
 Supported Python versions: **3.10, 3.11, 3.12** (covers Ubuntu 22.04 default, conda default, and most production deployments). Version detection is automatic via `/proc/[pid]/maps`.
 
 ### JSON Output with `--stack`
 
+Real output from a PyTorch ResNet-50 training run on A100 SXM4 — a cuBLAS matmul kernel launch captured via Driver API uprobes, with the full call chain from Python through cuBLAS to the GPU:
+
 ```json
 {
-  "timestamp": "2026-02-21T15:41:22.123456789Z",
-  "pid": 4821,
-  "tid": 4821,
-  "source": "cuda",
-  "op": "cudaMalloc",
-  "duration_ns": 8400000,
-  "duration": "8.4ms",
+  "timestamp": "2026-02-25T12:06:24.753983243Z",
+  "pid": 11435,
+  "tid": 11435,
+  "source": "driver",
+  "op": "cuLaunchKernel",
+  "duration_ns": 10900,
+  "duration": "11us",
   "stack": [
-    {"ip": "0x7f1234560000", "symbol": "cudaMalloc+0x1f", "file": "libcudart.so.12"},
-    {"ip": "0x7f1234000000", "symbol": "torch::CUDACachingAllocator::allocate+0x3a", "file": "libtorch_cuda.so"},
-    {"ip": "0x7f1200000000", "py_file": "train.py", "py_func": "forward", "py_line": 47},
-    {"ip": "0x7f1200000100", "py_file": "model.py", "py_func": "__call__", "py_line": 123}
+    {"ip": "0x0", "py_file": "train.py", "py_func": "train_step", "py_line": 8},
+    {"ip": "0x0", "py_file": "train.py", "py_func": "main", "py_line": 13},
+    {"ip": "0x0", "py_file": "train.py", "py_func": "<module>", "py_line": 1},
+    {"ip": "0x765bb62cfa44", "symbol": "cublasLtSSSMatmul+0x1d4", "file": "libcublasLt.so.12.8.4.1"},
+    {"ip": "0x765be7734046", "symbol": "cublasSgemm_v2+0xa6", "file": "libcublas.so.12.8.4.1"},
+    {"ip": "0x765c2517fa49", "file": "libtorch_cuda.so"}
   ]
 }
 ```
 
+This kernel launch is invisible to CUDA Runtime profilers — cuBLAS calls `cuLaunchKernel` directly. Only Ingero's Driver API uprobes capture it.
+
 ### Debug Output with `--stack --debug`
 
-When `--debug` is enabled, resolved stack frames are logged to stderr:
-
 ```
-[DEBUG] stack trace for cudaMalloc (PID 4821, TID 4821, 6 frames):
-[DEBUG]   [0] cudaMalloc+0x1f (libcudart.so.12)
-[DEBUG]   [1] torch::CUDACachingAllocator::allocate+0x3a (libtorch_cuda.so)
-[DEBUG]   [2] [Python] train.py:47 in forward()
-[DEBUG]   [3] [Python] model.py:123 in __call__()
-[DEBUG]   [4] _PyEval_EvalFrameDefault+0x2a1 (libpython3.10.so.1.0)
-[DEBUG]   [5] _start (python3.10)
+[DEBUG] stack trace for cuLaunchKernel (PID 11435, TID 11435, 6 frames):
+[DEBUG]   [0] [Python] train.py:8 in train_step()
+[DEBUG]   [1] [Python] train.py:13 in main()
+[DEBUG]   [2] [Python] train.py:1 in <module>()
+[DEBUG]   [3] cublasLtSSSMatmul+0x1d4 (libcublasLt.so.12)
+[DEBUG]   [4] cublasSgemm_v2+0xa6 (libcublas.so.12)
+[DEBUG]   [5] (libtorch_cuda.so)
 ```
 
 ## OTEL Integration (Optional)
@@ -420,59 +425,20 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 
 ## Integration Testing
 
-Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azure):
+Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azure). Stack tracing is on by default. GPU-measured overhead: **0.4-1.7%** (within noise).
 
-Stack tracing is on by default. GPU-measured overhead: **0.4-0.6%** (within noise).
+| GPU | VRAM | Tests | Pass | Fail | Skip | Stack OH | Stack Cov |
+|-----|------|-------|------|------|------|----------|-----------|
+| H100 (PCIe / SXM5) | 80 GB | 34 | 34 | 0 | 0 | +1.7% | 99.5% |
+| GH200 | 480 GB | 34 | 34 | 0 | 0 | +1.7% | 99.8% |
+| A100 SXM4 | 40 GB | 34 | 34 | 0 | 0 | +0.4% | 99.7% |
+| A10 | 24 GB | 34 | 34 | 0 | 0 | +0.5% | 99.6% |
+| RTX 4090 | 24 GB | 34 | 34 | 0 | 0 | +0.6% | 99.9% |
+| RTX 3090 | 24 GB | 34 | 34 | 0 | 0 | — | — |
 
-| GPU | VRAM | Tests | Pass | Fail | Skip | Throughput | Stack OH | Stack Cov |
-|-----|------|-------|------|------|------|-----------|----------|-----------|
-| RTX 3090 | 24 GB | 24 | 21 | 1* | 2 | 88,150/30s | -0.8% | 99.6% |
-| RTX 4090 | 24 GB | 35 | 35 | 0 | 0 | 127,548/3s | +0.6% | 99.9% |
-| A10 | 24 GB | 29 | 27 | 0 | 2 | 48,500/20s | +0.5% | 99.6% |
-| A100 SXM4 | 40 GB | 29 | 27 | 0 | 2 | 58,902/20s | +0.4% | 99.7% |
-| H100 PCIe | 80 GB | 29 | 27 | 0 | 2 | 44,673/20s | +1.7% | 99.5% |
+34/34 integration tests PASS across all GPUs. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper).
 
-\* RTX 3090 failure was a test infrastructure bug (fixed), not a product bug. SKIPs are CPython frame extraction and chain detection — expected, not regressions.
-
-**Latest: RTX 4090, Ubuntu 22.04 (2026-02-23)** — Driver 580.126.09, CUDA 12.1, Kernel 5.15.0-144, Go 1.26.0, PyTorch 2.5.1+cu121 (TensorDock)
-
-35/35 integration tests PASS — first clean sweep:
-
-- **check**: All system checks pass, GPU model + driver + BTF + CUDA libs detected
-- **trace**: 85,820 events; driver API: 23,383 cuLaunchKernel (0 cudaLaunchKernel — cuBLAS direct path)
-- **explain**: 357,990 events collected, incident report generated with causal chains
-- **MCP HTTPS**: get_check, get_trace_stats, run_demo validated (TLS 1.3, ephemeral self-signed cert)
-- **Prometheus**: System + CUDA metrics in valid exposition format
-- **record + query**: DB created, 10,000 events retrieved (default limit)
-- **--debug**: Verified on/off isolation (no debug noise when off, [DEBUG] present when on)
-
-**H100 PCIe 80GB, Ubuntu 22.04 (2026-02-22)** — Driver 570.148.08, CUDA 12.8, Kernel 6.8.0-60, 200GB RAM (Lambda Labs)
-
-27/29 PASS, 0 FAIL, 2 SKIP. cuCtxSynchronize p50: 875us (fastest tested GPU).
-
-**A100 SXM4 40GB, Ubuntu 22.04 (2026-02-22)** — Driver 570.148.08, CUDA 12.8 (Lambda Labs)
-
-27/29 PASS, 0 FAIL, 2 SKIP. 58,902 events/20s baseline, +0.4% stack overhead, 99.7% stack coverage.
-
-**A10 24GB, Ubuntu 22.04 (2026-02-22)** — Driver 570.148.08, CUDA 12.8 (Lambda Labs)
-
-27/29 PASS, 0 FAIL, 2 SKIP. DWARF offset discovery validated for CPython frame extraction.
-
-## Competitive Position
-
-Ingero is the only tool that traces the **full causal chain from host scheduler through CUDA Runtime and Driver APIs** and generates automated root cause analysis with AI-first MCP integration.
-
-| Tool | Depth | Driver API | Production-Safe | Root Cause | AI |
-|------|-------|-----------|----------------|-----------|-----|
-| nvidia-smi / DCGM | Surface counters | No | Yes | No | No |
-| Datadog GPU | DCGM relay | No | Yes | No | No |
-| ZymTrace | GPU-internal (SASS) | No | Yes | No | No |
-| Nsight | Deep (kernel-level) | Yes | No (10-100x) | No | No |
-| **Ingero** | **Cross-stack causal** | **Yes** | **Yes (<2%)** | **Yes** | **Yes (MCP)** |
-
-**Zero infrastructure**: Ingero is a single binary with embedded SQLite. No ClickHouse, no PostgreSQL, no MinIO, no Kubernetes required.
-
-## What's Next
+## Roadmap
 
 **v0.7 — K8s Ready:**
 - Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod/namespace)
@@ -495,7 +461,7 @@ Yes. eBPF programs are verified by the kernel before loading — they cannot cra
 No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Your application code is untouched. Traces any language — Python, C++, Java — anything linked against libcudart.so.
 
 **What GPUs are supported?**
-Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x/13.x. Tested on RTX 3090, RTX 3090 Ti, RTX 4090, A10, A100 SXM4, H100 PCIe.
+Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x/13.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
 
 **Does it work in containers?**
 Yes, with `--privileged` or appropriate BPF capabilities. The host kernel must have BTF enabled.
@@ -505,9 +471,9 @@ Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day ro
 
 ## License
 
-Ingero uses a standard eBPF split-licensing model to ensure maximum enterprise compatibility while strictly adhering to Linux kernel requirements.
+**Ingero is 100% free and open source.** Use it for anything — personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
 
-* **User-Space (Go Agent, CLI, Causal Engine, SQLite, MCP):** Licensed under the [Apache License, Version 2.0](LICENSE). This allows you to freely use, modify, and distribute the Ingero agent within your own proprietary infrastructure without risk of copyleft infection.
-* **Kernel-Space (eBPF C Code in the `bpf/` directory):** Dual-licensed under `GPL-2.0 OR BSD-3-Clause` ([LICENSE-GPL2](bpf/LICENSE-GPL2)). GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
+Dual-licensed following the standard eBPF split-licensing model (same as Cilium, Falco, and most eBPF projects):
 
-This separation guarantees that your proprietary application code remains untouched and unencumbered when traced by Ingero.
+* **User-Space** (Go agent, CLI, causal engine, SQLite, MCP): [Apache License 2.0](LICENSE) — maximum enterprise compatibility, no copyleft.
+* **Kernel-Space** (eBPF C code in `bpf/`): `GPL-2.0 OR BSD-3-Clause` — GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
