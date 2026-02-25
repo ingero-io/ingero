@@ -538,9 +538,7 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 	var nextWindow time.Time
 	bestChains := make(map[string]CausalChain) // key: layer:op → highest-severity chain
 
-	recordWindow := func() {
-		snap := collector.Snapshot()
-		chains := corr.SnapshotCausalChains(snap.Ops, pid)
+	mergeChains := func(chains []CausalChain) {
 		for _, ch := range chains {
 			if len(ch.Timeline) == 0 {
 				continue
@@ -553,8 +551,25 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 		}
 	}
 
+	recordWindow := func() {
+		snap := collector.Snapshot()
+		mergeChains(corr.SnapshotCausalChains(snap.Ops, pid))
+	}
+
+	// Global collector with a window large enough to hold all events.
+	// The rolling collector (1,000 samples) detects concentrated anomalies
+	// (e.g., CPU stress burst). The global collector detects anomalies that
+	// are spread across the full session (e.g., cudaDeviceSync with rare
+	// tail spikes that never concentrate in a single 1-second window).
+	globalWindow := len(evts)
+	if globalWindow < 1000 {
+		globalWindow = 1000
+	}
+	globalCollector := stats.New(stats.WithWindowSize(globalWindow))
+
 	for _, evt := range evts {
 		collector.Record(evt)
+		globalCollector.Record(evt)
 		if evt.Source == events.SourceHost {
 			corr.RecordHost(evt)
 		}
@@ -568,8 +583,14 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 		}
 	}
 
-	// Final snapshot to catch the last window.
+	// Final rolling-window snapshot.
 	recordWindow()
+
+	// Global snapshot: catches session-wide anomalies missed by the
+	// rolling window (e.g., operations whose tail latency is spread
+	// across the entire trace rather than concentrated in a burst).
+	globalSnap := globalCollector.Snapshot()
+	mergeChains(corr.SnapshotCausalChains(globalSnap.Ops, pid))
 
 	// Collect results.
 	result := make([]CausalChain, 0, len(bestChains))
