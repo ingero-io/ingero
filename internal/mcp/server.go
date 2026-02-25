@@ -263,7 +263,7 @@ func (s *Server) registerTools() {
 			}, struct{}{}, nil
 		}
 
-		evts, err := s.store.Query(store.QueryParams{Since: since})
+		evts, err := s.store.Query(store.QueryParams{Since: since, Limit: -1})
 		if err != nil {
 			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
 		}
@@ -335,6 +335,14 @@ func (s *Server) registerTools() {
 			Since: since,
 			Limit: limit,
 		}
+		// Op filter: resolve human-readable name to (source, op) pair.
+		if input.Op != "" {
+			source, op, ok := events.ResolveOp(input.Op)
+			if ok {
+				params.Source = uint8(source)
+				params.Op = op
+			}
+		}
 		// PIDs takes precedence over deprecated PID field.
 		if len(input.PIDs) > 0 {
 			pids := make([]uint32, 0, len(input.PIDs))
@@ -390,7 +398,8 @@ func (s *Server) registerTools() {
 		}
 
 		// Build query params. PIDs takes precedence over deprecated PID.
-		qparams := store.QueryParams{Since: since}
+		// Limit: -1 = scan all events for accurate chain analysis.
+		qparams := store.QueryParams{Since: since, Limit: -1}
 		var corrPID uint32
 		if len(input.PIDs) > 0 {
 			pids := make([]uint32, 0, len(input.PIDs))
