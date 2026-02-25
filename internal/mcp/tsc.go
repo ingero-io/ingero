@@ -37,6 +37,7 @@ var tscFieldMap = map[string]string{
 	"anomaly_count":   "an",
 	"wall_percent":    "w%",
 	"command":         "cmd",
+	"process_name":    "pn",
 }
 
 // tscReverseMap maps abbreviated names back to verbose names.

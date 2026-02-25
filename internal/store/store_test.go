@@ -400,6 +400,59 @@ func TestQueryByMultiplePIDsRich(t *testing.T) {
 	<-done
 }
 
+func TestQueryRichProcessName(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Record process names.
+	s.RecordProcessName(100, "python3")
+	s.RecordProcessName(200, "java")
+
+	// Insert events for both PIDs + one unknown PID.
+	for _, pid := range []uint32{100, 200, 300} {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.PID = pid
+		s.Record(evt)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	result, err := s.QueryRich(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryRich failed: %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(result))
+	}
+
+	nameByPID := map[uint32]string{}
+	for _, evt := range result {
+		nameByPID[evt.PID] = evt.ProcessName
+	}
+	if nameByPID[100] != "python3" {
+		t.Errorf("PID 100: expected process name 'python3', got %q", nameByPID[100])
+	}
+	if nameByPID[200] != "java" {
+		t.Errorf("PID 200: expected process name 'java', got %q", nameByPID[200])
+	}
+	if nameByPID[300] != "" {
+		t.Errorf("PID 300: expected empty process name, got %q", nameByPID[300])
+	}
+
+	cancel()
+	<-done
+}
+
 func TestQuerySinglePIDBackwardCompat(t *testing.T) {
 	s, err := New(":memory:")
 	if err != nil {

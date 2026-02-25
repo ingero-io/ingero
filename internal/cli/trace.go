@@ -251,6 +251,17 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			debugf("session %d started", sessionID)
 		}
 
+		// Record PID→name mappings for query-time enrichment.
+		for i, pid := range targetPIDs {
+			name := ""
+			if i < len(processNames) {
+				name = processNames[i]
+			}
+			if name != "" {
+				eventStore.RecordProcessName(uint32(pid), name)
+			}
+		}
+
 		defer func() {
 			// Wait for the batch writer goroutine to finish flushing
 			// before writing session metadata or closing the DB.

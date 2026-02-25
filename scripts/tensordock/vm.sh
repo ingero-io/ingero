@@ -451,7 +451,7 @@ cmd_deploy() {
         "apt-get install -y -qq bpftrace trace-cmd 2>/dev/null || true",
         "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || (apt-get install -y nvidia-dkms-550 nvidia-driver-550 2>&1 | tail -5) || true",
         "mkdir -p /home/user/workspace",
-        "GO_ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/') && cd /tmp && wget -q https://go.dev/dl/go1.26.0.linux-${GO_ARCH}.tar.gz && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.0.linux-${GO_ARCH}.tar.gz && rm go1.26.0.linux-${GO_ARCH}.tar.gz",
+        "case $(uname -m) in x86_64) GO_ARCH=amd64;; aarch64) GO_ARCH=arm64;; *) GO_ARCH=amd64;; esac && cd /tmp && wget -q https://go.dev/dl/go1.26.0.linux-${GO_ARCH}.tar.gz && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.0.linux-${GO_ARCH}.tar.gz && rm go1.26.0.linux-${GO_ARCH}.tar.gz",
         "grep -q /usr/local/go/bin /home/user/.bashrc || echo \"export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:\\$HOME/go/bin:\\$HOME/.local/bin:\\$PATH\" >> /home/user/.bashrc",
         "sudo -u user pip3 install --quiet torch torchvision numpy --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -3 || true",
         "sudo -u user pip3 install --quiet transformers datasets diffusers accelerate 2>&1 | tail -3 || true",

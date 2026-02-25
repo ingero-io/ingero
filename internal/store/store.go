@@ -111,6 +111,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 `
 
+const processNamesSchema = `
+CREATE TABLE IF NOT EXISTS process_names (
+	pid     INTEGER NOT NULL,
+	name    TEXT NOT NULL,
+	seen_at INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (pid)
+);
+`
+
 // lookupSchema creates static reference tables that make the DB self-describing.
 // Any SQL client can JOIN against these to get human-readable names.
 //
@@ -430,6 +439,7 @@ func New(dbPath string) (*Store, error) {
 	// tables are already populated).
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.6')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
+	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {
@@ -441,6 +451,12 @@ func New(dbPath string) (*Store, error) {
 	if _, err := db.Exec(sessionsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating sessions table: %w", err)
+	}
+
+	// Create process_names table (PID→name mapping for query enrichment).
+	if _, err := db.Exec(processNamesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating process_names table: %w", err)
 	}
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -715,10 +731,11 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 // Produced by QueryRich using SELECT JOIN against sources and ops tables.
 type RichEvent struct {
 	events.Event
-	SourceName string
-	SourceDesc string
-	OpName     string
-	OpDesc     string
+	SourceName  string
+	SourceDesc  string
+	OpName      string
+	OpDesc      string
+	ProcessName string // from process_names table (empty if unknown)
 }
 
 // QueryRich retrieves events with JOIN against lookup tables for human-readable names.
@@ -729,10 +746,12 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		COALESCE(s.name, 'SRC_' || e.source),
 		COALESCE(s.description, ''),
 		COALESCE(o.name, 'OP_' || e.op),
-		COALESCE(o.description, '')
+		COALESCE(o.description, ''),
+		COALESCE(pn.name, '')
 	FROM events e
 	LEFT JOIN sources s ON e.source = s.id
 	LEFT JOIN ops o ON e.source = o.source_id AND e.op = o.op_id
+	LEFT JOIN process_names pn ON e.pid = pn.pid
 	WHERE 1=1`
 	var args []interface{}
 
@@ -787,10 +806,11 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			retCode    int32
 			stackJSON  string
 			srcName, srcDesc, opName, opDesc string
+			procName   string
 		)
 		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos,
 			&gpuID, &arg0, &arg1, &retCode, &stackJSON,
-			&srcName, &srcDesc, &opName, &opDesc); err != nil {
+			&srcName, &srcDesc, &opName, &opDesc, &procName); err != nil {
 			return nil, fmt.Errorf("scanning rich event: %w", err)
 		}
 		re := RichEvent{
@@ -805,10 +825,11 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 				Args:      [2]uint64{arg0, arg1},
 				RetCode:   retCode,
 			},
-			SourceName: srcName,
-			SourceDesc: srcDesc,
-			OpName:     opName,
-			OpDesc:     opDesc,
+			SourceName:  srcName,
+			SourceDesc:  srcDesc,
+			OpName:      opName,
+			OpDesc:      opDesc,
+			ProcessName: procName,
 		}
 		re.Event.Stack = deserializeStackIPs(stackJSON)
 		result = append(result, re)
@@ -1099,6 +1120,13 @@ func (s *Store) StopSession(id int64, stoppedAt time.Time) error {
 		return fmt.Errorf("stopping session %d: %w", id, err)
 	}
 	return nil
+}
+
+// RecordProcessName stores a PID→name mapping for query-time enrichment.
+// Uses INSERT OR REPLACE so the most recent name wins if a PID is reused.
+func (s *Store) RecordProcessName(pid uint32, name string) {
+	s.db.Exec("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)",
+		pid, name, time.Now().UnixNano())
 }
 
 // QuerySessions retrieves sessions, optionally filtered by time range.
