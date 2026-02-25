@@ -1320,7 +1320,7 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 	} else if traceRecordAll {
 		fmt.Fprintf(w, "  Recording: %s (all events)\n", store.DefaultDBPath())
 	} else {
-		fmt.Fprintf(w, "  Recording: %s (selective — anomalies, sync, sched, lifecycle)\n", store.DefaultDBPath())
+		fmt.Fprintf(w, "  Recording: %s (selective — anomalies, sync, sched, page_alloc, lifecycle)\n", store.DefaultDBPath())
 	}
 	if traceStack {
 		fmt.Fprintln(w, "  Stack traces: enabled")

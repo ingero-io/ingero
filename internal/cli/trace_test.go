@@ -200,9 +200,10 @@ func TestShouldStoreHierarchy(t *testing.T) {
 
 		// Tier 4b: mm_page_alloc always stored (causal chain critical for
 		// memory pressure detection — chain engine needs Args[0] bytes).
+		// Real mm_page_alloc events have Duration=0; alloc bytes in Args[0].
 		{
 			name:      "mm_page_alloc",
-			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 5 * time.Microsecond, PID: 1000, Args: [2]uint64{16 * 1024 * 1024, 0}},
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 0, PID: 1000, Args: [2]uint64{16 * 1024 * 1024, 0}},
 			start:     pastBootstrap,
 			recAll:    false,
 			wantStore: true,
@@ -311,6 +312,8 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 	var allEvents []events.Event
 
 	// Phase 1: 50 normal cudaStreamSync (establish 1ms baseline).
+	// Spread over 0-500ms so the timeline spans >1s total, ensuring
+	// ReplayEventsForChains' 1-second windowed snapshot fires.
 	for i := 0; i < 50; i++ {
 		allEvents = append(allEvents, events.Event{
 			Timestamp: now.Add(time.Duration(i) * 10 * time.Millisecond),
@@ -335,22 +338,25 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 	}
 
 	// Phase 2: sched_switch burst (10 events, CPU preemption).
+	// Placed at t=1200ms so the full timeline >1s, triggering the windowed
+	// snapshot in ReplayEventsForChains (not just the final/global fallback).
+	// Args[1] = target_pid (matches real eBPF host_trace.bpf.c output).
 	for i := 0; i < 10; i++ {
 		allEvents = append(allEvents, events.Event{
-			Timestamp: now.Add(time.Duration(700+i) * time.Millisecond),
+			Timestamp: now.Add(time.Duration(1200+i) * time.Millisecond),
 			PID:       pid,
 			TID:       pid,
 			Source:    events.SourceHost,
 			Op:        uint8(events.HostSchedSwitch),
 			Duration:  5 * time.Millisecond,
-			Args:      [2]uint64{uint64(pid), 0}, // prev_pid = our PID
+			Args:      [2]uint64{0, uint64(pid)}, // target_pid in Args[1]
 		})
 	}
 
 	// Phase 2: inflated cudaStreamSync (tail spike from CPU contention).
 	for i := 0; i < 20; i++ {
 		allEvents = append(allEvents, events.Event{
-			Timestamp: now.Add(time.Duration(710+i) * time.Millisecond),
+			Timestamp: now.Add(time.Duration(1210+i) * time.Millisecond),
 			PID:       pid,
 			TID:       pid,
 			Source:    events.SourceCUDA,
@@ -396,10 +402,13 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 	}
 
 	// Replay stored events through chain engine (simulates ingero explain).
-	replayCollector := stats.New(stats.WithWindowSize(len(storedEvents)))
+	// Use default stats.New() (window=1000) to match real callers in
+	// explain.go and mcp/server.go. ReplayEventsForChains also creates an
+	// internal globalCollector with window=max(len(evts), 1000).
+	replayCollector := stats.New()
 	replayCorr := correlate.New(correlate.WithMaxAge(0)) // no pruning for replay
 
-	// Set system context (moderate CPU to trigger SYSTEM layer).
+	// Set system context (CPU >90% triggers SYSTEM layer → HIGH severity).
 	replayCorr.SetSystemSnapshot(&correlate.SystemContext{
 		CPUPercent: 92.0,
 		MemUsedPct: 60.0,
@@ -412,12 +421,16 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 		t.Fatal("replay of selectively stored events should detect causal chain")
 	}
 
-	// Verify a sched_switch chain was found.
+	// Verify a sched_switch chain was found with correct severity.
 	foundSchedChain := false
 	for _, ch := range chains {
 		for _, te := range ch.Timeline {
 			if te.Layer == "HOST" && strings.Contains(te.Op, "sched_switch") {
 				foundSchedChain = true
+				// CPU 92% > 90% threshold → severity must be HIGH.
+				if ch.Severity != "HIGH" {
+					t.Errorf("sched_switch chain severity = %q, want HIGH (CPU 92%%)", ch.Severity)
+				}
 			}
 		}
 	}
@@ -449,6 +462,7 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 	var allEvents []events.Event
 
 	// 100 mm_page_alloc events, 16MB each (total = 1.6GB > 1GB threshold).
+	// Real mm_page_alloc events have Duration=0; alloc bytes in Args[0].
 	for i := 0; i < 100; i++ {
 		allEvents = append(allEvents, events.Event{
 			Timestamp: now.Add(time.Duration(i) * 10 * time.Millisecond),
@@ -456,15 +470,28 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 			TID:       pid,
 			Source:    events.SourceHost,
 			Op:        uint8(events.HostPageAlloc),
-			Duration:  5 * time.Microsecond,
+			Duration:  0,
 			Args:      [2]uint64{16 * 1024 * 1024, 0}, // 16MB per alloc
+		})
+	}
+
+	// 100 normal cuLaunchKernel (bulk, should be aggregated — verifies that
+	// selective storage actually filters something in this test).
+	for i := 0; i < 100; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(1000+i) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDALaunchKernel),
+			Duration:  10 * time.Microsecond,
 		})
 	}
 
 	// 50 normal cudaStreamSync (baseline at 1ms — always stored as sync op).
 	for i := 0; i < 50; i++ {
 		allEvents = append(allEvents, events.Event{
-			Timestamp: now.Add(time.Duration(1000+i*10) * time.Millisecond),
+			Timestamp: now.Add(time.Duration(1100+i*10) * time.Millisecond),
 			PID:       pid,
 			TID:       pid,
 			Source:    events.SourceCUDA,
@@ -476,7 +503,7 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 	// 20 anomalous cudaStreamSync (inflated by memory pressure, 500x baseline).
 	for i := 0; i < 20; i++ {
 		allEvents = append(allEvents, events.Event{
-			Timestamp: now.Add(time.Duration(1500+i*10) * time.Millisecond),
+			Timestamp: now.Add(time.Duration(1600+i*10) * time.Millisecond),
 			PID:       pid,
 			TID:       pid,
 			Source:    events.SourceCUDA,
@@ -499,11 +526,11 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		}
 	}
 
-	// Verify mm_page_alloc events are preserved.
+	// Verify mm_page_alloc events are preserved and filtering happened.
 	counts := countEventsByType(storedEvents)
-	t.Logf("stored: %d/%d total, mm_page_alloc=%d, cudaStreamSync=%d",
+	t.Logf("stored: %d/%d total, mm_page_alloc=%d, cudaStreamSync=%d, cudaLaunchKernel=%d",
 		len(storedEvents), len(allEvents),
-		counts["mm_page_alloc"], counts["cudaStreamSync"])
+		counts["mm_page_alloc"], counts["cudaStreamSync"], counts["cudaLaunchKernel"])
 
 	if counts["mm_page_alloc"] == 0 {
 		t.Fatal("mm_page_alloc events must be stored for memory pressure chain detection; " +
@@ -516,12 +543,18 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 	if counts["cudaStreamSync"] != 70 {
 		t.Errorf("cudaStreamSync: stored=%d, want 70", counts["cudaStreamSync"])
 	}
+	// Verify filtering actually happened (cuLaunchKernel should be aggregated).
+	if len(storedEvents) >= len(allEvents) {
+		t.Errorf("selective storage should filter events: stored=%d total=%d",
+			len(storedEvents), len(allEvents))
+	}
 
 	// Replay stored events through chain engine.
-	replayCollector := stats.New(stats.WithWindowSize(len(storedEvents)))
+	// Use default stats.New() (window=1000) to match real callers.
+	replayCollector := stats.New()
 	replayCorr := correlate.New(correlate.WithMaxAge(0))
 
-	// Set system context with memory pressure.
+	// Set system context with memory pressure (mem >95%, swap >0 → HIGH severity).
 	replayCorr.SetSystemSnapshot(&correlate.SystemContext{
 		CPUPercent: 40.0,
 		MemUsedPct: 96.0,
@@ -536,12 +569,16 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		t.Fatal("replay should detect memory pressure causal chain from stored mm_page_alloc events")
 	}
 
-	// Verify a mm_page_alloc chain was found.
+	// Verify a mm_page_alloc chain was found with correct severity.
 	foundPageAllocChain := false
 	for _, ch := range chains {
 		for _, te := range ch.Timeline {
 			if te.Layer == "HOST" && strings.Contains(te.Op, "mm_page_alloc") {
 				foundPageAllocChain = true
+				// mem 96% > 95% + swap > 0 → severity must be HIGH.
+				if ch.Severity != "HIGH" {
+					t.Errorf("page_alloc chain severity = %q, want HIGH (mem 96%%)", ch.Severity)
+				}
 			}
 		}
 	}
