@@ -113,7 +113,7 @@ sudo make install # copies binary to /usr/local/bin/ingero
 Or add an alias if you prefer running from the build directory:
 
 ```bash
-alias ingero='sudo ./bin/ingero'
+alias ingero='./bin/ingero'
 ```
 
 > **One-line install** (when releases are available):
@@ -128,6 +128,8 @@ alias ingero='sudo ./bin/ingero'
 - Root / `CAP_BPF` + `CAP_PERFMON` (eBPF requires elevated privileges)
 - Tested on: GH200, H100, A100, A10, RTX 4090, RTX 3090 (x86_64 and aarch64)
 
+**Only `trace` needs sudo** — it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
+
 ## Commands
 
 ### `ingero check`
@@ -135,7 +137,7 @@ alias ingero='sudo ./bin/ingero'
 Check if your system is ready for eBPF-based GPU tracing.
 
 ```bash
-$ sudo ingero check
+$ ingero check
 
 Ingero — System Readiness Check
 
@@ -219,10 +221,10 @@ INCIDENT REPORT — 2 causal chains found (1 HIGH, 1 MEDIUM)
 Query stored events by time range, PID, and operation type.
 
 ```bash
-sudo ingero query --since 1h
-sudo ingero query --since 1h --pid 4821
-sudo ingero query --since 1h --pid 4821,5032
-sudo ingero query --since 30m --op cudaMemcpy --json
+ingero query --since 1h
+ingero query --since 1h --pid 4821
+ingero query --since 1h --pid 4821,5032
+ingero query --since 30m --op cudaMemcpy --json
 ```
 
 Storage uses SQLite with 7-day rolling retention. Data is stored locally at `~/.ingero/ingero.db` — nothing leaves your machine.
@@ -232,8 +234,8 @@ Storage uses SQLite with 7-day rolling retention. Data is stored locally at `~/.
 Start an MCP (Model Context Protocol) server for AI agent integration.
 
 ```bash
-sudo ingero mcp                   # stdio (for Claude Code / MCP clients)
-sudo ingero mcp --http :8080      # HTTPS/TLS 1.3 (self-signed cert)
+ingero mcp                        # stdio (for Claude Code / MCP clients)
+ingero mcp --http :8080           # HTTPS/TLS 1.3 (self-signed cert)
 ```
 
 **AI-first analysis**: MCP responses use telegraphic compression (TSC) by default, reducing token count by ~60%. Set `{"tsc": false}` per request for verbose output.
@@ -295,8 +297,8 @@ Stack tracing is **on by default** — every CUDA/Driver API event captures the 
 ```bash
 sudo ingero trace --json               # JSON with resolved stack traces (stacks on by default)
 sudo ingero trace --debug              # debug output shows resolved frames on stderr
-sudo ingero demo --json                # GPU demo with stack traces
-ingero explain                         # post-hoc causal analysis from DB
+sudo ingero demo --gpu --json          # GPU demo with stack traces (needs sudo)
+ingero explain                         # post-hoc causal analysis from DB (no sudo)
 sudo ingero trace --stack=false        # disable stacks if needed
 ```
 
