@@ -305,14 +305,20 @@ else
 fi
 
 if [ ! -z "$GO_INSTALL_NEEDED" ]; then
-    print_info "Downloading Go ${GO_BOOTSTRAP_VERSION}..."
+    # Detect architecture for correct Go binary
+    case "$(uname -m)" in
+        x86_64)  GO_ARCH="amd64" ;;
+        aarch64) GO_ARCH="arm64" ;;
+        *)       GO_ARCH="amd64" ;;
+    esac
+    print_info "Downloading Go ${GO_BOOTSTRAP_VERSION} (linux-${GO_ARCH})..."
     cd /tmp
-    wget -q "https://go.dev/dl/go${GO_BOOTSTRAP_VERSION}.linux-amd64.tar.gz"
+    wget -q "https://go.dev/dl/go${GO_BOOTSTRAP_VERSION}.linux-${GO_ARCH}.tar.gz"
 
     print_info "Installing Go..."
     sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf "go${GO_BOOTSTRAP_VERSION}.linux-amd64.tar.gz"
-    rm "go${GO_BOOTSTRAP_VERSION}.linux-amd64.tar.gz"
+    sudo tar -C /usr/local -xzf "go${GO_BOOTSTRAP_VERSION}.linux-${GO_ARCH}.tar.gz"
+    rm "go${GO_BOOTSTRAP_VERSION}.linux-${GO_ARCH}.tar.gz"
 
     # Add Go to PATH for interactive shells (.bashrc)
     if ! grep -q "/usr/local/go/bin" ~/.bashrc; then

@@ -269,18 +269,27 @@ func CheckGPUModel() CheckResult {
 	}
 }
 
-// CPUModel reads the CPU model name from /proc/cpuinfo.
-// Returns e.g. "AMD EPYC 7713 64-Core Processor". Empty string on failure.
+// CPUModel reads the CPU model name.
+// Tries /proc/cpuinfo "model name" first (x86_64), then falls back to
+// lscpu "Model name" (works on both x86_64 and aarch64).
+// Returns e.g. "AMD EPYC 7713 64-Core Processor" or "Neoverse-V2".
 func CPUModel() string {
-	data, err := os.ReadFile("/proc/cpuinfo")
-	if err != nil {
-		return ""
+	// /proc/cpuinfo — works on x86_64
+	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "model name") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					return strings.TrimSpace(parts[1])
+				}
+			}
+		}
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "model name") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
+	// Fallback: lscpu — works on x86_64 and aarch64 (ARM64)
+	if out, err := exec.Command("lscpu").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "Model name:") {
+				return strings.TrimSpace(strings.TrimPrefix(line, "Model name:"))
 			}
 		}
 	}

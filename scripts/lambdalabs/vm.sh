@@ -488,9 +488,10 @@ apt-get install -y -qq linux-tools-$(uname -r) 2>/dev/null || true
 apt-get install -y -qq bpftrace trace-cmd 2>/dev/null || true
 
 # Go
-cd /tmp && wget -q https://go.dev/dl/go1.26.0.linux-amd64.tar.gz \
-    && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz \
-    && rm go1.26.0.linux-amd64.tar.gz
+GO_ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/') && \
+    cd /tmp && wget -q https://go.dev/dl/go1.26.0.linux-${GO_ARCH}.tar.gz \
+    && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.0.linux-${GO_ARCH}.tar.gz \
+    && rm go1.26.0.linux-${GO_ARCH}.tar.gz
 
 grep -q /usr/local/go/bin /home/ubuntu/.bashrc || \
     echo 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/go/bin:$HOME/.local/bin:$PATH' >> /home/ubuntu/.bashrc
