@@ -273,17 +273,17 @@ done
 log "Test 3+7: trace --duration 15s (clean + driver API)"
 WL_PID=$(start_workload 18)
 sleep 1
-sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 15s > logs/watch-clean.json 2> logs/watch-clean.log
+sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 15s > logs/trace-clean.json 2> logs/trace-clean.log
 wait "$WL_PID" 2>/dev/null || true
 
-CLEAN_COUNT=$(count_events logs/watch-clean.json)
+CLEAN_COUNT=$(count_events logs/trace-clean.json)
 if [[ "$CLEAN_COUNT" -gt 100 ]]; then
     record "PASS" "T03: trace clean" "$CLEAN_COUNT events"
 else
     record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >100)"
 fi
 
-CU_COUNT=$(grep -c '"cuLaunchKernel"' logs/watch-clean.json 2>/dev/null || echo "0")
+CU_COUNT=$(grep -c '"cuLaunchKernel"' logs/trace-clean.json 2>/dev/null || echo "0")
 CU_COUNT=$(echo "$CU_COUNT" | head -1)
 if [[ "$CU_COUNT" -gt 0 ]]; then
     record "PASS" "T07: driver API: cuLaunchKernel" "$CU_COUNT events (from T03 session)"
@@ -295,10 +295,10 @@ fi
 log "Test 4: trace --debug --duration 15s"
 WL_PID=$(start_workload 18)
 sleep 1
-sudo ./bin/ingero trace --debug --json --duration 15s > logs/watch-debug.json 2> logs/watch-debug.log
+sudo ./bin/ingero trace --debug --json --duration 15s > logs/trace-debug.json 2> logs/trace-debug.log
 wait "$WL_PID" 2>/dev/null || true
-DEBUG_COUNT=$(count_events logs/watch-debug.json)
-DEBUG_LINES=$(grep -c '\[DEBUG\]' logs/watch-debug.log 2>/dev/null || echo "0")
+DEBUG_COUNT=$(count_events logs/trace-debug.json)
+DEBUG_LINES=$(grep -c '\[DEBUG\]' logs/trace-debug.log 2>/dev/null || echo "0")
 if [[ "$DEBUG_COUNT" -gt 100 && "$DEBUG_LINES" -gt 0 ]]; then
     record "PASS" "T04: trace --debug" "$DEBUG_COUNT events, $DEBUG_LINES debug lines"
 else
@@ -310,7 +310,7 @@ _test_start=$SECONDS
 log "Test 5: record + query"
 WL_PID=$(start_workload 14)
 sleep 1
-sudo ./bin/ingero trace --json --duration 10s > logs/watch-record.json 2> logs/watch-record.log
+sudo ./bin/ingero trace --json --duration 10s > logs/trace-record.json 2> logs/trace-record.log
 wait "$WL_PID" 2>/dev/null || true
 QUERY_OUT=$(sudo ./bin/ingero query --since 5m --json 2>/dev/null)
 QUERY_COUNT=$(echo "$QUERY_OUT" | grep -c '"op"' || true)
@@ -1425,7 +1425,7 @@ echo "$(ts) JSON:   logs/test-report.json"
 echo "$(ts) Benchmark: logs/benchmark-summary.txt"
 echo ""
 echo "Log files:"
-ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/watch-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log 2>/dev/null
+ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/trace-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log 2>/dev/null
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     exit 1
