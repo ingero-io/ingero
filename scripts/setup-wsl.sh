@@ -206,8 +206,9 @@ else
 fi
 
 if [ "$GO_NEEDED" -eq 1 ]; then
-    print_info "Installing Go $GO_BOOTSTRAP_VERSION (bootstrap — go.mod auto-downloads exact version)..."
-    wget -q "https://go.dev/dl/go${GO_BOOTSTRAP_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz
+    GO_ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+    print_info "Installing Go $GO_BOOTSTRAP_VERSION (linux-${GO_ARCH}, bootstrap — go.mod auto-downloads exact version)..."
+    wget -q "https://go.dev/dl/go${GO_BOOTSTRAP_VERSION}.linux-${GO_ARCH}.tar.gz" -O /tmp/go.tar.gz
     sudo rm -rf /usr/local/go
     sudo tar -C /usr/local -xzf /tmp/go.tar.gz
     rm /tmp/go.tar.gz

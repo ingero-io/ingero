@@ -6,7 +6,8 @@ REPO_ROOT := $(shell cd .. && pwd)
 BINARY := bin/ingero
 GOFLAGS := -tags linux
 BPF_CLANG := clang
-BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86
+BPF_TARGET_ARCH := $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_TARGET_ARCH)
 
 # Version info injected at build time via Go linker flags
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -21,7 +22,7 @@ all: generate build test lint
 
 # Generate eBPF Go bindings via bpf2go
 generate:
-	go generate ./internal/ebpf/...
+	BPF_TARGET_ARCH=$(BPF_TARGET_ARCH) go generate ./internal/ebpf/...
 
 # Build the agent binary (injects version from git at link time)
 build:
