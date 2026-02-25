@@ -1,8 +1,13 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/ingero-io/ingero/internal/correlate"
+	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/pkg/events"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,4 +77,502 @@ func TestDebugf(t *testing.T) {
 	debugMode = true
 	debugf("test message: %s %d", "hello", 42)
 	debugMode = false
+}
+
+// ---------------------------------------------------------------------------
+// shouldStore tests — validates the selective storage decision hierarchy
+// ---------------------------------------------------------------------------
+
+// TestShouldStoreHierarchy tests all 7 tiers of the shouldStore() decision
+// hierarchy using a table-driven approach. Each tier is tested independently.
+//
+// Teaching note: Go's table-driven test pattern ([]struct{...} + t.Run) is
+// the idiomatic way to test functions with many input combinations. Each
+// sub-test gets its own t.Run name, so failures pinpoint the exact case.
+func TestShouldStoreHierarchy(t *testing.T) {
+	// Build a collector with baseline data so IsAnomaly() works.
+	// We need ≥10 samples per op + a Snapshot() to update cachedP50.
+	collector := stats.New()
+	for i := 0; i < 100; i++ {
+		collector.Record(events.Event{
+			Timestamp: time.Now(),
+			PID:       1000,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDALaunchKernel),
+			Duration:  10 * time.Microsecond,
+		})
+		collector.Record(events.Event{
+			Timestamp: time.Now(),
+			PID:       1000,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostPageAlloc),
+			Duration:  5 * time.Microsecond,
+		})
+		collector.Record(events.Event{
+			Timestamp: time.Now(),
+			PID:       1000,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostSchedWakeup),
+			Duration:  2 * time.Microsecond,
+		})
+		collector.Record(events.Event{
+			Timestamp: time.Now(),
+			PID:       1000,
+			Source:    events.SourceDriver,
+			Op:        uint8(events.DriverLaunchKernel),
+			Duration:  8 * time.Microsecond,
+		})
+	}
+	collector.Snapshot() // updates cachedP50 for all ops
+
+	pastBootstrap := time.Now().Add(-1 * time.Minute) // well past 10s
+
+	tests := []struct {
+		name     string
+		evt      events.Event
+		start    time.Time
+		recAll   bool
+		wantStore bool
+	}{
+		// Tier 1: --record-all bypasses all filtering.
+		{
+			name:      "recordAll/cuLaunchKernel",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDALaunchKernel), Duration: 10 * time.Microsecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    true,
+			wantStore: true,
+		},
+
+		// Tier 2: Bootstrap window (first 10s) stores everything.
+		{
+			name:      "bootstrap/cuLaunchKernel",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDALaunchKernel), Duration: 10 * time.Microsecond, PID: 1000},
+			start:     time.Now(), // just started
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "bootstrap/sched_wakeup",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedWakeup), Duration: 2 * time.Microsecond, PID: 1000},
+			start:     time.Now(),
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 3: Process lifecycle always stored.
+		{
+			name:      "lifecycle/process_exec",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostProcessExec), PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "lifecycle/process_exit",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostProcessExit), PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "lifecycle/process_fork",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostProcessFork), PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "lifecycle/oom_kill",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostOOMKill), PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 4: sched_switch always stored (causal chain critical).
+		{
+			name:      "sched_switch",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 4b: mm_page_alloc always stored (causal chain critical for
+		// memory pressure detection — chain engine needs Args[0] bytes).
+		{
+			name:      "mm_page_alloc",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 5 * time.Microsecond, PID: 1000, Args: [2]uint64{16 * 1024 * 1024, 0}},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 5: Sync ops always stored (latency symptoms).
+		{
+			name:      "sync/cudaStreamSync",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDAStreamSync), Duration: 1 * time.Millisecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "sync/cudaDeviceSync",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDADeviceSync), Duration: 1 * time.Millisecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "sync/cuCtxSynchronize",
+			evt:       events.Event{Source: events.SourceDriver, Op: uint8(events.DriverCtxSync), Duration: 1 * time.Millisecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 6: Anomalous events (duration > 3x p50) stored.
+		{
+			name:      "anomaly/cuLaunchKernel_100x",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDALaunchKernel), Duration: 1 * time.Millisecond, PID: 1000}, // 100x the 10us baseline
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+		{
+			name:      "anomaly/driverLaunchKernel_100x",
+			evt:       events.Event{Source: events.SourceDriver, Op: uint8(events.DriverLaunchKernel), Duration: 800 * time.Microsecond, PID: 1000}, // 100x the 8us baseline
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: true,
+		},
+
+		// Tier 7: Normal events → aggregate only (NOT stored).
+		{
+			name:      "aggregate/cuLaunchKernel_normal",
+			evt:       events.Event{Source: events.SourceCUDA, Op: uint8(events.CUDALaunchKernel), Duration: 10 * time.Microsecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: false,
+		},
+		{
+			name:      "aggregate/sched_wakeup_normal",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedWakeup), Duration: 2 * time.Microsecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: false,
+		},
+		{
+			name:      "aggregate/driverLaunchKernel_normal",
+			evt:       events.Event{Source: events.SourceDriver, Op: uint8(events.DriverLaunchKernel), Duration: 8 * time.Microsecond, PID: 1000},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldStore(tt.evt, tt.start, tt.recAll, collector)
+			if got != tt.wantStore {
+				t.Errorf("shouldStore() = %v, want %v", got, tt.wantStore)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Selective storage → causal chain integration tests
+// ---------------------------------------------------------------------------
+
+// TestSelectiveStoragePreservesSchedSwitchChain verifies that events preserved
+// by selective storage are sufficient for sched_switch → cudaStreamSync causal
+// chain detection during REPLAY (ingero explain / MCP get_causal_chains).
+//
+// Teaching note: This is a cross-package integration test. During live tracing,
+// the correlator sees ALL events and chains work fine. But during replay
+// (explain/MCP), only SQLite-stored events are available. This test verifies
+// the stored subset is sufficient for the chain engine.
+//
+// The synthetic event stream has two phases:
+//   Phase 1 (baseline): normal cudaStreamSync at 1ms + bulk cuLaunchKernel
+//   Phase 2 (anomaly):  sched_switch burst → cudaStreamSync tail spike at 500ms
+//
+// shouldStore keeps: all sched_switch + all cudaStreamSync (always-store rules)
+// shouldStore drops: cuLaunchKernel (normal, aggregated)
+// Replay of stored events should still detect the chain.
+func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
+	pid := uint32(1000)
+	now := time.Now()
+
+	// Collector for shouldStore's anomaly detection (simulates live mode).
+	liveCollector := stats.New()
+
+	var allEvents []events.Event
+
+	// Phase 1: 50 normal cudaStreamSync (establish 1ms baseline).
+	for i := 0; i < 50; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(i) * 10 * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDAStreamSync),
+			Duration:  1 * time.Millisecond,
+		})
+	}
+
+	// Phase 1: 200 normal cuLaunchKernel (bulk, should be aggregated).
+	for i := 0; i < 200; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(500+i) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDALaunchKernel),
+			Duration:  10 * time.Microsecond,
+		})
+	}
+
+	// Phase 2: sched_switch burst (10 events, CPU preemption).
+	for i := 0; i < 10; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(700+i) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostSchedSwitch),
+			Duration:  5 * time.Millisecond,
+			Args:      [2]uint64{uint64(pid), 0}, // prev_pid = our PID
+		})
+	}
+
+	// Phase 2: inflated cudaStreamSync (tail spike from CPU contention).
+	for i := 0; i < 20; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(710+i) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDAStreamSync),
+			Duration:  500 * time.Millisecond, // 500x baseline
+		})
+	}
+
+	// Simulate live mode: feed ALL events to collector + apply shouldStore.
+	sessionStart := now.Add(-1 * time.Minute) // past bootstrap window
+	var storedEvents []events.Event
+
+	for i, evt := range allEvents {
+		liveCollector.Record(evt)
+		// Snapshot periodically to update cachedP50 (like real event loop).
+		if i%50 == 49 {
+			liveCollector.Snapshot()
+		}
+		if shouldStore(evt, sessionStart, false, liveCollector) {
+			storedEvents = append(storedEvents, evt)
+		}
+	}
+
+	// Verify filtering happened: some cuLaunchKernel events were dropped.
+	if len(storedEvents) >= len(allEvents) {
+		t.Fatalf("selective storage should filter events: stored=%d total=%d",
+			len(storedEvents), len(allEvents))
+	}
+
+	// Count stored events by type.
+	counts := countEventsByType(storedEvents)
+	t.Logf("stored: %d/%d total, sched_switch=%d, cudaStreamSync=%d, cudaLaunchKernel=%d",
+		len(storedEvents), len(allEvents),
+		counts["sched_switch"], counts["cudaStreamSync"], counts["cudaLaunchKernel"])
+
+	// All sched_switch must be preserved (always-store rule).
+	if counts["sched_switch"] != 10 {
+		t.Errorf("sched_switch: stored=%d, want 10 (always-store rule)", counts["sched_switch"])
+	}
+	// All cudaStreamSync must be preserved (sync op always-store rule).
+	if counts["cudaStreamSync"] != 70 { // 50 baseline + 20 anomalous
+		t.Errorf("cudaStreamSync: stored=%d, want 70 (sync op always-store rule)", counts["cudaStreamSync"])
+	}
+
+	// Replay stored events through chain engine (simulates ingero explain).
+	replayCollector := stats.New(stats.WithWindowSize(len(storedEvents)))
+	replayCorr := correlate.New(correlate.WithMaxAge(0)) // no pruning for replay
+
+	// Set system context (moderate CPU to trigger SYSTEM layer).
+	replayCorr.SetSystemSnapshot(&correlate.SystemContext{
+		CPUPercent: 92.0,
+		MemUsedPct: 60.0,
+		LoadAvg1:   8.0,
+	})
+
+	chains := correlate.ReplayEventsForChains(storedEvents, replayCollector, replayCorr, pid)
+
+	if len(chains) == 0 {
+		t.Fatal("replay of selectively stored events should detect causal chain")
+	}
+
+	// Verify a sched_switch chain was found.
+	foundSchedChain := false
+	for _, ch := range chains {
+		for _, te := range ch.Timeline {
+			if te.Layer == "HOST" && strings.Contains(te.Op, "sched_switch") {
+				foundSchedChain = true
+			}
+		}
+	}
+	if !foundSchedChain {
+		t.Errorf("expected sched_switch chain in replay, got %d chains: %v",
+			len(chains), chainSummaries(chains))
+	}
+}
+
+// TestSelectiveStoragePreservesPageAllocChain verifies that mm_page_alloc
+// events are preserved for memory pressure causal chain detection during replay.
+//
+// Teaching note: The causal chain engine counts mm_page_alloc events and sums
+// their Args[0] (bytes). If totalAllocBytes > 1GB, it triggers a memory
+// pressure chain. The aggregate table does NOT preserve Args, so individual
+// events must be stored. Without the shouldStore fix for mm_page_alloc,
+// replay would miss memory pressure chains entirely — a silent correctness gap.
+//
+// The symptom op is cudaStreamSync (always-stored as a sync op), not cudaMalloc,
+// because both baseline AND anomalous events must survive selective storage for
+// the chain engine to see a meaningful p99/p50 ratio. Sync ops are always
+// stored, so they naturally preserve the full latency distribution.
+func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
+	pid := uint32(1000)
+	now := time.Now()
+
+	liveCollector := stats.New()
+
+	var allEvents []events.Event
+
+	// 100 mm_page_alloc events, 16MB each (total = 1.6GB > 1GB threshold).
+	for i := 0; i < 100; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(i) * 10 * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostPageAlloc),
+			Duration:  5 * time.Microsecond,
+			Args:      [2]uint64{16 * 1024 * 1024, 0}, // 16MB per alloc
+		})
+	}
+
+	// 50 normal cudaStreamSync (baseline at 1ms — always stored as sync op).
+	for i := 0; i < 50; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(1000+i*10) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDAStreamSync),
+			Duration:  1 * time.Millisecond,
+		})
+	}
+
+	// 20 anomalous cudaStreamSync (inflated by memory pressure, 500x baseline).
+	for i := 0; i < 20; i++ {
+		allEvents = append(allEvents, events.Event{
+			Timestamp: now.Add(time.Duration(1500+i*10) * time.Millisecond),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDAStreamSync),
+			Duration:  500 * time.Millisecond,
+		})
+	}
+
+	// Filter through shouldStore.
+	sessionStart := now.Add(-1 * time.Minute) // past bootstrap
+	var storedEvents []events.Event
+
+	for i, evt := range allEvents {
+		liveCollector.Record(evt)
+		if i%30 == 29 {
+			liveCollector.Snapshot()
+		}
+		if shouldStore(evt, sessionStart, false, liveCollector) {
+			storedEvents = append(storedEvents, evt)
+		}
+	}
+
+	// Verify mm_page_alloc events are preserved.
+	counts := countEventsByType(storedEvents)
+	t.Logf("stored: %d/%d total, mm_page_alloc=%d, cudaStreamSync=%d",
+		len(storedEvents), len(allEvents),
+		counts["mm_page_alloc"], counts["cudaStreamSync"])
+
+	if counts["mm_page_alloc"] == 0 {
+		t.Fatal("mm_page_alloc events must be stored for memory pressure chain detection; " +
+			"shouldStore() must always-store mm_page_alloc (chain-critical)")
+	}
+	if counts["mm_page_alloc"] != 100 {
+		t.Errorf("mm_page_alloc: stored=%d, want 100 (always-store rule)", counts["mm_page_alloc"])
+	}
+	// All cudaStreamSync stored (sync op always-store rule).
+	if counts["cudaStreamSync"] != 70 {
+		t.Errorf("cudaStreamSync: stored=%d, want 70", counts["cudaStreamSync"])
+	}
+
+	// Replay stored events through chain engine.
+	replayCollector := stats.New(stats.WithWindowSize(len(storedEvents)))
+	replayCorr := correlate.New(correlate.WithMaxAge(0))
+
+	// Set system context with memory pressure.
+	replayCorr.SetSystemSnapshot(&correlate.SystemContext{
+		CPUPercent: 40.0,
+		MemUsedPct: 96.0,
+		MemAvailMB: 200,
+		SwapUsedMB: 500,
+		LoadAvg1:   4.0,
+	})
+
+	chains := correlate.ReplayEventsForChains(storedEvents, replayCollector, replayCorr, pid)
+
+	if len(chains) == 0 {
+		t.Fatal("replay should detect memory pressure causal chain from stored mm_page_alloc events")
+	}
+
+	// Verify a mm_page_alloc chain was found.
+	foundPageAllocChain := false
+	for _, ch := range chains {
+		for _, te := range ch.Timeline {
+			if te.Layer == "HOST" && strings.Contains(te.Op, "mm_page_alloc") {
+				foundPageAllocChain = true
+			}
+		}
+	}
+	if !foundPageAllocChain {
+		t.Errorf("expected mm_page_alloc chain in replay, got %d chains: %v",
+			len(chains), chainSummaries(chains))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// countEventsByType counts stored events by their human-readable op name.
+func countEventsByType(evts []events.Event) map[string]int {
+	counts := make(map[string]int)
+	for _, evt := range evts {
+		counts[evt.OpName()]++
+	}
+	return counts
+}
+
+// chainSummaries returns a compact string representation of chains for test output.
+func chainSummaries(chains []correlate.CausalChain) []string {
+	var ss []string
+	for _, ch := range chains {
+		ops := make([]string, len(ch.Timeline))
+		for i, te := range ch.Timeline {
+			ops[i] = te.Layer + ":" + te.Op
+		}
+		ss = append(ss, ch.Severity+"["+strings.Join(ops, " → ")+"]")
+	}
+	return ss
 }

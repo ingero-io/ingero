@@ -430,10 +430,10 @@ type aggValue struct {
 //  1. --record-all mode → always store
 //  2. Bootstrap (first 10s of session) → store (builds baseline in DB)
 //  3. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
-//  4. sched_switch → store (causal chain critical)
+//  4. sched_switch + mm_page_alloc → store (causal chain critical)
 //  5. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
 //  6. Anomalous (duration > 3x p50) → store (the interesting stuff)
-//  7. Everything else → aggregate only (cuLaunchKernel, mm_page_alloc, etc.)
+//  7. Everything else → aggregate only (cuLaunchKernel, sched_wakeup, etc.)
 func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool, collector *stats.Collector) bool {
 	if recordAll {
 		return true
@@ -451,6 +451,12 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool, colle
 			return true
 		case events.HostSchedSwitch:
 			// sched_switch is causal chain critical — always store.
+			return true
+		case events.HostPageAlloc:
+			// mm_page_alloc is causal chain critical — the chain engine sums
+			// Args[0] (allocation bytes) across individual events to detect
+			// memory pressure (>1GB threshold). Aggregates don't preserve Args,
+			// so individual events must be stored for replay (explain/MCP).
 			return true
 		}
 	}
