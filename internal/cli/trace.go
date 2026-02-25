@@ -1128,6 +1128,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 
 	// Periodic debug throughput counter (same as runTableMode).
 	var debugEventCount uint64
+	var storedEventCount uint64
 	var debugTickerCh <-chan time.Time
 	if debugMode {
 		dt := time.NewTicker(10 * time.Second)
@@ -1156,6 +1157,14 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 		select {
 		case <-ctx.Done():
 			flushAllAggregates(aggs, eventStore)
+			if eventStore != nil {
+				totalEvents := collector.Snapshot().TotalEvents
+				if totalEvents > 0 {
+					debugf("selective storage: %d/%d events stored individually (%.0f%% reduction)",
+						storedEventCount, totalEvents,
+						float64(uint64(totalEvents)-storedEventCount)/float64(totalEvents)*100)
+				}
+			}
 			return nil
 
 		case <-snapTicker.C:
@@ -1182,6 +1191,14 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 		case evt, ok := <-eventCh:
 			if !ok {
 				flushAllAggregates(aggs, eventStore)
+				if eventStore != nil {
+					totalEvents := collector.Snapshot().TotalEvents
+					if totalEvents > 0 {
+						debugf("selective storage: %d/%d events stored individually (%.0f%% reduction)",
+							storedEventCount, totalEvents,
+							float64(uint64(totalEvents)-storedEventCount)/float64(totalEvents)*100)
+					}
+				}
 				return nil
 			}
 
@@ -1205,6 +1222,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				stored := shouldStore(evt, sessionStart, traceRecordAll, collector)
 				if stored {
 					eventStore.Record(evt)
+					storedEventCount++
 				}
 				recordAggregate(aggs, evt, stored)
 			}
