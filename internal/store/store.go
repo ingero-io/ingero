@@ -422,10 +422,11 @@ func New(dbPath string) (*Store, error) {
 	}
 	populateLookupTables(db)
 
-	// Ensure schema_info version reflects the running binary, even for
-	// databases created by an older version (populateLookupTables skips
-	// inserts when tables are already populated).
+	// Ensure schema_info reflects the running binary, even for databases
+	// created by an older version (populateLookupTables skips inserts when
+	// tables are already populated).
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.6')")
+	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {

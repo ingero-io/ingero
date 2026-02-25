@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -593,6 +594,36 @@ func TestQuerySessions(t *testing.T) {
 	}
 	if recent[0].GPUModel != "A100" {
 		t.Errorf("recent session should be A100, got %q", recent[0].GPUModel)
+	}
+}
+
+func TestSessionsNoteOnReopenedDB(t *testing.T) {
+	// Verify that sessions_note is present in schema_info even when
+	// the DB was created by a previous open (populateLookupTables skips
+	// inserts when tables are already populated).
+	dbPath := filepath.Join(t.TempDir(), "reopen-test.db")
+
+	// First open — populates all tables.
+	s1, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("first New failed: %v", err)
+	}
+	s1.Close()
+
+	// Second open — populateLookupTables returns early (sources non-empty).
+	s2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("second New failed: %v", err)
+	}
+	defer s2.Close()
+
+	var val string
+	err = s2.db.QueryRow("SELECT value FROM schema_info WHERE key = 'sessions_note'").Scan(&val)
+	if err != nil {
+		t.Fatalf("sessions_note not found in schema_info after reopen: %v", err)
+	}
+	if val == "" {
+		t.Error("sessions_note value is empty")
 	}
 }
 
