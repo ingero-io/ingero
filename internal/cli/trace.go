@@ -39,6 +39,7 @@ var (
 	traceRecord    bool   // Record events to SQLite (default true).
 	traceRecordAll bool   // Store every event (disable selective storage).
 	traceStack     bool   // Capture userspace stack traces per event.
+	traceDBPath    string // Custom DB path (default: ~/.ingero/ingero.db).
 )
 
 var traceCmd = &cobra.Command{
@@ -67,6 +68,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceRecord, "record", true, "record events to SQLite (default true, use --record=false to disable)")
 	traceCmd.Flags().BoolVar(&traceRecordAll, "record-all", false, "store every event individually (disables selective storage, larger DB)")
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
+	traceCmd.Flags().StringVar(&traceDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -223,7 +225,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	var eventStore *store.Store
 	var sessionID int64
 	if traceRecord {
-		dbPath := store.DefaultDBPath()
+		dbPath := traceDBPath
+		if dbPath == "" {
+			dbPath = store.DefaultDBPath()
+		}
 		s, err := store.New(dbPath)
 		if err != nil {
 			return fmt.Errorf("opening database for recording: %w", err)

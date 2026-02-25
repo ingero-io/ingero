@@ -432,12 +432,26 @@ find_available_instance() {
 cmd_deploy() {
     print_header "Deploying Ingero GPU Instance (Lambda Labs)"
 
-    # Idempotency guard
+    # Idempotency guard — with auto-recovery of stale/dead instances
     if load_state; then
-        print_error "Instance already exists: ${STATE_INSTANCE_ID}"
-        print_info "Status: ${STATE_STATUS} | IP: ${STATE_IP}"
-        print_info "Use '$0 destroy' first."
-        exit 1
+        load_token
+        print_info "Existing instance found: ${STATE_INSTANCE_ID}. Checking if alive..."
+
+        local live_status
+        live_status=$(api_request GET "/instances/${STATE_INSTANCE_ID}" 2>/dev/null \
+            | jq -r '.data.status // "unknown"' 2>/dev/null) || live_status="unknown"
+
+        if [[ "$live_status" == "active" || "$live_status" == "booting" ]]; then
+            print_error "Instance still alive: ${STATE_INSTANCE_ID} (${live_status})"
+            print_info "IP: ${STATE_IP}"
+            print_info "Use '$0 destroy' first, or '$0 ssh' to connect."
+            exit 1
+        fi
+
+        # Instance is dead (terminated/unhealthy/unknown) — clean up stale state
+        print_warn "Instance ${STATE_INSTANCE_ID} is ${live_status}. Cleaning up stale state..."
+        remove_ssh_config
+        clear_state
     fi
 
     check_prerequisites
@@ -546,7 +560,7 @@ CLOUDINIT
     # Save initial state
     save_state "$instance_id" "" "booting" "$FOUND_TYPE" "$FOUND_REGION" "$FOUND_PRICE"
 
-    # Poll for active status
+    # Poll for active status — save IP progressively so state is never stale
     print_info "Waiting for instance to become active..."
     local ip="" status=""
     local elapsed=0
@@ -561,7 +575,12 @@ CLOUDINIT
         ip=$(echo "$detail_response" | jq -r '.data.ip // empty' 2>/dev/null)
         status=$(echo "$detail_response" | jq -r '.data.status // "unknown"' 2>/dev/null)
 
-        print_info "  Status: ${status} (${elapsed}s / ${API_POLL_TIMEOUT}s)"
+        # Save IP to state as soon as available (prevents stale state on interrupt)
+        if [[ -n "$ip" && "$ip" != "null" ]]; then
+            save_state "$instance_id" "$ip" "$status" "$FOUND_TYPE" "$FOUND_REGION" "$FOUND_PRICE"
+        fi
+
+        print_info "  Status: ${status} | IP: ${ip:-pending} (${elapsed}s / ${API_POLL_TIMEOUT}s)"
 
         if [[ "$status" == "active" && -n "$ip" && "$ip" != "null" ]]; then
             break
@@ -574,11 +593,16 @@ CLOUDINIT
         fi
     done
 
+    # Accept booting+IP — Lambda instances are often SSH-ready before API reports "active"
     if [[ -z "$ip" || "$ip" == "null" ]]; then
         print_error "Could not determine instance IP within ${API_POLL_TIMEOUT}s."
         save_state "$instance_id" "" "$status" "$FOUND_TYPE" "$FOUND_REGION" "$FOUND_PRICE"
         print_info "State saved. Check: $0 status"
         exit 1
+    fi
+
+    if [[ "$status" != "active" ]]; then
+        print_warn "Instance has IP but status is '${status}' (not 'active'). Proceeding — Lambda API lags behind actual state."
     fi
 
     # Save state with IP
