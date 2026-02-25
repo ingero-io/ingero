@@ -114,28 +114,29 @@ gpu-validate:
 gpu-test: gpu-sync
 	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
-# Transfer logs from GPU VM to local logs/<date>/ directory
+# Transfer logs from TensorDock GPU VM to local logs/<datetime_provider_gpu>/ directory
 gpu-logs:
-	@DATE=$$(date +%Y-%m-%d); \
-	mkdir -p logs/$$DATE; \
+	@GPU=$$(jq -r '.gpu_model // "unknown"' $(REPO_ROOT)/.tensordock-vm.json 2>/dev/null | sed 's/geforce//;s/-pcie.*//;s/-sxm.*//'); \
+	DIR="logs/$$(date +%Y-%m-%d_%H-%M-%S)_tensordock_$$GPU"; \
+	mkdir -p "$$DIR"; \
 	IP=$$(jq -r .ip $(REPO_ROOT)/.tensordock-vm.json 2>/dev/null); \
 	PORT=$$(jq -r .ssh_port $(REPO_ROOT)/.tensordock-vm.json 2>/dev/null); \
 	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then echo "No VM deployed."; exit 1; fi; \
-	echo "Transferring logs to logs/$$DATE..."; \
+	echo "Transferring logs to $$DIR..."; \
 	scp -P $$PORT -o StrictHostKeyChecking=no \
 		"user@$$IP:~/workspace/ingero/logs/*.log" \
 		"user@$$IP:~/workspace/ingero/logs/*.json" \
 		"user@$$IP:~/workspace/ingero/logs/*.txt" \
 		"user@$$IP:~/workspace/ingero/logs/*.out" \
-		logs/$$DATE/ 2>/dev/null || true; \
+		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -p $$PORT -o StrictHostKeyChecking=no user@$$IP \
 		'cp ~/.ingero/ingero.db /tmp/ingero.db 2>/dev/null || sudo cp /root/.ingero/ingero.db /tmp/ingero.db 2>/dev/null; chmod 644 /tmp/ingero.db 2>/dev/null' || true; \
 	scp -P $$PORT -o StrictHostKeyChecking=no \
 		user@$$IP:/tmp/ingero.db \
-		logs/$$DATE/ 2>/dev/null || true; \
-	echo "Logs transferred to logs/$$DATE/"; \
-	ls -la logs/$$DATE/
+		"$$DIR/" 2>/dev/null || true; \
+	echo "Logs transferred to $$DIR"; \
+	ls -la "$$DIR/"
 
 # Lambda Labs GPU VM lifecycle (H100 — no start/stop, only deploy/destroy)
 lambda-deploy:
@@ -162,27 +163,28 @@ lambda-validate:
 lambda-test: lambda-sync
 	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
-# Transfer logs from Lambda Labs VM to local logs/<date>/ directory
+# Transfer logs from Lambda Labs VM to local logs/<datetime_provider_gpu>/ directory
 lambda-logs:
-	@DATE=$$(date +%Y-%m-%d); \
-	mkdir -p logs/$$DATE; \
+	@GPU=$$(jq -r '.instance_type // "unknown"' $(REPO_ROOT)/.lambdalabs-vm.json 2>/dev/null | sed 's/gpu_1x_//'); \
+	DIR="logs/$$(date +%Y-%m-%d_%H-%M-%S)_lambda_$$GPU"; \
+	mkdir -p "$$DIR"; \
 	IP=$$(jq -r .ip $(REPO_ROOT)/.lambdalabs-vm.json 2>/dev/null); \
 	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then echo "No Lambda instance deployed."; exit 1; fi; \
-	echo "Transferring logs to logs/$$DATE..."; \
+	echo "Transferring logs to $$DIR..."; \
 	scp -o StrictHostKeyChecking=no \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.log" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.json" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.txt" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.out" \
-		logs/$$DATE/ 2>/dev/null || true; \
+		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -o StrictHostKeyChecking=no ubuntu@$$IP \
 		'cp ~/.ingero/ingero.db /tmp/ingero.db 2>/dev/null || sudo cp /root/.ingero/ingero.db /tmp/ingero.db 2>/dev/null; chmod 644 /tmp/ingero.db 2>/dev/null' || true; \
 	scp -o StrictHostKeyChecking=no \
 		ubuntu@$$IP:/tmp/ingero.db \
-		logs/$$DATE/ 2>/dev/null || true; \
-	echo "Logs transferred to logs/$$DATE/"; \
-	ls -la logs/$$DATE/
+		"$$DIR/" 2>/dev/null || true; \
+	echo "Logs transferred to $$DIR"; \
+	ls -la "$$DIR/"
 
 # Sync code to Lambda Labs VM via rsync (port 22 direct, user ubuntu)
 # Note: *_bpfel.go and *_bpfel.o are committed and required for build — do NOT exclude them
@@ -226,27 +228,28 @@ azure-validate:
 azure-test: azure-sync
 	bash scripts/azure/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
-# Transfer logs from Azure VM to local logs/<date>/ directory
+# Transfer logs from Azure VM to local logs/<datetime_provider_gpu>/ directory
 azure-logs:
-	@DATE=$$(date +%Y-%m-%d); \
-	mkdir -p logs/$$DATE; \
+	@GPU=$$(jq -r '.vm_size // "unknown"' $(REPO_ROOT)/.azure-vm.json 2>/dev/null | sed 's/Standard_//;s/_v[0-9]*$$//'); \
+	DIR="logs/$$(date +%Y-%m-%d_%H-%M-%S)_azure_$$GPU"; \
+	mkdir -p "$$DIR"; \
 	IP=$$(jq -r .ip $(REPO_ROOT)/.azure-vm.json 2>/dev/null); \
 	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then echo "No Azure VM deployed."; exit 1; fi; \
-	echo "Transferring logs to logs/$$DATE..."; \
+	echo "Transferring logs to $$DIR..."; \
 	scp -o StrictHostKeyChecking=no \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.log" \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.json" \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.txt" \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.out" \
-		logs/$$DATE/ 2>/dev/null || true; \
+		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -o StrictHostKeyChecking=no azureuser@$$IP \
 		'cp ~/.ingero/ingero.db /tmp/ingero.db 2>/dev/null || sudo cp /root/.ingero/ingero.db /tmp/ingero.db 2>/dev/null; chmod 644 /tmp/ingero.db 2>/dev/null' || true; \
 	scp -o StrictHostKeyChecking=no \
 		azureuser@$$IP:/tmp/ingero.db \
-		logs/$$DATE/ 2>/dev/null || true; \
-	echo "Logs transferred to logs/$$DATE/"; \
-	ls -la logs/$$DATE/
+		"$$DIR/" 2>/dev/null || true; \
+	echo "Logs transferred to $$DIR"; \
+	ls -la "$$DIR/"
 
 # Sync code to Azure VM via rsync (port 22 direct, user azureuser)
 # Note: *_bpfel.go and *_bpfel.o are committed and required for build — do NOT exclude them
