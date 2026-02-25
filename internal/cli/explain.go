@@ -127,7 +127,15 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	debugf("explain: replaying %d events", len(evts))
+	debugf("explain: replaying %d stored events", len(evts))
+
+	// Query aggregate totals so the report shows accurate total event counts
+	// even when selective storage discarded most individual events.
+	aggTotals, _ := s.QueryAggregateTotals(params)
+	if aggTotals.TotalEvents > 0 {
+		debugf("explain: aggregates show %d total events (%d stored individually)",
+			aggTotals.TotalEvents, aggTotals.StoredEvents)
+	}
 
 	// Replay events through stats + correlator.
 	// maxAge=0 disables pruning — replayed events have past timestamps and
@@ -171,7 +179,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	if explainJSON {
 		return renderChainsJSON(chains)
 	}
-	renderIncidentReport(chains, snap, nil, procCache, toUint32Slice(explainPIDs))
+	renderIncidentReport(chains, snap, nil, procCache, toUint32Slice(explainPIDs), &aggTotals)
 	return nil
 }
 
@@ -246,7 +254,9 @@ func renderStoredChainsJSON(chains []store.StoredChain) error {
 }
 
 // renderIncidentReport prints a human-readable incident report with causal chains.
-func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, sys *sysinfo.SystemSnapshot, procCache *discover.ProcCache, pids []uint32) {
+// aggTotals is optional — when non-nil and populated, shows accurate total event
+// counts from aggregates (selective storage may have discarded most individual events).
+func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, sys *sysinfo.SystemSnapshot, procCache *discover.ProcCache, pids []uint32, aggTotals ...*store.AggregateTotals) {
 	var b strings.Builder
 
 	// Header.
@@ -264,11 +274,22 @@ func renderIncidentReport(chains []correlate.CausalChain, snap *stats.Snapshot, 
 		}
 	}
 
+	// Extract aggregate totals if provided.
+	var agg *store.AggregateTotals
+	if len(aggTotals) > 0 && aggTotals[0] != nil && aggTotals[0].TotalEvents > 0 {
+		agg = aggTotals[0]
+	}
+
 	b.WriteString("INCIDENT REPORT")
 	if len(chains) == 0 {
 		b.WriteString(" — no causal chains detected\n\n")
-		b.WriteString(fmt.Sprintf("  Analyzed %d events over %s. No anomalous patterns found.\n",
-			snap.TotalEvents, formatDuration(snap.WallClock)))
+		if agg != nil {
+			b.WriteString(fmt.Sprintf("  Analyzed %d events (%d stored) over %s. No anomalous patterns found.\n",
+				agg.TotalEvents, snap.TotalEvents, formatDuration(snap.WallClock)))
+		} else {
+			b.WriteString(fmt.Sprintf("  Analyzed %d events over %s. No anomalous patterns found.\n",
+				snap.TotalEvents, formatDuration(snap.WallClock)))
+		}
 	} else {
 		b.WriteString(fmt.Sprintf(" — %d causal chain(s) found", len(chains)))
 		var parts []string

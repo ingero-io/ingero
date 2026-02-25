@@ -120,6 +120,31 @@ CREATE TABLE IF NOT EXISTS process_names (
 );
 `
 
+// aggregatesSchema stores per-minute, per-op aggregates for events that were
+// NOT individually stored (selective storage). This preserves accurate counts
+// and latency distributions while reducing DB size by ~33x.
+//
+// Why aggregates? At 24K events/sec (A100), the DB grows to 8 GB/hour. 97% of
+// events are noise (consistent cuLaunchKernel, mm_page_alloc). Only ~3% have
+// investigation value (sched_switch, sync anomalies, process lifecycle).
+// Selective storage keeps the interesting events individually and summarizes
+// the rest in minute-granularity buckets.
+const aggregatesSchema = `
+CREATE TABLE IF NOT EXISTS event_aggregates (
+	bucket   INTEGER NOT NULL,  -- minute-truncated unix nanos
+	source   INTEGER NOT NULL,
+	op       INTEGER NOT NULL,
+	pid      INTEGER NOT NULL DEFAULT 0,
+	count    INTEGER NOT NULL DEFAULT 0,
+	stored   INTEGER NOT NULL DEFAULT 0,
+	sum_dur  INTEGER NOT NULL DEFAULT 0,
+	min_dur  INTEGER NOT NULL DEFAULT 0,
+	max_dur  INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket, source, op, pid)
+);
+CREATE INDEX IF NOT EXISTS idx_aggregates_bucket ON event_aggregates(bucket);
+`
+
 // lookupSchema creates static reference tables that make the DB self-describing.
 // Any SQL client can JOIN against these to get human-readable names.
 //
@@ -293,6 +318,29 @@ type Session struct {
 	Flags     string
 }
 
+// Aggregate is a per-minute summary of events that were not individually stored.
+// Used by selective storage to preserve accurate counts and latency distributions.
+type Aggregate struct {
+	Bucket  int64  // minute-truncated unix nanos
+	Source  uint8  // event source (SourceCUDA, SourceHost, SourceDriver)
+	Op      uint8  // operation code within source
+	PID     uint32 // process ID (0 = all PIDs aggregated)
+	Count   int64  // total events in this bucket (stored + not-stored)
+	Stored  int64  // how many were individually stored in the events table
+	SumDur  int64  // sum of durations (nanos) — for computing mean
+	MinDur  int64  // minimum duration (nanos) in this bucket
+	MaxDur  int64  // maximum duration (nanos) in this bucket
+}
+
+// AggregateTotals summarizes event counts across all aggregates for a time range.
+// Used by explain/query/MCP to show accurate total counts even though most
+// individual events were not stored.
+type AggregateTotals struct {
+	TotalEvents  int64            // sum of all Count fields
+	StoredEvents int64            // sum of all Stored fields
+	ByOp         map[string]int64 // op_name → total count
+}
+
 // DefaultDBPath returns the default database path (~/.ingero/ingero.db).
 //
 // When running via sudo, resolves the invoking user's home directory
@@ -412,6 +460,10 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("setting WAL mode: %w", err)
 	}
 
+	// Set busy timeout so concurrent writers (event batch flush + aggregate
+	// flush) retry instead of failing immediately with SQLITE_BUSY.
+	db.Exec("PRAGMA busy_timeout = 5000")
+
 	// Create schema.
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -440,6 +492,7 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.6')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
+	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates for events not individually stored (selective storage). Use count-stored to get discarded count.')")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {
@@ -457,6 +510,12 @@ func New(dbPath string) (*Store, error) {
 	if _, err := db.Exec(processNamesSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating process_names table: %w", err)
+	}
+
+	// Create event_aggregates table (selective storage minute-buckets).
+	if _, err := db.Exec(aggregatesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating event_aggregates table: %w", err)
 	}
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -598,10 +657,11 @@ func (s *Store) flushBatch(batch []events.Event) {
 	tx.Commit()
 }
 
-// pruneOld deletes events, system snapshots, and sessions older than the retention period.
+// pruneOld deletes events, aggregates, system snapshots, and sessions older than the retention period.
 func (s *Store) pruneOld() {
 	cutoff := time.Now().Add(-s.retention).UnixNano()
 	s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
+	s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
 	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
 	s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
 }
@@ -1127,6 +1187,88 @@ func (s *Store) StopSession(id int64, stoppedAt time.Time) error {
 func (s *Store) RecordProcessName(pid uint32, name string) {
 	s.db.Exec("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)",
 		pid, name, time.Now().UnixNano())
+}
+
+// RecordAggregates batch-inserts aggregate rows (one per minute-bucket per op).
+// Called from the trace event loop when flushing completed minute-buckets.
+//
+// Each row represents one minute of a specific (source, op, pid) combination.
+// The "stored" count tracks how many events were individually stored in the
+// events table, so consumers can compute: discarded = count - stored.
+func (s *Store) RecordAggregates(aggs []Aggregate) {
+	if len(aggs) == 0 {
+		return
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO event_aggregates
+		(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	defer stmt.Close()
+
+	for _, a := range aggs {
+		stmt.Exec(a.Bucket, a.Source, a.Op, a.PID, a.Count, a.Stored, a.SumDur, a.MinDur, a.MaxDur)
+	}
+
+	tx.Commit()
+}
+
+// QueryAggregateTotals returns summarized event counts from the aggregates table
+// for a given time range. This provides accurate total event counts even when
+// selective storage discarded most individual events.
+//
+// The returned AggregateTotals.ByOp map uses human-readable op names (e.g.,
+// "cudaLaunchKernel") as keys, matching the stats.OpStats.Op field.
+func (s *Store) QueryAggregateTotals(q QueryParams) (AggregateTotals, error) {
+	result := AggregateTotals{ByOp: make(map[string]int64)}
+
+	query := `SELECT source, op, SUM(count), SUM(stored) FROM event_aggregates WHERE 1=1`
+	var args []interface{}
+
+	if !q.From.IsZero() {
+		query += " AND bucket >= ?"
+		args = append(args, q.From.UnixNano())
+	} else if q.Since > 0 {
+		query += " AND bucket >= ?"
+		args = append(args, time.Now().Add(-q.Since).UnixNano())
+	}
+	if !q.To.IsZero() {
+		query += " AND bucket <= ?"
+		args = append(args, q.To.UnixNano())
+	}
+	query, args = appendPIDFilter(query, args, q, "")
+
+	query += " GROUP BY source, op"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return result, fmt.Errorf("querying aggregate totals: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var source, op uint8
+		var count, stored int64
+		if err := rows.Scan(&source, &op, &count, &stored); err != nil {
+			return result, fmt.Errorf("scanning aggregate row: %w", err)
+		}
+		result.TotalEvents += count
+		result.StoredEvents += stored
+
+		// Resolve op name for the ByOp map.
+		evt := events.Event{Source: events.Source(source), Op: op}
+		opName := evt.OpName()
+		result.ByOp[opName] += count
+	}
+	return result, rows.Err()
 }
 
 // QuerySessions retrieves sessions, optionally filtered by time range.

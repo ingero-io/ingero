@@ -713,3 +713,87 @@ func TestBatchFlush(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestRecordAndQueryAggregates(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	bucket1 := now.Truncate(time.Minute).UnixNano()
+	bucket2 := now.Add(-1 * time.Minute).Truncate(time.Minute).UnixNano()
+
+	aggs := []Aggregate{
+		{Bucket: bucket1, Source: 1, Op: 3, PID: 100, Count: 5000, Stored: 50, SumDur: 1000000, MinDur: 100, MaxDur: 500},
+		{Bucket: bucket1, Source: 3, Op: 1, PID: 100, Count: 2000, Stored: 2000, SumDur: 500000, MinDur: 50, MaxDur: 1000},
+		{Bucket: bucket2, Source: 4, Op: 1, PID: 200, Count: 8000, Stored: 80, SumDur: 4000000, MinDur: 200, MaxDur: 800},
+	}
+
+	s.RecordAggregates(aggs)
+
+	// Query totals for all time.
+	totals, err := s.QueryAggregateTotals(QueryParams{Since: 5 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryAggregateTotals failed: %v", err)
+	}
+
+	if totals.TotalEvents != 15000 {
+		t.Errorf("TotalEvents = %d, want 15000", totals.TotalEvents)
+	}
+	if totals.StoredEvents != 2130 {
+		t.Errorf("StoredEvents = %d, want 2130", totals.StoredEvents)
+	}
+
+	// Verify ByOp map has the right op names.
+	if totals.ByOp["cudaLaunchKernel"] != 5000 {
+		t.Errorf("ByOp[cudaLaunchKernel] = %d, want 5000", totals.ByOp["cudaLaunchKernel"])
+	}
+	if totals.ByOp["sched_switch"] != 2000 {
+		t.Errorf("ByOp[sched_switch] = %d, want 2000", totals.ByOp["sched_switch"])
+	}
+	if totals.ByOp["cuLaunchKernel"] != 8000 {
+		t.Errorf("ByOp[cuLaunchKernel] = %d, want 8000", totals.ByOp["cuLaunchKernel"])
+	}
+
+	// Query with PID filter — should only get PID 100.
+	pidTotals, err := s.QueryAggregateTotals(QueryParams{
+		Since: 5 * time.Minute,
+		PIDs:  []uint32{100},
+	})
+	if err != nil {
+		t.Fatalf("QueryAggregateTotals(PID=100) failed: %v", err)
+	}
+	if pidTotals.TotalEvents != 7000 {
+		t.Errorf("PID 100 TotalEvents = %d, want 7000", pidTotals.TotalEvents)
+	}
+}
+
+func TestAggregatesPruned(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	// Insert an aggregate with a very old bucket (outside retention).
+	oldBucket := time.Now().Add(-8 * 24 * time.Hour).Truncate(time.Minute).UnixNano()
+	s.RecordAggregates([]Aggregate{
+		{Bucket: oldBucket, Source: 1, Op: 3, PID: 0, Count: 1000, Stored: 10},
+	})
+
+	// Verify it's there.
+	totals, _ := s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
+	if totals.TotalEvents != 1000 {
+		t.Fatalf("expected 1000 before prune, got %d", totals.TotalEvents)
+	}
+
+	// Prune should remove it (default retention is 7 days).
+	s.pruneOld()
+
+	totals, _ = s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
+	if totals.TotalEvents != 0 {
+		t.Errorf("expected 0 after prune, got %d", totals.TotalEvents)
+	}
+}
