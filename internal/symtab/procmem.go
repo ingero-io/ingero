@@ -72,17 +72,18 @@ func (m *ProcMem) ReadPtr(addr uint64) (uint64, error) {
 // ReadPyUnicodeString reads a Python unicode string object at the given address.
 // Returns the string content. Uses the compact ASCII fast path when possible.
 //
-// CPython string layout (PyASCIIObject for compact ASCII):
+// CPython string layout (PyASCIIObject for compact ASCII, x86_64):
 //
 //	offset 0:  ob_refcnt (8 bytes)
 //	offset 8:  ob_type (8 bytes)
 //	offset 16: length (8 bytes)
-//	offset 20: state (4 bytes) — contains ascii/compact flags
-//	offset 48: data starts (for compact ASCII)
+//	offset 24: hash (8 bytes)
+//	offset 32: state (4 bytes) — contains ascii/compact/kind flags
+//	offset 48: data starts (for compact ASCII, after wstr pointer + padding)
 //
 // For non-ASCII strings, the layout is more complex. We only handle
-// compact ASCII for v0.5 — this covers the vast majority of Python
-// filenames and function names.
+// compact ASCII — this covers the vast majority of Python filenames
+// and function names.
 func (m *ProcMem) ReadPyUnicodeString(addr uint64, offsets *PyOffsets, maxLen int) (string, error) {
 	if addr == 0 {
 		return "", nil
