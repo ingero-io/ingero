@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // debugLogFn is called for DWARF diagnostic messages when set.
@@ -263,9 +264,15 @@ func findDebugBuildFromBinary(ver string) string {
 	const prefix = "libpython"
 	debugLib := prefix + ver + "d.so"
 
+	// Multiarch directory: x86_64-linux-gnu on amd64, aarch64-linux-gnu on arm64.
+	archDir := "x86_64-linux-gnu"
+	if runtime.GOARCH == "arm64" {
+		archDir = "aarch64-linux-gnu"
+	}
+
 	dirs := []string{
-		"/usr/lib/x86_64-linux-gnu",
-		"/lib/x86_64-linux-gnu",
+		"/usr/lib/" + archDir,
+		"/lib/" + archDir,
 		"/usr/lib",
 		"/lib",
 	}
