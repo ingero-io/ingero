@@ -72,10 +72,11 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	// Resolve op name to Source+Op code.
 	if queryOp != "" {
 		source, op, ok := events.ResolveOp(queryOp)
-		if ok {
-			params.Source = uint8(source)
-			params.Op = op
+		if !ok {
+			return fmt.Errorf("unknown operation %q (examples: cudaMemcpy, cuLaunchKernel, sched_switch)", queryOp)
 		}
+		params.Source = uint8(source)
+		params.Op = op
 	}
 
 	evts, err := s.Query(params)
@@ -90,7 +91,7 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	if queryJSON {
 		return queryOutputJSON(evts)
 	}
-	return queryOutputTable(evts, params, &aggTotals)
+	return queryOutputTable(evts, params, dbPath, &aggTotals)
 }
 
 func queryOutputJSON(evts []events.Event) error {
@@ -140,10 +141,10 @@ func queryOutputJSON(evts []events.Event) error {
 	return enc.Encode(output)
 }
 
-func queryOutputTable(evts []events.Event, params store.QueryParams, aggTotals ...*store.AggregateTotals) error {
+func queryOutputTable(evts []events.Event, params store.QueryParams, dbPath string, aggTotals ...*store.AggregateTotals) error {
 	if len(evts) == 0 {
 		fmt.Println("  No events found.")
-		fmt.Printf("  Database: %s\n", store.DefaultDBPath())
+		fmt.Printf("  Database: %s\n", dbPath)
 		fmt.Printf("  Time range: last %s\n", params.Since)
 		return nil
 	}

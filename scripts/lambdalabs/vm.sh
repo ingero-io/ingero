@@ -156,6 +156,8 @@ api_request() {
     local url="${API_BASE}${endpoint}"
     local curl_args=(
         -s
+        --connect-timeout 10
+        --max-time 30
         -w "\n%{http_code}"
         -X "$method"
         -u "$LAMBDALABS_API_TOKEN:"
@@ -202,6 +204,7 @@ save_state() {
     fi
     created="${created:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
+    local tmp_state="${STATE_FILE}.tmp"
     jq -n \
         --arg id "$instance_id" \
         --arg ip "$ip" \
@@ -211,7 +214,7 @@ save_state() {
         --argjson rate "${rate_cents:-0}" \
         --arg created "$created" \
         '{instance_id: $id, ip: $ip, status: $status, instance_type: $type, region: $region, rate_cents_per_hour: $rate, created: $created}' \
-        > "$STATE_FILE"
+        > "$tmp_state" && mv "$tmp_state" "$STATE_FILE"
 }
 
 load_state() {
@@ -533,14 +536,14 @@ CLOUDINIT
 
         # Confirm once (first time we find availability)
         if [[ "$confirmed" == "false" ]]; then
-            local price_dollars
-            price_dollars=$(awk "BEGIN {printf \"%.2f\", ${FOUND_PRICE}/100}")
+            local confirm_price
+            confirm_price=$(awk "BEGIN {printf \"%.2f\", ${FOUND_PRICE}/100}")
 
             print_warn "Cost Warning:"
             print_info "  GPU: ${FOUND_DESC}"
             print_info "  Region: ${FOUND_REGION}"
             print_info "  Specs: ${FOUND_VCPUS} vCPU, ${FOUND_RAM}GB RAM, ${FOUND_STORAGE}GB SSD"
-            print_info "  Rate: \$${price_dollars}/hr"
+            print_info "  Rate: \$${confirm_price}/hr"
             print_info "  NO pause/resume — billing runs until you destroy."
             echo ""
             if [[ "$FORCE_MODE" != "true" ]]; then
@@ -590,6 +593,10 @@ CLOUDINIT
     done
 
     print_success "Instance launched: ${instance_id} (attempt $launch_attempt)"
+
+    # Compute price from final FOUND_PRICE (may differ from confirmed type if retry switched GPU)
+    local price_dollars
+    price_dollars=$(awk "BEGIN {printf \"%.2f\", ${FOUND_PRICE}/100}")
 
     # Save initial state
     save_state "$instance_id" "" "booting" "$FOUND_TYPE" "$FOUND_REGION" "$FOUND_PRICE"

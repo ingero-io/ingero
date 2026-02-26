@@ -270,9 +270,17 @@ SYNC_FILE = '${ML_TMPDIR}/sync.json'
 LAUNCH_FILE = '${ML_TMPDIR}/launch.json'
 SCHED_FILE = '${ML_TMPDIR}/sched.json'
 
-sync_events = json.load(open(SYNC_FILE)) or []
-launch_events = json.load(open(LAUNCH_FILE)) or []
-sched_events = json.load(open(SCHED_FILE)) or []
+def load_events(path):
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        print(f'WARNING: {path} contained {type(data).__name__}, expected list', file=sys.stderr)
+        return []
+    return data
+
+sync_events = load_events(SYNC_FILE)
+launch_events = load_events(LAUNCH_FILE)
+sched_events = load_events(SCHED_FILE)
 
 # Output event counts (for T22a and display)
 print(f'event_counts: sync={len(sync_events)} launch={len(launch_events)} sched={len(sched_events)}')
