@@ -102,24 +102,33 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 ## Install
 
+### Binary Release (recommended)
+
+Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
+
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.7.0`):
+
 ```bash
-# Build from source (requires clang-14, Linux kernel with BTF)
+# Linux amd64
+VERSION=0.7.0
+curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
+sudo mv ingero /usr/local/bin/
+
+# Linux arm64 (GH200, Grace Hopper, Graviton)
+VERSION=0.7.0
+curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
+sudo mv ingero /usr/local/bin/
+```
+
+### Build from Source
+
+```bash
+# Requires clang-14, Linux kernel with BTF
 git clone https://github.com/ingero-io/ingero.git
 cd ingero
 make              # generates eBPF bindings, builds, tests, and lints — single command
 sudo make install # copies binary to /usr/local/bin/ingero
 ```
-
-Or add an alias if you prefer running from the build directory:
-
-```bash
-alias ingero='./bin/ingero'
-```
-
-> **One-line install** (when releases are available):
-> ```bash
-> curl -fsSL https://get.ingero.io | sh
-> ```
 
 ## Requirements
 
@@ -172,6 +181,9 @@ sudo ingero trace --duration 60s           # stop after 60 seconds
 sudo ingero trace --json                   # JSON output (pipe to jq)
 sudo ingero trace --verbose                # show individual events
 sudo ingero trace --stack=false            # disable stack traces (saves ~0.4-0.6% overhead)
+sudo ingero trace --max-db 10g             # limit DB to 10 GB (default), prunes oldest events
+sudo ingero trace --max-db 500m            # limit DB to 500 MB (tight disk budget)
+sudo ingero trace --max-db 0               # unlimited (no size-based pruning)
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 ```
@@ -421,7 +433,7 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 4. **System** — reads CPU/memory/load/swap from `/proc` once per second
 5. **Stats** — computes rolling p50/p95/p99 per operation, flags anomalies
 6. **Correlate** — assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver) by timestamp and PID
-7. **Store** — writes events to SQLite with 7-day rolling retention (on by default, disable with `--record=false`)
+7. **Store** — writes events to SQLite with 7-day rolling retention + size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
 8. **Export** — pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
 9. **Serve** — exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
 
@@ -469,7 +481,7 @@ Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x/13.x. Tested on GH200 (aarch6
 Yes, with `--privileged` or appropriate BPF capabilities. The host kernel must have BTF enabled.
 
 **Where is data stored?**
-Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day rolling retention.
+Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day rolling retention + size-based pruning (default 10 GB, configure with `--max-db`).
 
 ## License
 
