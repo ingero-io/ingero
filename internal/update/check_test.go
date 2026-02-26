@@ -109,8 +109,9 @@ func TestShouldSkip(t *testing.T) {
 	}{
 		{"dev", false, true},
 		{"", false, true},
-		{"0.7.0-22-g0763640", false, true},
-		{"0.7.0-dirty", false, true},
+		{"0.7.0-22-g0763640", false, false}, // git describe — parseSemver strips suffix
+		{"0.7.0-dirty", false, false},        // dirty build — still check for updates
+		{"v0.6-32-g6efdbb5", false, false},   // typical dev build
 		{"0.6", false, false},
 		{"0.7.0", false, false},
 	}
@@ -475,6 +476,53 @@ func TestCheckNoStateFetches(t *testing.T) {
 }
 
 // --- ingeroDir tests ---
+
+// --- WaitNotice tests ---
+
+func TestWaitNoticeWithUpdate(t *testing.T) {
+	ch := make(chan Result, 1)
+	ch <- Result{
+		UpdateAvailable: true,
+		LatestVersion:   "0.8.0",
+		CurrentVersion:  "0.6",
+	}
+
+	var buf bytes.Buffer
+	waitNoticeTo(&buf, ch, time.Second)
+
+	output := buf.String()
+	if !strings.Contains(output, "0.8.0") || !strings.Contains(output, "0.6") {
+		t.Errorf("expected update notice, got: %s", output)
+	}
+}
+
+func TestWaitNoticeTimeout(t *testing.T) {
+	ch := make(chan Result) // unbuffered, never sent to
+
+	var buf bytes.Buffer
+	start := time.Now()
+	waitNoticeTo(&buf, ch, 50*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("WaitNotice took %v, expected ~50ms timeout", elapsed)
+	}
+	if buf.Len() > 0 {
+		t.Errorf("expected no output on timeout, got: %s", buf.String())
+	}
+}
+
+func TestWaitNoticeNoUpdate(t *testing.T) {
+	ch := make(chan Result, 1)
+	close(ch)
+
+	var buf bytes.Buffer
+	waitNoticeTo(&buf, ch, time.Second)
+
+	if buf.Len() > 0 {
+		t.Errorf("expected no output, got: %s", buf.String())
+	}
+}
 
 func TestIngeroDir(t *testing.T) {
 	dir := t.TempDir()
