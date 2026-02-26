@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -209,6 +210,25 @@ func writeState(path string, st stateFile) {
 		return
 	}
 	os.Rename(tmp, path)
+	chownForSudoUser(path)
+}
+
+// chownForSudoUser changes file ownership to the invoking user when running
+// under sudo. Without this, `sudo ingero trace` creates root-owned files in
+// the user's ~/.ingero/, and subsequent non-root runs can't update the cache.
+// Same pattern as store.chownForSudoUser — duplicated to avoid import cycle.
+func chownForSudoUser(path string) {
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser == "" || os.Getuid() != 0 {
+		return
+	}
+	u, err := user.Lookup(sudoUser)
+	if err != nil {
+		return
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	os.Chown(path, uid, gid)
 }
 
 // githubRelease is the minimal GitHub API response we need.

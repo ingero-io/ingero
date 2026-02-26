@@ -136,11 +136,15 @@ echo -e "$(ts) ${CYAN}[SETUP]${NC} ResNet-50 training + CPU contention (stress-n
 # First run on a fresh VM downloads ~170MB at variable speed — if the download
 # happens during the trace window, zero CUDA events are captured (T22c fails).
 echo -e "$(ts)   Pre-downloading CIFAR-10 dataset..."
-python3 -c "
+if ! python3 -c "
 import torchvision
 torchvision.datasets.CIFAR10(root='/tmp/cifar10', train=True, download=True)
 print('CIFAR-10 ready')
-" > logs/ml-dataset-download.log 2>&1
+" > logs/ml-dataset-download.log 2>&1; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} CIFAR-10 download failed. See logs/ml-dataset-download.log"
+    cat logs/ml-dataset-download.log
+    exit 1
+fi
 echo -e "$(ts)   $(tail -1 logs/ml-dataset-download.log)"
 
 # Start ResNet-50 training (3 epochs, batch-size 64 — enough GPU work for 45s trace)
@@ -177,6 +181,20 @@ echo -e "$(ts)   Tracing ${TRACE_DURATION}s to $ML_DB..."
 sudo ./bin/ingero trace --db "$ML_DB" --record-all --duration ${TRACE_DURATION}s \
     --json > logs/ml-trace.json 2> logs/ml-trace.log
 TRACE_EXIT=$?
+
+if [[ "$TRACE_EXIT" -ne 0 ]]; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Trace failed (exit $TRACE_EXIT). See logs/ml-trace.log"
+    cat logs/ml-trace.log
+    record "FAIL" "T22a: trace captured events" "trace exited $TRACE_EXIT"
+    # Skip Q1-Q4 — no data
+    echo ""
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${RED}FAIL=1${NC}  Total=1  (trace failed, skipping Q1-Q4)"
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+    ML_RESULTS+=("T22a|T22a: trace captured events|FAIL|trace exited $TRACE_EXIT|0")
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
 
 # Count events
 TOTAL_EVENTS=$(gcount '"op"' logs/ml-trace.json)
@@ -258,10 +276,10 @@ echo -e "$(ts) ${CYAN}── Q2: \"Is it the GPU or the host?\" ─────�
 _test_start=$SECONDS
 
 # Tool 1: GPU kernel health (cuLaunchKernel = driver API)
-LAUNCH_OUT=$(./bin/ingero query --db "$ML_DB" --since 5m --op cuLaunchKernel --json 2>/dev/null)
-LAUNCH_COUNT=$(echo "$LAUNCH_OUT" | gcount '"op"')
-# Extract p50 latency from durations
-LAUNCH_STATS=$(echo "$LAUNCH_OUT" | python3 -c "
+# Read directly from trace JSON (JSONL) — query --json outputs a JSON array
+# which the line-by-line Python parser cannot parse (silently returns "no durations").
+LAUNCH_COUNT=$(gcount '"cuLaunchKernel"' logs/ml-trace.json)
+LAUNCH_STATS=$(grep '"cuLaunchKernel"' logs/ml-trace.json | python3 -c "
 import json, sys
 durations = []
 for line in sys.stdin:
@@ -283,9 +301,8 @@ else:
 echo -e "$(ts)   → cuLaunchKernel: ${LAUNCH_COUNT} events, ${LAUNCH_STATS}"
 
 # Tool 2: Host scheduler health (sched_switch)
-SCHED_OUT=$(./bin/ingero query --db "$ML_DB" --since 5m --op sched_switch --json 2>/dev/null)
-SCHED_COUNT=$(echo "$SCHED_OUT" | gcount '"op"')
-SCHED_STATS=$(echo "$SCHED_OUT" | python3 -c "
+SCHED_COUNT=$(gcount '"sched_switch"' logs/ml-trace.json)
+SCHED_STATS=$(grep '"sched_switch"' logs/ml-trace.json | python3 -c "
 import json, sys
 durations = []
 for line in sys.stdin:
@@ -414,6 +431,10 @@ echo -e "$(ts) ${CYAN}── Q4: \"Can an AI agent diagnose this via MCP?\" ─�
 _test_start=$SECONDS
 
 MCP_PORT=8081  # Use different port from gpu-test.sh Phase 5
+
+# Kill any leftover MCP server from a previous crashed run
+sudo pkill -f "ingero mcp.*${MCP_PORT}" 2>/dev/null || true
+sleep 0.5
 
 # Start MCP server against the ML investigation DB
 sudo ./bin/ingero mcp --http ":${MCP_PORT}" --db "$ML_DB" > logs/ml-mcp-server.log 2>&1 &

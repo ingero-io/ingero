@@ -475,13 +475,16 @@ Yes. eBPF programs are verified by the kernel before loading — they cannot cra
 No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Your application code is untouched. Traces any language — Python, C++, Java — anything linked against libcudart.so.
 
 **What GPUs are supported?**
-Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x/13.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
+Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
 
 **Does it work in containers?**
 Yes, with `--privileged` or appropriate BPF capabilities. The host kernel must have BTF enabled.
 
 **Where is data stored?**
-Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day rolling retention + size-based pruning (default 10 GB, configure with `--max-db`).
+Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day rolling retention + size-based pruning (default 10 GB, configure with `--max-db`). Use `--db /path/to/file.db` for a custom location.
+
+**Does it check for updates?**
+Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero checks GitHub Releases for newer versions (once per 24 hours, cached in `~/.ingero/update-check`). The check runs in the background and never delays your command. Set `INGERO_NO_UPDATE_NOTIFIER=1` to disable. Skipped for `query`, `mcp`, `version`, and dev builds.
 
 ## License
 

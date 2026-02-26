@@ -14,6 +14,7 @@ builds:
       - arm64
     flags:
       - -trimpath
+      - -tags=linux
     ldflags:
       - -s -w
       - -X github.com/ingero-io/ingero/internal/version.version={{.Version}}
@@ -36,16 +37,16 @@ changelog:
   sort: asc
   groups:
     - title: Features
-      regexp: '^feat'
+      regexp: 'feat[:(]'
     - title: Bug Fixes
-      regexp: '^fix'
+      regexp: 'fix[:(]'
     - title: Documentation
-      regexp: '^docs'
+      regexp: 'docs[:(]'
     - title: Other
       order: 999
   filters:
     exclude:
-      - '^Merge'
+      - 'Merge'
 
 release:
   github:
