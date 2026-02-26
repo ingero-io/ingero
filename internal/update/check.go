@@ -86,13 +86,32 @@ func printNoticeTo(w io.Writer, ch <-chan Result) {
 	}
 }
 
+// WaitNotice waits up to timeout for the update check result and prints
+// a notice to stderr if an update is available. Used by `ingero version`
+// where the command exits instantly and the async goroutine needs time.
+func WaitNotice(ch <-chan Result, timeout time.Duration) {
+	waitNoticeTo(os.Stderr, ch, timeout)
+}
+
+func waitNoticeTo(w io.Writer, ch <-chan Result, timeout time.Duration) {
+	select {
+	case r, ok := <-ch:
+		if ok && r.UpdateAvailable {
+			fmt.Fprintf(w, "\nA new version of ingero is available: %s → %s\nhttps://github.com/ingero-io/ingero/releases/latest\n",
+				r.CurrentVersion, r.LatestVersion)
+		}
+	case <-time.After(timeout):
+		// Timed out — don't delay the CLI further.
+	}
+}
+
 func shouldSkip(v string) bool {
 	if v == "" || v == "dev" {
 		return true
 	}
-	if strings.Contains(v, "-") {
-		return true
-	}
+	// Note: versions like "v0.6-32-g6efdbb5" (git describe) are NOT skipped.
+	// parseSemver strips everything after "-" for comparison, so 0.6-32-g6efdbb5
+	// compares as 0.6.0 — correct for detecting newer releases.
 	if os.Getenv("INGERO_NO_UPDATE_NOTIFIER") != "" {
 		return true
 	}

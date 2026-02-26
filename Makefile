@@ -13,6 +13,12 @@ BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_TARGET_ARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+# Semantic version for README: 0.6.32 (base tag + commits-since-tag)
+BASE_VER := $(shell echo $(VERSION) | sed 's/^v//; s/-.*//')
+PATCH    := $(shell echo $(VERSION) | sed -n 's/^v[^-]*-\([0-9]*\)-.*/\1/p')
+SEMVER   := $(BASE_VER).$(if $(PATCH),$(PATCH),0)
+
 LDFLAGS := -ldflags "-X github.com/ingero-io/ingero/internal/version.version=$(VERSION) \
 	-X github.com/ingero-io/ingero/internal/version.commit=$(COMMIT) \
 	-X github.com/ingero-io/ingero/internal/version.date=$(DATE)"
@@ -28,6 +34,7 @@ generate:
 build:
 	@mkdir -p bin
 	go build $(GOFLAGS) $(LDFLAGS) -o $(BINARY) ./cmd/ingero/
+	-@sed -i 's/^\*\*Version: [^*]*\*\*/**Version: $(SEMVER)**/' README.md
 
 # Run tests
 test:
