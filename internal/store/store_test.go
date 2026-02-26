@@ -1166,6 +1166,15 @@ func TestPruneBySizeOnDisk(t *testing.T) {
 		t.Errorf("expected some events to remain after pruning, got 0")
 	}
 
+	// Verify disk size actually shrank — this is the whole point of --max-db.
+	sizeAfter := s.diskUsage()
+	if sizeAfter >= sizeBefore {
+		t.Errorf("expected disk usage to shrink: before=%d, after=%d", sizeBefore, sizeAfter)
+	}
+	t.Logf("disk: %d → %d bytes (%.0f%% reduction), events: %d → %d",
+		sizeBefore, sizeAfter, 100*(1-float64(sizeAfter)/float64(sizeBefore)),
+		countBefore, countAfter)
+
 	// Verify oldest events were removed (newest should remain).
 	// Query with Limit: -1 (unlimited) returns events in chronological order
 	// (ASC after internal DESC+reverse). result[0] is the oldest remaining.
