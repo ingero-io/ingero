@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/ingero-io/ingero/internal/update"
 	"github.com/ingero-io/ingero/internal/version"
 	"github.com/spf13/cobra"
 )
+
+// updateCh receives the result of a background version check.
+// Set in PersistentPreRun, read in PersistentPostRun.
+var updateCh <-chan update.Result
 
 // debugMode enables diagnostic output on stderr. Set via --debug flag.
 var debugMode bool
@@ -61,6 +66,27 @@ func init() {
 	// Disable the auto-generated "completion" command — not useful for a CLI tool
 	// that users run directly (not in scripts that need shell completion).
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
+
+	// Background update check: start before command runs, print after.
+	// Skipped for: ingero (bare help), version (is version-display itself),
+	// query (data pipeline), mcp (long-running server).
+	//
+	// NOTE: cobra "closest parent wins" — if ANY subcommand defines its own
+	// PersistentPreRun[E], the root's hook is silently skipped for that command.
+	// Currently no subcommand defines PersistentPreRun. Keep it that way.
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		switch cmd.Name() {
+		case "ingero", "version", "query", "mcp":
+			return
+		}
+		updateCh = update.CheckInBackground(version.Version())
+	}
+
+	rootCmd.PersistentPostRun = func(cmd *cobra.Command, args []string) {
+		if updateCh != nil {
+			update.PrintNotice(updateCh)
+		}
+	}
 
 	// Subcommands are registered in their own files' init() functions.
 	// See check.go and trace.go — each calls rootCmd.AddCommand().

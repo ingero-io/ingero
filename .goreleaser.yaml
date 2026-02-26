@@ -1,0 +1,58 @@
+version: 2
+
+project_name: ingero
+
+builds:
+  - main: ./cmd/ingero/
+    binary: ingero
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/ingero-io/ingero/internal/version.version={{.Version}}
+      - -X github.com/ingero-io/ingero/internal/version.commit={{.ShortCommit}}
+      - -X github.com/ingero-io/ingero/internal/version.date={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "ingero_{{.Version}}_{{.Os}}_{{.Arch}}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "ingero_checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^feat'
+    - title: Bug Fixes
+      regexp: '^fix'
+    - title: Documentation
+      regexp: '^docs'
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^Merge'
+
+release:
+  github:
+    owner: ingero-io
+    name: ingero
+  draft: false
+  prerelease: auto
+
+snapshot:
+  version_template: "{{.Tag}}-next"
