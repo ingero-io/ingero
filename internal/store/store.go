@@ -294,7 +294,7 @@ type Store struct {
 	// from the Run() goroutine (flushBatch), so no mutex needed.
 	stackCache map[uint64]bool
 
-	maxDBSize int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
+	maxDBSize atomic.Int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
 
 	mu      sync.Mutex
 	closed  bool
@@ -734,6 +734,11 @@ func (s *Store) flushBatch(batch []events.Event) {
 	}
 
 	tx.Commit()
+
+	// Check size limit after every flush. Cheap when under the limit
+	// (3 stat() calls, early return). When over, prunes oldest data
+	// immediately rather than waiting for the hourly prune cycle.
+	s.pruneBySize()
 }
 
 // loadStackCache pre-populates the in-memory stack cache from the stack_traces
@@ -753,9 +758,9 @@ func (s *Store) loadStackCache() {
 	}
 }
 
-// pruneOld deletes events, aggregates, system snapshots, causal chains, and
-// sessions older than the retention period. Also removes orphaned stack traces
-// no longer referenced by any event.
+// pruneOld deletes events, aggregates, system snapshots, causal chains,
+// sessions, and stale process names older than the retention period.
+// Also removes orphaned stack traces no longer referenced by any event.
 func (s *Store) pruneOld() {
 	cutoff := time.Now().Add(-s.retention).UnixNano()
 	s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
@@ -763,6 +768,7 @@ func (s *Store) pruneOld() {
 	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
 	s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
 	s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
+	s.db.Exec("DELETE FROM process_names WHERE seen_at < ?", cutoff)
 
 	// Remove stack traces no longer referenced by any event. NOT EXISTS with
 	// LIMIT 1 lets SQLite short-circuit after finding the first match, avoiding
@@ -841,10 +847,10 @@ func ParseSize(s string) (int64, error) {
 }
 
 // SetMaxDBSize sets the maximum DB+WAL+SHM size in bytes. 0 = no limit.
-// Must be called before Run(). pruneBySize() enforces this limit during
-// periodic pruning (every DefaultPruneInterval).
+// Safe to call before or during Run(). pruneBySize() enforces this limit
+// after every flush and during periodic pruning (every DefaultPruneInterval).
 func (s *Store) SetMaxDBSize(bytes int64) {
-	s.maxDBSize = bytes
+	s.maxDBSize.Store(bytes)
 }
 
 // diskUsage returns the total size of the DB file + WAL + SHM in bytes.
@@ -876,30 +882,33 @@ func (s *Store) diskUsage() int64 {
 // WAL frames into the main DB, making freed pages reclaimable. PASSIVE
 // is used (not TRUNCATE) to avoid blocking concurrent readers.
 func (s *Store) pruneBySize() {
-	if s.maxDBSize <= 0 {
+	maxSize := s.maxDBSize.Load()
+	if maxSize <= 0 {
 		return
 	}
 
+	pruned := false
+
 	for i := 0; i < 3; i++ {
 		currentSize := s.diskUsage()
-		if currentSize <= s.maxDBSize {
-			return
+		if currentSize <= maxSize {
+			break
 		}
 
 		// Target 90% to leave headroom for new writes between prune cycles.
-		target := int64(float64(s.maxDBSize) * 0.9)
+		target := int64(float64(maxSize) * 0.9)
 
 		var minTS, maxTS int64
 		err := s.db.QueryRow("SELECT MIN(timestamp), MAX(timestamp) FROM events").Scan(&minTS, &maxTS)
 		if err != nil || minTS == 0 || maxTS == 0 || minTS >= maxTS {
-			return // no data or single-point — nothing to prune
+			break // no data or single-point — nothing to prune
 		}
 
 		// keepFraction: what fraction of the time range to keep.
 		// E.g., if DB is 2x the limit, keep ~45% of the time range.
 		keepFraction := float64(target) / float64(currentSize)
 		if keepFraction >= 1.0 {
-			return
+			break
 		}
 		cutoff := maxTS - int64(float64(maxTS-minTS)*keepFraction)
 
@@ -915,6 +924,8 @@ func (s *Store) pruneBySize() {
 			SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
 		)`)
 
+		pruned = true
+
 		// Checkpoint WAL so deleted pages become reclaimable in the main DB.
 		// PASSIVE avoids blocking concurrent readers (MCP queries, explain).
 		s.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
@@ -923,12 +934,20 @@ func (s *Store) pruneBySize() {
 		// the file retains its size (free pages stay allocated) and
 		// diskUsage() won't see improvement on the next iteration.
 		// On older DBs without incremental auto_vacuum, this is a no-op.
-		overage := currentSize - s.maxDBSize
+		overage := currentSize - maxSize
 		pagesToReclaim := overage / 4096 // 1 page ≈ 4KB
 		if pagesToReclaim < 1000 {
 			pagesToReclaim = 1000
 		}
 		s.db.Exec(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pagesToReclaim))
+	}
+
+	// Rebuild stack cache after pruning — deleted stack_traces rows must
+	// be evicted so new events with the same hash re-insert correctly.
+	// Only pay the cost when we actually deleted something.
+	if pruned {
+		s.stackCache = make(map[uint64]bool)
+		s.loadStackCache()
 	}
 }
 
