@@ -132,14 +132,26 @@ REPORT_FILE="logs/ml-investigation-report.md"
 
 echo -e "$(ts) ${CYAN}[SETUP]${NC} ResNet-50 training + CPU contention (stress-ng 4 workers)..."
 
-# Start ResNet-50 training (1 epoch, batch-size 64 — lighter for test speed)
+# Pre-download CIFAR-10 dataset so training starts GPU work immediately.
+# First run on a fresh VM downloads ~170MB at variable speed — if the download
+# happens during the trace window, zero CUDA events are captured (T22c fails).
+echo -e "$(ts)   Pre-downloading CIFAR-10 dataset..."
+python3 -c "
+import torchvision
+torchvision.datasets.CIFAR10(root='/tmp/cifar10', train=True, download=True)
+print('CIFAR-10 ready')
+" > logs/ml-dataset-download.log 2>&1
+echo -e "$(ts)   $(tail -1 logs/ml-dataset-download.log)"
+
+# Start ResNet-50 training (3 epochs, batch-size 64 — enough GPU work for 45s trace)
 python3 tests/workloads/training/resnet50_cifar10.py \
-    --epochs 1 --batch-size 64 > logs/ml-training.log 2>&1 &
+    --epochs 3 --batch-size 64 > logs/ml-training.log 2>&1 &
 TRAIN_PID=$!
 cleanup_pids+=("$TRAIN_PID")
 
-# Wait for training to start (CUDA init + dataset download on first run)
-sleep 5
+# Wait for CUDA init + first batch to reach the GPU (model.to(device) + first forward pass)
+echo -e "$(ts)   Waiting for training to reach GPU..."
+sleep 10
 
 # Verify training process is alive
 if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
@@ -148,8 +160,10 @@ if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
     exit 1
 fi
 
-# Start CPU contention with stress-ng (4 workers, matrixprod stressor)
-sudo stress-ng --cpu 4 --cpu-method matrixprod --timeout ${TRACE_DURATION}s > /dev/null 2>&1 &
+# Start CPU contention with stress-ng (saturate ALL cores — 4 workers on a
+# 30-core A10 VM doesn't cause enough scheduling jitter for bimodal latency)
+NCPUS=$(nproc)
+sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout ${TRACE_DURATION}s > /dev/null 2>&1 &
 STRESS_PID=$!
 cleanup_pids+=("$STRESS_PID")
 sleep 1
@@ -330,10 +344,11 @@ echo -e "$(ts) ${CYAN}── Q3: \"Show me how CPU contention hits my CUDA calls
 _test_start=$SECONDS
 
 # Tool: cudaStreamSync latency distribution
-SYNC_OUT=$(./bin/ingero query --db "$ML_DB" --since 5m --op cudaStreamSync --json 2>/dev/null)
-SYNC_COUNT=$(echo "$SYNC_OUT" | gcount '"op"')
+# Read directly from trace JSON (has duration_ns) rather than query --json
+# (query serializes from SQLite with different field names).
+SYNC_COUNT=$(gcount '"cudaStreamSync"' logs/ml-trace.json)
 
-SYNC_ANALYSIS=$(echo "$SYNC_OUT" | python3 -c "
+SYNC_ANALYSIS=$(grep '"cudaStreamSync"' logs/ml-trace.json | python3 -c "
 import json, sys
 durations = []
 for line in sys.stdin:
