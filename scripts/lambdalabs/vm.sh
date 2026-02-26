@@ -97,6 +97,11 @@ SSH_WAIT_INTERVAL=10
 API_POLL_INTERVAL=5
 API_POLL_TIMEOUT=600    # 10 min — Lambda H100 boot can take 5-10 min (API lags behind actual state)
 
+# Launch retry — Lambda often shows capacity that sells out between the
+# availability check and the launch API call (HTTP 400 race condition).
+LAUNCH_RETRY_MAX=${LAUNCH_RETRY_MAX:-90}        # default 90 attempts = 3 hours
+LAUNCH_RETRY_INTERVAL=${LAUNCH_RETRY_INTERVAL:-120}  # 2 min between retries
+
 # ============================================================================
 # Utility Functions
 # ============================================================================
@@ -456,31 +461,8 @@ cmd_deploy() {
 
     check_prerequisites
     ensure_ssh_key
-    find_available_instance || exit 1
 
-    # Format price
-    local price_dollars
-    price_dollars=$(awk "BEGIN {printf \"%.2f\", ${FOUND_PRICE}/100}")
-
-    # Confirm
-    print_warn "Cost Warning:"
-    print_info "  GPU: ${FOUND_DESC}"
-    print_info "  Region: ${FOUND_REGION}"
-    print_info "  Specs: ${FOUND_VCPUS} vCPU, ${FOUND_RAM}GB RAM, ${FOUND_STORAGE}GB SSD"
-    print_info "  Rate: \$${price_dollars}/hr"
-    print_info "  NO pause/resume — billing runs until you destroy."
-    echo ""
-    if [[ "$FORCE_MODE" != "true" ]]; then
-        read -p "Continue with deployment? [y/N] " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            print_info "Deployment cancelled."
-            exit 0
-        fi
-    else
-        print_info "Auto-confirmed (--force)"
-    fi
-
-    # Build cloud-init user_data
+    # Build cloud-init user_data (static — built once before retry loop)
     local user_data
     user_data=$(cat << 'CLOUDINIT'
 #!/bin/bash
@@ -525,37 +507,89 @@ echo "Cloud-init complete: $(date)" > /home/ubuntu/workspace/cloud-init-done.txt
 CLOUDINIT
 )
 
-    # Launch
-    print_info "Launching ${FOUND_TYPE} in ${FOUND_REGION}..."
+    # Launch with retry — Lambda GPU capacity is volatile. Instances sell out
+    # between the availability check and the launch API call (HTTP 400 race),
+    # or may not be available at all. Retry both cases.
+    local instance_id=""
+    local launch_attempt=0
+    local confirmed="false"
 
-    local request_body
-    request_body=$(jq -n \
-        --arg region "$FOUND_REGION" \
-        --arg type "$FOUND_TYPE" \
-        --arg key "$SSH_KEY_NAME" \
-        --arg name "$INSTANCE_NAME" \
-        --arg user_data "$user_data" \
-        '{
-            region_name: $region,
-            instance_type_name: $type,
-            ssh_key_names: [$key],
-            name: $name,
-            user_data: $user_data
-        }')
+    while [[ -z "$instance_id" || "$instance_id" == "null" ]]; do
+        launch_attempt=$((launch_attempt + 1))
+        if [[ $launch_attempt -gt $LAUNCH_RETRY_MAX ]]; then
+            print_error "No instance available after ${LAUNCH_RETRY_MAX} attempts ($(( LAUNCH_RETRY_MAX * LAUNCH_RETRY_INTERVAL / 60 )) min). Giving up."
+            exit 1
+        fi
 
-    local launch_response
-    launch_response=$(api_request POST "/instance-operations/launch" "$request_body")
+        if [[ $launch_attempt -gt 1 ]]; then
+            print_info "Attempt $launch_attempt/$LAUNCH_RETRY_MAX — re-checking availability..."
+        fi
 
-    local instance_id
-    instance_id=$(echo "$launch_response" | jq -r '.data.instance_ids[0]')
+        if ! find_available_instance; then
+            print_info "Retrying in ${LAUNCH_RETRY_INTERVAL}s..."
+            sleep "$LAUNCH_RETRY_INTERVAL"
+            continue
+        fi
 
-    if [[ -z "$instance_id" || "$instance_id" == "null" ]]; then
-        print_error "Failed to launch instance."
-        echo "$launch_response" | jq '.' 2>/dev/null || echo "$launch_response"
-        exit 1
-    fi
+        # Confirm once (first time we find availability)
+        if [[ "$confirmed" == "false" ]]; then
+            local price_dollars
+            price_dollars=$(awk "BEGIN {printf \"%.2f\", ${FOUND_PRICE}/100}")
 
-    print_success "Instance launched: ${instance_id}"
+            print_warn "Cost Warning:"
+            print_info "  GPU: ${FOUND_DESC}"
+            print_info "  Region: ${FOUND_REGION}"
+            print_info "  Specs: ${FOUND_VCPUS} vCPU, ${FOUND_RAM}GB RAM, ${FOUND_STORAGE}GB SSD"
+            print_info "  Rate: \$${price_dollars}/hr"
+            print_info "  NO pause/resume — billing runs until you destroy."
+            echo ""
+            if [[ "$FORCE_MODE" != "true" ]]; then
+                read -p "Continue with deployment? [y/N] " confirm
+                if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                    print_info "Deployment cancelled."
+                    exit 0
+                fi
+            else
+                print_info "Auto-confirmed (--force)"
+            fi
+            confirmed="true"
+        fi
+
+        print_info "Launching ${FOUND_TYPE} in ${FOUND_REGION}..."
+
+        local request_body
+        request_body=$(jq -n \
+            --arg region "$FOUND_REGION" \
+            --arg type "$FOUND_TYPE" \
+            --arg key "$SSH_KEY_NAME" \
+            --arg name "$INSTANCE_NAME" \
+            --arg user_data "$user_data" \
+            '{
+                region_name: $region,
+                instance_type_name: $type,
+                ssh_key_names: [$key],
+                name: $name,
+                user_data: $user_data
+            }')
+
+        local launch_response
+        if ! launch_response=$(api_request POST "/instance-operations/launch" "$request_body"); then
+            print_warn "Launch failed (sold out between check and launch). Will retry..."
+            sleep "$LAUNCH_RETRY_INTERVAL"
+            continue
+        fi
+
+        instance_id=$(echo "$launch_response" | jq -r '.data.instance_ids[0]')
+
+        if [[ -z "$instance_id" || "$instance_id" == "null" ]]; then
+            print_warn "Launch returned no instance ID. Will retry..."
+            instance_id=""
+            sleep "$LAUNCH_RETRY_INTERVAL"
+            continue
+        fi
+    done
+
+    print_success "Instance launched: ${instance_id} (attempt $launch_attempt)"
 
     # Save initial state
     save_state "$instance_id" "" "booting" "$FOUND_TYPE" "$FOUND_REGION" "$FOUND_PRICE"
