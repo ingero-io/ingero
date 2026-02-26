@@ -1077,6 +1077,8 @@ func TestPruneBySizeNoOp(t *testing.T) {
 	s.pruneBySize() // should not panic or error
 
 	// On-disk store with generous limit — nothing should be pruned.
+	// Stop Run() before calling pruneBySize() from the test goroutine
+	// to avoid racing on stackCache (which is single-goroutine by design).
 	dbPath := filepath.Join(t.TempDir(), "noprune-test.db")
 	s2, err := New(dbPath)
 	if err != nil {
@@ -1091,11 +1093,13 @@ func TestPruneBySizeNoOp(t *testing.T) {
 		close(done)
 	}()
 
-	// Insert some events.
+	// Insert some events via the Run() channel, then stop Run().
 	for i := 0; i < 50; i++ {
 		s2.Record(makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond))
 	}
 	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-done
 
 	countBefore, _ := s2.Count()
 
@@ -1107,9 +1111,6 @@ func TestPruneBySizeNoOp(t *testing.T) {
 	if countAfter != countBefore {
 		t.Errorf("expected no pruning: before=%d, after=%d", countBefore, countAfter)
 	}
-
-	cancel()
-	<-done
 }
 
 func TestPruneBySizeOnDisk(t *testing.T) {
@@ -1136,6 +1137,11 @@ func TestPruneBySizeOnDisk(t *testing.T) {
 		s.Record(evt)
 	}
 	time.Sleep(500 * time.Millisecond)
+
+	// Stop Run() before calling pruneBySize() from the test goroutine —
+	// pruneBySize accesses stackCache which is single-goroutine by design.
+	cancel()
+	<-done
 
 	// Force a WAL checkpoint so disk usage reflects all writes.
 	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -1194,9 +1200,6 @@ func TestPruneBySizeOnDisk(t *testing.T) {
 			t.Errorf("expected newest event near %v, got %v", lastInserted, newest)
 		}
 	}
-
-	cancel()
-	<-done
 }
 
 func TestSetMaxDBSize(t *testing.T) {
@@ -1207,13 +1210,13 @@ func TestSetMaxDBSize(t *testing.T) {
 	defer s.Close()
 
 	s.SetMaxDBSize(10 * (1 << 30))
-	if s.maxDBSize != 10*(1<<30) {
-		t.Errorf("maxDBSize = %d, want %d", s.maxDBSize, 10*(1<<30))
+	if got := s.maxDBSize.Load(); got != 10*(1<<30) {
+		t.Errorf("maxDBSize = %d, want %d", got, 10*(1<<30))
 	}
 
 	s.SetMaxDBSize(0)
-	if s.maxDBSize != 0 {
-		t.Errorf("maxDBSize = %d, want 0", s.maxDBSize)
+	if got := s.maxDBSize.Load(); got != 0 {
+		t.Errorf("maxDBSize = %d, want 0", got)
 	}
 }
 
@@ -1256,4 +1259,183 @@ func TestDiskUsageIncludesWAL(t *testing.T) {
 	if usage < mainInfo.Size() {
 		t.Errorf("diskUsage() = %d, expected >= main DB size %d", usage, mainInfo.Size())
 	}
+}
+
+// TestPruneBySizeAutoTrigger verifies that pruneBySize fires automatically
+// after flushBatch when the DB exceeds maxDBSize — the actual production path.
+func TestPruneBySizeAutoTrigger(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "auto-prune.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert events to grow the DB.
+	baseTime := time.Now().Add(-10 * time.Minute)
+	for i := 0; i < 2000; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Checkpoint so diskUsage reflects writes.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	sizeBefore := s.diskUsage()
+
+	// Set a small limit — below current size. The next flush should auto-prune.
+	s.SetMaxDBSize(sizeBefore / 3)
+
+	// Insert more events to trigger a flushBatch, which calls pruneBySize.
+	for i := 0; i < DefaultBatchSize+1; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = time.Now()
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify events were pruned automatically (not by direct pruneBySize call).
+	count, _ := s.Count()
+	if count >= 2000+DefaultBatchSize {
+		t.Errorf("expected auto-pruning to reduce events, got %d", count)
+	}
+	t.Logf("auto-prune: %d events remain (started with %d+%d)", count, 2000, DefaultBatchSize+1)
+
+	cancel()
+	<-done
+}
+
+// TestPruneBySizeStackCacheRebuild verifies that stacks deleted during pruning
+// are correctly re-inserted when new events with the same call stack arrive.
+// Without the cache rebuild, the stackCache would say "already in DB" for a
+// deleted hash, and the LEFT JOIN would return empty stacks.
+func TestPruneBySizeStackCacheRebuild(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "stack-rebuild.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Phase 1: Insert events with a specific stack.
+	stack := makeStack(0xaaa, 0xbbb, 0xccc)
+	baseTime := time.Now().Add(-10 * time.Minute)
+	for i := 0; i < 500; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+		evt.Stack = stack
+		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify stack exists.
+	var stackCount int64
+	s.db.QueryRow("SELECT COUNT(*) FROM stack_traces").Scan(&stackCount)
+	if stackCount != 1 {
+		t.Fatalf("expected 1 stack trace before prune, got %d", stackCount)
+	}
+
+	// Phase 2: Set tiny maxDBSize and trigger prune via new events.
+	// This should delete old events + orphaned stack traces + rebuild cache.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	s.SetMaxDBSize(s.diskUsage() / 4)
+
+	// Insert new events with the SAME stack — after pruning, the stack should
+	// be re-inserted (not skipped by stale cache).
+	for i := 0; i < DefaultBatchSize+1; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+		evt.Stack = stack
+		evt.Timestamp = time.Now()
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Phase 3: Query the new events — stacks should be resolved, not empty.
+	result, err := s.Query(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("expected some recent events after prune, got 0")
+	}
+
+	// Check that at least one recent event has a resolved stack.
+	hasStack := false
+	for _, evt := range result {
+		if len(evt.Stack) == 3 && evt.Stack[0].IP == 0xaaa {
+			hasStack = true
+			break
+		}
+	}
+	if !hasStack {
+		t.Errorf("expected recent events to have resolved stacks (3 frames starting at 0xaaa), "+
+			"but none found among %d events", len(result))
+	}
+
+	cancel()
+	<-done
+}
+
+// TestPruneBySizeTinyLimit verifies that an impossibly small maxDBSize
+// (smaller than the schema overhead) doesn't panic or deadlock.
+// pruneBySize should delete all events and exit gracefully.
+func TestPruneBySizeTinyLimit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tiny-limit.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert events.
+	baseTime := time.Now().Add(-5 * time.Minute)
+	for i := 0; i < 500; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Set limit to 1 byte — way below schema overhead. This forces
+	// pruneBySize to delete everything it can, but the DB file will
+	// still be larger than 1 byte due to schema pages.
+	s.SetMaxDBSize(1)
+
+	// Trigger via new events. Should not panic or hang.
+	for i := 0; i < DefaultBatchSize+1; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = time.Now()
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// The DB won't be 1 byte (schema overhead), but old events should be gone.
+	// Some new events may also have been pruned. The key assertion is: no panic.
+	count, _ := s.Count()
+	t.Logf("tiny limit: %d events remain after prune", count)
+
+	cancel()
+	<-done
 }
