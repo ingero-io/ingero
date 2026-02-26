@@ -1439,3 +1439,274 @@ func TestPruneBySizeTinyLimit(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// --- ExecuteReadOnly tests ---
+
+func TestExecuteReadOnly_Select(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Basic SELECT on a known table.
+	cols, rows, truncated, err := s.ExecuteReadOnly(ctx, "SELECT COUNT(*) AS n FROM events", 0)
+	if err != nil {
+		t.Fatalf("ExecuteReadOnly failed: %v", err)
+	}
+	if truncated {
+		t.Error("unexpected truncation")
+	}
+	if len(cols) != 1 || cols[0] != "n" {
+		t.Errorf("columns = %v, want [n]", cols)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	// SQLite returns int64 for COUNT(*).
+	val, ok := rows[0][0].(int64)
+	if !ok {
+		t.Fatalf("expected int64, got %T", rows[0][0])
+	}
+	if val != 0 {
+		t.Errorf("expected 0 events, got %d", val)
+	}
+}
+
+func TestExecuteReadOnly_RejectsWrite(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	writes := []string{
+		"INSERT INTO events (timestamp,pid,tid,source,op,duration) VALUES (0,0,0,0,0,0)",
+		"UPDATE events SET pid=0",
+		"DELETE FROM events",
+		"DROP TABLE events",
+		"ALTER TABLE events ADD COLUMN foo INTEGER",
+		"CREATE TABLE evil (id INTEGER)",
+		"ATTACH DATABASE ':memory:' AS evil",
+		"VACUUM",
+	}
+	for _, q := range writes {
+		_, _, _, err := s.ExecuteReadOnly(ctx, q, 0)
+		if err == nil {
+			t.Errorf("expected error for %q, got nil", q)
+		}
+	}
+}
+
+func TestExecuteReadOnly_RejectsWritableCTE(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Writable CTEs start with WITH but contain write keywords.
+	// These must be rejected by the write-keyword scan.
+	cteDML := []string{
+		"WITH ids AS (SELECT id FROM events LIMIT 5) DELETE FROM events WHERE id IN (SELECT id FROM ids)",
+		"WITH x AS (SELECT 1) INSERT INTO events (timestamp,pid,tid,source,op,duration) VALUES (0,0,0,0,0,0)",
+		"WITH x AS (SELECT 1) UPDATE events SET pid=0",
+	}
+	for _, q := range cteDML {
+		_, _, _, err := s.ExecuteReadOnly(ctx, q, 0)
+		if err == nil {
+			t.Errorf("expected error for writable CTE %q, got nil", q)
+		}
+	}
+}
+
+func TestExecuteReadOnly_RejectsPragma(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_, _, _, err = s.ExecuteReadOnly(ctx, "PRAGMA table_info(events)", 0)
+	if err == nil {
+		t.Error("expected error for PRAGMA query, got nil")
+	}
+}
+
+func TestExecuteReadOnly_RejectsMultiStatement(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_, _, _, err = s.ExecuteReadOnly(ctx, "SELECT 1; DROP TABLE events", 0)
+	if err == nil {
+		t.Error("expected error for multi-statement query, got nil")
+	}
+
+	// Trailing semicolon with only whitespace after is OK.
+	cols, rows, _, err := s.ExecuteReadOnly(ctx, "SELECT 1 AS x; ", 0)
+	if err != nil {
+		t.Fatalf("trailing semicolon should be allowed: %v", err)
+	}
+	if len(cols) != 1 || len(rows) != 1 {
+		t.Errorf("expected 1 col + 1 row, got %d cols + %d rows", len(cols), len(rows))
+	}
+}
+
+func TestExecuteReadOnly_RowLimit(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert 50 events.
+	for i := 0; i < 50; i++ {
+		s.Record(makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Query with maxRows=10 — should truncate at 10.
+	_, rows, truncated, err := s.ExecuteReadOnly(ctx, "SELECT * FROM events", 10)
+	if err != nil {
+		t.Fatalf("ExecuteReadOnly failed: %v", err)
+	}
+	if len(rows) != 10 {
+		t.Errorf("expected 10 rows with limit, got %d", len(rows))
+	}
+	if !truncated {
+		t.Error("expected truncated=true with 50 events and limit=10")
+	}
+
+	// maxRows > 10000 should be capped at 10000.
+	_, rows2, truncated2, err := s.ExecuteReadOnly(ctx, "SELECT * FROM events", 99999)
+	if err != nil {
+		t.Fatalf("ExecuteReadOnly failed: %v", err)
+	}
+	if len(rows2) != 50 {
+		t.Errorf("expected 50 rows (all events, cap not hit), got %d", len(rows2))
+	}
+	if truncated2 {
+		t.Error("expected truncated=false with 50 events and cap=10000")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestExecuteReadOnly_TruncatedAccuracy(t *testing.T) {
+	// Verify that truncated is false when the query returns exactly maxRows
+	// (no extra row exists), and true only when there genuinely are more.
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert exactly 10 events.
+	for i := 0; i < 10; i++ {
+		s.Record(makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Query with maxRows=10 — exactly 10 exist, so truncated should be false.
+	_, rows, truncated, err := s.ExecuteReadOnly(ctx, "SELECT * FROM events", 10)
+	if err != nil {
+		t.Fatalf("ExecuteReadOnly failed: %v", err)
+	}
+	if len(rows) != 10 {
+		t.Errorf("expected 10 rows, got %d", len(rows))
+	}
+	if truncated {
+		t.Error("expected truncated=false when row count exactly equals limit")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestExecuteReadOnly_WithCTE(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	cols, rows, _, err := s.ExecuteReadOnly(ctx, "WITH cte AS (SELECT 42 AS val) SELECT val FROM cte", 0)
+	if err != nil {
+		t.Fatalf("CTE query failed: %v", err)
+	}
+	if len(cols) != 1 || cols[0] != "val" {
+		t.Errorf("columns = %v, want [val]", cols)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0][0].(int64) != 42 {
+		t.Errorf("expected 42, got %v", rows[0][0])
+	}
+}
+
+func TestExecuteReadOnly_EmptyResultNotNil(t *testing.T) {
+	// Verify that 0 rows returns empty slice (not nil) to avoid JSON "null".
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_, rows, _, err := s.ExecuteReadOnly(ctx, "SELECT * FROM events WHERE 1=0", 0)
+	if err != nil {
+		t.Fatalf("ExecuteReadOnly failed: %v", err)
+	}
+	if rows == nil {
+		t.Error("expected non-nil empty slice for 0 rows, got nil")
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows, got %d", len(rows))
+	}
+}
+
+func TestExecuteReadOnly_SqliteMasterAllowed(t *testing.T) {
+	// Schema enumeration via sqlite_master is allowed (schema is public in
+	// the tool description anyway, and useful for AI exploration).
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_, rows, _, err := s.ExecuteReadOnly(ctx, "SELECT type, name FROM sqlite_master ORDER BY name", 0)
+	if err != nil {
+		t.Fatalf("sqlite_master query failed: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Error("expected sqlite_master to return schema objects")
+	}
+}
