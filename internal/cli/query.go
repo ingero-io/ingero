@@ -114,7 +114,7 @@ func queryOutputJSON(evts []events.Event) error {
 		Stack      []jsonStackFrame `json:"stack,omitempty"`
 	}
 
-	var output []jsonEvt
+	output := make([]jsonEvt, 0, len(evts))
 	for _, evt := range evts {
 		je := jsonEvt{
 			Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),

@@ -270,9 +270,9 @@ SYNC_FILE = '${ML_TMPDIR}/sync.json'
 LAUNCH_FILE = '${ML_TMPDIR}/launch.json'
 SCHED_FILE = '${ML_TMPDIR}/sched.json'
 
-sync_events = json.load(open(SYNC_FILE))
-launch_events = json.load(open(LAUNCH_FILE))
-sched_events = json.load(open(SCHED_FILE))
+sync_events = json.load(open(SYNC_FILE)) or []
+launch_events = json.load(open(LAUNCH_FILE)) or []
+sched_events = json.load(open(SCHED_FILE)) or []
 
 # Output event counts (for T22a and display)
 print(f'event_counts: sync={len(sync_events)} launch={len(launch_events)} sched={len(sched_events)}')
@@ -683,7 +683,7 @@ if [[ "$SYNC_COUNT" -gt 0 ]]; then
     fi
 else
     # No cudaStreamSync events — try cudaDeviceSync as fallback
-    DSYNC_COUNT=$(./bin/ingero query --db "$ML_DB" --op cudaDeviceSync --limit 1 --since 10m 2>/dev/null | grep -c 'cudaDeviceSync' || echo "0")
+    DSYNC_COUNT=$(./bin/ingero query --db "$ML_DB" --op cudaDeviceSync --limit 1 --since 10m 2>/dev/null | gcount 'cudaDeviceSync')
     if [[ "$DSYNC_COUNT" -gt 0 ]]; then
         record "SKIP" "T22e: sync tail amplification" "no cudaStreamSync but ${DSYNC_COUNT} cudaDeviceSync (workload uses device sync)"
     else
