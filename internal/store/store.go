@@ -2,16 +2,20 @@
 //
 // Events are buffered in memory and batch-flushed to SQLite for performance.
 // WAL mode enables concurrent reads while the writer flushes batches.
-// Rolling 7-day retention keeps the database from growing unbounded.
+// Rolling 7-day time retention plus optional size-based pruning (--max-db).
 package store
 
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,12 +53,26 @@ CREATE TABLE IF NOT EXISTS events (
 	arg0       INTEGER NOT NULL DEFAULT 0,
 	arg1       INTEGER NOT NULL DEFAULT 0,
 	ret_code   INTEGER NOT NULL DEFAULT 0,
-	stack_ips  TEXT    NOT NULL DEFAULT ''
+	stack_hash INTEGER NOT NULL DEFAULT 0  -- FK to stack_traces.hash (0 = no stack)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_pid ON events(pid);
 CREATE INDEX IF NOT EXISTS idx_events_source_op ON events(source, op);
+`
+
+// stackTracesSchema stores deduplicated stack traces. Each unique call stack
+// (sequence of instruction pointers) is stored once, keyed by FNV-64 hash.
+// Events reference stacks by hash instead of storing the full text inline.
+//
+// Why? A typical ML training loop has 50-500 unique call stacks, but each
+// repeats thousands of times. On A100 at 24K events/sec with --stack:
+// inline storage = ~658MB/4min; with interning = ~13MB/4min (~50x reduction).
+const stackTracesSchema = `
+CREATE TABLE IF NOT EXISTS stack_traces (
+	hash INTEGER PRIMARY KEY,  -- FNV-64 of raw IP bytes (no AUTOINCREMENT needed)
+	ips  TEXT    NOT NULL       -- JSON array of hex IPs: ["0x7f1234","0x7f5678"]
+);
 `
 
 const chainsSchema = `
@@ -245,7 +263,7 @@ func populateLookupTables(db *sql.DB) {
 		{"arg0_note", "Operation-specific: byte size for alloc/memcpy, kernel function pointer for launch"},
 		{"arg1_note", "Operation-specific: memcpy direction for cudaMemcpy, unused for most ops"},
 		{"ret_code_note", "CUDA return code (0 = cudaSuccess). Host events always 0."},
-		{"stack_ips_note", "JSON array of hex instruction pointers, e.g. [\"0x7f1234\",\"0x7f5678\"]. Empty if --stack not used."},
+		{"stack_traces_note", "Deduplicated stacks: events.stack_hash → stack_traces.hash. Query: SELECT e.*, st.ips FROM events e LEFT JOIN stack_traces st ON e.stack_hash = st.hash"},
 		{"example_query", "SELECT e.id, s.name AS source, o.name AS op, e.duration/1000 AS dur_us, e.pid FROM events e JOIN sources s ON e.source = s.id JOIN ops o ON e.source = o.source_id AND e.op = o.op_id ORDER BY e.timestamp DESC LIMIT 20"},
 		{"system_snapshots_note", "System metrics sampled every 1s during recording. Replay with correlator for post-hoc causal chain analysis."},
 		{"sessions_note", "One row per 'ingero trace' invocation. Correlate with events via time range."},
@@ -259,6 +277,7 @@ func populateLookupTables(db *sql.DB) {
 
 // migrateSchema adds columns that may be missing in older databases.
 const migrateAddStackIPs = `ALTER TABLE events ADD COLUMN stack_ips TEXT NOT NULL DEFAULT ''`
+const migrateAddStackHash = `ALTER TABLE events ADD COLUMN stack_hash INTEGER NOT NULL DEFAULT 0`
 
 // Store provides persistent event storage backed by SQLite.
 type Store struct {
@@ -269,6 +288,13 @@ type Store struct {
 	retention  time.Duration
 	runDone    chan struct{} // closed when Run() exits
 	runActive  atomic.Bool  // true once Run() is called
+
+	// stackCache tracks which stack hashes are already in the stack_traces
+	// table, avoiding redundant INSERTs and JSON serialization. Only accessed
+	// from the Run() goroutine (flushBatch), so no mutex needed.
+	stackCache map[uint64]bool
+
+	maxDBSize int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
 
 	mu      sync.Mutex
 	closed  bool
@@ -454,6 +480,12 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
+	// Enable incremental auto-vacuum so pruneBySize() can reclaim disk space
+	// via PRAGMA incremental_vacuum. Must be set before any tables are created
+	// (i.e., before the first page is written). Only takes effect on newly
+	// created DBs — existing databases retain their original auto_vacuum mode.
+	db.Exec("PRAGMA auto_vacuum = INCREMENTAL")
+
 	// Enable WAL mode for concurrent reads during writes.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
@@ -470,8 +502,22 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("creating schema: %w", err)
 	}
 
-	// Migrate: add stack_ips column if missing (older databases).
-	db.Exec(migrateAddStackIPs) // Ignore error — column already exists is expected.
+	// Schema migrations for backward compatibility with older databases.
+	// Both ALTER TABLEs are idempotent — they fail silently if the column
+	// already exists. New databases get stack_hash from the schema and
+	// stack_ips from this migration (unused but harmless — 0 bytes overhead).
+	db.Exec(migrateAddStackHash)
+	db.Exec(migrateAddStackIPs)
+
+	// Create stack_traces table (deduplicated stack interning).
+	if _, err := db.Exec(stackTracesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating stack_traces table: %w", err)
+	}
+
+	// Migrate: if there are events with inline stack_ips, intern them into
+	// the stack_traces table. No-op for new databases.
+	migrateInlineStacks(db)
 
 	// Create causal_chains table.
 	if _, err := db.Exec(chainsSchema); err != nil {
@@ -493,6 +539,9 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates for events not individually stored (selective storage). Use count-stored to get discarded count.')")
+	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
+	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. Query: SELECT e.*, st.ips FROM events e LEFT JOIN stack_traces st ON e.stack_hash = st.hash')")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {
@@ -531,6 +580,7 @@ func New(dbPath string) (*Store, error) {
 		snapshotCh: make(chan SystemSnapshot, 64), // 1 snapshot/sec, 64 = ~1 min buffer
 		retention:  DefaultRetention,
 		runDone:    make(chan struct{}),
+		stackCache: make(map[uint64]bool),
 	}
 
 	return s, nil
@@ -563,6 +613,10 @@ func (s *Store) Record(evt events.Event) {
 func (s *Store) Run(ctx context.Context) {
 	s.runActive.Store(true)
 	defer close(s.runDone)
+
+	// Pre-load stack cache from existing DB so restarted sessions don't
+	// re-insert stacks that already exist from a previous trace.
+	s.loadStackCache()
 
 	flushTicker := time.NewTicker(DefaultFlushInterval)
 	defer flushTicker.Stop()
@@ -619,6 +673,10 @@ func (s *Store) Run(ctx context.Context) {
 }
 
 // flushBatch writes a batch of events in a single transaction.
+// Stack traces are interned: each unique stack is stored once in stack_traces,
+// and events reference it by FNV-64 hash. This reduces DB size ~50x when
+// --stack is enabled, since ML training loops repeat the same few call stacks
+// across thousands of events.
 func (s *Store) flushBatch(batch []events.Event) {
 	if len(batch) == 0 {
 		return
@@ -629,17 +687,38 @@ func (s *Store) flushBatch(batch []events.Event) {
 		return
 	}
 
-	stmt, err := tx.Prepare(`INSERT INTO events (timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_ips)
+	// Prepare: event insert uses stack_hash (integer FK) instead of inline JSON.
+	evtStmt, err := tx.Prepare(`INSERT INTO events (timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
 	}
-	defer stmt.Close()
+	defer evtStmt.Close()
+
+	// Prepare: stack insert uses INSERT OR IGNORE — safe for hash collisions
+	// with existing rows (astronomically unlikely with FNV-64, but correct).
+	stackStmt, err := tx.Prepare(`INSERT OR IGNORE INTO stack_traces (hash, ips) VALUES (?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	defer stackStmt.Close()
 
 	for _, evt := range batch {
-		stackJSON := serializeStackIPs(evt.Stack)
-		stmt.Exec(
+		var stackHash int64
+		if len(evt.Stack) > 0 {
+			h := hashStackIPs(evt.Stack)
+			stackHash = int64(h)
+			if !s.stackCache[h] {
+				// New stack — serialize and insert. Only pay the JSON
+				// serialization cost once per unique stack.
+				ipsJSON := serializeStackIPs(evt.Stack)
+				stackStmt.Exec(stackHash, ipsJSON)
+				s.stackCache[h] = true
+			}
+		}
+		evtStmt.Exec(
 			evt.Timestamp.UnixNano(),
 			evt.PID,
 			evt.TID,
@@ -650,20 +729,207 @@ func (s *Store) flushBatch(batch []events.Event) {
 			evt.Args[0],
 			evt.Args[1],
 			evt.RetCode,
-			stackJSON,
+			stackHash,
 		)
 	}
 
 	tx.Commit()
 }
 
-// pruneOld deletes events, aggregates, system snapshots, and sessions older than the retention period.
+// loadStackCache pre-populates the in-memory stack cache from the stack_traces
+// table. Called once at Run() startup so that a restarted trace session against
+// the same DB doesn't re-insert stacks that already exist.
+func (s *Store) loadStackCache() {
+	rows, err := s.db.Query("SELECT hash FROM stack_traces")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err == nil {
+			s.stackCache[uint64(h)] = true
+		}
+	}
+}
+
+// pruneOld deletes events, aggregates, system snapshots, causal chains, and
+// sessions older than the retention period. Also removes orphaned stack traces
+// no longer referenced by any event.
 func (s *Store) pruneOld() {
 	cutoff := time.Now().Add(-s.retention).UnixNano()
 	s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
 	s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
 	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
+	s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
 	s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
+
+	// Remove stack traces no longer referenced by any event. NOT EXISTS with
+	// LIMIT 1 lets SQLite short-circuit after finding the first match, avoiding
+	// a full events table scan per stack_traces row. Runs once per hour.
+	s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
+		SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
+	)`)
+
+	// Rebuild stack cache after pruning — deleted stack_traces rows must be
+	// evicted from the in-memory cache, otherwise new events with the same
+	// stack hash would skip the INSERT (cache says "already in DB") and
+	// produce dangling references.
+	s.stackCache = make(map[uint64]bool)
+	s.loadStackCache()
+
+	// Size-based pruning: if --max-db is set and the DB exceeds the limit,
+	// delete oldest data proportionally until the file fits.
+	s.pruneBySize()
+}
+
+// ParseSize parses a human-friendly size string like "10g", "500m", "1t" into bytes.
+// Accepts optional trailing "b"/"B" (e.g., "10GB", "500mb"). Case-insensitive on unit.
+// Returns an error for unparseable input, non-positive values, or empty strings.
+//
+//	ParseSize("10g")   → 10 * 1024^3
+//	ParseSize("500MB") → 500 * 1024^2
+//	ParseSize("1t")    → 1 * 1024^4
+func ParseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+
+	// Strip optional trailing b/B (e.g., "10GB" → "10G").
+	s = strings.TrimRight(s, "bB")
+	if s == "" {
+		return 0, fmt.Errorf("size string has no numeric part")
+	}
+
+	// Last character is the unit multiplier.
+	unit := s[len(s)-1]
+	var multiplier int64
+	switch unit {
+	case 'k', 'K':
+		multiplier = 1 << 10
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		multiplier = 1 << 20
+		s = s[:len(s)-1]
+	case 'g', 'G':
+		multiplier = 1 << 30
+		s = s[:len(s)-1]
+	case 't', 'T':
+		multiplier = 1 << 40
+		s = s[:len(s)-1]
+	default:
+		// No unit suffix — treat as bytes.
+		multiplier = 1
+	}
+
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parsing size %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("size must be positive, got %d", n)
+	}
+
+	// Guard against int64 overflow. Go silently wraps on overflow, so
+	// e.g. "9999999t" would produce a negative value without this check.
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("size %d with multiplier %d overflows int64", n, multiplier)
+	}
+
+	return n * multiplier, nil
+}
+
+// SetMaxDBSize sets the maximum DB+WAL+SHM size in bytes. 0 = no limit.
+// Must be called before Run(). pruneBySize() enforces this limit during
+// periodic pruning (every DefaultPruneInterval).
+func (s *Store) SetMaxDBSize(bytes int64) {
+	s.maxDBSize = bytes
+}
+
+// diskUsage returns the total size of the DB file + WAL + SHM in bytes.
+// Returns 0 for in-memory databases or on error.
+func (s *Store) diskUsage() int64 {
+	if s.dbPath == ":memory:" || s.dbPath == "" {
+		return 0
+	}
+	var total int64
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		info, err := os.Stat(s.dbPath + suffix)
+		if err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// pruneBySize deletes oldest events proportionally to bring the DB under maxDBSize.
+//
+// Algorithm: compute what fraction of the time range to keep based on
+// currentSize vs target (90% of maxDBSize for headroom), then delete
+// everything older than the cutoff. Loops up to 3 iterations because
+// each iteration's time-proportional cut may underestimate if data is
+// skewed (e.g., sparse old data, dense recent data).
+//
+// Key detail: in WAL mode, DELETEs write to the WAL rather than freeing
+// main-DB pages. We run a PASSIVE checkpoint before each vacuum to move
+// WAL frames into the main DB, making freed pages reclaimable. PASSIVE
+// is used (not TRUNCATE) to avoid blocking concurrent readers.
+func (s *Store) pruneBySize() {
+	if s.maxDBSize <= 0 {
+		return
+	}
+
+	for i := 0; i < 3; i++ {
+		currentSize := s.diskUsage()
+		if currentSize <= s.maxDBSize {
+			return
+		}
+
+		// Target 90% to leave headroom for new writes between prune cycles.
+		target := int64(float64(s.maxDBSize) * 0.9)
+
+		var minTS, maxTS int64
+		err := s.db.QueryRow("SELECT MIN(timestamp), MAX(timestamp) FROM events").Scan(&minTS, &maxTS)
+		if err != nil || minTS == 0 || maxTS == 0 || minTS >= maxTS {
+			return // no data or single-point — nothing to prune
+		}
+
+		// keepFraction: what fraction of the time range to keep.
+		// E.g., if DB is 2x the limit, keep ~45% of the time range.
+		keepFraction := float64(target) / float64(currentSize)
+		if keepFraction >= 1.0 {
+			return
+		}
+		cutoff := maxTS - int64(float64(maxTS-minTS)*keepFraction)
+
+		// Delete events, aggregates, snapshots, chains, sessions older than cutoff.
+		s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
+		s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
+		s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
+		s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
+		s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
+
+		// Clean orphaned stack traces.
+		s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
+			SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
+		)`)
+
+		// Checkpoint WAL so deleted pages become reclaimable in the main DB.
+		// PASSIVE avoids blocking concurrent readers (MCP queries, explain).
+		s.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+
+		// Reclaim freed pages proportional to the overage. Without this,
+		// the file retains its size (free pages stay allocated) and
+		// diskUsage() won't see improvement on the next iteration.
+		// On older DBs without incremental auto_vacuum, this is a no-op.
+		overage := currentSize - s.maxDBSize
+		pagesToReclaim := overage / 4096 // 1 page ≈ 4KB
+		if pagesToReclaim < 1000 {
+			pagesToReclaim = 1000
+		}
+		s.db.Exec(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pagesToReclaim))
+	}
 }
 
 // appendPIDFilter appends a PID filter clause to a SQL query.
@@ -692,43 +958,48 @@ func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix 
 }
 
 // Query retrieves events matching the given parameters.
+// Stack traces are resolved via LEFT JOIN against the stack_traces interning table.
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
-	query := "SELECT timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_ips FROM events WHERE 1=1"
+	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
+		e.gpu_id, e.arg0, e.arg1, e.ret_code, COALESCE(st.ips, '')
+	FROM events e
+	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
+	WHERE 1=1`
 	var args []interface{}
 
 	// Time range.
 	if !q.From.IsZero() {
-		query += " AND timestamp >= ?"
+		query += " AND e.timestamp >= ?"
 		args = append(args, q.From.UnixNano())
 	} else if q.Since > 0 {
-		query += " AND timestamp >= ?"
+		query += " AND e.timestamp >= ?"
 		args = append(args, time.Now().Add(-q.Since).UnixNano())
 	}
 
 	if !q.To.IsZero() {
-		query += " AND timestamp <= ?"
+		query += " AND e.timestamp <= ?"
 		args = append(args, q.To.UnixNano())
 	}
 
 	// PID filter (single or multi).
-	query, args = appendPIDFilter(query, args, q, "")
+	query, args = appendPIDFilter(query, args, q, "e.")
 
 	// Source filter.
 	if q.Source > 0 {
-		query += " AND source = ?"
+		query += " AND e.source = ?"
 		args = append(args, q.Source)
 	}
 
 	// Op filter (only if Source is set).
 	if q.Source > 0 && q.Op > 0 {
-		query += " AND op = ?"
+		query += " AND e.op = ?"
 		args = append(args, q.Op)
 	}
 
 	// Fetch the newest events first (DESC) so the LIMIT keeps the most
 	// recent data rather than the oldest.  We reverse the slice afterward
 	// to return chronological order.
-	query += " ORDER BY timestamp DESC"
+	query += " ORDER BY e.timestamp DESC"
 
 	// Limit: 0 = default 10K, -1 = unlimited, >0 = explicit.
 	if q.Limit >= 0 {
@@ -802,13 +1073,14 @@ type RichEvent struct {
 // Use this for AI/MCP output where self-describing data matters.
 func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
-		e.gpu_id, e.arg0, e.arg1, e.ret_code, e.stack_ips,
+		e.gpu_id, e.arg0, e.arg1, e.ret_code, COALESCE(st.ips, ''),
 		COALESCE(s.name, 'SRC_' || e.source),
 		COALESCE(s.description, ''),
 		COALESCE(o.name, 'OP_' || e.op),
 		COALESCE(o.description, ''),
 		COALESCE(pn.name, '')
 	FROM events e
+	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	LEFT JOIN sources s ON e.source = s.id
 	LEFT JOIN ops o ON e.source = o.source_id AND e.op = o.op_id
 	LEFT JOIN process_names pn ON e.pid = pn.pid
@@ -1346,4 +1618,126 @@ func deserializeStackIPs(s string) []events.StackFrame {
 		fmt.Sscanf(ipStr, "0x%x", &frames[i].IP)
 	}
 	return frames
+}
+
+// hashStackIPs computes an FNV-64a hash of a stack trace's raw instruction
+// pointers. Two stacks with the same IPs in the same order produce the same
+// hash. Used as the primary key in the stack_traces interning table.
+//
+// We hash raw uint64 bytes directly instead of serializing to JSON first —
+// this avoids allocations and hex formatting for the common case where the
+// stack is already in the cache.
+func hashStackIPs(stack []events.StackFrame) uint64 {
+	h := fnv.New64a()
+	var buf [8]byte
+	for _, f := range stack {
+		binary.LittleEndian.PutUint64(buf[:], f.IP)
+		h.Write(buf[:])
+	}
+	return h.Sum64()
+}
+
+// migrateInlineStacks migrates events that have inline stack_ips (TEXT) but no
+// stack_hash. This handles databases created before the interning optimization.
+// Runs once on New() — if no events have inline stacks, it's a no-op.
+func migrateInlineStacks(db *sql.DB) {
+	// Check if the old stack_ips column exists. If not, nothing to migrate.
+	var hasStackIPs bool
+	rows, err := db.Query("PRAGMA table_info(events)")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			continue
+		}
+		if name == "stack_ips" {
+			hasStackIPs = true
+		}
+	}
+	if !hasStackIPs {
+		return
+	}
+
+	// Count events with inline stacks that need migration.
+	var count int64
+	db.QueryRow("SELECT COUNT(*) FROM events WHERE stack_ips != '' AND stack_hash = 0").Scan(&count)
+	if count == 0 {
+		return
+	}
+
+	// Migrate in batches of 10K. Loop until no more unmigrated rows remain.
+	// Each iteration: read a batch of inline stacks, compute hashes, intern
+	// unique stacks into stack_traces, update event rows with their hash.
+	type migEntry struct {
+		id      int64
+		ipsJSON string
+		hash    int64
+	}
+
+	for {
+		migRows, err := db.Query("SELECT id, stack_ips FROM events WHERE stack_ips != '' AND stack_hash = 0 LIMIT 10000")
+		if err != nil {
+			return
+		}
+
+		var entries []migEntry
+		for migRows.Next() {
+			var id int64
+			var ipsJSON string
+			if err := migRows.Scan(&id, &ipsJSON); err != nil {
+				continue
+			}
+			frames := deserializeStackIPs(ipsJSON)
+			if len(frames) == 0 {
+				continue
+			}
+			h := hashStackIPs(frames)
+			entries = append(entries, migEntry{id: id, ipsJSON: ipsJSON, hash: int64(h)})
+		}
+		migRows.Close()
+
+		if len(entries) == 0 {
+			break // no more rows to migrate
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return
+		}
+
+		// Insert unique stacks.
+		stackStmt, err := tx.Prepare("INSERT OR IGNORE INTO stack_traces (hash, ips) VALUES (?, ?)")
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		inserted := make(map[int64]bool)
+		for _, e := range entries {
+			if !inserted[e.hash] {
+				stackStmt.Exec(e.hash, e.ipsJSON)
+				inserted[e.hash] = true
+			}
+		}
+		stackStmt.Close()
+
+		// Update events with hash.
+		updStmt, err := tx.Prepare("UPDATE events SET stack_hash = ? WHERE id = ?")
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		for _, e := range entries {
+			updStmt.Exec(e.hash, e.id)
+		}
+		updStmt.Close()
+
+		tx.Commit()
+	}
 }

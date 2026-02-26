@@ -40,6 +40,7 @@ var (
 	traceRecordAll bool   // Store every event (disable selective storage).
 	traceStack     bool   // Capture userspace stack traces per event.
 	traceDBPath    string // Custom DB path (default: ~/.ingero/ingero.db).
+	traceMaxDB     string // Max DB size (e.g., "10g"). 0 = unlimited.
 )
 
 var traceCmd = &cobra.Command{
@@ -69,6 +70,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceRecordAll, "record-all", false, "store every event individually (disables selective storage, larger DB)")
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
 	traceCmd.Flags().StringVar(&traceDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
+	traceCmd.Flags().StringVar(&traceMaxDB, "max-db", "10g", "max database size (e.g., 10g, 500m, 1t). 0 = unlimited")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -235,6 +237,16 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 		eventStore = s
 		debugf("recording to %s", dbPath)
+
+		// Set size-based DB retention if --max-db is specified.
+		if traceMaxDB != "" && traceMaxDB != "0" {
+			maxBytes, err := store.ParseSize(traceMaxDB)
+			if err != nil {
+				s.Close() // close DB before returning — defer isn't registered yet
+				return fmt.Errorf("parsing --max-db %q: %w", traceMaxDB, err)
+			}
+			eventStore.SetMaxDBSize(maxBytes)
+		}
 
 		// Record session metadata (GPU model, driver, CPU, OS, etc.).
 		// These are ~1ms reads at startup — no overhead concern.
@@ -1340,10 +1352,20 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 
 	if !traceRecord {
 		fmt.Fprintln(w, "  Recording: disabled (--record=false)")
-	} else if traceRecordAll {
-		fmt.Fprintf(w, "  Recording: %s (all events)\n", store.DefaultDBPath())
 	} else {
-		fmt.Fprintf(w, "  Recording: %s (selective — anomalies, sync, sched, page_alloc, lifecycle)\n", store.DefaultDBPath())
+		dbDisplay := traceDBPath
+		if dbDisplay == "" {
+			dbDisplay = store.DefaultDBPath()
+		}
+		mode := "selective"
+		if traceRecordAll {
+			mode = "all events"
+		}
+		if traceMaxDB != "" && traceMaxDB != "0" {
+			fmt.Fprintf(w, "  Recording: %s (%s, max %s)\n", dbDisplay, mode, traceMaxDB)
+		} else {
+			fmt.Fprintf(w, "  Recording: %s (%s)\n", dbDisplay, mode)
+		}
 	}
 	if traceStack {
 		fmt.Fprintln(w, "  Stack traces: enabled")
@@ -1459,6 +1481,9 @@ func formatTraceFlags() string {
 	}
 	if traceProm != "" {
 		flags = append(flags, "prometheus")
+	}
+	if traceMaxDB != "" && traceMaxDB != "0" {
+		flags = append(flags, "max-db="+traceMaxDB)
 	}
 	return strings.Join(flags, ",")
 }
