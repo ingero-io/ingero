@@ -342,10 +342,16 @@ func (s *Server) registerTools() {
 		// Op filter: resolve human-readable name to (source, op) pair.
 		if input.Op != "" {
 			source, op, ok := events.ResolveOp(input.Op)
-			if ok {
-				params.Source = uint8(source)
-				params.Op = op
+			if !ok {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("Unknown operation %q. Examples: cudaMemcpy, cuLaunchKernel, sched_switch", input.Op)},
+					},
+					IsError: true,
+				}, struct{}{}, nil
 			}
+			params.Source = uint8(source)
+			params.Op = op
 		}
 		// PIDs takes precedence over deprecated PID field.
 		if len(input.PIDs) > 0 {
