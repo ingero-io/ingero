@@ -20,14 +20,11 @@ Output: ML_RESULT lines to stdout (for gpu-test.sh ingestion) + report file.
 
 import argparse
 import json
-import os
-import subprocess
 import ssl
 import sys
-import time
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # MCP Client
@@ -44,7 +41,7 @@ class MCPClient:
         self._ctx.check_hostname = False
         self._ctx.verify_mode = ssl.CERT_NONE
 
-    def call(self, tool: str, arguments: dict | None = None) -> dict:
+    def call(self, tool: str, arguments: Optional[dict] = None) -> dict:
         """Call an MCP tool and return the parsed result."""
         self._id += 1
         payload = {
@@ -148,24 +145,6 @@ def safe_div(a, b, default=0):
         return default
     return a / b
 
-def fmt_us(nanos) -> str:
-    """Format nanoseconds as microseconds."""
-    if nanos is None:
-        return "N/A"
-    return f"{nanos / 1000:.0f}us"
-
-def fmt_ms(nanos) -> str:
-    """Format nanoseconds as milliseconds."""
-    if nanos is None:
-        return "N/A"
-    return f"{nanos / 1e6:.1f}ms"
-
-def fmt_pct(frac) -> str:
-    """Format fraction as percentage."""
-    if frac is None:
-        return "N/A"
-    return f"{frac * 100:.1f}%"
-
 
 # ---------------------------------------------------------------------------
 # Investigation Framework
@@ -208,6 +187,8 @@ class Investigation:
     def result_line(self) -> str:
         """ML_RESULT line for gpu-test.sh ingestion."""
         detail = f"{self.verdict}: {self.finding}"
+        # Sanitize pipe chars — they are the field delimiter in ML_RESULT protocol.
+        detail = detail.replace("|", "/")
         if len(detail) > 200:
             detail = detail[:197] + "..."
         return f"ML_RESULT|{self.tid}|{self.tid}: {self.title}|{self.status}|{detail}|0"
@@ -396,8 +377,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             inv.set_verdict("DETECTED",
                             f"allocs={allocs}, frees={frees}, imbalance={imbalance}, total={total_bytes/1e6:.0f}MB")
         elif allocs > 0:
-            inv.set_verdict("DETECTED",
-                            f"allocs={allocs}, frees={frees}, total={total_bytes/1e6:.0f}MB (alloc_stress visible)")
+            inv.set_verdict("HEALTHY",
+                            f"allocs={allocs}, frees={frees}, total={total_bytes/1e6:.0f}MB (balanced)")
         else:
             inv.set_verdict("HEALTHY", "no allocation events")
     else:
@@ -429,8 +410,9 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     cnt = r2_rows[0].get("cnt", 0) if r2_rows else 0
     avg = r2_rows[0].get("avg_dur", 0) or 0 if r2_rows else 0
     var_dur = r2_rows[0].get("var_dur", 0) or 0 if r2_rows else 0
-    cv = (var_dur ** 0.5 / avg) if avg > 0 else 0
-    if cv > 2.0:
+    # max(0, ...) prevents complex numbers from negative variance (floating-point imprecision)
+    cv = (max(0, var_dur) ** 0.5 / avg) if avg > 0 else 0
+    if cv > 3.0:  # Threshold 3.0: mixed workloads naturally have CV ~2-3
         inv.set_verdict("DETECTED", f"kernel duration CV={cv:.2f} (bimodal suspected)")
     else:
         inv.set_verdict("HEALTHY", f"kernel duration CV={cv:.2f}, no bimodal pattern")
@@ -552,13 +534,17 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=False,
                         question="Is there hardware degradation? Baseline drift in transfer speeds?")
 
-    # Action 1: memcpy p99 per 15s bucket (trend check)
+    # Action 1: memcpy p99 per 15s bucket (trend check) — scoped to most recent session
     r1 = mcp.run_sql("""
+        WITH last_session AS (
+            SELECT started_at FROM sessions ORDER BY started_at DESC LIMIT 1
+        )
         SELECT CAST(timestamp / 15000000000 AS INT) * 15 as bucket,
                COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us
         FROM events WHERE source=1 AND op=4
+          AND timestamp >= (SELECT CAST(strftime('%s', started_at) AS INT) * 1000000000 FROM last_session)
         GROUP BY bucket ORDER BY bucket
     """)
     rows1 = sql_to_dicts(r1)
@@ -745,8 +731,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         inv.set_verdict("DETECTED",
                         f"mallocs={mallocs}, frees={frees}, net leak={imbalance}")
     elif mallocs > 0:
-        inv.set_verdict("DETECTED",
-                        f"mallocs={mallocs}, frees={frees} (alloc_stress activity)")
+        inv.set_verdict("HEALTHY",
+                        f"mallocs={mallocs}, frees={frees}, balanced (no leak)")
     else:
         inv.set_verdict("HEALTHY", "no allocation events")
 
@@ -777,7 +763,9 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     max_us = r1_rows[0].get("max_us", 0) or 0 if r1_rows else 0
     avg_us = r1_rows[0].get("avg_us", 0) or 0 if r1_rows else 0
     outlier_ratio = safe_div(max_us, avg_us)
-    if outlier_ratio > 50 and cnt > 100:
+    # Threshold 200x: mixed workloads (cold start + steady state) naturally have high
+    # max/avg ratios due to different kernel types. Only flag extreme outliers.
+    if outlier_ratio > 200 and cnt > 100:
         inv.set_verdict("DETECTED", f"kernel outlier ratio {outlier_ratio:.1f}x (may indicate AMP)")
     else:
         inv.set_verdict("HEALTHY", f"kernel count={cnt}, outlier ratio={outlier_ratio:.1f}x")
@@ -818,14 +806,13 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "baseline vs contention launch throughput",
                    f"{len(rows2)} phases")
 
-    # Action 3: overhead fraction
+    # Action 3: overhead fraction (CUDA+Driver only — excluding HOST to avoid inflated denominator)
     r3 = mcp.run_sql("""
         SELECT
-            SUM(CASE WHEN source=3 THEN duration ELSE 0 END) as host_dur,
             SUM(CASE WHEN source=1 AND op=4 THEN duration ELSE 0 END) as memcpy_dur,
             SUM(CASE WHEN (source=1 AND op=3) OR (source=4 AND op=1) THEN duration ELSE 0 END) as launch_dur,
             SUM(duration) as total_dur
-        FROM events
+        FROM events WHERE source IN (1, 4)
     """)
     r3_rows = sql_to_dicts(r3)
     inv.add_action("run_sql", "overhead (sched + memcpy) vs launch fraction",
@@ -1300,14 +1287,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     if rows1:
         dir_info = ", ".join(f"{r.get('dir', '?')}: {r.get('cnt', 0)} calls" for r in rows1)
-        bw_info = ", ".join(f"{r.get('dir', '?')}: {r.get('bw_gbps', 0):.1f} GB/s" for r in rows3) if rows3 else ""
+        bw_info = ", ".join(
+            f"{r.get('dir', '?')}: {(r.get('bw_gbps') or 0):.1f} GB/s" for r in rows3
+        ) if rows3 else ""
 
         if memcpy_pct > 20:
             inv.set_verdict("DETECTED",
                             f"memcpy={memcpy_pct:.1f}% of CUDA time. {dir_info}. BW: {bw_info}")
         else:
-            inv.set_verdict("DETECTED",
-                            f"memcpy={memcpy_pct:.1f}% wall-time. {dir_info}")
+            inv.set_verdict("HEALTHY",
+                            f"memcpy={memcpy_pct:.1f}% wall-time (low). {dir_info}")
     else:
         inv.set_verdict("HEALTHY", "no memcpy events (driver-only transfers)")
 

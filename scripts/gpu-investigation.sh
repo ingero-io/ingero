@@ -186,8 +186,9 @@ echo -e "$(ts)   Training PID: $TRAIN_PID"
 echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) with --record-all --stack..."
 
 # Start trace — --record-all stores every event, --stack captures call stacks
-sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration ${TRACE_DURATION}s \
-    2> logs/gpu-inv-trace.log &
+# Redirect both stdout and stderr to log (stdout bleed corrupts ML_RESULT parsing).
+sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration "${TRACE_DURATION}s" \
+    > logs/gpu-inv-trace.log 2>&1 &
 TRACE_PID=$!
 cleanup_pids+=("$TRACE_PID")
 
@@ -237,7 +238,9 @@ sleep 40
 echo -e "$(ts) ${CYAN}[PHASE 4]${NC} Killing stressors, recovery phase (20s)..."
 PHASE4_START=$(date +%s.%N)
 
-sudo kill "$STRESS_PID" 2>/dev/null || true
+# pkill -f the actual stress-ng workers — sudo kill on the wrapper PID
+# only kills the sudo process, not the stress-ng children it spawned.
+sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
 
 # Phase 4 + 5 run for the remaining 30s of the trace
 echo -e "$(ts)   Waiting for trace to finish (~30s remaining)..."
@@ -270,7 +273,8 @@ sudo cp "${ML_DB}-shm" logs/gpu-investigation.db-shm 2>/dev/null && sudo chmod 6
 echo -e "$(ts) ${CYAN}[MCP]${NC} Starting MCP server..."
 
 MCP_PORT=$(( 8443 + RANDOM % 1000 ))
-./bin/ingero mcp --db "$ML_DB" --http ":${MCP_PORT}" > logs/gpu-inv-mcp.log 2>&1 &
+# sudo required: trace creates root-owned DB, MCP server must be able to read it.
+sudo ./bin/ingero mcp --db "$ML_DB" --http ":${MCP_PORT}" > logs/gpu-inv-mcp.log 2>&1 &
 MCP_PID=$!
 cleanup_pids+=("$MCP_PID")
 
