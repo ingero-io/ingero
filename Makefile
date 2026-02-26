@@ -129,6 +129,8 @@ gpu-logs:
 		"user@$$IP:~/workspace/ingero/logs/*.json" \
 		"user@$$IP:~/workspace/ingero/logs/*.txt" \
 		"user@$$IP:~/workspace/ingero/logs/*.out" \
+		"user@$$IP:~/workspace/ingero/logs/*.db" \
+		"user@$$IP:~/workspace/ingero/logs/*.md" \
 		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -p $$PORT -o StrictHostKeyChecking=no user@$$IP \
@@ -177,6 +179,8 @@ lambda-logs:
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.json" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.txt" \
 		"ubuntu@$$IP:~/workspace/ingero/logs/*.out" \
+		"ubuntu@$$IP:~/workspace/ingero/logs/*.db" \
+		"ubuntu@$$IP:~/workspace/ingero/logs/*.md" \
 		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -o StrictHostKeyChecking=no ubuntu@$$IP \
@@ -242,6 +246,8 @@ azure-logs:
 		"azureuser@$$IP:~/workspace/ingero/logs/*.json" \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.txt" \
 		"azureuser@$$IP:~/workspace/ingero/logs/*.out" \
+		"azureuser@$$IP:~/workspace/ingero/logs/*.db" \
+		"azureuser@$$IP:~/workspace/ingero/logs/*.md" \
 		"$$DIR/" 2>/dev/null || true; \
 	echo "Transferring SQLite DB..."; \
 	ssh -o StrictHostKeyChecking=no azureuser@$$IP \
