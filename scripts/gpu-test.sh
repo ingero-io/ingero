@@ -20,7 +20,7 @@
 #   3: OTLP + Prometheus export (T14a-e, T15-T17)
 #   4: Stack latency benchmark (T18)
 #   5: MCP AI diagnostic (T19a-e, T20-T21)
-#   6: ML engineer investigation (T22a-T22g)
+#   6: GPU problem investigation (T23a-T23w, 23 issues via MCP)
 #
 # Parallelization strategy (saves ~350s / 44% faster):
 #   - T02 demos + T09 synthetics run as background jobs during Phase 1
@@ -1331,20 +1331,20 @@ else
 fi
 
 ################################################################################
-# Phase 6: ML Engineer Investigation (T22a-T22g)
+# Phase 6: GPU Problem Investigation (T23a-T23w, 23 issues via MCP)
 ################################################################################
-header "Phase 6: ML Engineer Investigation"
+header "Phase 6: GPU Problem Investigation (23 issues)"
 
 _test_start=$SECONDS
-log "Running ML investigation scenario (ResNet-50 + stress-ng + MCP)..."
+log "Running 23 GPU problem investigations (ResNet-50 + alloc_stress + stress-ng + MCP)..."
 
-ML_OUTPUT=$(bash scripts/ml-investigation.sh 2>&1)
+ML_OUTPUT=$(bash scripts/gpu-investigation.sh 2>&1)
 ML_EXIT=$?
 
 # Display the script's output (it has its own formatting)
 echo "$ML_OUTPUT" | grep -v '^ML_RESULT|'
 
-# Ingest structured results from ml-investigation.sh
+# Ingest structured results from gpu-investigation.sh
 ML_INGESTED=0
 while IFS='|' read -r tid name status detail dur; do
     record "$status" "$name" "$detail"
@@ -1353,13 +1353,13 @@ done < <(echo "$ML_OUTPUT" | grep '^ML_RESULT|' | sed 's/^ML_RESULT|//')
 
 if [[ "$ML_INGESTED" -eq 0 ]]; then
     if [[ "$ML_EXIT" -ne 0 ]]; then
-        record "FAIL" "T22a: ML investigation" "script failed (exit $ML_EXIT)"
+        record "FAIL" "T23a: GPU investigation" "script failed (exit $ML_EXIT)"
     else
-        record "FAIL" "T22a: ML investigation" "no structured results returned"
+        record "FAIL" "T23a: GPU investigation" "no structured results returned"
     fi
 fi
 
-log "ML investigation: ingested $ML_INGESTED test results"
+log "GPU investigation: ingested $ML_INGESTED test results"
 
 ################################################################################
 # Final Report
@@ -1457,7 +1457,7 @@ echo "$(ts) JSON:   logs/test-report.json"
 echo "$(ts) Benchmark: logs/benchmark-summary.txt"
 echo ""
 echo "Log files:"
-ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/trace-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log logs/ml-*.{json,log} logs/ml-investigation-report.md 2>/dev/null
+ls -la logs/test-report.txt logs/test-report.json logs/benchmark-summary.txt logs/integration-report.log logs/mcp-server.log logs/mcp-session.txt logs/bg-*.out logs/stack-*.{json,log} logs/otlp-*.{json,log} logs/combined-*.{json,log} logs/explain-*.log logs/bench-*.json logs/trace-*.{json,log} logs/check-*.log logs/demo-*.{json,log} logs/prom-*.{json,log,txt} logs/db-schema.txt logs/nvidia-smi.log logs/uname.log logs/version.log logs/ml-*.{json,log} logs/ml-investigation-report.md logs/gpu-inv-*.{json,log} logs/gpu-investigation-report.log logs/gpu-investigation.db 2>/dev/null
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     exit 1
