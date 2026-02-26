@@ -14,6 +14,8 @@
 # Setup: ResNet-50 CIFAR-10 training + stress-ng CPU contention
 # Methodology: 60s trace — first 15s baseline (no stress), then 45s contention.
 #   Single trace, two phases. Stress-ng starts at t+15s in background.
+#   All analysis reads from DB via per-op queries (ingero query --json --op X),
+#   demonstrating the production workflow: trace → DB → query → analyze.
 # Result: 7 tests (T22a-T22g), markdown report, structured result lines
 #
 # Run standalone:   bash scripts/ml-investigation.sh
@@ -75,6 +77,7 @@ record() {
 # PIDs to clean up on exit
 cleanup_pids=()
 ML_DB=""
+ML_TMPDIR=""
 cleanup() {
     # Kill sudo-spawned processes FIRST (pkill -f) — kill+wait on the sudo
     # wrapper PID can deadlock because sudo doesn't forward SIGTERM to children.
@@ -95,6 +98,7 @@ cleanup() {
     if [[ -n "$ML_DB" ]]; then
         rm -f "${ML_DB}" "${ML_DB}-wal" "${ML_DB}-shm" 2>/dev/null || true
     fi
+    [[ -n "$ML_TMPDIR" ]] && rm -rf "$ML_TMPDIR"
 }
 trap cleanup EXIT
 
@@ -177,7 +181,7 @@ echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) in background..."
 # Use --record-all so every event is individually queryable (Q2-Q3 need
 # per-event cuLaunchKernel and cudaStreamSync latencies, not just aggregates).
 sudo ./bin/ingero trace --db "$ML_DB" --record-all --duration ${TRACE_DURATION}s \
-    --json > logs/ml-trace.json 2> logs/ml-trace.log &
+    2> logs/ml-trace.log &
 TRACE_PID=$!
 cleanup_pids+=("$TRACE_PID")
 
@@ -216,13 +220,16 @@ sudo cp "$ML_DB" logs/ml-investigation.db && sudo chmod 644 logs/ml-investigatio
 sudo cp "${ML_DB}-wal" logs/ml-investigation.db-wal 2>/dev/null && sudo chmod 644 logs/ml-investigation.db-wal || true
 sudo cp "${ML_DB}-shm" logs/ml-investigation.db-shm 2>/dev/null && sudo chmod 644 logs/ml-investigation.db-shm || true
 
-# Count events
-TOTAL_EVENTS=$(gcount '"op"' logs/ml-trace.json)
-CUDA_EVENTS=$(gcount '"source":"cuda"' logs/ml-trace.json)
-DRIVER_EVENTS=$(gcount '"source":"driver"' logs/ml-trace.json)
-HOST_EVENTS=$(gcount '"source":"host"' logs/ml-trace.json)
+# Query events from DB per-op (production workflow: query specific operations)
+ML_TMPDIR=$(mktemp -d)
 
-echo -e "$(ts)   Done: ${TOTAL_EVENTS} events (cuda=${CUDA_EVENTS} driver=${DRIVER_EVENTS} host=${HOST_EVENTS})"
+echo -e "$(ts)   Querying events from DB..."
+./bin/ingero query --db "$ML_DB" --json --op cudaStreamSync --limit -1 --since 10m \
+    > "$ML_TMPDIR/sync.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/sync.json"
+./bin/ingero query --db "$ML_DB" --json --op cuLaunchKernel --limit -1 --since 10m \
+    > "$ML_TMPDIR/launch.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/launch.json"
+./bin/ingero query --db "$ML_DB" --json --op sched_switch --limit -1 --since 10m \
+    > "$ML_TMPDIR/sched.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/sched.json"
 
 # Kill stress-ng now (trace is done)
 sudo kill "$STRESS_PID" 2>/dev/null || true
@@ -231,12 +238,13 @@ kill "$TRAIN_PID" 2>/dev/null || true
 wait "$TRAIN_PID" 2>/dev/null || true
 
 ################################################################################
-# Unified Python analysis — single JSONL pass
+# Unified Python analysis — per-op DB queries
 #
-# Reads logs/ml-trace.json once, outputs all computed values for downstream
-# tests. Avoids reading the (potentially ~900MB) file 3 separate times.
+# Reads 3 per-op JSON arrays from DB queries (sync, launch, sched).
+# Outputs all computed values for downstream tests.
 #
 # Output lines (one per metric, parseable via grep -oP):
+#   event_counts: sync=X launch=Y sched=Z
 #   launch_full: n=X p50=Yus p99=Zus ratio=Wx
 #   sched_full: n=X max=Yus over_10ms=Z has_durations=yes|no
 #   sync_full: n=X p50=Yus p99=Zus ratio=Wx
@@ -258,11 +266,21 @@ import json, sys
 from datetime import datetime
 
 BASELINE_SECS = ${BASELINE_SECS}
+SYNC_FILE = '${ML_TMPDIR}/sync.json'
+LAUNCH_FILE = '${ML_TMPDIR}/launch.json'
+SCHED_FILE = '${ML_TMPDIR}/sched.json'
+
+sync_events = json.load(open(SYNC_FILE))
+launch_events = json.load(open(LAUNCH_FILE))
+sched_events = json.load(open(SCHED_FILE))
+
+# Output event counts (for T22a and display)
+print(f'event_counts: sync={len(sync_events)} launch={len(launch_events)} sched={len(sched_events)}')
 
 sync_durs = []
 launch_durs = []
 sched_durs = []
-sched_total = 0
+sched_total = len(sched_events)
 
 # Phase-split collections (keyed by phase: 'baseline' or 'contention')
 phase_sync = {'baseline': [], 'contention': []}
@@ -271,15 +289,9 @@ phase_launch = {'baseline': [], 'contention': []}
 # Temporal bins: second offset -> {sched_count, sync_p99s}
 temporal_bins = {}
 
-first_ts = None
-
 def parse_ts(ts_str):
     \"\"\"Parse RFC3339Nano timestamp to epoch seconds (float).\"\"\"
     try:
-        # Handle nanosecond precision by truncating to microseconds.
-        # Go's RFC3339Nano can emit 1-9 fractional digits; Python 3.10's
-        # fromisoformat requires exactly 3 or 6 digits (3.11+ is more lenient).
-        # Pad to 6 digits for cross-version compatibility.
         s = ts_str.rstrip('Z')
         if '.' in s:
             base, frac = s.split('.', 1)
@@ -290,51 +302,59 @@ def parse_ts(ts_str):
     except:
         return None
 
-for line in sys.stdin:
-    try:
-        e = json.loads(line)
-    except:
-        continue
-
-    op = e.get('op', '')
-    d = e.get('duration_ns', 0)
+# Find first_ts across ALL events (they interleave temporally)
+all_timestamps = []
+for e in sync_events + launch_events + sched_events:
     ts_str = e.get('timestamp', '')
-    ts_epoch = parse_ts(ts_str) if ts_str else None
+    if ts_str:
+        t = parse_ts(ts_str)
+        if t is not None:
+            all_timestamps.append(t)
 
-    # Determine phase based on relative offset from first event
-    phase = 'contention'  # default if we can't determine
-    sec_offset = None
-    if ts_epoch is not None:
-        if first_ts is None:
-            first_ts = ts_epoch
-        sec_offset = ts_epoch - first_ts
-        phase = 'baseline' if sec_offset < BASELINE_SECS else 'contention'
+first_ts = min(all_timestamps) if all_timestamps else None
 
-        # Temporal bin (integer second)
-        sec_bin = int(sec_offset)
-        if sec_bin not in temporal_bins:
-            temporal_bins[sec_bin] = {'sched': 0, 'sync_durs': []}
+def classify(ts_str):
+    \"\"\"Return (phase, sec_offset) for a timestamp.\"\"\"
+    if not ts_str or first_ts is None:
+        return 'contention', None
+    t = parse_ts(ts_str)
+    if t is None:
+        return 'contention', None
+    sec_offset = t - first_ts
+    phase = 'baseline' if sec_offset < BASELINE_SECS else 'contention'
+    sec_bin = int(sec_offset)
+    if sec_bin not in temporal_bins:
+        temporal_bins[sec_bin] = {'sched': 0, 'sync_durs': []}
+    return phase, sec_offset
 
-    if op == 'cudaStreamSync':
-        if d > 0:
-            dur_us = d / 1000
-            sync_durs.append(dur_us)
-            phase_sync[phase].append(dur_us)
-            if sec_offset is not None:
-                temporal_bins[int(sec_offset)]['sync_durs'].append(dur_us)
-
-    elif op == 'cuLaunchKernel':
-        if d > 0:
-            dur_us = d / 1000
-            launch_durs.append(dur_us)
-            phase_launch[phase].append(dur_us)
-
-    elif op == 'sched_switch':
-        sched_total += 1
-        if d > 0:
-            sched_durs.append(d / 1000)
+# Process sync events
+for e in sync_events:
+    d = e.get('duration_ns', 0)
+    phase, sec_offset = classify(e.get('timestamp', ''))
+    if d > 0:
+        dur_us = d / 1000
+        sync_durs.append(dur_us)
+        phase_sync[phase].append(dur_us)
         if sec_offset is not None:
-            temporal_bins[int(sec_offset)]['sched'] += 1
+            temporal_bins[int(sec_offset)]['sync_durs'].append(dur_us)
+
+# Process launch events
+for e in launch_events:
+    d = e.get('duration_ns', 0)
+    phase, sec_offset = classify(e.get('timestamp', ''))
+    if d > 0:
+        dur_us = d / 1000
+        launch_durs.append(dur_us)
+        phase_launch[phase].append(dur_us)
+
+# Process sched events
+for e in sched_events:
+    d = e.get('duration_ns', 0)
+    phase, sec_offset = classify(e.get('timestamp', ''))
+    if d > 0:
+        sched_durs.append(d / 1000)
+    if sec_offset is not None:
+        temporal_bins[int(sec_offset)]['sched'] += 1
 
 
 def percentiles(vals):
@@ -400,7 +420,6 @@ else:
 
 # --- Temporal correlation ---
 # Spearman rank correlation: sched_count vs sync_p99 per second
-# Only use seconds that have both sched and sync data
 paired_secs = []
 for sec_bin, data in sorted(temporal_bins.items()):
     if data['sched'] > 0 or data['sync_durs']:
@@ -419,7 +438,7 @@ def rank(values):
         j = i
         while j < len(indexed) and indexed[j][1] == indexed[i][1]:
             j += 1
-        avg_rank = (i + j + 1) / 2  # average rank for ties
+        avg_rank = (i + j + 1) / 2
         for k in range(i, j):
             ranks[indexed[k][0]] = avg_rank
         i = j
@@ -428,15 +447,12 @@ def rank(values):
 if len(paired_secs) >= 5:
     sched_vals = [p[0] for p in paired_secs]
     sync_vals = [p[1] for p in paired_secs]
-    # Guard: if either variable is constant (all ties), rho is undefined
     if len(set(sched_vals)) < 2 or len(set(sync_vals)) < 2:
         print('temporal_rho: N/A')
     else:
         r_sched = rank(sched_vals)
         r_sync = rank(sync_vals)
         n = len(paired_secs)
-        # Approximate Spearman (no tie-correction term; with non-constant
-        # data and 60+ bins the approximation error is <0.01)
         d_sq = sum((r_sched[i] - r_sync[i])**2 for i in range(n))
         rho = 1 - (6 * d_sq) / (n * (n*n - 1))
         print(f'temporal_rho: {rho:.2f}')
@@ -458,7 +474,7 @@ if paired_secs:
         print('temporal_overlap: 0%')
 else:
     print('temporal_overlap: N/A')
-" < logs/ml-trace.json 2>logs/ml-analysis-stderr.log || echo "analysis_error")
+" 2>logs/ml-analysis-stderr.log || echo "analysis_error")
 
 echo "$ANALYSIS_OUT" > logs/ml-analysis.log
 
@@ -475,6 +491,19 @@ LAUNCH_RATE=$(echo "$ANALYSIS_OUT" | grep '^launch_rate:' || echo "")
 TEMPORAL_RHO=$(echo "$ANALYSIS_OUT" | grep -oP 'temporal_rho: \K\S+' || echo "N/A")
 TEMPORAL_OVERLAP=$(echo "$ANALYSIS_OUT" | grep -oP 'temporal_overlap: \K\S+' || echo "N/A")
 
+# Extract event counts from analysis (approximate — only sync+launch+sched, but
+# sufficient for T22a threshold check of >1000)
+SYNC_TOTAL=$(echo "$ANALYSIS_OUT" | grep -oP 'sync=\K[0-9]+' | head -1 || echo "0")
+LAUNCH_TOTAL=$(echo "$ANALYSIS_OUT" | grep -oP 'launch=\K[0-9]+' | head -1 || echo "0")
+SCHED_TOTAL=$(echo "$ANALYSIS_OUT" | grep -oP 'sched=\K[0-9]+' | head -1 || echo "0")
+TOTAL_EVENTS=$((SYNC_TOTAL + LAUNCH_TOTAL + SCHED_TOTAL))
+
+# Map per-op counts to source categories for T22a
+CUDA_EVENTS=$SYNC_TOTAL      # cudaStreamSync = cuda source
+DRIVER_EVENTS=$LAUNCH_TOTAL   # cuLaunchKernel = driver source
+HOST_EVENTS=$SCHED_TOTAL      # sched_switch = host source
+
+echo -e "$(ts)   Done: ${TOTAL_EVENTS} events (sync=${SYNC_TOTAL} launch=${LAUNCH_TOTAL} sched=${SCHED_TOTAL})"
 echo -e "$(ts)   Analysis complete. See logs/ml-analysis.log"
 
 echo ""
@@ -506,7 +535,7 @@ if [[ "$CHAIN_COUNT" -gt 0 ]]; then
 fi
 
 # T22a: trace captured events — require CUDA/driver data for investigation
-# PASS: >1000 events AND (CUDA > 0 OR DRIVER > 0) AND HOST > 0
+# PASS: >1000 events AND (sync > 0 OR launch > 0) AND sched > 0
 # FAIL: enough events but no CUDA/driver data (investigation impossible)
 # FAIL: too few events total
 CUDA_PRESENT=0
@@ -514,12 +543,12 @@ if [[ "$TOTAL_EVENTS" -gt 1000 ]]; then
     if [[ "$CUDA_EVENTS" -gt 0 || "$DRIVER_EVENTS" -gt 0 ]]; then
         CUDA_PRESENT=1
         if [[ "$HOST_EVENTS" -gt 0 ]]; then
-            record "PASS" "T22a: trace captured events" "${TOTAL_EVENTS} events (cuda=${CUDA_EVENTS} driver=${DRIVER_EVENTS} host=${HOST_EVENTS})"
+            record "PASS" "T22a: trace captured events" "${TOTAL_EVENTS} events (sync=${SYNC_TOTAL} launch=${LAUNCH_TOTAL} sched=${SCHED_TOTAL})"
         else
-            record "PASS" "T22a: trace captured events" "${TOTAL_EVENTS} events (cuda=${CUDA_EVENTS} driver=${DRIVER_EVENTS}, no host — cross-stack limited)"
+            record "PASS" "T22a: trace captured events" "${TOTAL_EVENTS} events (sync=${SYNC_TOTAL} launch=${LAUNCH_TOTAL}, no sched — cross-stack limited)"
         fi
     else
-        record "FAIL" "T22a: trace captured events" "no CUDA/driver data for investigation (cuda=${CUDA_EVENTS} driver=${DRIVER_EVENTS} host=${HOST_EVENTS})"
+        record "FAIL" "T22a: trace captured events" "no CUDA/driver data for investigation (sync=${SYNC_TOTAL} launch=${LAUNCH_TOTAL} sched=${SCHED_TOTAL})"
     fi
 else
     record "FAIL" "T22a: trace captured events" "only ${TOTAL_EVENTS} events (need >1000)"
@@ -654,7 +683,7 @@ if [[ "$SYNC_COUNT" -gt 0 ]]; then
     fi
 else
     # No cudaStreamSync events — try cudaDeviceSync as fallback
-    DSYNC_COUNT=$(gcount '"cudaDeviceSync"' logs/ml-trace.json)
+    DSYNC_COUNT=$(./bin/ingero query --db "$ML_DB" --op cudaDeviceSync --limit 1 --since 10m 2>/dev/null | grep -c 'cudaDeviceSync' || echo "0")
     if [[ "$DSYNC_COUNT" -gt 0 ]]; then
         record "SKIP" "T22e: sync tail amplification" "no cudaStreamSync but ${DSYNC_COUNT} cudaDeviceSync (workload uses device sync)"
     else
@@ -810,7 +839,7 @@ fi
     echo "**Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "**GPU**: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
     echo "**DB**: ${ML_DB}"
-    echo "**Events**: ${TOTAL_EVENTS} (cuda=${CUDA_EVENTS} driver=${DRIVER_EVENTS} host=${HOST_EVENTS})"
+    echo "**Events**: ${TOTAL_EVENTS} (sync=${SYNC_TOTAL} launch=${LAUNCH_TOTAL} sched=${SCHED_TOTAL})"
     echo "**Methodology**: ${BASELINE_SECS}s baseline + $((TRACE_DURATION - BASELINE_SECS))s contention (stress-ng $(nproc) workers)"
     echo ""
     echo "## Q1: \"My training is slow — what's the root cause?\""
@@ -832,7 +861,7 @@ fi
     echo ""
     echo "## Q2: \"Is it the GPU or the host?\""
     echo ""
-    echo "**Tools**: Unified analysis from trace JSONL"
+    echo "**Tools**: Per-operation DB queries (\`ingero query --json\`)"
     echo ""
     echo "### GPU Kernel Health (cuLaunchKernel)"
     echo ""
@@ -857,7 +886,7 @@ fi
     echo ""
     echo "## Q3: \"Show me how CPU contention hits my CUDA calls\""
     echo ""
-    echo "**Tools**: Unified analysis from trace JSONL"
+    echo "**Tools**: Per-operation DB queries (\`ingero query --json\`)"
     echo ""
     echo "### cudaStreamSync Latency"
     echo ""
