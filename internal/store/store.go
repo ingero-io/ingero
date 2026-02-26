@@ -1260,6 +1260,111 @@ func (s *Store) Close() error {
 	return err
 }
 
+// ExecuteReadOnly runs a read-only SQL query against the database and returns
+// the column names, row data, and whether the result was truncated by maxRows.
+//
+// Validation layers (defense-in-depth):
+//  1. First keyword must be SELECT, WITH, or EXPLAIN
+//  2. Write keywords (INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/REPLACE)
+//     rejected anywhere in the query — blocks writable CTEs like
+//     WITH x AS (...) DELETE FROM events RETURNING *
+//  3. Multi-statement queries rejected (semicolon + non-whitespace)
+//
+// maxRows caps returned rows (default 1000, max 10000). Fetches maxRows+1
+// internally to detect truncation accurately.
+func (s *Store) ExecuteReadOnly(ctx context.Context, query string, maxRows int) ([]string, [][]any, bool, error) {
+	// Default and cap row limit.
+	if maxRows <= 0 {
+		maxRows = 1000
+	}
+	if maxRows > 10000 {
+		maxRows = 10000
+	}
+
+	// Validate: first keyword must be SELECT, WITH, or EXPLAIN.
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return nil, nil, false, fmt.Errorf("empty query")
+	}
+	firstWord := strings.ToUpper(strings.Fields(trimmed)[0])
+	switch firstWord {
+	case "SELECT", "WITH", "EXPLAIN":
+		// allowed
+	default:
+		return nil, nil, false, fmt.Errorf("only SELECT, WITH, and EXPLAIN queries are allowed (got %s)", firstWord)
+	}
+
+	// Reject write keywords anywhere in the query. This blocks writable CTEs
+	// (WITH ... DELETE/INSERT/UPDATE) which pass the first-word check.
+	// SQL comments (/* */ and --) are included in the uppercase string, so
+	// commented-out writes are also rejected — safe direction (false positive).
+	upper := strings.ToUpper(trimmed)
+	for _, kw := range []string{
+		"INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ",
+		"CREATE ", "ATTACH ", "DETACH ", "REPLACE ", "REINDEX", "VACUUM",
+	} {
+		if strings.Contains(upper, kw) {
+			return nil, nil, false, fmt.Errorf("write operations are not allowed in read-only queries")
+		}
+	}
+
+	// Reject multi-statement queries: no semicolons followed by non-whitespace.
+	// Find the first semicolon and check if anything meaningful follows it.
+	if idx := strings.Index(trimmed, ";"); idx >= 0 {
+		rest := strings.TrimSpace(trimmed[idx+1:])
+		if rest != "" {
+			return nil, nil, false, fmt.Errorf("multi-statement queries are not allowed")
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, trimmed)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("query execution failed: %w", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("reading columns: %w", err)
+	}
+
+	// Fetch maxRows+1 to detect truncation accurately. If we get exactly
+	// maxRows, we don't know if there were more — the +1 row tells us.
+	result := make([][]any, 0)
+	for rows.Next() {
+		if len(result) > maxRows {
+			break
+		}
+		// Create scan targets — database/sql needs pointers to any.
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, nil, false, fmt.Errorf("scanning row: %w", err)
+		}
+		// Normalize []byte → string so JSON marshal doesn't base64-encode
+		// TEXT column values. modernc.org/sqlite may return []byte for TEXT.
+		for i, v := range vals {
+			if b, ok := v.([]byte); ok {
+				vals[i] = string(b)
+			}
+		}
+		result = append(result, vals)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, fmt.Errorf("iterating rows: %w", err)
+	}
+
+	truncated := len(result) > maxRows
+	if truncated {
+		result = result[:maxRows]
+	}
+
+	return cols, result, truncated, nil
+}
+
 // StoredChain is a causal chain as persisted in SQLite.
 // Mirrors correlate.CausalChain but uses plain types for storage independence.
 type StoredChain struct {

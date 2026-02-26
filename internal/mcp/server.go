@@ -1,6 +1,6 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes seven tools to AI agents:
+// The MCP server exposes eight tools to AI agents:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
 //   - get_trace_stats: Get recent CUDA/host stats from the SQLite database
 //   - query_events: Query stored events with filters
@@ -8,6 +8,7 @@
 //   - get_sessions: Query trace session metadata (GPU, CPU, driver, OS, versions)
 //   - run_demo: Run a synthetic demo scenario
 //   - get_test_report: Return the GPU integration test report (JSON)
+//   - run_sql: Execute read-only SQL for ad-hoc analysis
 //
 // Usage:
 //
@@ -607,6 +608,97 @@ func (s *Server) registerTools() {
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: string(pretty)},
+			},
+		}, struct{}{}, nil
+	})
+
+	// Tool 8: run_sql — execute read-only SQL for ad-hoc analysis.
+	//
+	// Why this exists: the 7 fixed tools answer pre-anticipated questions.
+	// When an AI needs temporal bucketing, threshold analysis, per-PID breakdowns,
+	// or cross-operation correlation, it hits a wall. run_sql lets the AI generate
+	// ad-hoc SQL, turning it from a dashboard reader into a full analyst.
+	type sqlInput struct {
+		Query string `json:"query" jsonschema:"Read-only SQL (SELECT/WITH/EXPLAIN). See tool description for schema."`
+		Limit int    `json:"limit,omitempty" jsonschema:"max rows returned (default 1000, max 10000)"`
+		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+	}
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name: "run_sql",
+		Description: `Execute read-only SQL on the Ingero database. For ad-hoc analysis the fixed tools can't do: temporal bucketing, threshold queries, per-PID breakdowns, throughput calculations. Timeout: 5s.
+
+Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash), system_snapshots(timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur), stack_traces(hash, ips TEXT JSON), schema_info(key, value).
+
+JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), events.stack_hash=stack_traces.hash.
+Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).`,
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sqlInput) (*gomcp.CallToolResult, struct{}, error) {
+		if s.store == nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
+				},
+			}, struct{}{}, nil
+		}
+
+		if strings.TrimSpace(input.Query) == "" {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "query parameter is required"},
+				},
+				IsError: true,
+			}, struct{}{}, nil
+		}
+
+		limit := input.Limit
+		if limit <= 0 {
+			limit = 1000
+		}
+		if limit > 10000 {
+			limit = 10000
+		}
+
+		// 5-second timeout to prevent runaway queries.
+		queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		cols, rows, truncated, err := s.store.ExecuteReadOnly(queryCtx, input.Query, limit)
+		elapsed := time.Since(start)
+		if err != nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf("SQL error: %v", err)},
+				},
+				IsError: true,
+			}, struct{}{}, nil
+		}
+
+		// Build JSON response: columns array + data array-of-arrays.
+		// Array-of-arrays avoids duplicate column name clobbering (e.g.,
+		// SELECT a.id, b.id) and is more compact than per-row key maps.
+		header := map[string]any{
+			"rows":        len(rows),
+			"truncated":   truncated,
+			"duration_ms": elapsed.Milliseconds(),
+		}
+
+		output := map[string]any{
+			"meta":    header,
+			"columns": cols,
+			"data":    rows,
+		}
+
+		tsc := input.TSC == nil || *input.TSC
+		var data []byte
+		if tsc {
+			data, _ = json.Marshal(output)
+		} else {
+			data, _ = json.MarshalIndent(output, "", "  ")
+		}
+
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: string(data)},
 			},
 		}, struct{}{}, nil
 	})
