@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -795,5 +796,455 @@ func TestAggregatesPruned(t *testing.T) {
 	totals, _ = s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
 	if totals.TotalEvents != 0 {
 		t.Errorf("expected 0 after prune, got %d", totals.TotalEvents)
+	}
+}
+
+// makeStack creates a test stack trace with the given instruction pointers.
+func makeStack(ips ...uint64) []events.StackFrame {
+	frames := make([]events.StackFrame, len(ips))
+	for i, ip := range ips {
+		frames[i] = events.StackFrame{IP: ip}
+	}
+	return frames
+}
+
+func TestStackInterning(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Create two identical stacks and one different stack.
+	stackA := makeStack(0x7f001000, 0x7f002000, 0x7f003000)
+	stackB := makeStack(0x7f001000, 0x7f002000, 0x7f003000) // same as A
+	stackC := makeStack(0x7f004000, 0x7f005000)              // different
+
+	// Record 3 events: two with stackA/B (identical), one with stackC.
+	evt1 := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+	evt1.Stack = stackA
+	s.Record(evt1)
+
+	evt2 := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 20*time.Microsecond)
+	evt2.Stack = stackB
+	s.Record(evt2)
+
+	evt3 := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 30*time.Microsecond)
+	evt3.Stack = stackC
+	s.Record(evt3)
+
+	// Event with no stack.
+	evt4 := makeEvt(events.SourceHost, uint8(events.HostSchedSwitch), 5*time.Microsecond)
+	s.Record(evt4)
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify deduplication: stack_traces should have exactly 2 rows
+	// (one for stackA/B, one for stackC).
+	var stackCount int64
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM stack_traces").Scan(&stackCount); err != nil {
+		t.Fatalf("counting stack_traces: %v", err)
+	}
+	if stackCount != 2 {
+		t.Errorf("expected 2 unique stacks in stack_traces, got %d", stackCount)
+	}
+
+	// Query via Query() — stacks should round-trip correctly.
+	result, err := s.Query(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(result) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(result))
+	}
+
+	// Events are chronological (oldest first). Check stacks.
+	if len(result[0].Stack) != 3 {
+		t.Errorf("event 0: expected 3 stack frames, got %d", len(result[0].Stack))
+	} else if result[0].Stack[0].IP != 0x7f001000 {
+		t.Errorf("event 0 frame 0: IP = 0x%x, want 0x7f001000", result[0].Stack[0].IP)
+	}
+
+	if len(result[1].Stack) != 3 {
+		t.Errorf("event 1: expected 3 stack frames, got %d", len(result[1].Stack))
+	}
+
+	if len(result[2].Stack) != 2 {
+		t.Errorf("event 2: expected 2 stack frames, got %d", len(result[2].Stack))
+	} else if result[2].Stack[0].IP != 0x7f004000 {
+		t.Errorf("event 2 frame 0: IP = 0x%x, want 0x7f004000", result[2].Stack[0].IP)
+	}
+
+	// Event 4 (no stack) should have nil/empty stack.
+	if len(result[3].Stack) != 0 {
+		t.Errorf("event 3: expected 0 stack frames, got %d", len(result[3].Stack))
+	}
+
+	// Verify QueryRich also returns stacks correctly.
+	richResult, err := s.QueryRich(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryRich failed: %v", err)
+	}
+	if len(richResult) != 4 {
+		t.Fatalf("QueryRich: expected 4 events, got %d", len(richResult))
+	}
+	if len(richResult[0].Stack) != 3 {
+		t.Errorf("QueryRich event 0: expected 3 stack frames, got %d", len(richResult[0].Stack))
+	}
+
+	cancel()
+	<-done
+}
+
+func TestStackHashDeterministic(t *testing.T) {
+	// Same IPs in same order must produce the same hash.
+	stack1 := makeStack(0xdead, 0xbeef, 0xcafe)
+	stack2 := makeStack(0xdead, 0xbeef, 0xcafe)
+	h1 := hashStackIPs(stack1)
+	h2 := hashStackIPs(stack2)
+	if h1 != h2 {
+		t.Errorf("identical stacks produced different hashes: %d vs %d", h1, h2)
+	}
+
+	// Different IPs must produce different hashes.
+	stack3 := makeStack(0xdead, 0xbeef, 0xfeed)
+	h3 := hashStackIPs(stack3)
+	if h1 == h3 {
+		t.Errorf("different stacks produced same hash: %d", h1)
+	}
+
+	// Order matters.
+	stack4 := makeStack(0xbeef, 0xdead, 0xcafe)
+	h4 := hashStackIPs(stack4)
+	if h1 == h4 {
+		t.Errorf("reordered stacks produced same hash: %d", h1)
+	}
+
+	// Empty stack.
+	h5 := hashStackIPs(nil)
+	if h5 == h1 {
+		t.Errorf("empty stack produced same hash as non-empty")
+	}
+}
+
+func TestStackCachePreload(t *testing.T) {
+	// Test that a second Run() session against the same DB reuses
+	// existing stack_traces (no duplicate inserts).
+	dbPath := filepath.Join(t.TempDir(), "cache-preload.db")
+
+	// First session: insert events with stacks.
+	s1, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("first New failed: %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan struct{})
+	go func() {
+		s1.Run(ctx1)
+		close(done1)
+	}()
+
+	stack := makeStack(0xaaa, 0xbbb, 0xccc)
+	for i := 0; i < 5; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+		evt.Stack = stack
+		s1.Record(evt)
+	}
+	time.Sleep(300 * time.Millisecond)
+	cancel1()
+	<-done1
+	s1.Close()
+
+	// Count stacks after first session.
+	s2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("second New failed: %v", err)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() {
+		s2.Run(ctx2)
+		close(done2)
+	}()
+
+	// Insert same stack again — should not create a new row.
+	for i := 0; i < 3; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+		evt.Stack = stack
+		s2.Record(evt)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	var stackCount int64
+	s2.db.QueryRow("SELECT COUNT(*) FROM stack_traces").Scan(&stackCount)
+	if stackCount != 1 {
+		t.Errorf("expected 1 unique stack after two sessions, got %d", stackCount)
+	}
+
+	// Total events should be 8 (5 from first + 3 from second session).
+	evtCount, _ := s2.Count()
+	if evtCount != 8 {
+		t.Errorf("expected 8 events total, got %d", evtCount)
+	}
+
+	cancel2()
+	<-done2
+	s2.Close()
+}
+
+func TestParseSize(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    int64
+		wantErr bool
+	}{
+		{"10g", 10 * (1 << 30), false},
+		{"10G", 10 * (1 << 30), false},
+		{"10GB", 10 * (1 << 30), false},
+		{"10gb", 10 * (1 << 30), false},
+		{"500m", 500 * (1 << 20), false},
+		{"500M", 500 * (1 << 20), false},
+		{"500MB", 500 * (1 << 20), false},
+		{"100k", 100 * (1 << 10), false},
+		{"1t", 1 << 40, false},
+		{"1T", 1 << 40, false},
+		{"1024", 1024, false},       // plain bytes
+		{"", 0, true},               // empty
+		{"abc", 0, true},            // no number
+		{"-5g", 0, true},            // negative
+		{"0g", 0, true},             // zero
+		{"9999999t", 0, true},       // overflow
+		{"  10g  ", 10 * (1 << 30), false}, // whitespace
+	}
+
+	for _, tt := range tests {
+		got, err := ParseSize(tt.input)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("ParseSize(%q) = %d, want error", tt.input, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseSize(%q) error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("ParseSize(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDiskUsage(t *testing.T) {
+	// In-memory store should return 0.
+	memStore, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New(:memory:) failed: %v", err)
+	}
+	defer memStore.Close()
+	if got := memStore.diskUsage(); got != 0 {
+		t.Errorf("diskUsage(:memory:) = %d, want 0", got)
+	}
+
+	// On-disk store should return positive value after schema creation.
+	dbPath := filepath.Join(t.TempDir(), "diskusage-test.db")
+	diskStore, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer diskStore.Close()
+	if got := diskStore.diskUsage(); got <= 0 {
+		t.Errorf("diskUsage(on-disk) = %d, want > 0", got)
+	}
+}
+
+func TestPruneBySizeNoOp(t *testing.T) {
+	// maxDBSize=0 → pruneBySize is a no-op (no limit set).
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+	s.pruneBySize() // should not panic or error
+
+	// On-disk store with generous limit — nothing should be pruned.
+	dbPath := filepath.Join(t.TempDir(), "noprune-test.db")
+	s2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s2.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s2.Run(ctx)
+		close(done)
+	}()
+
+	// Insert some events.
+	for i := 0; i < 50; i++ {
+		s2.Record(makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	countBefore, _ := s2.Count()
+
+	// Set a very generous limit (1 GB) — nothing should be pruned.
+	s2.SetMaxDBSize(1 << 30)
+	s2.pruneBySize()
+
+	countAfter, _ := s2.Count()
+	if countAfter != countBefore {
+		t.Errorf("expected no pruning: before=%d, after=%d", countBefore, countAfter)
+	}
+
+	cancel()
+	<-done
+}
+
+func TestPruneBySizeOnDisk(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "prune-test.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert enough events to make the DB grow. Use distinct timestamps
+	// so pruneBySize has a time range to work with.
+	baseTime := time.Now().Add(-10 * time.Minute)
+	for i := 0; i < 2000; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Force a WAL checkpoint so disk usage reflects all writes.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	sizeBefore := s.diskUsage()
+	countBefore, _ := s.Count()
+	if sizeBefore == 0 {
+		t.Fatalf("expected positive disk usage after inserts, got 0")
+	}
+	if countBefore < 2000 {
+		t.Fatalf("expected at least 2000 events, got %d", countBefore)
+	}
+
+	// Set max to something well below current size to force pruning.
+	// Use a small target that will definitely be exceeded.
+	smallLimit := sizeBefore / 3
+	s.SetMaxDBSize(smallLimit)
+	s.pruneBySize()
+
+	// Force another checkpoint to see the effects.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	countAfter, _ := s.Count()
+	if countAfter >= countBefore {
+		t.Errorf("expected events to be pruned: before=%d, after=%d", countBefore, countAfter)
+	}
+	if countAfter == 0 {
+		t.Errorf("expected some events to remain after pruning, got 0")
+	}
+
+	// Verify oldest events were removed (newest should remain).
+	// Query with Limit: -1 (unlimited) returns events in chronological order
+	// (ASC after internal DESC+reverse). result[0] is the oldest remaining.
+	result, _ := s.Query(QueryParams{Limit: -1})
+	if len(result) > 0 {
+		oldest := result[0].Timestamp
+		// With keepFraction ~0.3, cutoff ≈ baseTime + 1400ms. Use 500ms as
+		// a conservative threshold that still validates meaningful pruning.
+		if oldest.Before(baseTime.Add(500 * time.Millisecond)) {
+			t.Errorf("expected oldest remaining event well past base time, got offset %v",
+				oldest.Sub(baseTime))
+		}
+		// Newest event should still be the last one inserted.
+		newest := result[len(result)-1].Timestamp
+		lastInserted := baseTime.Add(1999 * time.Millisecond)
+		if newest.Before(lastInserted.Add(-10 * time.Millisecond)) {
+			t.Errorf("expected newest event near %v, got %v", lastInserted, newest)
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+func TestSetMaxDBSize(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	s.SetMaxDBSize(10 * (1 << 30))
+	if s.maxDBSize != 10*(1<<30) {
+		t.Errorf("maxDBSize = %d, want %d", s.maxDBSize, 10*(1<<30))
+	}
+
+	s.SetMaxDBSize(0)
+	if s.maxDBSize != 0 {
+		t.Errorf("maxDBSize = %d, want 0", s.maxDBSize)
+	}
+}
+
+// TestAutoVacuumPragma verifies that new databases get auto_vacuum=INCREMENTAL.
+func TestAutoVacuumPragma(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "vacuum-test.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	var mode int
+	err = s.db.QueryRow("PRAGMA auto_vacuum").Scan(&mode)
+	if err != nil {
+		t.Fatalf("PRAGMA auto_vacuum query failed: %v", err)
+	}
+	// 2 = INCREMENTAL. Note: only works on newly created DBs.
+	if mode != 2 {
+		t.Errorf("auto_vacuum = %d, want 2 (INCREMENTAL)", mode)
+	}
+}
+
+// TestDiskUsageIncludesWAL verifies that diskUsage sums the main DB + WAL files.
+func TestDiskUsageIncludesWAL(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wal-test.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+	defer s.Close()
+
+	// After schema creation, the main DB file should exist.
+	mainInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("main DB file not found: %v", err)
+	}
+
+	usage := s.diskUsage()
+	if usage < mainInfo.Size() {
+		t.Errorf("diskUsage() = %d, expected >= main DB size %d", usage, mainInfo.Size())
 	}
 }
