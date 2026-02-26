@@ -228,11 +228,11 @@ sudo cp "${ML_DB}-shm" logs/ml-investigation.db-shm 2>/dev/null && sudo chmod 64
 ML_TMPDIR=$(mktemp -d)
 
 echo -e "$(ts)   Querying events from DB..."
-./bin/ingero query --db "$ML_DB" --json --op cudaStreamSync --limit -1 --since 10m \
+./bin/ingero query --db "$ML_DB" --json --op cudaStreamSync --limit -1 --since 5m \
     > "$ML_TMPDIR/sync.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/sync.json"
-./bin/ingero query --db "$ML_DB" --json --op cuLaunchKernel --limit -1 --since 10m \
+./bin/ingero query --db "$ML_DB" --json --op cuLaunchKernel --limit -1 --since 5m \
     > "$ML_TMPDIR/launch.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/launch.json"
-./bin/ingero query --db "$ML_DB" --json --op sched_switch --limit -1 --since 10m \
+./bin/ingero query --db "$ML_DB" --json --op sched_switch --limit -1 --since 5m \
     > "$ML_TMPDIR/sched.json" 2>/dev/null || echo "[]" > "$ML_TMPDIR/sched.json"
 
 # Kill stress-ng now (trace is done)
@@ -267,7 +267,7 @@ echo -e "$(ts) ${CYAN}[ANALYSIS]${NC} Running unified analysis..."
 
 ANALYSIS_OUT=$(python3 -c "
 import json, sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 BASELINE_SECS = ${BASELINE_SECS}
 STRESS_EPOCH = ${STRESS_START_EPOCH}
@@ -310,7 +310,7 @@ def parse_ts(ts_str):
             base, frac = s.split('.', 1)
             frac = frac[:6].ljust(6, '0')
             s = base + '.' + frac
-        dt = datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except:
         return None
@@ -746,7 +746,7 @@ if [[ "$SYNC_COUNT" -gt 0 ]]; then
     fi
 else
     # No cudaStreamSync events — try cudaDeviceSync as fallback
-    DSYNC_COUNT=$(./bin/ingero query --db "$ML_DB" --op cudaDeviceSync --limit 1 --since 10m 2>/dev/null | gcount 'cudaDeviceSync')
+    DSYNC_COUNT=$(./bin/ingero query --db "$ML_DB" --op cudaDeviceSync --limit 1 --since 5m 2>/dev/null | gcount 'cudaDeviceSync')
     if [[ "$DSYNC_COUNT" -gt 0 ]]; then
         record "SKIP" "T22e: sync tail amplification" "no cudaStreamSync but ${DSYNC_COUNT} cudaDeviceSync (workload uses device sync)"
     else
