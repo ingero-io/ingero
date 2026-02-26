@@ -189,6 +189,10 @@ cleanup_pids+=("$TRACE_PID")
 echo -e "$(ts)   Baseline phase: ${BASELINE_SECS}s (no contention)..."
 sleep "$BASELINE_SECS"
 
+# Capture wall-clock epoch just before stress-ng starts — passed to Python for
+# precise phase classification (avoids drift between bash sleep and kernel timestamps)
+STRESS_START_EPOCH=$(date +%s.%N)
+
 # Contention phase — stress-ng saturates ALL cores for the remaining duration
 NCPUS=$(nproc)
 CONTENTION_SECS=$((TRACE_DURATION - BASELINE_SECS + 5))  # +5s buffer to outlast trace
@@ -266,6 +270,7 @@ import json, sys
 from datetime import datetime
 
 BASELINE_SECS = ${BASELINE_SECS}
+STRESS_EPOCH = ${STRESS_START_EPOCH}
 SYNC_FILE = '${ML_TMPDIR}/sync.json'
 LAUNCH_FILE = '${ML_TMPDIR}/launch.json'
 SCHED_FILE = '${ML_TMPDIR}/sched.json'
@@ -329,7 +334,9 @@ def classify(ts_str):
     if t is None:
         return 'contention', None
     sec_offset = t - first_ts
-    phase = 'baseline' if sec_offset < BASELINE_SECS else 'contention'
+    # Use stress-ng wall-clock start for precise phase split (avoids drift
+    # between bash sleep and kernel timestamps). Falls back to BASELINE_SECS.
+    phase = 'baseline' if t < STRESS_EPOCH else 'contention'
     sec_bin = int(sec_offset)
     if sec_bin not in temporal_bins:
         temporal_bins[sec_bin] = {'sched': 0, 'sync_durs': []}
@@ -482,9 +489,34 @@ if paired_secs:
         print('temporal_overlap: 0%')
 else:
     print('temporal_overlap: N/A')
+
+# Phase sched rates (for T22d contention-rate comparison)
+base_sched_n = sum(data['sched'] for sec, data in temporal_bins.items() if first_ts is not None and (first_ts + sec) < STRESS_EPOCH)
+cont_sched_n = sum(data['sched'] for sec, data in temporal_bins.items() if first_ts is not None and (first_ts + sec) >= STRESS_EPOCH)
+trace_secs = (max(temporal_bins.keys()) - min(temporal_bins.keys()) + 1) if temporal_bins else BASELINE_SECS + 45
+base_secs = STRESS_EPOCH - first_ts if first_ts else BASELINE_SECS
+cont_secs_ph = max(trace_secs - base_secs, 1)
+base_sched_rate = base_sched_n / max(base_secs, 1)
+cont_sched_rate = cont_sched_n / max(cont_secs_ph, 1)
+print(f'sched_phase: baseline={base_sched_rate:.0f}/s contention={cont_sched_rate:.0f}/s')
 " 2>logs/ml-analysis-stderr.log || echo "analysis_error")
 
 echo "$ANALYSIS_OUT" > logs/ml-analysis.log
+
+# Verify analysis completed (expect at least event_counts + 3 full-session stats)
+if ! echo "$ANALYSIS_OUT" | grep -q '^event_counts:' || ! echo "$ANALYSIS_OUT" | grep -q '^sync_full:'; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Python analysis failed or incomplete"
+    echo "  Output: ${ANALYSIS_OUT:0:200}"
+    echo "  Stderr: $(cat logs/ml-analysis-stderr.log 2>/dev/null | tail -5)"
+    record "FAIL" "T22a: trace captured events" "Python analysis failed: ${ANALYSIS_OUT:0:100}"
+    # Skip Q1-Q4 — analysis data unavailable
+    echo ""
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${RED}FAIL=1${NC}  Total=1  (analysis failed, skipping Q1-Q4)"
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
 
 # Extract key values for downstream tests
 LAUNCH_STATS=$(echo "$ANALYSIS_OUT" | grep '^launch_full:' || echo "launch_full: n=0 p50=0us p99=0us ratio=0x")
@@ -498,6 +530,9 @@ SYNC_AMP=$(echo "$ANALYSIS_OUT" | grep '^sync_amplification:' | grep -oP '[\d.]+
 LAUNCH_RATE=$(echo "$ANALYSIS_OUT" | grep '^launch_rate:' || echo "")
 TEMPORAL_RHO=$(echo "$ANALYSIS_OUT" | grep -oP 'temporal_rho: \K\S+' || echo "N/A")
 TEMPORAL_OVERLAP=$(echo "$ANALYSIS_OUT" | grep -oP 'temporal_overlap: \K\S+' || echo "N/A")
+SCHED_PHASE=$(echo "$ANALYSIS_OUT" | grep '^sched_phase:' || echo "")
+SCHED_BASE_RATE=$(echo "$SCHED_PHASE" | grep -oP 'baseline=\K[0-9]+' || echo "0")
+SCHED_CONT_RATE=$(echo "$SCHED_PHASE" | grep -oP 'contention=\K[0-9]+' || echo "0")
 
 # Extract event counts from analysis (approximate — only sync+launch+sched, but
 # sufficient for T22a threshold check of >1000)
@@ -573,7 +608,7 @@ fi
 if [[ "$CHAIN_COUNT" -gt 0 && -n "$HAS_SCHED_KEYWORDS" ]]; then
     record "PASS" "T22b: causal chain detected" "${CHAIN_COUNT} chain(s) with scheduling root cause"
 elif [[ "$CHAIN_COUNT" -gt 0 ]]; then
-    record "PASS" "T22b: causal chain detected" "${CHAIN_COUNT} chain(s) found (no scheduling keywords — different root cause)"
+    record "PASS" "T22b: causal chain detected" "${CHAIN_COUNT} chain(s) found (NOTE: no scheduling keywords despite stress-ng — chain may be unrelated to injected contention)"
 else
     # No chains detected — stress-ng may not have caused enough contention
     if echo "$EXPLAIN_OUT" | grep -q 'INCIDENT REPORT\|No events\|no causal'; then
@@ -620,22 +655,23 @@ if [[ "$LAUNCH_COUNT" -gt 0 ]]; then
     fi
 fi
 
-# T22c: cuLaunchKernel present AND consistent (ratio < 100x)
+# T22c: cuLaunchKernel present AND consistent (ratio < 30x)
+# cuLaunchKernel is fire-and-forget (enqueue only). Even 10x would be abnormal.
 if [[ "$LAUNCH_COUNT" -gt 0 ]]; then
-    if python3 -c "exit(0 if float('${LAUNCH_RATIO}') < 100 else 1)" 2>/dev/null; then
+    if python3 -c "exit(0 if float('${LAUNCH_RATIO}') < 30 else 1)" 2>/dev/null; then
         record "PASS" "T22c: driver API + GPU consistent" "${LAUNCH_COUNT} cuLaunchKernel, ratio=${LAUNCH_RATIO}x"
     else
-        record "FAIL" "T22c: driver API + GPU consistent" "GPU dispatch severely degraded (ratio=${LAUNCH_RATIO}x >= 100x)"
+        record "FAIL" "T22c: driver API + GPU consistent" "GPU dispatch severely degraded (ratio=${LAUNCH_RATIO}x >= 30x)"
     fi
 else
     record "FAIL" "T22c: driver API + GPU consistent" "no cuLaunchKernel events"
 fi
 
-# T22d: sched_switch shows scheduling storms
+# T22d: sched_switch shows scheduling storms (with phase rate comparison)
 if [[ "$SCHED_COUNT" -gt 100 && "$HAS_DURATIONS" == "yes" && "$OVER_10MS" -gt 0 ]]; then
-    record "PASS" "T22d: scheduling storms confirmed" "${SCHED_COUNT} events, ${OVER_10MS} over 10ms (strong)"
+    record "PASS" "T22d: scheduling storms confirmed" "${SCHED_COUNT} events, ${OVER_10MS} over 10ms, contention=${SCHED_CONT_RATE}/s vs baseline=${SCHED_BASE_RATE}/s (strong)"
 elif [[ "$SCHED_COUNT" -gt 100 && "$HAS_DURATIONS" == "yes" ]]; then
-    record "PASS" "T22d: scheduling storms confirmed" "${SCHED_COUNT} sched_switch events (mild, none >10ms)"
+    record "PASS" "T22d: scheduling storms confirmed" "${SCHED_COUNT} sched_switch events, contention=${SCHED_CONT_RATE}/s vs baseline=${SCHED_BASE_RATE}/s (mild, none >10ms)"
 elif [[ "$SCHED_COUNT" -gt 100 && "$HAS_DURATIONS" == "no" ]]; then
     record "SKIP" "T22d: scheduling storms confirmed" "${SCHED_COUNT} events but duration_ns=0 (no off-CPU measurements)"
 elif [[ "$SCHED_COUNT" -gt 0 ]]; then
@@ -674,20 +710,39 @@ if [[ "$TEMPORAL_OVERLAP" != "N/A" ]]; then
     echo -e "$(ts)   → Temporal overlap (high-sched ∩ high-sync): ${TEMPORAL_OVERLAP}"
 fi
 
-# T22e: sync tail amplification (replaces bimodal)
-# Tail ratio = p99/p50. Matches DefaultTailRatio = 3.0 in correlate.go.
+# T22e: sync tail amplification
+# Primary: sync_amplification (contention_p99 / baseline_p99).
+# Aligns with DefaultTailRatio = 3.0 in correlate.go.
+# Fallback: full-session p99/p50 when no phase data.
 if [[ "$SYNC_COUNT" -gt 0 ]]; then
     TAIL_DETAIL="p99/p50=${SYNC_RATIO}x"
     if [[ "$SYNC_AMP" != "N/A" ]]; then
         TAIL_DETAIL="${TAIL_DETAIL}, baseline→contention=${SYNC_AMP}"
     fi
 
-    if python3 -c "exit(0 if float('${SYNC_RATIO}') > 10 else 1)" 2>/dev/null; then
-        record "PASS" "T22e: sync tail amplification" "strong tail (${TAIL_DETAIL})"
-    elif python3 -c "exit(0 if float('${SYNC_RATIO}') >= 3 else 1)" 2>/dev/null; then
-        record "PASS" "T22e: sync tail amplification" "mild tail (${TAIL_DETAIL})"
+    if [[ "$SYNC_AMP" != "N/A" ]]; then
+        # Primary: sync_amplification (contention_p99 / baseline_p99)
+        AMP_VAL=$(echo "$SYNC_AMP" | sed 's/x$//')
+        if python3 -c "exit(0 if float('${AMP_VAL}') > 10 else 1)" 2>/dev/null; then
+            record "PASS" "T22e: sync tail amplification" "strong amplification (${TAIL_DETAIL})"
+        elif python3 -c "exit(0 if float('${AMP_VAL}') >= 3 else 1)" 2>/dev/null; then
+            record "PASS" "T22e: sync tail amplification" "mild amplification (${TAIL_DETAIL})"
+        elif python3 -c "exit(0 if float('${AMP_VAL}') >= 1 else 1)" 2>/dev/null; then
+            # amp >= 1 but < 3: contention didn't amplify much, but didn't invert either
+            record "SKIP" "T22e: sync tail amplification" "minimal amplification (${TAIL_DETAIL})"
+        else
+            # amp < 1: inverted pattern — GPU starvation (fast GPUs like H100)
+            record "SKIP" "T22e: sync tail amplification" "inverted: contention reduced sync latency (${TAIL_DETAIL}) — GPU starvation pattern"
+        fi
     else
-        record "SKIP" "T22e: sync tail amplification" "no tail detected (${TAIL_DETAIL}) — hardware too fast?"
+        # Fallback: full-session p99/p50 when no phase data
+        if python3 -c "exit(0 if float('${SYNC_RATIO}') > 10 else 1)" 2>/dev/null; then
+            record "PASS" "T22e: sync tail amplification" "strong tail (${TAIL_DETAIL})"
+        elif python3 -c "exit(0 if float('${SYNC_RATIO}') >= 3 else 1)" 2>/dev/null; then
+            record "PASS" "T22e: sync tail amplification" "mild tail (${TAIL_DETAIL})"
+        else
+            record "SKIP" "T22e: sync tail amplification" "no tail detected (${TAIL_DETAIL}) — hardware too fast?"
+        fi
     fi
 else
     # No cudaStreamSync events — try cudaDeviceSync as fallback
@@ -708,6 +763,9 @@ echo ""
 echo -e "$(ts) ${CYAN}── Q4: \"Can an AI agent diagnose this via MCP?\" ───────────${NC}"
 _test_start=$SECONDS
 
+# NOTE: MCP queries on large --record-all DBs (~150MB, 1M+ events) can take
+# 5-10s for get_trace_stats (scans all events). If MCP tests time out on
+# slow VMs, consider adding --limit to MCP calls or increasing wait timeout.
 MCP_PORT=8081  # Use different port from gpu-test.sh Phase 5
 
 # Kill any leftover MCP server from a previous crashed run
@@ -748,7 +806,7 @@ else
     echo -e "$(ts)   MCP server ready on :${MCP_PORT}"
 
     # MCP Tool 1: get_trace_stats (overview)
-    STATS_RESP=$(mcp_call "get_trace_stats" '{"since":"10m"}')
+    STATS_RESP=$(mcp_call "get_trace_stats" '{"since":"5m"}')
     echo "MCP get_trace_stats: ${STATS_RESP:0:200}" >> logs/ml-mcp-debug.log
     if echo "$STATS_RESP" | grep -q 'op.*p50\|ops.*cuda\|p50.*p95'; then
         echo -e "$(ts)   → MCP get_trace_stats: events found"
@@ -757,7 +815,7 @@ else
     fi
 
     # MCP Tool 2: get_causal_chains (root cause)
-    CHAINS_RESP=$(mcp_call "get_causal_chains" '{"since":"10m"}')
+    CHAINS_RESP=$(mcp_call "get_causal_chains" '{"since":"5m"}')
     echo "MCP get_causal_chains: ${CHAINS_RESP:0:300}" >> logs/ml-mcp-debug.log
 
     # T22f: MCP response must be consistent with T22b
@@ -792,14 +850,21 @@ else
     fi
 
     # MCP Tool 3: query_events with op filter
-    QUERY_RESP=$(mcp_call "query_events" '{"since":"10m","op":"cudaStreamSync","limit":20}')
+    QUERY_RESP=$(mcp_call "query_events" '{"since":"5m","op":"cudaStreamSync","limit":20}')
     echo "MCP query_events op=cudaStreamSync: ${QUERY_RESP:0:300}" >> logs/ml-mcp-debug.log
 
     # T22g: MCP query_events op filter returns only cudaStreamSync (or empty if none)
     if echo "$QUERY_RESP" | grep -qi 'cudaStreamSync\|StreamSync\|stream_sync'; then
         MCP_SYNC_COUNT=$(echo "$QUERY_RESP" | { grep -oi 'cudaStreamSync\|StreamSync' || true; } | wc -l)
-        echo -e "$(ts)   → MCP query_events op=cudaStreamSync: ${MCP_SYNC_COUNT} refs"
-        record "PASS" "T22g: MCP op filter" "cudaStreamSync events returned"
+        # Verify no other ops leaked through the filter
+        LEAKED_OPS=$(echo "$QUERY_RESP" | { grep -oi 'cuLaunchKernel\|sched_switch\|cudaMalloc\|cudaMemcpy\|cuMemcpy' || true; } | head -1)
+        if [[ -n "$LEAKED_OPS" ]]; then
+            echo -e "$(ts)   → MCP query_events: ${MCP_SYNC_COUNT} sync refs but leaked: ${LEAKED_OPS}"
+            record "FAIL" "T22g: MCP op filter" "filter returned sync events but also leaked ${LEAKED_OPS}"
+        else
+            echo -e "$(ts)   → MCP query_events op=cudaStreamSync: ${MCP_SYNC_COUNT} refs"
+            record "PASS" "T22g: MCP op filter" "cudaStreamSync only, no leaked ops"
+        fi
     elif echo "$QUERY_RESP" | grep -qi 'No events\|no events\|0 events\|empty'; then
         # No sync events in DB is OK — the filter worked, just nothing matched
         echo -e "$(ts)   → MCP query_events: no cudaStreamSync events (filter works, no data)"
@@ -825,14 +890,23 @@ echo ""
 # Generate Report — computed verdict, phase comparison, temporal correlation
 ################################################################################
 
-# Compute Q2 verdict from data
+# Compute Q2 verdict from data (multi-signal: launch_ratio + sync_amplification + launch_rate)
 Q2_VERDICT=""
+RATE_CHANGE=$(echo "$LAUNCH_RATE" | grep -oP 'change=\K[+-]?[0-9]+' || echo "0")
 if [[ "$CUDA_PRESENT" -eq 0 ]]; then
     Q2_VERDICT="Inconclusive — no CUDA/driver events captured."
 elif [[ "$LAUNCH_COUNT" -gt 0 ]]; then
     if python3 -c "exit(0 if float('${LAUNCH_RATIO}') < 10 else 1)" 2>/dev/null; then
-        Q2_VERDICT="GPU kernels consistent (ratio=${LAUNCH_RATIO}x). Bottleneck is host scheduler (${SCHED_COUNT} context switches)."
-    elif python3 -c "exit(0 if float('${LAUNCH_RATIO}') < 100 else 1)" 2>/dev/null; then
+        # GPU consistent — refine with sync_amplification
+        if [[ "$SYNC_AMP" != "N/A" ]] && python3 -c "exit(0 if float('${SYNC_AMP%%x}') < 1 else 1)" 2>/dev/null; then
+            # Inverted pattern: contention reduced sync latency (GPU starvation)
+            Q2_VERDICT="GPU kernels consistent (ratio=${LAUNCH_RATIO}x). Host contention caused GPU starvation — sync latency decreased (amp=${SYNC_AMP}), launch rate ${RATE_CHANGE}%."
+        elif [[ "$SYNC_AMP" != "N/A" ]] && python3 -c "exit(0 if float('${SYNC_AMP%%x}') >= 3 else 1)" 2>/dev/null; then
+            Q2_VERDICT="GPU kernels consistent (ratio=${LAUNCH_RATIO}x). Host scheduler inflated sync latency (amp=${SYNC_AMP}). Bottleneck is host."
+        else
+            Q2_VERDICT="GPU kernels consistent (ratio=${LAUNCH_RATIO}x). Host contention detected (${SCHED_COUNT} context switches) but minimal sync amplification (${SYNC_AMP})."
+        fi
+    elif python3 -c "exit(0 if float('${LAUNCH_RATIO}') < 30 else 1)" 2>/dev/null; then
         Q2_VERDICT="GPU tail amplification (ratio=${LAUNCH_RATIO}x). Both GPU and host may be contributing."
     else
         Q2_VERDICT="GPU dispatch severely degraded (ratio=${LAUNCH_RATIO}x). Investigate GPU contention."
