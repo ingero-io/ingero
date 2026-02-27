@@ -471,9 +471,14 @@ func (s *Server) registerTools() {
 		// Fallback: if replay produces 0 chains, check stored chains in DB.
 		// The replay can miss chains on very large DBs (>1M events) where the
 		// rolling collector's window dilutes anomalies, or when time.Now()-based
-		// query bounds exclude relevant events.
+		// query bounds exclude relevant events. Use since=0 to query all stored
+		// chains — the event time range may not align with chain detection time
+		// (chains use DetectedAt from time.Now() at detection, not event timestamps).
 		if len(chains) == 0 {
-			stored, err := s.store.QueryChains(since)
+			stored, err := s.store.QueryChains(0)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: querying stored chains: %v\n", err)
+			}
 			if err == nil && len(stored) > 0 {
 				text := formatStoredChains(stored, tsc)
 				return &gomcp.CallToolResult{

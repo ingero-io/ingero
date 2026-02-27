@@ -95,7 +95,7 @@ cleanup() {
     done
 
     if [[ -n "$ML_DB" ]]; then
-        rm -f "${ML_DB}" "${ML_DB}-wal" "${ML_DB}-shm" 2>/dev/null || true
+        sudo rm -f "${ML_DB}" "${ML_DB}-wal" "${ML_DB}-shm" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -344,6 +344,10 @@ if [[ "$INGESTED" -eq 0 ]]; then
     else
         record "FAIL" "T23a: GPU investigation" "no structured results returned"
     fi
+elif [[ "$ANALYSIS_EXIT" -ne 0 && "$INGESTED" -lt 23 ]]; then
+    record "FAIL" "T23a: GPU investigation" "partial results: ${INGESTED}/23 (exit $ANALYSIS_EXIT)"
+    echo "Analysis stderr:"
+    cat logs/gpu-inv-analysis-stderr.log
 fi
 
 ################################################################################

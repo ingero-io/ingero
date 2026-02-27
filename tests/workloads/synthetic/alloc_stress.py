@@ -22,15 +22,25 @@ import torch
 def _get_cuda_runtime():
     """Load libcudart.so for direct cudaMalloc/cudaFree calls."""
     path = ctypes.util.find_library("cudart")
-    if not path:
-        # Try common locations
+    lib = None
+    if path:
+        lib = ctypes.CDLL(path)
+    else:
+        # Try common locations (find_library misses LD_LIBRARY_PATH on Python <3.12)
         for candidate in ["libcudart.so", "libcudart.so.12", "libcudart.so.11"]:
             try:
-                return ctypes.CDLL(candidate)
+                lib = ctypes.CDLL(candidate)
+                break
             except OSError:
                 continue
-        return None
-    return ctypes.CDLL(path)
+    if lib:
+        # Declare argtypes/restype for correct behavior on ARM64 (GH200) and
+        # to prevent ctypes from guessing types via default C promotion rules.
+        lib.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        lib.cudaMalloc.restype = ctypes.c_int
+        lib.cudaFree.argtypes = [ctypes.c_void_p]
+        lib.cudaFree.restype = ctypes.c_int
+    return lib
 
 
 def direct_cuda_alloc_free(lib, sizes_bytes, rounds=3):
@@ -44,7 +54,9 @@ def direct_cuda_alloc_free(lib, sizes_bytes, rounds=3):
                 print(f"    cudaMalloc({size} bytes) failed: error {ret}")
                 continue
             if ptr.value:
-                lib.cudaFree(ptr)
+                ret = lib.cudaFree(ptr)
+                if ret != 0:
+                    print(f"    cudaFree failed: error {ret}")
                 ptr.value = None
 
 
@@ -129,7 +141,7 @@ def main():
     max_mb = int(free_mem / (1024 * 1024)) // 4
     sizes = [s for s in [1, 4, 16, 64, 128, 256, 512] if s <= max_mb]
     if not sizes:
-        sizes = [1, 4, 16]
+        sizes = [1]
     print(f"  Free VRAM: {free_mem / 1e9:.1f} GB, max alloc: {max_mb} MB, sizes: {sizes}")
     print()
     deadline = time.time() + args.duration if args.duration > 0 else 0
@@ -151,19 +163,31 @@ def main():
             direct_cuda_alloc_free(cudart, direct_sizes, rounds=2)
             print(f"  Done in {time.time() - t0:.1f}s\n")
 
-        print(f"{prefix}Phase 1: Sequential alloc/free (1MB to 512MB)")
+        print(f"{prefix}Phase 1: Sequential alloc/free (1MB to {sizes[-1]}MB)")
         t0 = time.time()
-        sequential_alloc(sizes, device)
+        try:
+            sequential_alloc(sizes, device)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  OOM: {e}")
+            torch.cuda.empty_cache()
         print(f"  Done in {time.time() - t0:.1f}s\n")
 
         print(f"{prefix}Phase 2: Fragmentation pattern")
         t0 = time.time()
-        fragmentation_pattern(device)
+        try:
+            fragmentation_pattern(device)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  OOM: {e}")
+            torch.cuda.empty_cache()
         print(f"  Done in {time.time() - t0:.1f}s\n")
 
         print(f"{prefix}Phase 3: Rapid small allocations")
         t0 = time.time()
-        rapid_small_alloc(device)
+        try:
+            rapid_small_alloc(device)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  OOM: {e}")
+            torch.cuda.empty_cache()
         print(f"  Done in {time.time() - t0:.1f}s\n")
 
         if deadline == 0 or time.time() >= deadline:
