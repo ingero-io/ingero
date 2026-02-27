@@ -13,9 +13,9 @@ probes:
     enabled: true
     # Path to libcudart.so (auto-detected if empty)
     library_path: ""
-  nvidia:
+  driver:
     enabled: true
-    # Requires kprobe support for nvidia.ko
+    # CUDA Driver API uprobes on libcuda.so (auto-detected)
   host:
     enabled: true
     # Tracepoints: sched_switch, sched_wakeup, mm_page_alloc, oom_kill
@@ -26,10 +26,10 @@ probes:
 
 # Storage
 store:
-  # SQLite database path
-  path: /var/lib/ingero/ingero.db
-  # Rolling retention window
-  retention_days: 7
+  # SQLite database path (default: ~/.ingero/ingero.db)
+  path: ~/.ingero/ingero.db
+  # Max DB size (e.g., 10g, 500m, 1t). 0 = unlimited.
+  max_db_size: 10g
 
 # MCP server
 mcp:

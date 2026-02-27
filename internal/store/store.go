@@ -2,7 +2,7 @@
 //
 // Events are buffered in memory and batch-flushed to SQLite for performance.
 // WAL mode enables concurrent reads while the writer flushes batches.
-// Rolling 7-day time retention plus optional size-based pruning (--max-db).
+// Size-based pruning keeps the DB under --max-db (default 10 GB).
 package store
 
 import (
@@ -33,10 +33,9 @@ const (
 	// DefaultFlushInterval is the max time between flushes.
 	DefaultFlushInterval = 100 * time.Millisecond
 
-	// DefaultRetention is how long events are kept before pruning.
-	DefaultRetention = 7 * 24 * time.Hour
-
-	// DefaultPruneInterval is how often we check for expired events.
+	// DefaultPruneInterval is the fallback interval for size-based pruning.
+	// In practice, pruneBySize() also runs after every flushBatch(), so
+	// this ticker only matters when no events arrive for an extended period.
 	DefaultPruneInterval = 1 * time.Hour
 )
 
@@ -295,7 +294,6 @@ type Store struct {
 	dbPath     string
 	insertCh   chan events.Event
 	snapshotCh chan SystemSnapshot
-	retention  time.Duration
 	runDone    chan struct{} // closed when Run() exits
 	runActive  atomic.Bool  // true once Run() is called
 
@@ -590,7 +588,6 @@ func New(dbPath string) (*Store, error) {
 		dbPath:     dbPath,
 		insertCh:   make(chan events.Event, DefaultBatchSize*2),
 		snapshotCh: make(chan SystemSnapshot, 64), // 1 snapshot/sec, 64 = ~1 min buffer
-		retention:  DefaultRetention,
 		runDone:    make(chan struct{}),
 		stackCache: make(map[uint64]bool),
 	}
@@ -637,7 +634,7 @@ func (s *Store) Run(ctx context.Context) {
 	defer pruneTicker.Stop()
 
 	// Prune on startup.
-	s.pruneOld()
+	s.prune()
 
 	var batch []events.Event
 
@@ -660,7 +657,7 @@ func (s *Store) Run(ctx context.Context) {
 			}
 
 		case <-pruneTicker.C:
-			s.pruneOld()
+			s.prune()
 
 		case <-ctx.Done():
 			// Final flush.
@@ -770,34 +767,10 @@ func (s *Store) loadStackCache() {
 	}
 }
 
-// pruneOld deletes events, aggregates, system snapshots, causal chains,
-// sessions, and stale process names older than the retention period.
-// Also removes orphaned stack traces no longer referenced by any event.
-func (s *Store) pruneOld() {
-	cutoff := time.Now().Add(-s.retention).UnixNano()
-	s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
-	s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
-	s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
-	s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
-	s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
-	s.db.Exec("DELETE FROM process_names WHERE seen_at < ?", cutoff)
-
-	// Remove stack traces no longer referenced by any event. NOT EXISTS with
-	// LIMIT 1 lets SQLite short-circuit after finding the first match, avoiding
-	// a full events table scan per stack_traces row. Runs once per hour.
-	s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
-		SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
-	)`)
-
-	// Rebuild stack cache after pruning — deleted stack_traces rows must be
-	// evicted from the in-memory cache, otherwise new events with the same
-	// stack hash would skip the INSERT (cache says "already in DB") and
-	// produce dangling references.
-	s.stackCache = make(map[uint64]bool)
-	s.loadStackCache()
-
-	// Size-based pruning: if --max-db is set and the DB exceeds the limit,
-	// delete oldest data proportionally until the file fits.
+// prune performs size-based pruning. When --max-db is set and the DB exceeds
+// the limit, deletes oldest events proportionally until the file fits.
+// No-op when --max-db is 0 (unlimited).
+func (s *Store) prune() {
 	s.pruneBySize()
 }
 
@@ -882,6 +855,8 @@ func (s *Store) diskUsage() int64 {
 }
 
 // pruneBySize deletes oldest events proportionally to bring the DB under maxDBSize.
+// This is the sole retention mechanism — there is no time-based retention.
+// The default --max-db is 10 GB, lasting a few hours under average GPU load.
 //
 // Algorithm: compute what fraction of the time range to keep based on
 // currentSize vs target (90% of maxDBSize for headroom), then delete
@@ -910,8 +885,17 @@ func (s *Store) pruneBySize() {
 		// Target 90% to leave headroom for new writes between prune cycles.
 		target := int64(float64(maxSize) * 0.9)
 
+		// Compute the time range across both events and aggregates so
+		// size-based pruning works even if one table is empty.
+		// COALESCE handles the case where one or both tables are empty
+		// (MIN/MAX return NULL for empty tables).
 		var minTS, maxTS int64
-		err := s.db.QueryRow("SELECT MIN(timestamp), MAX(timestamp) FROM events").Scan(&minTS, &maxTS)
+		err := s.db.QueryRow(`
+			SELECT COALESCE(MIN(lo), 0), COALESCE(MAX(hi), 0) FROM (
+				SELECT MIN(timestamp) AS lo, MAX(timestamp) AS hi FROM events
+				UNION ALL
+				SELECT MIN(bucket) AS lo, MAX(bucket) AS hi FROM event_aggregates
+			)`).Scan(&minTS, &maxTS)
 		if err != nil || minTS == 0 || maxTS == 0 || minTS >= maxTS {
 			break // no data or single-point — nothing to prune
 		}
@@ -924,12 +908,13 @@ func (s *Store) pruneBySize() {
 		}
 		cutoff := maxTS - int64(float64(maxTS-minTS)*keepFraction)
 
-		// Delete events, aggregates, snapshots, chains, sessions older than cutoff.
+		// Delete events, aggregates, snapshots, chains, sessions, stale process names.
 		s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
 		s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
 		s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
 		s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
 		s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
+		s.db.Exec("DELETE FROM process_names WHERE seen_at < ?", cutoff)
 
 		// Clean orphaned stack traces.
 		s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
