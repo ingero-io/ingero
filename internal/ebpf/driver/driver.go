@@ -224,7 +224,7 @@ func (t *Tracer) Close() error {
 
 	var errs []error
 	if t.reader != nil {
-		if err := t.reader.Close(); err != nil {
+		if err := t.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
 			errs = append(errs, err)
 		}
 	}
