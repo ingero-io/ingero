@@ -40,7 +40,10 @@ def direct_cuda_alloc_free(lib, sizes_bytes, rounds=3):
     for _ in range(rounds):
         for size in sizes_bytes:
             ret = lib.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(size))
-            if ret == 0 and ptr.value:
+            if ret != 0:
+                print(f"    cudaMalloc({size} bytes) failed: error {ret}")
+                continue
+            if ptr.value:
                 lib.cudaFree(ptr)
                 ptr.value = None
 
@@ -121,7 +124,14 @@ def main():
         print("  WARNING: libcudart not found, using PyTorch only (caching allocator)")
     print()
 
-    sizes = [1, 4, 16, 64, 128, 256, 512]
+    # Cap sizes to 25% of free VRAM to avoid OOM when running alongside training
+    free_mem = torch.cuda.mem_get_info(device)[0]
+    max_mb = int(free_mem / (1024 * 1024)) // 4
+    sizes = [s for s in [1, 4, 16, 64, 128, 256, 512] if s <= max_mb]
+    if not sizes:
+        sizes = [1, 4, 16]
+    print(f"  Free VRAM: {free_mem / 1e9:.1f} GB, max alloc: {max_mb} MB, sizes: {sizes}")
+    print()
     deadline = time.time() + args.duration if args.duration > 0 else 0
     iteration = 0
 
@@ -133,8 +143,11 @@ def main():
         if cudart:
             print(f"{prefix}Direct cudaMalloc/cudaFree")
             t0 = time.time()
-            direct_sizes = [1 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024,
-                            256 * 1024 * 1024]
+            max_direct = max_mb * 1024 * 1024
+            direct_sizes = [s for s in [1 * 1024 * 1024, 16 * 1024 * 1024,
+                            64 * 1024 * 1024, 256 * 1024 * 1024] if s <= max_direct]
+            if not direct_sizes:
+                direct_sizes = [1 * 1024 * 1024]
             direct_cuda_alloc_free(cudart, direct_sizes, rounds=2)
             print(f"  Done in {time.time() - t0:.1f}s\n")
 
@@ -156,6 +169,7 @@ def main():
         if deadline == 0 or time.time() >= deadline:
             break
 
+    torch.cuda.synchronize()
     print("alloc_stress complete.")
 
 
