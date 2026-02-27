@@ -209,6 +209,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     """Run all 23 GPU problem investigations."""
     investigations = []
 
+    # Pre-fetch expensive MCP calls once (120s timeout each). These are reused
+    # across multiple investigations to avoid redundant queries on large DBs.
+    _cached_chains = mcp.get_causal_chains("10m")
+    _cached_stats = mcp.get_trace_stats("10m")
+    _cached_sessions = mcp.get_sessions("0")
+
     # =========================================================================
     # T23a: #1 NCCL Hangs — provoked via Phase 3
     # =========================================================================
@@ -241,8 +247,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "per-PID sync latency",
                    f"{len(rows2)} PIDs with sync events")
 
-    # Action 3: causal chains
-    r3 = mcp.get_causal_chains("10m")
+    # Action 3: causal chains (cached)
+    r3 = _cached_chains
     chains_text = r3.get("text", "")
     chain_count = chains_text.count("[HIGH]") + chains_text.count("[MEDIUM]") + chains_text.count("[LOW]")
     inv.add_action("get_causal_chains", "since=10m", f"{chain_count} chains found")
@@ -284,8 +290,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="My GPU is at 30% utilization. Where's the bottleneck?")
 
-    # Action 1: trace stats
-    r1 = mcp.get_trace_stats("10m")
+    # Action 1: trace stats (cached)
+    r1 = _cached_stats
     stats_text = r1.get("text", r1.get("data", ""))
     inv.add_action("get_trace_stats", "since=10m", "wall% breakdown")
 
@@ -413,7 +419,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=False,
                         question="Are there signs of silent data corruption?")
 
-    r1 = mcp.get_trace_stats("10m")
+    r1 = _cached_stats  # cached
     inv.add_action("get_trace_stats", "anomaly counts on kernel ops", "check anomalies")
 
     r2 = mcp.run_sql("""
@@ -627,8 +633,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="Is CPU contention causing GPU latency spikes?")
 
-    # Action 1: causal chains with scheduling keywords
-    r1 = mcp.get_causal_chains("10m")
+    # Action 1: causal chains with scheduling keywords (cached)
+    r1 = _cached_chains
     chains_text = r1.get("text", "")
     high_chains = chains_text.count("[HIGH]")
     inv.add_action("get_causal_chains", "HIGH chains",
@@ -795,7 +801,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "cuLaunchKernel duration variance",
                    f"{r1_rows[0].get('cnt', 0) if r1_rows else 0} kernel events")
 
-    r2 = mcp.get_trace_stats("10m")
+    r2 = _cached_stats  # cached
     inv.add_action("get_trace_stats", "anomaly flags on kernel ops", "anomaly check")
 
     # Cross-check: sched_switch storms explain outliers via CPU contention, not AMP.
@@ -830,8 +836,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="What fraction of GPU time is actual training vs. overhead?")
 
-    # Action 1: trace stats wall% breakdown
-    r1 = mcp.get_trace_stats("10m")
+    # Action 1: trace stats wall% breakdown (cached)
+    r1 = _cached_stats
     inv.add_action("get_trace_stats", "wall% breakdown", "overhead analysis")
 
     # Action 2: baseline vs contention cuLaunchKernel throughput
@@ -1008,7 +1014,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=False,
                         question="Are driver and CUDA versions compatible?")
 
-    r1 = mcp.get_sessions("0")
+    r1 = _cached_sessions  # cached
     sessions_text = r1.get("text", str(r1.get("data", "")))
     inv.add_action("get_sessions", "GPU, driver, CUDA, kernel versions",
                    "compatibility check")
@@ -1394,8 +1400,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "per-second CUDA event counts for correlation",
                    f"{len(cuda_per_sec)} seconds with CUDA events")
 
-    # Action 2: causal chains
-    r2 = mcp.get_causal_chains("10m")
+    # Action 2: causal chains (cached)
+    r2 = _cached_chains
     chains_text = r2.get("text", "")
     chain_count = chains_text.count("[HIGH]") + chains_text.count("[MEDIUM]") + chains_text.count("[LOW]")
     inv.add_action("get_causal_chains", "any chains", f"{chain_count} chains")
@@ -1435,8 +1441,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "per-process CUDA event summary",
                    f"{len(rows1)} processes")
 
-    # Action 2: session process names
-    r2 = mcp.get_sessions("0")
+    # Action 2: session process names (cached)
+    r2 = _cached_sessions
     inv.add_action("get_sessions", "process names", "check for Triton/vLLM")
 
     # Verdict: HEALTHY (no Triton in workload)
@@ -1451,7 +1457,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     investigations.append(inv)
 
-    return investigations
+    return investigations, _cached_sessions
 
 
 # ---------------------------------------------------------------------------
@@ -1459,11 +1465,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 # ---------------------------------------------------------------------------
 
 def generate_report(investigations: list[Investigation], mcp: MCPClient,
-                    db_path: str, report_path: str):
+                    db_path: str, report_path: str,
+                    cached_sessions: Optional[dict] = None):
     """Generate the investigation report."""
 
-    # Get session info for header
-    sessions_resp = mcp.get_sessions("0")
+    # Get session info for header (use cached if available)
+    sessions_resp = cached_sessions or mcp.get_sessions("0")
     sessions_text = sessions_resp.get("text", str(sessions_resp.get("data", "")))
 
     # Get total event count
@@ -1583,7 +1590,7 @@ def main():
     print("Running 23 GPU problem investigations...")
     print()
 
-    investigations = run_investigations(mcp, args)
+    investigations, cached_sessions = run_investigations(mcp, args)
 
     # Print per-investigation status
     for inv in investigations:
@@ -1599,7 +1606,8 @@ def main():
     # Generate report
     print()
     print(f"Generating report: {args.report}")
-    report = generate_report(investigations, mcp, args.db, args.report)
+    report = generate_report(investigations, mcp, args.db, args.report,
+                              cached_sessions=cached_sessions)
 
     # Summary
     detected = sum(1 for i in investigations if i.verdict == "DETECTED")

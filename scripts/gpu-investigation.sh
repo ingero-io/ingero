@@ -173,11 +173,12 @@ TRAIN_PID=$!
 cleanup_pids+=("$TRAIN_PID")
 
 # Start alloc_stress BEFORE the trace so auto-discovery enrolls its PID.
-# --delay 20: initializes CUDA immediately (makes PID discoverable), then sleeps
-# 20s before actual stress work begins (aligns with Phase 2 at t=20s).
-# --duration 30: stress runs for 30s (covers Phase 2's 20-50s window).
-echo -e "$(ts)   Starting alloc_stress.py (delay=20s, duration=30s)..."
-python3 tests/workloads/synthetic/alloc_stress.py --delay 20 --duration 30 \
+# --delay 30: initializes CUDA immediately (makes PID discoverable), then sleeps
+# 30s before actual stress work begins. Since alloc_stress launches ~10s before
+# the trace, the delay expires at trace-time t=20s (aligns with Phase 2).
+# --duration 30: stress runs for 30s (covers Phase 2's t=20-50s window).
+echo -e "$(ts)   Starting alloc_stress.py (delay=30s, duration=30s)..."
+python3 tests/workloads/synthetic/alloc_stress.py --delay 30 --duration 30 \
     > logs/gpu-inv-alloc-stress.log 2>&1 &
 ALLOC_PID=$!
 cleanup_pids+=("$ALLOC_PID")
