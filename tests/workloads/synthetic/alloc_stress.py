@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="CUDA device")
     parser.add_argument("--duration", type=int, default=0,
                         help="Loop for this many seconds (0 = single pass)")
+    parser.add_argument("--delay", type=int, default=0,
+                        help="Delay in seconds before starting stress (CUDA init happens immediately)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -123,9 +125,12 @@ def main():
     print(f"  VRAM: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
     if args.duration > 0:
         print(f"  Duration: {args.duration}s (looping)")
+    if args.delay > 0:
+        print(f"  Delay: {args.delay}s (CUDA initialized, waiting before stress)")
     print()
 
-    # Warm up CUDA context
+    # Warm up CUDA context — this makes the process discoverable by Ingero's
+    # auto-discovery (scans /proc/*/maps for libcudart.so).
     torch.empty(1, device=device)
 
     # Load libcudart for direct cudaMalloc/cudaFree (bypasses caching allocator)
@@ -135,6 +140,12 @@ def main():
     else:
         print("  WARNING: libcudart not found, using PyTorch only (caching allocator)")
     print()
+
+    # Wait for delay (CUDA already initialized — Ingero can discover us)
+    if args.delay > 0:
+        print(f"  Waiting {args.delay}s before starting stress...")
+        time.sleep(args.delay)
+        print(f"  Delay complete, starting stress.")
 
     # Cap sizes to 25% of free VRAM to avoid OOM when running alongside training
     free_mem = torch.cuda.mem_get_info(device)[0]
