@@ -20,7 +20,7 @@
 #   3: OTLP + Prometheus export (T14a-e, T15-T17)
 #   4: Stack latency benchmark (T18)
 #   5: MCP AI diagnostic (T19a-e, T20-T21)
-#   6: GPU problem investigation (T23a-T23w, 23 issues via MCP)
+#   6: GPU problem investigation (T23a-T23ab, 28 issues via MCP)
 #
 # Parallelization strategy (saves ~350s / 44% faster):
 #   - T02 demos + T09 synthetics run as background jobs during Phase 1
@@ -1331,12 +1331,12 @@ else
 fi
 
 ################################################################################
-# Phase 6: GPU Problem Investigation (T23a-T23w, 23 issues via MCP)
+# Phase 6: GPU Problem Investigation (T23a-T23ab, 28 issues via MCP)
 ################################################################################
-header "Phase 6: GPU Problem Investigation (23 issues)"
+header "Phase 6: GPU Problem Investigation (28 issues)"
 
 _test_start=$SECONDS
-log "Running 23 GPU problem investigations (ResNet-50 + alloc_stress + stress-ng + MCP)..."
+log "Running 28 GPU problem investigations (ResNet-50 + alloc_stress + stress-ng + MCP)..."
 
 ML_OUTPUT=$(bash scripts/gpu-investigation.sh 2>&1)
 ML_EXIT=$?
