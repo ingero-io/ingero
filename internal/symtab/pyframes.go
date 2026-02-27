@@ -176,9 +176,9 @@ func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", info.LibPath)
 	}
 
-	// Parse /proc/[pid]/maps to find the library's load address.
-	// _PyRuntime lives in .data (read-write), so we search all regions
-	// for this path, not just executable ones.
+	// Parse /proc/[pid]/maps to find the library's base address.
+	// We use the first executable region for this path to compute
+	// the load address (base = region.Start - region.Offset).
 	regions, err := parseMapsFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return 0, err

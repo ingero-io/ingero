@@ -136,3 +136,108 @@ func TestEventOpName(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveOp verifies name → (Source, Op) resolution.
+func TestResolveOp(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantSource Source
+		wantOp     uint8
+	}{
+		{"cudaMalloc", SourceCUDA, uint8(CUDAMalloc)},
+		{"cudaFree", SourceCUDA, uint8(CUDAFree)},
+		{"cudaLaunchKernel", SourceCUDA, uint8(CUDALaunchKernel)},
+		{"cudaMemcpy", SourceCUDA, uint8(CUDAMemcpy)},
+		{"cudaStreamSync", SourceCUDA, uint8(CUDAStreamSync)},
+		{"cudaDeviceSync", SourceCUDA, uint8(CUDADeviceSync)},
+		{"cudaMemcpyAsync", SourceCUDA, uint8(CUDAMemcpyAsync)},
+		{"cuLaunchKernel", SourceDriver, uint8(DriverLaunchKernel)},
+		{"cuMemcpy", SourceDriver, uint8(DriverMemcpy)},
+		{"cuMemcpyAsync", SourceDriver, uint8(DriverMemcpyAsync)},
+		{"cuCtxSynchronize", SourceDriver, uint8(DriverCtxSync)},
+		{"cuMemAlloc", SourceDriver, uint8(DriverMemAlloc)},
+		{"sched_switch", SourceHost, uint8(HostSchedSwitch)},
+		{"sched_wakeup", SourceHost, uint8(HostSchedWakeup)},
+		{"mm_page_alloc", SourceHost, uint8(HostPageAlloc)},
+		{"oom_kill", SourceHost, uint8(HostOOMKill)},
+		{"process_exec", SourceHost, uint8(HostProcessExec)},
+		{"process_exit", SourceHost, uint8(HostProcessExit)},
+		{"process_fork", SourceHost, uint8(HostProcessFork)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src, op, ok := ResolveOp(tt.name)
+			if !ok {
+				t.Fatalf("ResolveOp(%q) returned not found", tt.name)
+			}
+			if src != tt.wantSource || op != tt.wantOp {
+				t.Errorf("ResolveOp(%q) = (%v, %d), want (%v, %d)",
+					tt.name, src, op, tt.wantSource, tt.wantOp)
+			}
+		})
+	}
+}
+
+// TestResolveOp_CaseInsensitive verifies case-insensitive lookup.
+func TestResolveOp_CaseInsensitive(t *testing.T) {
+	cases := []string{"CUDAMALLOC", "CudaMalloc", "cudamalloc", "CULAUNCHKERNEL", "SCHED_SWITCH"}
+	for _, name := range cases {
+		if _, _, ok := ResolveOp(name); !ok {
+			t.Errorf("ResolveOp(%q) should resolve (case-insensitive)", name)
+		}
+	}
+}
+
+// TestResolveOp_RoundTrip verifies String() → ResolveOp() round-trips for all ops.
+func TestResolveOp_RoundTrip(t *testing.T) {
+	cudaOps := []CUDAOp{CUDAMalloc, CUDAFree, CUDALaunchKernel, CUDAMemcpy, CUDAStreamSync, CUDADeviceSync, CUDAMemcpyAsync}
+	for _, op := range cudaOps {
+		name := op.String()
+		src, resolved, ok := ResolveOp(name)
+		if !ok {
+			t.Errorf("ResolveOp(%q) failed round-trip", name)
+			continue
+		}
+		if src != SourceCUDA || resolved != uint8(op) {
+			t.Errorf("ResolveOp(%q) = (%v, %d), want (cuda, %d)", name, src, resolved, op)
+		}
+	}
+
+	driverOps := []DriverOp{DriverLaunchKernel, DriverMemcpy, DriverMemcpyAsync, DriverCtxSync, DriverMemAlloc}
+	for _, op := range driverOps {
+		name := op.String()
+		src, resolved, ok := ResolveOp(name)
+		if !ok {
+			t.Errorf("ResolveOp(%q) failed round-trip", name)
+			continue
+		}
+		if src != SourceDriver || resolved != uint8(op) {
+			t.Errorf("ResolveOp(%q) = (%v, %d), want (driver, %d)", name, src, resolved, op)
+		}
+	}
+
+	hostOps := []HostOp{HostSchedSwitch, HostSchedWakeup, HostPageAlloc, HostOOMKill, HostProcessExec, HostProcessExit, HostProcessFork}
+	for _, op := range hostOps {
+		name := op.String()
+		src, resolved, ok := ResolveOp(name)
+		if !ok {
+			t.Errorf("ResolveOp(%q) failed round-trip", name)
+			continue
+		}
+		if src != SourceHost || resolved != uint8(op) {
+			t.Errorf("ResolveOp(%q) = (%v, %d), want (host, %d)", name, src, resolved, op)
+		}
+	}
+}
+
+// TestResolveOp_Unknown verifies unknown names return false.
+func TestResolveOp_Unknown(t *testing.T) {
+	unknowns := []string{"", "nonexistent", "cudaMallocX", "foobar"}
+	for _, name := range unknowns {
+		if _, _, ok := ResolveOp(name); ok {
+			t.Errorf("ResolveOp(%q) should return false", name)
+		}
+	}
+}
+
