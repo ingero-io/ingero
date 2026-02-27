@@ -120,6 +120,7 @@ func TestEventOpName(t *testing.T) {
 		{"driver launch", SourceDriver, uint8(DriverLaunchKernel), "cuLaunchKernel"},
 		{"driver memcpy", SourceDriver, uint8(DriverMemcpy), "cuMemcpy"},
 		{"driver ctx sync", SourceDriver, uint8(DriverCtxSync), "cuCtxSynchronize"},
+		{"driver memcpy async", SourceDriver, uint8(DriverMemcpyAsync), "cuMemcpyAsync"},
 		{"driver mem alloc", SourceDriver, uint8(DriverMemAlloc), "cuMemAlloc"},
 		{"driver unknown", SourceDriver, 99, "driver_op(99)"},
 		{"nvidia unknown", SourceNvidia, 1, "op(1)"},
@@ -186,6 +187,18 @@ func TestResolveOp_CaseInsensitive(t *testing.T) {
 		if _, _, ok := ResolveOp(name); !ok {
 			t.Errorf("ResolveOp(%q) should resolve (case-insensitive)", name)
 		}
+	}
+}
+
+// TestResolveOp_Aliases verifies alternative names resolve correctly.
+func TestResolveOp_Aliases(t *testing.T) {
+	// cuMemAllocV2 is an alias for cuMemAlloc (driver symbol versioning).
+	src, op, ok := ResolveOp("cuMemAllocV2")
+	if !ok {
+		t.Fatal("ResolveOp(\"cuMemAllocV2\") returned not found")
+	}
+	if src != SourceDriver || op != uint8(DriverMemAlloc) {
+		t.Errorf("ResolveOp(\"cuMemAllocV2\") = (%v, %d), want (driver, %d)", src, op, DriverMemAlloc)
 	}
 }
 
