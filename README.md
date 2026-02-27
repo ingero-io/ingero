@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.52**
+**Version: 0.6.55**
 
 *"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
 
@@ -239,7 +239,7 @@ ingero query --since 1h --pid 4821,5032
 ingero query --since 30m --op cudaMemcpy --json
 ```
 
-Storage uses SQLite with 7-day rolling retention. Data is stored locally at `~/.ingero/ingero.db` — nothing leaves your machine.
+Storage uses SQLite with size-based pruning (default 10 GB via `--max-db`). Data is stored locally at `~/.ingero/ingero.db` — nothing leaves your machine.
 
 ### `ingero mcp`
 
@@ -263,6 +263,7 @@ ingero mcp --http :8080           # HTTPS/TLS 1.3 (self-signed cert)
 | `get_sessions` | Trace session metadata (GPU, CPU, driver, OS, versions) |
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
+| `run_sql` | Execute read-only SQL for ad-hoc analysis |
 
 **curl examples** (with `--http :8080`):
 
@@ -433,7 +434,7 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 4. **System** — reads CPU/memory/load/swap from `/proc` once per second
 5. **Stats** — computes rolling p50/p95/p99 per operation, flags anomalies
 6. **Correlate** — assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver) by timestamp and PID
-7. **Store** — writes events to SQLite with 7-day rolling retention + size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
+7. **Store** — writes events to SQLite with size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
 8. **Export** — pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
 9. **Serve** — exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
 
@@ -512,7 +513,7 @@ Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H
 Yes, with `--privileged` or appropriate BPF capabilities. The host kernel must have BTF enabled.
 
 **Where is data stored?**
-Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. 7-day rolling retention + size-based pruning (default 10 GB, configure with `--max-db`). Use `--db /path/to/file.db` for a custom location.
+Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-based pruning keeps the DB under 10 GB by default. With `--record-all`, this covers a few hours of heavy GPU load; with selective storage (default), it lasts much longer. Configure with `--max-db` (e.g., `--max-db 500m`, `--max-db 0` for unlimited). Use `--db /path/to/file.db` for a custom location.
 
 **Does it check for updates?**
 Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero checks GitHub Releases for newer versions (once per 24 hours, cached in `~/.ingero/update-check`). The check runs in the background and never delays your command. Set `INGERO_NO_UPDATE_NOTIFIER=1` to disable. Skipped for `query`, `mcp`, `version`, and dev builds.

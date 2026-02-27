@@ -238,7 +238,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		eventStore = s
 		debugf("recording to %s", dbPath)
 
-		// Set size-based DB retention if --max-db is specified.
+		// Set size-based DB limit if --max-db is specified.
 		if traceMaxDB != "" && traceMaxDB != "0" {
 			maxBytes, err := store.ParseSize(traceMaxDB)
 			if err != nil {

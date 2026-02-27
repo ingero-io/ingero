@@ -147,7 +147,7 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	// Replay system snapshots for post-hoc causal chain analysis.
 	// When --last N is used, params has no time filter, so scope snapshot
 	// query to the actual event time range. Otherwise PeakSystemContext
-	// would pick peaks from the entire 7-day retention window.
+	// would pick peaks from the entire DB history.
 	snapshotParams := params
 	if explainLast > 0 && len(evts) > 0 {
 		snapshotParams.From = evts[0].Timestamp

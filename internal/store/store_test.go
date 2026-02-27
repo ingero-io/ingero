@@ -771,31 +771,47 @@ func TestRecordAndQueryAggregates(t *testing.T) {
 	}
 }
 
-func TestAggregatesPruned(t *testing.T) {
-	s, err := New(":memory:")
+func TestAggregatesPrunedBySize(t *testing.T) {
+	// Size-based pruning only works with on-disk DBs (stat() checks file size).
+	// Use a temp file to test the actual pruning path.
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "test-prune.db")
+	s, err := New(dbPath)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
 	defer s.Close()
 
-	// Insert an aggregate with a very old bucket (outside retention).
+	// Insert an old aggregate (8 days ago) and a recent one (1 minute ago).
+	// pruneBySize needs a time range (min < max) to compute the cutoff.
 	oldBucket := time.Now().Add(-8 * 24 * time.Hour).Truncate(time.Minute).UnixNano()
+	newBucket := time.Now().Add(-1 * time.Minute).Truncate(time.Minute).UnixNano()
 	s.RecordAggregates([]Aggregate{
 		{Bucket: oldBucket, Source: 1, Op: 3, PID: 0, Count: 1000, Stored: 10},
+		{Bucket: newBucket, Source: 1, Op: 3, PID: 0, Count: 50, Stored: 5},
 	})
 
-	// Verify it's there.
+	// Verify both are there.
 	totals, _ := s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
-	if totals.TotalEvents != 1000 {
-		t.Fatalf("expected 1000 before prune, got %d", totals.TotalEvents)
+	if totals.TotalEvents != 1050 {
+		t.Fatalf("expected 1050 before prune, got %d", totals.TotalEvents)
 	}
 
-	// Prune should remove it (default retention is 7 days).
-	s.pruneOld()
+	// Without --max-db, prune() is a no-op — all data stays.
+	s.prune()
+	totals, _ = s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
+	if totals.TotalEvents != 1050 {
+		t.Fatalf("expected 1050 after prune (no limit), got %d", totals.TotalEvents)
+	}
+
+	// Set a tiny max-db to force pruning. With keepFraction ≈ 0,
+	// the cutoff lands near maxTS — the old bucket is deleted.
+	s.SetMaxDBSize(1) // 1 byte — will prune everything
+	s.prune()
 
 	totals, _ = s.QueryAggregateTotals(QueryParams{From: time.Unix(0, oldBucket)})
-	if totals.TotalEvents != 0 {
-		t.Errorf("expected 0 after prune, got %d", totals.TotalEvents)
+	if totals.TotalEvents > 50 {
+		t.Errorf("expected old aggregate pruned, got total %d", totals.TotalEvents)
 	}
 }
 
