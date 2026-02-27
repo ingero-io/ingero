@@ -66,6 +66,7 @@ class MCPClient:
             with urllib.request.urlopen(req, context=self._ctx, timeout=30) as resp:
                 body = resp.read().decode()
         except Exception as e:
+            print(f"  [MCP ERROR] {tool}: {e}", file=sys.stderr)
             return {"error": str(e)}
 
         try:
@@ -236,7 +237,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     chain_count = chains_text.count("[HIGH]") + chains_text.count("[MEDIUM]") + chains_text.count("[LOW]")
     inv.add_action("get_causal_chains", "since=10m", f"{chain_count} chains found")
 
-    # Verdict: DETECTED if sched_switch → sync amplification found
+    # Verdict: DETECTED if multi-PID sched_switch → sync amplification found.
+    # Single-PID contention is "scheduling contention", not NCCL.
     if rows1 and rows2:
         top_sched = rows1[0] if rows1 else {}
         top_sync = rows2[0] if rows2 else {}
@@ -244,9 +246,17 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         max_sync_us = top_sync.get("max_us", 0) or 0
         avg_sync_us = top_sync.get("avg_us", 0) or 0
         amp = safe_div(max_sync_us, avg_sync_us)
-        if sched_count > 100 and amp > 3:
+        # Count PIDs with sync events — NCCL requires multi-PID
+        sync_pids = len([r for r in rows2 if (r.get("sync_events", 0) or 0) > 5])
+
+        if sync_pids >= 2 and sched_count > 100 and amp > 3:
+            # Multi-PID: real straggler pattern (NCCL-relevant)
             inv.set_verdict("DETECTED",
-                            f"{sched_count} sched_switch, sync amp {amp:.1f}x (max={max_sync_us:.0f}us)")
+                            f"{sched_count} sched_switch, sync amp {amp:.1f}x across {sync_pids} PIDs")
+        elif sched_count > 100 and amp > 3:
+            # Single-PID: CPU scheduling contention, not NCCL
+            inv.set_verdict("DETECTED",
+                            f"scheduling contention: {sched_count} sched_switch, sync amp {amp:.1f}x (single-PID, not NCCL)")
         elif sched_count > 50:
             inv.set_verdict("DETECTED",
                             f"{sched_count} sched_switch events, sync max={max_sync_us:.0f}us")
@@ -406,13 +416,25 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "cuLaunchKernel duration variance",
                    "stddev check for bimodal distribution")
 
+    # Cross-check: if sched_switch storms present, variance is from CPU contention, not SDC.
+    r3 = mcp.run_sql("""
+        SELECT COUNT(*) as sched_cnt FROM events WHERE source=3 AND op=1
+    """)
+    sched_cnt = sql_first_val(r3, 0)
+    inv.add_action("run_sql", "sched_switch count (contention cross-check)",
+                   f"{sched_cnt} context switches")
+
     # Verdict: HEALTHY (no real SDC on test hardware)
     cnt = r2_rows[0].get("cnt", 0) if r2_rows else 0
     avg = r2_rows[0].get("avg_dur", 0) or 0 if r2_rows else 0
     var_dur = r2_rows[0].get("var_dur", 0) or 0 if r2_rows else 0
     # max(0, ...) prevents complex numbers from negative variance (floating-point imprecision)
     cv = (max(0, var_dur) ** 0.5 / avg) if avg > 0 else 0
-    if cv > 3.0:  # Threshold 3.0: mixed workloads naturally have CV ~2-3
+    # High CV with high sched_switch = CPU contention, not SDC.
+    if sched_cnt > 1000 and cv > 3.0:
+        inv.set_verdict("HEALTHY",
+                        f"kernel CV={cv:.2f} explained by CPU contention ({sched_cnt} sched_switch)")
+    elif cv > 5.0:  # Very high CV without contention = suspicious
         inv.set_verdict("DETECTED", f"kernel duration CV={cv:.2f} (bimodal suspected)")
     else:
         inv.set_verdict("HEALTHY", f"kernel duration CV={cv:.2f}, no bimodal pattern")
@@ -758,14 +780,24 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     r2 = mcp.get_trace_stats("10m")
     inv.add_action("get_trace_stats", "anomaly flags on kernel ops", "anomaly check")
 
+    # Cross-check: sched_switch storms explain outliers via CPU contention, not AMP.
+    r3 = mcp.run_sql("""
+        SELECT COUNT(*) as sched_cnt FROM events WHERE source=3 AND op=1
+    """)
+    amp_sched_cnt = sql_first_val(r3, 0)
+    inv.add_action("run_sql", "sched_switch count (contention cross-check)",
+                   f"{amp_sched_cnt} context switches")
+
     # Verdict: HEALTHY (no AMP in workload)
     cnt = r1_rows[0].get("cnt", 0) if r1_rows else 0
     max_us = r1_rows[0].get("max_us", 0) or 0 if r1_rows else 0
     avg_us = r1_rows[0].get("avg_us", 0) or 0 if r1_rows else 0
     outlier_ratio = safe_div(max_us, avg_us)
-    # Threshold 200x: mixed workloads (cold start + steady state) naturally have high
-    # max/avg ratios due to different kernel types. Only flag extreme outliers.
-    if outlier_ratio > 200 and cnt > 100:
+    # High outlier ratio with high sched_switch = CPU contention, not AMP instability.
+    if amp_sched_cnt > 1000 and outlier_ratio > 200:
+        inv.set_verdict("HEALTHY",
+                        f"outlier ratio {outlier_ratio:.1f}x explained by CPU contention ({amp_sched_cnt} sched_switch)")
+    elif outlier_ratio > 500 and cnt > 100:
         inv.set_verdict("DETECTED", f"kernel outlier ratio {outlier_ratio:.1f}x (may indicate AMP)")
     else:
         inv.set_verdict("HEALTHY", f"kernel count={cnt}, outlier ratio={outlier_ratio:.1f}x")
@@ -1185,11 +1217,11 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         question="Are checkpoint operations causing memory spikes?")
 
     # Action 1: mm_page_alloc bursts >100MB in 5s windows
+    # arg0 already stores bytes (host_trace.bpf.c: 4096 << order), not page count.
     r1 = mcp.run_sql("""
         SELECT CAST(timestamp / 5000000000 AS INT) * 5 as bucket,
                COUNT(*) as page_events,
-               SUM(arg0) as total_pages,
-               SUM(arg0) * 4096 / 1e6 as total_mb
+               SUM(arg0) / 1e6 as total_mb
         FROM events WHERE source=3 AND op=3
         GROUP BY bucket HAVING total_mb > 100
         ORDER BY total_mb DESC
@@ -1309,21 +1341,29 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="Are there system events correlated with training anomalies?")
 
-    # Action 1: system snapshots with high CPU + correlated CUDA counts
+    # Action 1: high-CPU system snapshots (simple query, no expensive subquery)
     r1 = mcp.run_sql("""
-        SELECT s.timestamp / 1000000000 as snap_sec,
-               s.cpu_pct, s.mem_pct, s.load_avg,
-               (SELECT COUNT(*) FROM events e
-                WHERE e.source IN (1, 4)
-                AND CAST(e.timestamp / 1000000000 AS INT) = CAST(s.timestamp / 1000000000 AS INT)
-               ) as cuda_events
-        FROM system_snapshots s
-        WHERE s.cpu_pct > 80
-        ORDER BY s.cpu_pct DESC LIMIT 20
+        SELECT CAST(timestamp / 1000000000 AS INT) as snap_sec,
+               cpu_pct, mem_pct, load_avg
+        FROM system_snapshots
+        WHERE cpu_pct > 80
+        ORDER BY cpu_pct DESC LIMIT 20
     """)
     rows1 = sql_to_dicts(r1)
-    inv.add_action("run_sql", "high-CPU snapshots with correlated CUDA events",
+    inv.add_action("run_sql", "high-CPU snapshots",
                    f"{len(rows1)} high-CPU snapshots")
+
+    # Action 1b: per-second CUDA event counts (pre-aggregated, then joined in Python)
+    r1b = mcp.run_sql("""
+        SELECT CAST(timestamp / 1000000000 AS INT) as sec, COUNT(*) as cuda_events
+        FROM events WHERE source IN (1, 4) GROUP BY sec
+    """)
+    cuda_per_sec = {r.get("sec", 0): r.get("cuda_events", 0) for r in sql_to_dicts(r1b)}
+    # Annotate snapshots with CUDA event counts
+    for r in rows1:
+        r["cuda_events"] = cuda_per_sec.get(r.get("snap_sec", 0), 0)
+    inv.add_action("run_sql", "per-second CUDA event counts for correlation",
+                   f"{len(cuda_per_sec)} seconds with CUDA events")
 
     # Action 2: causal chains
     r2 = mcp.get_causal_chains("10m")

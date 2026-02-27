@@ -467,6 +467,23 @@ func (s *Server) registerTools() {
 		// live trace behavior). Single-pass replay averages them away.
 		chains := correlate.ReplayEventsForChains(evts, collector, corr, corrPID)
 		tsc := input.TSC == nil || *input.TSC
+
+		// Fallback: if replay produces 0 chains, check stored chains in DB.
+		// The replay can miss chains on very large DBs (>1M events) where the
+		// rolling collector's window dilutes anomalies, or when time.Now()-based
+		// query bounds exclude relevant events.
+		if len(chains) == 0 {
+			stored, err := s.store.QueryChains(since)
+			if err == nil && len(stored) > 0 {
+				text := formatStoredChains(stored, tsc)
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: text},
+					},
+				}, struct{}{}, nil
+			}
+		}
+
 		text := formatCausalChains(chains, tsc)
 
 		return &gomcp.CallToolResult{
@@ -740,6 +757,49 @@ func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 		result += fmt.Sprintf("  Root cause: %s\n", ch.RootCause)
 		for _, evt := range ch.Timeline {
 			result += fmt.Sprintf("  [%s] %s\n", evt.Layer, evt.Detail)
+		}
+		if len(ch.Recommendations) > 0 {
+			result += "  Fix: " + fmt.Sprintf("%v", ch.Recommendations) + "\n"
+		}
+		result += "\n"
+	}
+	return result
+}
+
+func formatStoredChains(chains []store.StoredChain, tsc bool) string {
+	if len(chains) == 0 {
+		return "No causal chains detected. System appears healthy."
+	}
+
+	if tsc {
+		var out []map[string]interface{}
+		for _, ch := range chains {
+			var tl []map[string]interface{}
+			for _, te := range ch.Timeline {
+				tl = append(tl, TSCMap(true,
+					"layer", te.Layer,
+					"detail", te.Detail,
+				))
+			}
+			m := TSCMap(true,
+				"severity", ch.Severity,
+				"summary", ch.Summary,
+				"root_cause", ch.RootCause,
+				"recommendations", ch.Recommendations,
+			)
+			m["tl"] = tl
+			out = append(out, m)
+		}
+		data, _ := json.Marshal(out)
+		return string(data)
+	}
+
+	result := fmt.Sprintf("%d stored causal chain(s) found:\n\n", len(chains))
+	for _, ch := range chains {
+		result += fmt.Sprintf("[%s] %s\n", ch.Severity, ch.Summary)
+		result += fmt.Sprintf("  Root cause: %s\n", ch.RootCause)
+		for _, te := range ch.Timeline {
+			result += fmt.Sprintf("  [%s] %s\n", te.Layer, te.Detail)
 		}
 		if len(ch.Recommendations) > 0 {
 			result += "  Fix: " + fmt.Sprintf("%v", ch.Recommendations) + "\n"
