@@ -233,6 +233,8 @@ func FindLibCUDA() (string, error) {
 }
 
 // findLibInProcMaps searches /proc/<pid>/maps for a library matching substr.
+// Extracts the file path from the last whitespace-delimited field in the maps line,
+// avoiding per-call regex compilation.
 func findLibInProcMaps(pid int, substr string) (string, error) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
@@ -240,12 +242,18 @@ func findLibInProcMaps(pid int, substr string) (string, error) {
 	}
 	defer f.Close()
 
-	re := regexp.MustCompile(`\S+` + regexp.QuoteMeta(substr) + `\S*`)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.Contains(line, substr) {
-			if path := re.FindString(line); path != "" {
+		if !strings.Contains(line, substr) {
+			continue
+		}
+		// /proc/pid/maps format: addr perms offset dev inode [pathname]
+		// The pathname is the last field (field 6+). Use Fields to extract it.
+		fields := strings.Fields(line)
+		if len(fields) >= 6 {
+			path := fields[len(fields)-1]
+			if strings.Contains(path, substr) {
 				return path, nil
 			}
 		}

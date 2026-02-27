@@ -22,10 +22,10 @@ struct {
 } host_events SEC(".maps");
 
 // In-kernel PID filter. Only events involving these PIDs are emitted.
-// Populated by Go agent; max_entries=64 is plenty for targeted GPU tracing.
+// Populated by Go agent; 256 entries covers K8s nodes with many GPU pods.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
+	__uint(max_entries, 256);
 	__type(key, __u32);   // PID (tgid)
 	__type(value, __u8);  // presence = "trace this PID"
 } target_pids SEC(".maps");

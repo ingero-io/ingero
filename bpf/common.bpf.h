@@ -26,6 +26,7 @@
 #define CUDA_OP_MEMCPY           4
 #define CUDA_OP_STREAM_SYNC      5
 #define CUDA_OP_DEVICE_SYNC      6
+#define CUDA_OP_MEMCPY_ASYNC     7
 
 /* CUDA driver operation types (libcuda.so) */
 #define DRIVER_OP_LAUNCH_KERNEL    1
@@ -33,6 +34,18 @@
 #define DRIVER_OP_MEMCPY_ASYNC     3
 #define DRIVER_OP_CTX_SYNC         4
 #define DRIVER_OP_MEM_ALLOC        5
+
+/* Per-thread entry state: timestamp + args at CUDA/driver function entry.
+ * Shared by cuda_trace.bpf.c and driver_trace.bpf.c.
+ * Keyed by TID — each thread can only be in one CUDA call at a time.
+ */
+struct entry_state {
+	__u64 timestamp_ns;
+	__u8  op;
+	__u8  _pad[7];
+	__u64 arg0;
+	__u64 arg1;
+};
 
 /* Stack trace capture — max userspace frames per event.
  * bpf_get_stack() supports up to 127 frames; 64 covers deep Python +

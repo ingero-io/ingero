@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -127,14 +128,21 @@ func parseMapsLine(line string) (MapRegion, bool) {
 }
 
 // FindRegion returns the MapRegion containing addr, or nil if not found.
-// Regions should be sorted by Start (they are from /proc/maps).
+// Regions are sorted by Start address (from /proc/maps).
+// Uses binary search: O(log n) instead of O(n) per stack frame lookup.
 func FindRegion(regions []MapRegion, addr uint64) *MapRegion {
-	// Linear scan — /proc/maps typically has <100 executable regions.
-	// For higher throughput, could switch to binary search.
-	for i := range regions {
-		if regions[i].Contains(addr) {
-			return &regions[i]
-		}
+	// Binary search for the last region whose Start <= addr.
+	// sort.Search finds the first index where regions[i].Start > addr,
+	// so the candidate is at index-1.
+	i := sort.Search(len(regions), func(i int) bool {
+		return regions[i].Start > addr
+	})
+	if i == 0 {
+		return nil // addr is below all regions
+	}
+	r := &regions[i-1]
+	if r.Contains(addr) {
+		return r
 	}
 	return nil
 }

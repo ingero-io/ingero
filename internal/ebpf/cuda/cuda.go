@@ -2,7 +2,6 @@ package cuda
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -25,6 +24,9 @@ type Tracer struct {
 	reader       *ringbuf.Reader      // reads events from kernel ring buffer
 	eventCh      chan events.Event     // output channel for parsed events
 	dropped      atomic.Uint64        // events dropped due to full channel
+	readErrors   atomic.Uint64        // ring buffer read errors
+	parseErrors  atomic.Uint64        // event parse failures
+	closed       atomic.Bool          // prevents double-close
 }
 
 // Option configures a Tracer.
@@ -67,9 +69,15 @@ func (t *Tracer) Attach() error {
 		return fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
-	// If anything below fails, clean up the loaded objects.
+	// If anything below fails, clean up accumulated links + loaded objects.
 	var closeFn func()
-	closeFn = func() { t.objs.Close() }
+	closeFn = func() {
+		for _, l := range t.links {
+			l.Close()
+		}
+		t.links = nil
+		t.objs.Close()
+	}
 	defer func() {
 		if closeFn != nil {
 			closeFn()
@@ -150,11 +158,13 @@ func (t *Tracer) Run(ctx context.Context) {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return // Clean shutdown
 			}
+			t.readErrors.Add(1)
 			continue // Transient error, skip
 		}
 
 		evt, err := parseEvent(record.RawSample)
 		if err != nil {
+			t.parseErrors.Add(1)
 			continue // Malformed event, skip
 		}
 
@@ -202,60 +212,35 @@ func parseEvent(raw []byte) (events.Event, error) {
 
 	// Check for stack event (576 bytes).
 	if len(raw) >= stackEventSize {
-		evt.Stack = parseStackIPs(raw, baseSize)
+		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}
 
 	return evt, nil
 }
 
-// parseStackIPs extracts stack frames from the stack section of a cuda_event_stack.
-// The stack section starts at baseOffset (byte 56):
-//
-//	offset 56: stack_depth (uint16 LE) — number of valid IPs
-//	offset 58: _stack_pad[3] (6 bytes)
-//	offset 64: stack_ips[MAX_STACK_DEPTH] (up to 64 * 8 = 512 bytes)
-func parseStackIPs(raw []byte, baseOffset int) []events.StackFrame {
-	if len(raw) < baseOffset+8 {
-		return nil
-	}
-
-	depth := binary.LittleEndian.Uint16(raw[baseOffset : baseOffset+2])
-	if depth == 0 || depth > 64 {
-		return nil
-	}
-
-	ipsOffset := baseOffset + 8 // skip stack_depth (2) + pad (6)
-	frames := make([]events.StackFrame, 0, depth)
-	for i := uint16(0); i < depth; i++ {
-		off := ipsOffset + int(i)*8
-		if off+8 > len(raw) {
-			break
-		}
-		ip := binary.LittleEndian.Uint64(raw[off : off+8])
-		if ip == 0 {
-			break // zero IP marks end of valid frames
-		}
-		frames = append(frames, events.StackFrame{IP: ip})
-	}
-	return frames
-}
-
-// Close releases all eBPF resources in reverse order of creation.
+// Close releases all eBPF resources. Safe to call multiple times (idempotent).
+// Closes in reverse order: reader → links → objects.
 func (t *Tracer) Close() error {
-	if t.reader != nil {
-		t.reader.Close()
+	if t.closed.Swap(true) {
+		return nil // Already closed
 	}
 
+	var errs []error
+	if t.reader != nil {
+		if err := t.reader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, l := range t.links {
-		l.Close()
+		if err := l.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	t.links = nil
-
 	if err := t.objs.Close(); err != nil {
-		return fmt.Errorf("closing eBPF objects: %w", err)
+		errs = append(errs, fmt.Errorf("closing eBPF objects: %w", err))
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // LibPath returns the path to the libcudart.so being traced.
@@ -272,4 +257,14 @@ func (t *Tracer) ProbeCount() int {
 // This is an atomic counter — safe to call from any goroutine.
 func (t *Tracer) Dropped() uint64 {
 	return t.dropped.Load()
+}
+
+// ReadErrors returns the number of ring buffer read errors (transient kernel-side failures).
+func (t *Tracer) ReadErrors() uint64 {
+	return t.readErrors.Load()
+}
+
+// ParseErrors returns the number of malformed events that failed to parse.
+func (t *Tracer) ParseErrors() uint64 {
+	return t.parseErrors.Load()
 }

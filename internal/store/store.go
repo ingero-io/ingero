@@ -236,6 +236,7 @@ func populateLookupTables(db *sql.DB) {
 		{1, 4, "cudaMemcpy", "Synchronous host<->device memory copy"},
 		{1, 5, "cudaStreamSync", "Wait for all ops in a CUDA stream to complete"},
 		{1, 6, "cudaDeviceSync", "Wait for all GPU work on device to complete"},
+		{1, 7, "cudaMemcpyAsync", "Asynchronous host<->device memory copy"},
 		// Host kernel (source=3)
 		{3, 1, "sched_switch", "CPU context switch — thread was descheduled"},
 		{3, 2, "sched_wakeup", "Thread woken up and enqueued to run queue"},
@@ -261,7 +262,7 @@ func populateLookupTables(db *sql.DB) {
 		{"timestamp_unit", "nanoseconds (Unix epoch)"},
 		{"duration_unit", "nanoseconds"},
 		{"arg0_note", "Operation-specific: byte size for alloc/memcpy, kernel function pointer for launch"},
-		{"arg1_note", "Operation-specific: memcpy direction for cudaMemcpy, unused for most ops"},
+		{"arg1_note", "Operation-specific: memcpy direction for cudaMemcpy/cudaMemcpyAsync, unused for most ops"},
 		{"ret_code_note", "CUDA return code (0 = cudaSuccess). Host events always 0."},
 		{"stack_traces_note", "Deduplicated stacks: events.stack_hash → stack_traces.hash. Query: SELECT e.*, st.ips FROM events e LEFT JOIN stack_traces st ON e.stack_hash = st.hash"},
 		{"example_query", "SELECT e.id, s.name AS source, o.name AS op, e.duration/1000 AS dur_us, e.pid FROM events e JOIN sources s ON e.source = s.id JOIN ops o ON e.source = o.source_id AND e.op = o.op_id ORDER BY e.timestamp DESC LIMIT 20"},

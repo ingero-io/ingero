@@ -33,27 +33,20 @@ struct {
 	__type(value, struct ingero_config);
 } driver_config_map SEC(".maps");
 
-// Per-thread entry state for driver API calls.
-struct driver_entry_state {
-	__u64 timestamp_ns;
-	__u8  op;
-	__u8  _pad[7];
-	__u64 arg0;
-	__u64 arg1;
-};
+// entry_state is defined in common.bpf.h (shared with cuda_trace.bpf.c).
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
 	__type(key, __u32);
-	__type(value, struct driver_entry_state);
+	__type(value, struct entry_state);
 } driver_entry_map SEC(".maps");
 
 // ---- Helpers ----
 
 static __always_inline void driver_save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg1)
 {
-	struct driver_entry_state state = {};
+	struct entry_state state = {};
 	state.timestamp_ns = bpf_ktime_get_ns();
 	state.op = op;
 	state.arg0 = arg0;
@@ -64,7 +57,7 @@ static __always_inline void driver_save_entry(__u32 tid, __u8 op, __u64 arg0, __
 
 static __always_inline void driver_emit_event(struct pt_regs *ctx,
 					      __u32 pid, __u32 tid,
-					      struct driver_entry_state *entry,
+					      struct entry_state *entry,
 					      __s32 return_code)
 {
 	__u64 now = bpf_ktime_get_ns();
@@ -148,7 +141,7 @@ int uretprobe_cu_launch_kernel(struct pt_regs *ctx)
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
-	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
 	if (!entry)
 		return 0;
 
@@ -178,7 +171,7 @@ int uretprobe_cu_memcpy(struct pt_regs *ctx)
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
-	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
 	if (!entry)
 		return 0;
 
@@ -208,7 +201,7 @@ int uretprobe_cu_memcpy_async(struct pt_regs *ctx)
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
-	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
 	if (!entry)
 		return 0;
 
@@ -237,7 +230,7 @@ int uretprobe_cu_ctx_sync(struct pt_regs *ctx)
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
-	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
 	if (!entry)
 		return 0;
 
@@ -267,7 +260,7 @@ int uretprobe_cu_mem_alloc(struct pt_regs *ctx)
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
-	struct driver_entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
 	if (!entry)
 		return 0;
 

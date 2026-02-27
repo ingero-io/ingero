@@ -27,8 +27,9 @@ const maxPyFrameDepth = 64
 // It caches the _PyRuntime address and thread state lookups.
 //
 // Thread-safe: can be called from multiple goroutines.
+// Uses RWMutex so concurrent cache hits (reads) don't serialize.
 type PyFrameWalker struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Per-PID cached state.
 	cache map[uint32]*pyProcessState
@@ -93,10 +94,21 @@ func (w *PyFrameWalker) WalkPythonFrames(pid, tid uint32) ([]PyFrame, error) {
 }
 
 // getProcessState returns cached Python process info, initializing if needed.
+// Uses RLock for cache hits (fast path), upgrading to Lock only on cache miss.
 func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
+	// Fast path: RLock for cache hit.
+	w.mu.RLock()
+	if s, ok := w.cache[pid]; ok {
+		w.mu.RUnlock()
+		return s, nil
+	}
+	w.mu.RUnlock()
+
+	// Slow path: Lock for cache miss + initialization.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Double-check: another goroutine may have initialized while we upgraded.
 	if s, ok := w.cache[pid]; ok {
 		return s, nil
 	}

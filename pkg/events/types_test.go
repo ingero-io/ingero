@@ -38,6 +38,7 @@ func TestCUDAOpString(t *testing.T) {
 		{CUDAMemcpy, "cudaMemcpy"},
 		{CUDAStreamSync, "cudaStreamSync"},
 		{CUDADeviceSync, "cudaDeviceSync"},
+		{CUDAMemcpyAsync, "cudaMemcpyAsync"},
 		{CUDAOp(0), "unknown(0)"},
 		{CUDAOp(99), "unknown(99)"},
 	}

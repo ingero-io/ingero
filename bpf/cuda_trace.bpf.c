@@ -26,15 +26,7 @@ struct {
 	__type(value, struct ingero_config);
 } config_map SEC(".maps");
 
-// Per-thread entry state: timestamp + args at CUDA function entry.
-// Keyed by TID — each thread can only be in one CUDA call at a time.
-struct entry_state {
-	__u64 timestamp_ns;
-	__u8  op;
-	__u8  _pad[7];
-	__u64 arg0;
-	__u64 arg1;
-};
+// entry_state is defined in common.bpf.h (shared with driver_trace.bpf.c).
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -244,7 +236,8 @@ int uretprobe_cuda_stream_sync(struct pt_regs *ctx)
 }
 
 // ---- cudaMemcpyAsync uprobes ----
-// Reuses CUDA_OP_MEMCPY; arg0 = count (bytes), arg1 = kind
+// Uses distinct CUDA_OP_MEMCPY_ASYNC (7) to distinguish from sync cudaMemcpy (4).
+// arg0 = count (bytes), arg1 = kind (direction)
 
 SEC("uprobe/cudaMemcpyAsync")
 int uprobe_cuda_memcpy_async(struct pt_regs *ctx)
@@ -253,7 +246,7 @@ int uprobe_cuda_memcpy_async(struct pt_regs *ctx)
 	__u64 count = (__u64)PT_REGS_PARM3(ctx);
 	__u64 kind  = (__u64)PT_REGS_PARM4(ctx);
 
-	save_entry(tid, CUDA_OP_MEMCPY, count, kind);
+	save_entry(tid, CUDA_OP_MEMCPY_ASYNC, count, kind);
 	return 0;
 }
 
