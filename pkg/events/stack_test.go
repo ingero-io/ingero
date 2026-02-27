@@ -84,3 +84,21 @@ func TestParseStackIPs_ZeroIPTerminates(t *testing.T) {
 		t.Errorf("got IP %#x, want 0xDEAD", frames[0].IP)
 	}
 }
+
+func TestParseStackIPs_MaxDepth(t *testing.T) {
+	// Boundary test: depth == 64 (MAX_STACK_DEPTH) should be accepted.
+	base := 56
+	buf := make([]byte, base+8+64*8) // header + 64 IPs
+	binary.LittleEndian.PutUint16(buf[base:], 64)
+	for i := 0; i < 64; i++ {
+		binary.LittleEndian.PutUint64(buf[base+8+i*8:], uint64(0x1000+i))
+	}
+
+	frames := ParseStackIPs(buf, base)
+	if len(frames) != 64 {
+		t.Fatalf("depth=64 should yield 64 frames, got %d", len(frames))
+	}
+	if frames[0].IP != 0x1000 || frames[63].IP != 0x103F {
+		t.Errorf("boundary IPs wrong: first=%#x last=%#x", frames[0].IP, frames[63].IP)
+	}
+}

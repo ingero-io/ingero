@@ -424,9 +424,18 @@ func TestFindDebugBuildLib_Nonexistent(t *testing.T) {
 	// and searches system-wide for debug libs. If libpython3.10d.so is installed
 	// (e.g., via libpython3.10-dbg), this correctly returns a result.
 	if result := findDebugBuildLib("/nonexistent/python3.10"); result != "" {
-		// Verify it actually found a valid debug library
+		// Verify it actually found a valid debug library with DWARF
 		if _, err := os.Stat(result); err != nil {
 			t.Errorf("returned path does not exist: %q", result)
+		}
+		f, err := elf.Open(result)
+		if err != nil {
+			t.Errorf("cannot open returned lib %q: %v", result, err)
+		} else {
+			if !hasInlineDWARF(f) {
+				t.Errorf("returned lib %q has no DWARF info", result)
+			}
+			f.Close()
 		}
 	}
 	if result := findDebugBuildLib("/usr/bin/bash"); result != "" {
