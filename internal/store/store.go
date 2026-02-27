@@ -98,14 +98,23 @@ CREATE INDEX IF NOT EXISTS idx_chains_severity ON causal_chains(severity);
 const snapshotsSchema = `
 CREATE TABLE IF NOT EXISTS system_snapshots (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	timestamp  INTEGER NOT NULL,  -- unix nanos
+	timestamp  INTEGER NOT NULL UNIQUE,  -- unix nanos (unique prevents duplicates)
 	cpu_pct    REAL    NOT NULL,  -- CPU utilization %
 	mem_pct    REAL    NOT NULL,  -- memory used %
 	mem_avail  INTEGER NOT NULL,  -- available MB
 	swap_mb    INTEGER NOT NULL,  -- swap used MB
 	load_avg   REAL    NOT NULL   -- 1-minute load average
 );
-CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON system_snapshots(timestamp);
+`
+
+// snapshotsMigration upgrades pre-dedup databases (created before the UNIQUE
+// constraint was added). CREATE TABLE IF NOT EXISTS is name-only — it does NOT
+// apply schema changes to existing tables. This migration ensures the unique
+// constraint exists by creating a unique index, and drops the old non-unique
+// index that is now redundant.
+const snapshotsMigration = `
+DROP INDEX IF EXISTS idx_snapshots_timestamp;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_ts_uniq ON system_snapshots(timestamp);
 `
 
 const sessionsSchema = `
@@ -549,6 +558,8 @@ func New(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating system_snapshots table: %w", err)
 	}
+	// Migrate pre-dedup databases: add unique index, drop redundant non-unique index.
+	db.Exec(snapshotsMigration)
 
 	// Create sessions table (one row per 'ingero trace' invocation).
 	if _, err := db.Exec(sessionsSchema); err != nil {
@@ -1494,7 +1505,7 @@ func (s *Store) RecordSnapshot(snap SystemSnapshot) {
 // writeSnapshot inserts a single system snapshot. Called from Run() goroutine
 // to serialize with event batch writes and avoid SQLite write contention.
 func (s *Store) writeSnapshot(snap SystemSnapshot) {
-	s.db.Exec(`INSERT INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg)
+	s.db.Exec(`INSERT OR IGNORE INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		snap.Timestamp.UnixNano(),
 		snap.CPUPercent,

@@ -1,9 +1,9 @@
 #!/bin/bash
 ################################################################################
-# GPU Problem Investigation — 23 Issues via MCP
+# GPU Problem Investigation — 28 Issues via MCP
 #
 # Comprehensive GPU causal observability validation. Runs a 5-phase 120s trace
-# with ResNet-50 training + alloc_stress + stress-ng, then investigates all 23
+# with ResNet-50 training + alloc_stress + stress-ng, then investigates all 28
 # GPU problems Ingero can detect through MCP tool calls (primarily run_sql).
 #
 # Architecture: Bash handles trace/workload lifecycle, Python handles MCP
@@ -18,7 +18,7 @@
 #   4 (90-110s):  Recovery (stressors killed, training continues)
 #   5 (110-120s): Continued clean training
 #
-# Output: 23 test results (T23a-T23w), investigation report, ML_RESULT lines
+# Output: 28 test results (T23a-T23ab), investigation report, ML_RESULT lines
 #
 # Run standalone:   bash scripts/gpu-investigation.sh
 # Run via suite:    bash scripts/gpu-test.sh   (Phase 6)
@@ -132,7 +132,7 @@ mkdir -p logs
 
 echo ""
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}  GPU Problem Investigation — 23 Issues via MCP${NC}"
+echo -e "${BLUE}  GPU Problem Investigation — 28 Issues via MCP${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo ""
 
@@ -311,11 +311,11 @@ fi
 echo -e "$(ts)   MCP server ready on :${MCP_PORT}"
 
 ################################################################################
-# Run Python Analysis (23 Investigations)
+# Run Python Analysis (28 Investigations)
 ################################################################################
 
 echo ""
-echo -e "$(ts) ${CYAN}[ANALYSIS]${NC} Running 23 GPU problem investigations via MCP..."
+echo -e "$(ts) ${CYAN}[ANALYSIS]${NC} Running 28 GPU problem investigations via MCP..."
 
 ANALYSIS_OUTPUT=$(python3 scripts/gpu-investigation-analysis.py \
     --mcp-url "https://localhost:${MCP_PORT}/mcp" \
@@ -353,8 +353,8 @@ if [[ "$INGESTED" -eq 0 ]]; then
     else
         record "FAIL" "T23a: GPU investigation" "no structured results returned"
     fi
-elif [[ "$ANALYSIS_EXIT" -ne 0 && "$INGESTED" -lt 23 ]]; then
-    record "FAIL" "T23a: GPU investigation" "partial results: ${INGESTED}/23 (exit $ANALYSIS_EXIT)"
+elif [[ "$ANALYSIS_EXIT" -ne 0 && "$INGESTED" -lt 28 ]]; then
+    record "FAIL" "T23a: GPU investigation" "partial results: ${INGESTED}/28 (exit $ANALYSIS_EXIT)"
     echo "Analysis stderr:"
     cat logs/gpu-inv-analysis-stderr.log
 fi

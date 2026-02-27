@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""GPU Problem Investigation — 23 Issues via MCP.
+"""GPU Problem Investigation — 28 Issues via MCP.
 
-Investigates all 23 GPU problems Ingero can detect by querying the database
+Investigates all 28 GPU problems Ingero can detect by querying the database
 exclusively through MCP tool calls (run_sql, get_causal_chains, get_trace_stats,
 get_sessions). Simulates how an AI agent would investigate GPU issues.
 
@@ -16,6 +16,14 @@ Verdicts:
   INCONCLUSIVE — insufficient data (SKIP)
 
 Output: ML_RESULT lines to stdout (for gpu-test.sh ingestion) + report file.
+
+Known limitations:
+  - Ring buffer drops ~8% under heavy contention phases (17K+ events/sec).
+    This is expected with 256KB per-CPU ring buffers. Increasing to 512KB
+    or 1MB in bpf/ would reduce drops but increase kernel memory footprint.
+  - No cuMemFree probe — frees=0 is always true, making malloc/free balance
+    unreliable. PyTorch caching allocator also holds memory without freeing.
+  - Thermal throttle detection uses host-side launch latency (proxy signal).
 """
 
 import argparse
@@ -206,7 +214,7 @@ class Investigation:
 
 
 def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
-    """Run all 23 GPU problem investigations."""
+    """Run all 28 GPU problem investigations."""
     investigations = []
 
     # Pre-fetch expensive MCP calls once (120s timeout each). These are reused
@@ -273,7 +281,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             # Single-PID: CPU scheduling contention, not NCCL
             inv.set_verdict("DETECTED",
                             f"scheduling contention: {sched_count} sched_switch, sync amp {amp:.1f}x (single-PID, not NCCL)")
-        elif sched_count > 50:
+        elif sched_count > 500:
+            # Moderate scheduler activity without sync amplification — not NCCL but notable
             inv.set_verdict("DETECTED",
                             f"{sched_count} sched_switch events, sync max={max_sync_us:.0f}us")
         else:
@@ -307,7 +316,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: memcpy + total CUDA duration (separate queries avoid full-table CASE scan)
     r3a = mcp.run_sql("""
         SELECT SUM(duration) as memcpy_dur, COUNT(*) as memcpy_cnt
-        FROM events WHERE source=1 AND op IN (4,7)
+        FROM events WHERE (source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3))
     """)
     r3b = mcp.run_sql("""
         SELECT SUM(duration) as total_dur FROM events WHERE source IN (1, 4)
@@ -323,16 +332,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "memcpy wall-time fraction",
                    f"memcpy+sync fractions computed")
 
-    # Verdict
+    # Verdict (session-wide average — per-phase breakdown is in T23l goodput analysis)
     if r3_rows:
         total = r3_rows[0].get("total_dur", 0) or 1
         sync_dur = r3_rows[0].get("sync_dur", 0) or 0
         memcpy_dur = r3_rows[0].get("memcpy_dur", 0) or 0
         sync_pct = sync_dur / total * 100
         memcpy_pct = memcpy_dur / total * 100
-        if sync_pct > 10 or memcpy_pct > 20:
+        if sync_pct > 8 or memcpy_pct > 20:
             inv.set_verdict("DETECTED",
-                            f"sync wall={sync_pct:.1f}%, memcpy wall={memcpy_pct:.1f}%")
+                            f"sync wall={sync_pct:.1f}%, memcpy wall={memcpy_pct:.1f}% (session avg, see T23l for phase)")
         else:
             inv.set_verdict("HEALTHY",
                             f"sync wall={sync_pct:.1f}%, memcpy wall={memcpy_pct:.1f}%")
@@ -399,12 +408,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             if first_avg > 0 and last_avg > first_avg * 2:
                 trending = True
 
-        if imbalance > 10 or trending:
+        if trending:
+            inv.set_verdict("DETECTED",
+                            f"alloc duration trending up, allocs={allocs}, total={total_bytes/1e6:.0f}MB")
+        elif frees > 0 and imbalance > 10:
             inv.set_verdict("DETECTED",
                             f"allocs={allocs}, frees={frees}, imbalance={imbalance}, total={total_bytes/1e6:.0f}MB")
         elif allocs > 0:
             inv.set_verdict("HEALTHY",
-                            f"allocs={allocs}, frees={frees}, total={total_bytes/1e6:.0f}MB (balanced)")
+                            f"allocs={allocs}, frees={frees}, total={total_bytes/1e6:.0f}MB"
+                            + (" (frees=0 expected: caching allocator / no cuMemFree probe)" if frees == 0 else " (balanced)"))
         else:
             inv.set_verdict("HEALTHY", "no allocation events")
     else:
@@ -447,11 +460,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # max(0, ...) prevents complex numbers from negative variance (floating-point imprecision)
     cv = (max(0, var_dur) ** 0.5 / avg) if avg > 0 else 0
     # High CV with high sched_switch = CPU contention, not SDC.
-    # Upper bound: CV > 50 is suspicious even with contention.
-    if sched_cnt > 1000 and 3.0 < cv <= 50.0:
+    # Contention explains moderate CV (up to ~10x). Beyond that, something else is going on.
+    if cv > 10.0:
+        # Extreme CV — suspicious even with CPU contention
+        inv.set_verdict("DETECTED", f"kernel duration CV={cv:.2f} (bimodal suspected)")
+    elif sched_cnt > 1000 and cv > 3.0:
+        # Moderate CV fully explained by CPU contention
         inv.set_verdict("HEALTHY",
                         f"kernel CV={cv:.2f} explained by CPU contention ({sched_cnt} sched_switch)")
-    elif cv > 5.0:  # Very high CV without contention (or extreme CV > 50 with contention)
+    elif cv > 5.0:
+        # High CV without contention — suspicious
         inv.set_verdict("DETECTED", f"kernel duration CV={cv:.2f} (bimodal suspected)")
     else:
         inv.set_verdict("HEALTHY", f"kernel duration CV={cv:.2f}, no bimodal pattern")
@@ -518,16 +536,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="Are there cudaMalloc spikes indicating memory pressure?")
 
-    # Action 1: large allocs (>1MB)
+    # Action 1: large allocs (>10MB — 1MB triggers on routine cuDNN workspace allocs)
     r1 = mcp.run_sql("""
         SELECT COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us,
                SUM(arg0)/1e6 as total_mb
-        FROM events WHERE ((source=1 AND op=1) OR (source=4 AND op=5)) AND arg0 > 1048576
+        FROM events WHERE ((source=1 AND op=1) OR (source=4 AND op=5)) AND arg0 > 10485760
     """)
     r1_rows = sql_to_dicts(r1)
-    inv.add_action("run_sql", "cudaMalloc events with arg0 > 1MB",
+    inv.add_action("run_sql", "cudaMalloc events with arg0 > 10MB",
                    f"{r1_rows[0].get('cnt', 0) if r1_rows else 0} large allocs")
 
     # Action 2: alloc spikes correlated with sync spikes (5s buckets)
@@ -582,7 +600,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us
-        FROM events WHERE source=1 AND op IN (4,7)
+        FROM events WHERE ((source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3)))
           AND timestamp >= (SELECT started_at FROM last_session)
         GROUP BY bucket ORDER BY bucket
     """)
@@ -701,10 +719,10 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "per-second CUDA event counts (idle gap detection)",
                    f"{len(rows1)} active seconds")
 
-    # Action 2: trace time range
+    # Action 2: CUDA event time range (not all events — host events inflate the range)
     r2 = mcp.run_sql("""
         SELECT MIN(timestamp)/1e9 as min_s, MAX(timestamp)/1e9 as max_s
-        FROM events
+        FROM events WHERE source IN (1, 4)
     """)
     r2_rows = sql_to_dicts(r2)
     inv.add_action("run_sql", "trace time range",
@@ -773,9 +791,14 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     frees = r1_rows[0].get("frees", 0) or 0 if r1_rows else 0
     imbalance = mallocs - frees
 
-    if mallocs > 0 and imbalance > 10:
+    # Note: frees=0 is normal for PyTorch (caching allocator holds memory) and for
+    # driver API (no cuMemFree probe yet). Only flag as leak if frees > 0 but imbalanced.
+    if mallocs > 0 and frees > 0 and imbalance > 10:
         inv.set_verdict("DETECTED",
                         f"mallocs={mallocs}, frees={frees}, net leak={imbalance}")
+    elif mallocs > 0 and frees == 0:
+        inv.set_verdict("HEALTHY",
+                        f"mallocs={mallocs}, frees=0 (expected: PyTorch caching allocator / no cuMemFree probe)")
     elif mallocs > 0:
         inv.set_verdict("HEALTHY",
                         f"mallocs={mallocs}, frees={frees}, balanced (no leak)")
@@ -818,11 +841,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     avg_us = r1_rows[0].get("avg_us", 0) or 0 if r1_rows else 0
     outlier_ratio = safe_div(max_us, avg_us)
     # High outlier ratio with high sched_switch = CPU contention, not AMP instability.
-    # Upper bound: outlier_ratio > 5000 is suspicious even with contention.
-    if amp_sched_cnt > 1000 and 200 < outlier_ratio <= 5000:
+    # Contention explains moderate outliers (up to ~1000x). Beyond that, something else is going on.
+    if outlier_ratio > 1000 and cnt > 100:
+        # Extreme outlier ratio — suspicious even with CPU contention
+        inv.set_verdict("DETECTED", f"kernel outlier ratio {outlier_ratio:.1f}x (may indicate AMP)")
+    elif amp_sched_cnt > 1000 and outlier_ratio > 200:
+        # Moderate outlier ratio explained by CPU contention
         inv.set_verdict("HEALTHY",
                         f"outlier ratio {outlier_ratio:.1f}x explained by CPU contention ({amp_sched_cnt} sched_switch)")
     elif outlier_ratio > 500 and cnt > 100:
+        # High outlier ratio without contention — suspicious
         inv.set_verdict("DETECTED", f"kernel outlier ratio {outlier_ratio:.1f}x (may indicate AMP)")
     else:
         inv.set_verdict("HEALTHY", f"kernel count={cnt}, outlier ratio={outlier_ratio:.1f}x")
@@ -866,7 +894,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: overhead fraction (CUDA+Driver only — excluding HOST to avoid inflated denominator)
     r3 = mcp.run_sql("""
         SELECT
-            SUM(CASE WHEN source=1 AND op IN (4,7) THEN duration ELSE 0 END) as memcpy_dur,
+            SUM(CASE WHEN (source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3)) THEN duration ELSE 0 END) as memcpy_dur,
             SUM(CASE WHEN (source=1 AND op=3) OR (source=4 AND op=1) THEN duration ELSE 0 END) as launch_dur,
             SUM(duration) as total_dur
         FROM events WHERE source IN (1, 4)
@@ -922,7 +950,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         JOIN ops o ON e.source=o.source_id AND e.op=o.op_id
         CROSS JOIN t0
         WHERE e.timestamp < t0.ts + 15000000000
-          AND ((e.source=1 AND e.op IN (1,4,7)) OR (e.source=4 AND e.op=5))
+          AND ((e.source=1 AND e.op IN (1,4,7)) OR (e.source=4 AND e.op IN (2,3,5)))
         GROUP BY o.name
     """)
     rows1 = sql_to_dicts(r1)
@@ -958,9 +986,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     if ratio > 5:
         inv.set_verdict("DETECTED",
                         f"cold-start ratio={ratio:.1f}x (first={first_us:.0f}us, steady={steady_us:.0f}us)")
-    elif rows1:
+    elif ratio > 2:
         inv.set_verdict("DETECTED",
-                        f"cold-start ops found: {', '.join(r.get('op_name', '?') for r in rows1)}")
+                        f"moderate cold-start ratio={ratio:.1f}x (first={first_us:.0f}us, steady={steady_us:.0f}us)")
+    elif rows1:
+        inv.set_verdict("HEALTHY",
+                        f"cold-start ratio={ratio:.1f}x (within normal range)")
     else:
         inv.set_verdict("HEALTHY", "no cold-start pattern")
 
@@ -1054,7 +1085,10 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "sched_switch count (contention cross-check)",
                    f"{thermal_sched_cnt} context switches")
 
-    # Verdict: check monotonic increase, cross-check with sched_switch
+    # Verdict: check monotonic increase in kernel launch latency, cross-check with sched_switch.
+    # Note: we measure host-side launch duration (uprobe → uretprobe), not GPU-internal execution.
+    # Thermal throttling increases GPU execution time, which increases the return time of sync
+    # calls but doesn't directly affect launch latency. This is a proxy signal at best.
     if len(rows1) >= 3:
         avgs = [r.get("avg_us", 0) or 0 for r in rows1]
         # Monotonic check: are the last few buckets consistently higher?
@@ -1118,7 +1152,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: first memcpy H2D (model weight transfer)
     r3 = mcp.run_sql("""
         SELECT duration/1000 as dur_us, arg0 as bytes, arg1 as direction
-        FROM events WHERE source=1 AND op IN (4,7) AND arg1=1
+        FROM events WHERE ((source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3))) AND arg1=1
         ORDER BY timestamp LIMIT 5
     """)
     rows3 = sql_to_dicts(r3)
@@ -1137,18 +1171,17 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         inv.set_verdict("DETECTED",
                         f"cold-start ratio={ratio:.1f}x (moderate init penalty)")
     elif rows1:
-        # Even with low ratio, cold start exists (first events are init)
-        first_ops = ", ".join(r.get("name", "?") for r in rows1[:3])
-        inv.set_verdict("DETECTED", f"init sequence: {first_ops}")
+        inv.set_verdict("HEALTHY",
+                        f"cold-start ratio={ratio:.1f}x (minimal init penalty)")
     else:
         inv.set_verdict("INCONCLUSIVE", "no CUDA events")
 
     investigations.append(inv)
 
     # =========================================================================
-    # T23r: #18 Multi-GPU TP Overhead — provoked via Phase 2
+    # T23r: #18 Multi-process GPU contention — provoked via Phase 2
     # =========================================================================
-    inv = Investigation("T23r", 18, "Multi-GPU TP overhead", "MEDIUM",
+    inv = Investigation("T23r", 18, "Multi-process GPU contention", "MEDIUM",
                         provoked=True,
                         question="Is there a straggler process affecting training?")
 
@@ -1169,7 +1202,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 2: straggler ratio (max/min sync per PID)
     if len(rows1) >= 2:
         max_sync = max(r.get("max_us", 0) or 0 for r in rows1)
-        min_sync = min(r.get("max_us", 0) or 0 for r in rows1 if (r.get("max_us", 0) or 0) > 0)
+        positive_syncs = [r.get("max_us", 0) or 0 for r in rows1 if (r.get("max_us", 0) or 0) > 0]
+        min_sync = min(positive_syncs) if positive_syncs else 0
         straggler_ratio = safe_div(max_sync, min_sync) if min_sync > 0 else 0
         inv.add_action("computed", "straggler ratio: max/min sync per PID",
                        f"ratio={straggler_ratio:.1f}x")
@@ -1309,7 +1343,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="Is PCIe bandwidth a bottleneck?")
 
-    # Action 1: memcpy by direction
+    # Action 1: memcpy by direction (runtime + driver)
     r1 = mcp.run_sql("""
         SELECT
             CASE arg1 WHEN 1 THEN 'H2D' WHEN 2 THEN 'D2H' WHEN 3 THEN 'D2D' ELSE 'unknown' END as dir,
@@ -1317,17 +1351,17 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             AVG(arg0) as avg_bytes,
             AVG(duration)/1000 as avg_us,
             SUM(duration) as total_dur
-        FROM events WHERE source=1 AND op IN (4,7)
+        FROM events WHERE (source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3))
         GROUP BY arg1
     """)
     rows1 = sql_to_dicts(r1)
     inv.add_action("run_sql", "cudaMemcpy by direction, avg size, avg duration",
                    f"{len(rows1)} directions")
 
-    # Action 2: memcpy wall-time percentage
+    # Action 2: memcpy wall-time percentage (runtime + driver)
     r2 = mcp.run_sql("""
         SELECT
-            SUM(CASE WHEN source=1 AND op IN (4,7) THEN duration ELSE 0 END) as memcpy_dur,
+            SUM(CASE WHEN (source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3)) THEN duration ELSE 0 END) as memcpy_dur,
             SUM(duration) as total_dur
         FROM events WHERE source IN (1, 4)
     """)
@@ -1335,12 +1369,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "memcpy wall-time % of total CUDA time",
                    "bandwidth analysis")
 
-    # Action 3: estimated bandwidth per direction
+    # Action 3: estimated bandwidth per direction (runtime + driver)
     r3 = mcp.run_sql("""
         SELECT
             CASE arg1 WHEN 1 THEN 'H2D' WHEN 2 THEN 'D2H' WHEN 3 THEN 'D2D' ELSE 'unknown' END as dir,
             SUM(arg0) / (SUM(duration) / 1e9 + 0.001) / 1e9 as bw_gbps
-        FROM events WHERE source=1 AND op IN (4,7) AND duration > 0
+        FROM events WHERE ((source=1 AND op IN (4,7)) OR (source=4 AND op IN (2,3))) AND duration > 0
         GROUP BY arg1
     """)
     rows3 = sql_to_dicts(r3)
@@ -1457,6 +1491,210 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     investigations.append(inv)
 
+    # =========================================================================
+    # T23x: #24 OOM Kill Detection — NOT provoked (but oom_kill events captured)
+    # =========================================================================
+    inv = Investigation("T23x", 24, "OOM kill detection", "HIGH",
+                        provoked=False,
+                        question="Were any processes killed by the OOM killer?")
+
+    r1 = mcp.run_sql("""
+        SELECT e.pid, pn.name, e.timestamp, e.arg1 as victim_pid
+        FROM events e LEFT JOIN process_names pn ON e.pid=pn.pid
+        WHERE e.source=3 AND e.op=4
+        ORDER BY e.timestamp
+    """)
+    rows1 = sql_to_dicts(r1)
+    inv.add_action("run_sql", "oom_kill events (source=3, op=4)",
+                   f"{len(rows1)} OOM kills")
+
+    if rows1:
+        pids = ", ".join(f"PID {r.get('pid', '?')} ({r.get('name', 'unknown')})" for r in rows1[:3])
+        inv.set_verdict("DETECTED", f"{len(rows1)} OOM kills: {pids}")
+    else:
+        inv.set_verdict("HEALTHY", "no OOM kills during trace")
+
+    investigations.append(inv)
+
+    # =========================================================================
+    # T23y: #25 Process Lifecycle — NOT provoked (but fork/exec/exit captured)
+    # =========================================================================
+    inv = Investigation("T23y", 25, "Process lifecycle", "MEDIUM",
+                        provoked=False,
+                        question="Were there unexpected process exits or forks during training?")
+
+    r1 = mcp.run_sql("""
+        SELECT
+            COUNT(CASE WHEN op=5 THEN 1 END) as execs,
+            COUNT(CASE WHEN op=6 THEN 1 END) as exits,
+            COUNT(CASE WHEN op=7 THEN 1 END) as forks
+        FROM events WHERE source=3 AND op IN (5,6,7)
+    """)
+    r1_rows = sql_to_dicts(r1)
+    inv.add_action("run_sql", "process_exec/exit/fork counts",
+                   f"execs/exits/forks counted")
+
+    # Check for exits of CUDA processes (potential crashes)
+    r2 = mcp.run_sql("""
+        SELECT e.pid, pn.name, e.timestamp
+        FROM events e LEFT JOIN process_names pn ON e.pid=pn.pid
+        WHERE e.source=3 AND e.op=6
+        AND e.pid IN (SELECT DISTINCT pid FROM events WHERE source IN (1,4))
+        ORDER BY e.timestamp
+    """)
+    cuda_exits = sql_to_dicts(r2)
+    inv.add_action("run_sql", "CUDA process exits",
+                   f"{len(cuda_exits)} CUDA processes exited")
+
+    execs = r1_rows[0].get("execs", 0) or 0 if r1_rows else 0
+    exits = r1_rows[0].get("exits", 0) or 0 if r1_rows else 0
+    forks = r1_rows[0].get("forks", 0) or 0 if r1_rows else 0
+
+    if cuda_exits:
+        pids = ", ".join(f"PID {r.get('pid', '?')} ({r.get('name', 'unknown')})" for r in cuda_exits[:3])
+        inv.set_verdict("DETECTED",
+                        f"{len(cuda_exits)} CUDA process exits: {pids} (exec={execs}, fork={forks})")
+    elif exits > 0 or forks > 0:
+        inv.set_verdict("HEALTHY",
+                        f"exec={execs}, exit={exits}, fork={forks} (no CUDA process exits)")
+    else:
+        inv.set_verdict("HEALTHY", "no process lifecycle events")
+
+    investigations.append(inv)
+
+    # =========================================================================
+    # T23z: #26 Scheduler Wakeup Storms — NOT provoked
+    # =========================================================================
+    inv = Investigation("T23z", 26, "Scheduler wakeup storms", "MEDIUM",
+                        provoked=False,
+                        question="Are there excessive scheduler wakeups for GPU processes?")
+
+    # Note: sched_wakeup is a point event (duration=0 in eBPF). We measure
+    # wakeup frequency anomalies, not latency. Actual wakeup-to-run latency
+    # would require correlating sched_wakeup with the next sched_switch for
+    # the same PID, which is not currently tracked.
+    r1 = mcp.run_sql("""
+        SELECT CAST(timestamp / 1000000000 AS INT) as sec,
+               COUNT(*) as wakeup_cnt
+        FROM events WHERE source=3 AND op=2
+        GROUP BY sec ORDER BY wakeup_cnt DESC LIMIT 20
+    """)
+    rows1 = sql_to_dicts(r1)
+    inv.add_action("run_sql", "per-second sched_wakeup counts",
+                   f"{len(rows1)} seconds with wakeup events")
+
+    # Action 2: total wakeup count
+    r2 = mcp.run_sql("SELECT COUNT(*) as cnt FROM events WHERE source=3 AND op=2")
+    total_wakeups = sql_first_val(r2, 0)
+    inv.add_action("run_sql", "total sched_wakeup count", f"{total_wakeups} wakeups")
+
+    if rows1:
+        max_per_sec = max(r.get("wakeup_cnt", 0) or 0 for r in rows1)
+        if max_per_sec > 500:  # >500 wakeups/sec is a storm
+            inv.set_verdict("DETECTED",
+                            f"wakeup storm: max {max_per_sec}/sec, {total_wakeups} total")
+        else:
+            inv.set_verdict("HEALTHY",
+                            f"wakeup rate OK: max {max_per_sec}/sec, {total_wakeups} total")
+    else:
+        inv.set_verdict("HEALTHY", "no sched_wakeup events")
+
+    investigations.append(inv)
+
+    # =========================================================================
+    # T23aa: #27 Per-GPU Analysis — NOT provoked
+    # =========================================================================
+    inv = Investigation("T23aa", 27, "Per-GPU analysis", "MEDIUM",
+                        provoked=False,
+                        question="Is one GPU slower or more error-prone than others?")
+
+    r1 = mcp.run_sql("""
+        SELECT gpu_id, COUNT(*) as events,
+               AVG(duration)/1000 as avg_us,
+               MAX(duration)/1000 as max_us
+        FROM events WHERE source IN (1, 4) AND gpu_id > 0
+        GROUP BY gpu_id ORDER BY gpu_id
+    """)
+    rows1 = sql_to_dicts(r1)
+    inv.add_action("run_sql", "per-GPU event distribution",
+                   f"{len(rows1)} GPUs with events")
+
+    if len(rows1) >= 2:
+        # Compare avg durations across GPUs
+        avgs = [r.get("avg_us", 0) or 0 for r in rows1]
+        max_avg = max(avgs) if avgs else 0
+        min_avg = min(a for a in avgs if a > 0) if any(a > 0 for a in avgs) else 0
+        skew = safe_div(max_avg, min_avg) if min_avg > 0 else 0
+        if skew > 2:
+            inv.set_verdict("DETECTED",
+                            f"{len(rows1)} GPUs, avg duration skew {skew:.1f}x")
+        else:
+            inv.set_verdict("HEALTHY",
+                            f"{len(rows1)} GPUs, balanced (skew {skew:.1f}x)")
+    elif len(rows1) == 1:
+        inv.set_verdict("HEALTHY", "single GPU — no cross-GPU comparison")
+    else:
+        inv.set_verdict("HEALTHY", "no per-GPU data (gpu_id not set)")
+
+    investigations.append(inv)
+
+    # =========================================================================
+    # T23ab: #28 Phase-Aware Analysis — provoked (all phases)
+    # =========================================================================
+    inv = Investigation("T23ab", 28, "Phase-aware analysis", "LOW-MED",
+                        provoked=True,
+                        question="How do CUDA metrics change across workload phases?")
+
+    r1 = mcp.run_sql("""
+        WITH boundaries AS (SELECT MIN(timestamp) as t0 FROM events)
+        SELECT
+            CASE
+                WHEN timestamp < (SELECT t0 FROM boundaries) + 20000000000 THEN '1_baseline'
+                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 20000000000
+                     AND (SELECT t0 FROM boundaries) + 50000000000 THEN '2_alloc_stress'
+                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 50000000000
+                     AND (SELECT t0 FROM boundaries) + 90000000000 THEN '3_contention'
+                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 90000000000
+                     AND (SELECT t0 FROM boundaries) + 110000000000 THEN '4_recovery'
+                ELSE '5_clean'
+            END as phase,
+            COUNT(*) as events,
+            AVG(duration)/1000 as avg_us,
+            MAX(duration)/1000 as max_us,
+            COUNT(CASE WHEN source=3 AND op=1 THEN 1 END) as sched_switches
+        FROM events GROUP BY phase ORDER BY phase
+    """)
+    rows1 = sql_to_dicts(r1)
+    inv.add_action("run_sql", "per-phase event metrics",
+                   f"{len(rows1)} phases analyzed")
+
+    if len(rows1) >= 3:
+        phase_summary = "; ".join(
+            f"{r.get('phase', '?')}: {r.get('events', 0)} events, avg={r.get('avg_us', 0) or 0:.0f}us, sched={r.get('sched_switches', 0)}"
+            for r in rows1
+        )
+        # Check for contention phase degradation
+        contention = next((r for r in rows1 if "contention" in str(r.get("phase", ""))), None)
+        baseline = next((r for r in rows1 if "baseline" in str(r.get("phase", ""))), None)
+        if contention and baseline:
+            ct_avg = contention.get("avg_us", 0) or 0
+            bl_avg = baseline.get("avg_us", 0) or 0
+            degradation = safe_div(ct_avg, bl_avg) if bl_avg > 0 else 0
+            if degradation > 2:
+                inv.set_verdict("DETECTED",
+                                f"contention phase {degradation:.1f}x slower than baseline. {phase_summary}")
+            else:
+                inv.set_verdict("HEALTHY",
+                                f"contention/baseline ratio={degradation:.1f}x. {phase_summary}")
+        else:
+            inv.set_verdict("HEALTHY", phase_summary)
+    elif rows1:
+        inv.set_verdict("HEALTHY", f"{len(rows1)} phases (insufficient for comparison)")
+    else:
+        inv.set_verdict("INCONCLUSIVE", "no events")
+
+    investigations.append(inv)
+
     return investigations, _cached_sessions
 
 
@@ -1481,7 +1719,7 @@ def generate_report(investigations: list[Investigation], mcp: MCPClient,
     sep = "=" * 70
 
     lines.append(sep)
-    lines.append("GPU PROBLEM INVESTIGATION REPORT — 23 Issues")
+    lines.append("GPU PROBLEM INVESTIGATION REPORT — 28 Issues")
     lines.append(sep)
     lines.append("")
 
@@ -1512,7 +1750,7 @@ def generate_report(investigations: list[Investigation], mcp: MCPClient,
     # Per-investigation detail
     for inv in investigations:
         lines.append(sep)
-        lines.append(f"INVESTIGATION {inv.number}/23: {inv.title}")
+        lines.append(f"INVESTIGATION {inv.number}/28: {inv.title}")
         lines.append(f"Severity: {inv.severity} | Provoked: {'Yes' if inv.provoked else 'No'}")
         lines.append(sep)
         lines.append("")
@@ -1559,7 +1797,7 @@ def generate_report(investigations: list[Investigation], mcp: MCPClient,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="GPU Problem Investigation — 23 Issues via MCP")
+    parser = argparse.ArgumentParser(description="GPU Problem Investigation — 28 Issues via MCP")
     parser.add_argument("--mcp-url", required=True, help="MCP HTTPS endpoint URL")
     parser.add_argument("--db", required=True, help="Path to ingero.db")
     parser.add_argument("--report", default="logs/gpu-investigation-report.log",
@@ -1575,7 +1813,7 @@ def main():
 
     mcp = MCPClient(args.mcp_url)
 
-    # Preflight: verify MCP connectivity before running 23 investigations
+    # Preflight: verify MCP connectivity before running 28 investigations
     preflight = mcp.run_sql("SELECT COUNT(*) FROM events")
     if "error" in preflight:
         print(f"ERROR: MCP preflight failed: {preflight['error']}", file=sys.stderr)
@@ -1586,8 +1824,8 @@ def main():
         sys.exit(1)
     print(f"MCP connected. DB has {event_count:,} events.")
 
-    # Run all 23 investigations
-    print("Running 23 GPU problem investigations...")
+    # Run all 28 investigations
+    print("Running 28 GPU problem investigations...")
     print()
 
     investigations, cached_sessions = run_investigations(mcp, args)
@@ -1600,7 +1838,7 @@ def main():
             "SKIP": "\033[1;33m",
         }.get(inv.status, "")
         nc = "\033[0m" if status_color else ""
-        print(f"  {status_color}[{inv.status}]{nc} T23{chr(ord('a') + inv.number - 1)}: "
+        print(f"  {status_color}[{inv.status}]{nc} {inv.tid}: "
               f"#{inv.number} {inv.title} — {inv.verdict}: {inv.finding[:80]}")
 
     # Generate report
