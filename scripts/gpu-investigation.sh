@@ -203,7 +203,7 @@ sleep 20
 # Phase 2: Allocation stress (20-50s)
 ################################################################################
 
-echo -e "$(ts) ${CYAN}[PHASE 2]${NC} Starting alloc_stress.py (30s)..."
+echo -e "$(ts) ${CYAN}[PHASE 2]${NC} Starting alloc_stress.py (25s)..."
 PHASE2_START=$(date +%s.%N)
 
 python3 tests/workloads/synthetic/alloc_stress.py --duration 25 > logs/gpu-inv-alloc-stress.log 2>&1 &

@@ -242,7 +242,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     if rows1 and rows2:
         top_sched = rows1[0] if rows1 else {}
         top_sync = rows2[0] if rows2 else {}
-        sched_count = top_sched.get("sched_events", 0)
+        sched_count = top_sched.get("sched_events", 0) or 0
         max_sync_us = top_sync.get("max_us", 0) or 0
         avg_sync_us = top_sync.get("avg_us", 0) or 0
         amp = safe_div(max_sync_us, avg_sync_us)
@@ -431,10 +431,11 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # max(0, ...) prevents complex numbers from negative variance (floating-point imprecision)
     cv = (max(0, var_dur) ** 0.5 / avg) if avg > 0 else 0
     # High CV with high sched_switch = CPU contention, not SDC.
-    if sched_cnt > 1000 and cv > 3.0:
+    # Upper bound: CV > 50 is suspicious even with contention.
+    if sched_cnt > 1000 and 3.0 < cv <= 50.0:
         inv.set_verdict("HEALTHY",
                         f"kernel CV={cv:.2f} explained by CPU contention ({sched_cnt} sched_switch)")
-    elif cv > 5.0:  # Very high CV without contention = suspicious
+    elif cv > 5.0:  # Very high CV without contention (or extreme CV > 50 with contention)
         inv.set_verdict("DETECTED", f"kernel duration CV={cv:.2f} (bimodal suspected)")
     else:
         inv.set_verdict("HEALTHY", f"kernel duration CV={cv:.2f}, no bimodal pattern")
@@ -566,7 +567,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us
         FROM events WHERE source=1 AND op=4
-          AND timestamp >= (SELECT CAST(strftime('%s', started_at) AS INT) * 1000000000 FROM last_session)
+          AND timestamp >= (SELECT started_at FROM last_session)
         GROUP BY bucket ORDER BY bucket
     """)
     rows1 = sql_to_dicts(r1)
@@ -794,7 +795,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     avg_us = r1_rows[0].get("avg_us", 0) or 0 if r1_rows else 0
     outlier_ratio = safe_div(max_us, avg_us)
     # High outlier ratio with high sched_switch = CPU contention, not AMP instability.
-    if amp_sched_cnt > 1000 and outlier_ratio > 200:
+    # Upper bound: outlier_ratio > 5000 is suspicious even with contention.
+    if amp_sched_cnt > 1000 and 200 < outlier_ratio <= 5000:
         inv.set_verdict("HEALTHY",
                         f"outlier ratio {outlier_ratio:.1f}x explained by CPU contention ({amp_sched_cnt} sched_switch)")
     elif outlier_ratio > 500 and cnt > 100:
