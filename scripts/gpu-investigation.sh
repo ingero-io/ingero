@@ -172,8 +172,18 @@ python3 tests/workloads/training/resnet50_cifar10.py \
 TRAIN_PID=$!
 cleanup_pids+=("$TRAIN_PID")
 
-# Wait for CUDA init
-echo -e "$(ts)   Waiting for training to reach GPU..."
+# Start alloc_stress BEFORE the trace so auto-discovery enrolls its PID.
+# --delay 20: initializes CUDA immediately (makes PID discoverable), then sleeps
+# 20s before actual stress work begins (aligns with Phase 2 at t=20s).
+# --duration 30: stress runs for 30s (covers Phase 2's 20-50s window).
+echo -e "$(ts)   Starting alloc_stress.py (delay=20s, duration=30s)..."
+python3 tests/workloads/synthetic/alloc_stress.py --delay 20 --duration 30 \
+    > logs/gpu-inv-alloc-stress.log 2>&1 &
+ALLOC_PID=$!
+cleanup_pids+=("$ALLOC_PID")
+
+# Wait for CUDA init (both training and alloc_stress)
+echo -e "$(ts)   Waiting for training + alloc_stress to reach GPU..."
 sleep 10
 
 if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
@@ -182,11 +192,13 @@ if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
     exit 1
 fi
 
-echo -e "$(ts)   Training PID: $TRAIN_PID"
+echo -e "$(ts)   Training PID: $TRAIN_PID, Alloc PID: $ALLOC_PID"
 echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) with --record-all --stack..."
 
 # Start trace — --record-all stores every event, --stack captures call stacks
 # Redirect both stdout and stderr to log (stdout bleed corrupts ML_RESULT parsing).
+# Auto-discovery will find both training (TRAIN_PID) and alloc_stress (ALLOC_PID)
+# because both have already initialized CUDA (loaded libcudart.so).
 sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration "${TRACE_DURATION}s" \
     > logs/gpu-inv-trace.log 2>&1 &
 TRACE_PID=$!
@@ -195,22 +207,18 @@ cleanup_pids+=("$TRACE_PID")
 # Record phase timestamps (epoch seconds) for Python analysis
 PHASE1_START=$(date +%s.%N)
 
-# Phase 1 runs for 20s (trace is already capturing)
+# Phase 1 runs for 20s (trace capturing, alloc_stress in delay/sleep)
 echo -e "$(ts)   Phase 1: baseline (20s)..."
 sleep 20
 
 ################################################################################
-# Phase 2: Allocation stress (20-50s)
+# Phase 2: Allocation stress (20-50s) — alloc_stress delay expires, stress begins
 ################################################################################
 
-echo -e "$(ts) ${CYAN}[PHASE 2]${NC} Starting alloc_stress.py (25s)..."
+echo -e "$(ts) ${CYAN}[PHASE 2]${NC} alloc_stress.py delay expired, stress active (30s)..."
 PHASE2_START=$(date +%s.%N)
 
-python3 tests/workloads/synthetic/alloc_stress.py --duration 25 > logs/gpu-inv-alloc-stress.log 2>&1 &
-ALLOC_PID=$!
-cleanup_pids+=("$ALLOC_PID")
-
-# Phase 2 runs for 30s
+# Phase 2 runs for 30s (alloc_stress does actual work during this window)
 sleep 30
 
 ################################################################################
@@ -220,11 +228,11 @@ sleep 30
 echo -e "$(ts) ${CYAN}[PHASE 3]${NC} Starting stress-ng (40s, $(nproc) workers)..."
 PHASE3_START=$(date +%s.%N)
 
-# Kill alloc_stress if still running (it should have finished by now)
+# Kill alloc_stress if still running (it should have finished its 30s duration by now)
 kill "$ALLOC_PID" 2>/dev/null || true
 
 NCPUS=$(nproc)
-sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 45s > /dev/null 2>&1 &
+sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 35s > /dev/null 2>&1 &
 STRESS_PID=$!
 cleanup_pids+=("$STRESS_PID")
 

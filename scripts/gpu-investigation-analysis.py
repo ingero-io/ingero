@@ -41,7 +41,8 @@ class MCPClient:
         self._ctx.check_hostname = False
         self._ctx.verify_mode = ssl.CERT_NONE
 
-    def call(self, tool: str, arguments: Optional[dict] = None) -> dict:
+    def call(self, tool: str, arguments: Optional[dict] = None,
+             timeout: int = 30) -> dict:
         """Call an MCP tool and return the parsed result."""
         self._id += 1
         payload = {
@@ -63,7 +64,7 @@ class MCPClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, context=self._ctx, timeout=30) as resp:
+            with urllib.request.urlopen(req, context=self._ctx, timeout=timeout) as resp:
                 body = resp.read().decode()
         except Exception as e:
             print(f"  [MCP ERROR] {tool}: {e}", file=sys.stderr)
@@ -76,6 +77,12 @@ class MCPClient:
 
         # Extract text content from MCP response
         result = parsed.get("result", {})
+        # Check for MCP-level errors (e.g. SQL syntax error, timeout)
+        if result.get("isError"):
+            content = result.get("content", [])
+            err_text = content[0].get("text", "MCP error") if content else "MCP error"
+            print(f"  [MCP ERROR] {tool}: {err_text}", file=sys.stderr)
+            return {"error": err_text}
         content = result.get("content", [])
         if content and isinstance(content, list):
             text = content[0].get("text", "")
@@ -91,12 +98,12 @@ class MCPClient:
         return self.call("run_sql", {"query": query, "limit": limit, "tsc": False})
 
     def get_causal_chains(self, since: str = "10m") -> dict:
-        """Get causal chains."""
-        return self.call("get_causal_chains", {"since": since, "tsc": False})
+        """Get causal chains (120s timeout — replay is expensive on large DBs)."""
+        return self.call("get_causal_chains", {"since": since, "tsc": False}, timeout=120)
 
     def get_trace_stats(self, since: str = "10m") -> dict:
-        """Get trace statistics."""
-        return self.call("get_trace_stats", {"since": since, "tsc": False})
+        """Get trace statistics (120s timeout — aggregation on large DBs)."""
+        return self.call("get_trace_stats", {"since": since, "tsc": False}, timeout=120)
 
     def get_sessions(self, since: str = "0") -> dict:
         """Get trace sessions."""
@@ -138,7 +145,10 @@ def sql_to_dicts(resp: dict) -> list[dict]:
     """Convert SQL response to list of dicts."""
     cols = sql_cols(resp)
     rows = sql_rows(resp)
-    return [{cols[i]: row[i] for i in range(len(cols))} for row in rows]
+    if not cols:
+        return []
+    # Guard: skip rows shorter than columns (malformed/truncated responses)
+    return [dict(zip(cols, row)) for row in rows if len(row) >= len(cols)]
 
 def safe_div(a, b, default=0):
     """Safe division."""
@@ -224,7 +234,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                AVG(e.duration)/1000 as avg_us,
                MAX(e.duration)/1000 as max_us
         FROM events e LEFT JOIN process_names pn ON e.pid=pn.pid
-        WHERE (e.source=1 AND e.op=5) OR (e.source=4 AND e.op=4)
+        WHERE (e.source=1 AND e.op IN (5,6)) OR (e.source=4 AND e.op=4)
         GROUP BY e.pid ORDER BY max_us DESC LIMIT 10
     """)
     rows2 = sql_to_dicts(r2)
@@ -282,7 +292,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 2: sync total duration (separate query for speed on large DBs)
     r2 = mcp.run_sql("""
         SELECT SUM(duration) as sync_dur, COUNT(*) as sync_cnt
-        FROM events WHERE (source=1 AND op=5) OR (source=4 AND op=4)
+        FROM events WHERE (source=1 AND op IN (5,6)) OR (source=4 AND op=4)
     """)
     rows2 = sql_to_dicts(r2)
     inv.add_action("run_sql", "sync total duration",
@@ -314,7 +324,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         memcpy_dur = r3_rows[0].get("memcpy_dur", 0) or 0
         sync_pct = sync_dur / total * 100
         memcpy_pct = memcpy_dur / total * 100
-        if sync_pct > 20 or memcpy_pct > 30:
+        if sync_pct > 10 or memcpy_pct > 20:
             inv.set_verdict("DETECTED",
                             f"sync wall={sync_pct:.1f}%, memcpy wall={memcpy_pct:.1f}%")
         else:
@@ -519,8 +529,8 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         SELECT CAST(timestamp / 5000000000 AS INT) * 5 as bucket,
                COUNT(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN 1 END) as allocs,
                MAX(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN duration END)/1000 as alloc_max_us,
-               COUNT(CASE WHEN (source=1 AND op=5) OR (source=4 AND op=4) THEN 1 END) as syncs,
-               MAX(CASE WHEN (source=1 AND op=5) OR (source=4 AND op=4) THEN duration END)/1000 as sync_max_us
+               COUNT(CASE WHEN (source=1 AND op IN (5,6)) OR (source=4 AND op=4) THEN 1 END) as syncs,
+               MAX(CASE WHEN (source=1 AND op IN (5,6)) OR (source=4 AND op=4) THEN duration END)/1000 as sync_max_us
         FROM events GROUP BY bucket ORDER BY bucket
     """)
     rows2 = sql_to_dicts(r2)
@@ -585,15 +595,22 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "sched_switch frequency trending",
                    f"{len(rows2)} buckets")
 
-    # Verdict: check for monotonic increase (drift)
+    # Verdict: check for monotonic increase (drift), cross-check with sched_switch
     if len(rows1) >= 3:
         avgs = [r.get("avg_us", 0) or 0 for r in rows1]
         # Simple trend: is the last third > 2x the first third?
         third = len(avgs) // 3
         first_third = sum(avgs[:third]) / max(third, 1)
         last_third = sum(avgs[-third:]) / max(third, 1)
+        # Cross-check: if sched_switch storms present, latency increase is CPU contention, not HW drift
+        sched_cnts = [r.get("cnt", 0) or 0 for r in rows2]
+        total_sched = sum(sched_cnts)
         if first_third > 0 and last_third > first_third * 2:
-            inv.set_verdict("DETECTED", f"memcpy drift: first={first_third:.0f}us → last={last_third:.0f}us")
+            if total_sched > 1000:
+                inv.set_verdict("HEALTHY",
+                                f"memcpy drift ({first_third:.0f}→{last_third:.0f}us) explained by CPU contention ({total_sched} sched_switch)")
+            else:
+                inv.set_verdict("DETECTED", f"memcpy drift: first={first_third:.0f}us → last={last_third:.0f}us")
         else:
             inv.set_verdict("HEALTHY", f"memcpy stable across {len(rows1)} intervals")
     elif rows1:
@@ -632,7 +649,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     r3 = mcp.run_sql("""
         SELECT CAST(timestamp / 1000000000 AS INT) as sec,
                COUNT(CASE WHEN source=3 AND op=1 THEN 1 END) as sched_cnt,
-               MAX(CASE WHEN (source=1 AND op=5) OR (source=4 AND op=4) THEN duration END)/1000 as sync_max_us
+               MAX(CASE WHEN (source=1 AND op IN (5,6)) OR (source=4 AND op=4) THEN duration END)/1000 as sync_max_us
         FROM events GROUP BY sec
         HAVING sched_cnt > 0 OR sync_max_us > 0
         ORDER BY sec
@@ -707,7 +724,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     if total_idle > 5:
         inv.set_verdict("DETECTED",
                         f"{total_idle} idle seconds ({missing_secs} empty + {idle_secs} low-activity)")
-    elif total_idle > 0:
+    elif total_idle > 2:
         inv.set_verdict("DETECTED", f"{total_idle} idle seconds out of {total_secs:.0f}s")
     elif total_secs > 0:
         inv.set_verdict("HEALTHY", f"active {active_secs}/{total_secs:.0f}s")
@@ -1025,7 +1042,13 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "cuLaunchKernel p50 per 15s bucket",
                    f"{len(rows1)} buckets")
 
-    # Verdict: check monotonic increase
+    # Cross-check: sched_switch count (CPU contention inflates kernel durations too)
+    r_sched = mcp.run_sql("SELECT COUNT(*) as cnt FROM events WHERE source=3 AND op=1")
+    thermal_sched_cnt = sql_first_val(r_sched, 0)
+    inv.add_action("run_sql", "sched_switch count (contention cross-check)",
+                   f"{thermal_sched_cnt} context switches")
+
+    # Verdict: check monotonic increase, cross-check with sched_switch
     if len(rows1) >= 3:
         avgs = [r.get("avg_us", 0) or 0 for r in rows1]
         # Monotonic check: are the last few buckets consistently higher?
@@ -1033,8 +1056,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         first_half = sum(avgs[:half]) / max(half, 1)
         second_half = sum(avgs[half:]) / max(len(avgs) - half, 1)
         if first_half > 0 and second_half > first_half * 1.5:
-            inv.set_verdict("DETECTED",
-                            f"kernel avg rising: first={first_half:.0f}us → last={second_half:.0f}us")
+            if thermal_sched_cnt > 1000:
+                inv.set_verdict("HEALTHY",
+                                f"kernel avg rise ({first_half:.0f}→{second_half:.0f}us) explained by CPU contention ({thermal_sched_cnt} sched_switch)")
+            else:
+                inv.set_verdict("DETECTED",
+                                f"kernel avg rising: first={first_half:.0f}us → last={second_half:.0f}us")
         else:
             inv.set_verdict("HEALTHY",
                             f"kernel avg stable: {first_half:.0f}us → {second_half:.0f}us")
@@ -1125,7 +1152,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                AVG(e.duration)/1000 as avg_us,
                MAX(e.duration)/1000 as max_us
         FROM events e LEFT JOIN process_names pn ON e.pid=pn.pid
-        WHERE (e.source=1 AND e.op=5) OR (e.source=4 AND e.op=4)
+        WHERE (e.source=1 AND e.op IN (5,6)) OR (e.source=4 AND e.op=4)
         GROUP BY e.pid HAVING sync_cnt > 5
         ORDER BY max_us DESC
     """)
@@ -1238,7 +1265,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                COUNT(*) as sync_cnt,
                MAX(duration)/1000 as max_sync_us
         FROM events
-        WHERE (source=1 AND op=5) OR (source=4 AND op=4)
+        WHERE (source=1 AND op IN (5,6)) OR (source=4 AND op=4)
         GROUP BY bucket ORDER BY bucket
     """)
     rows2 = sql_to_dicts(r2)
@@ -1530,13 +1557,27 @@ def main():
     parser.add_argument("--db", required=True, help="Path to ingero.db")
     parser.add_argument("--report", default="logs/gpu-investigation-report.log",
                         help="Report output path")
-    parser.add_argument("--phase1-start", type=float, default=0, help="Phase 1 epoch timestamp")
-    parser.add_argument("--phase2-start", type=float, default=0, help="Phase 2 epoch timestamp")
-    parser.add_argument("--phase3-start", type=float, default=0, help="Phase 3 epoch timestamp")
-    parser.add_argument("--phase4-start", type=float, default=0, help="Phase 4 epoch timestamp")
+    # Phase timestamps accepted but unused — the analysis uses relative offsets
+    # from the first event timestamp (more reliable than wall-clock phase
+    # boundaries which drift due to probe attachment time).
+    parser.add_argument("--phase1-start", type=float, default=0)
+    parser.add_argument("--phase2-start", type=float, default=0)
+    parser.add_argument("--phase3-start", type=float, default=0)
+    parser.add_argument("--phase4-start", type=float, default=0)
     args = parser.parse_args()
 
     mcp = MCPClient(args.mcp_url)
+
+    # Preflight: verify MCP connectivity before running 23 investigations
+    preflight = mcp.run_sql("SELECT COUNT(*) FROM events")
+    if "error" in preflight:
+        print(f"ERROR: MCP preflight failed: {preflight['error']}", file=sys.stderr)
+        sys.exit(1)
+    event_count = sql_first_val(preflight, 0)
+    if event_count == 0:
+        print("ERROR: database contains 0 events", file=sys.stderr)
+        sys.exit(1)
+    print(f"MCP connected. DB has {event_count:,} events.")
 
     # Run all 23 investigations
     print("Running 23 GPU problem investigations...")
