@@ -206,7 +206,7 @@ sleep 20
 echo -e "$(ts) ${CYAN}[PHASE 2]${NC} Starting alloc_stress.py (30s)..."
 PHASE2_START=$(date +%s.%N)
 
-python3 tests/workloads/synthetic/alloc_stress.py > logs/gpu-inv-alloc-stress.log 2>&1 &
+python3 tests/workloads/synthetic/alloc_stress.py --duration 25 > logs/gpu-inv-alloc-stress.log 2>&1 &
 ALLOC_PID=$!
 cleanup_pids+=("$ALLOC_PID")
 
