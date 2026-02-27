@@ -307,7 +307,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: memcpy + total CUDA duration (separate queries avoid full-table CASE scan)
     r3a = mcp.run_sql("""
         SELECT SUM(duration) as memcpy_dur, COUNT(*) as memcpy_cnt
-        FROM events WHERE source=1 AND op=4
+        FROM events WHERE source=1 AND op IN (4,7)
     """)
     r3b = mcp.run_sql("""
         SELECT SUM(duration) as total_dur FROM events WHERE source IN (1, 4)
@@ -582,7 +582,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us
-        FROM events WHERE source=1 AND op=4
+        FROM events WHERE source=1 AND op IN (4,7)
           AND timestamp >= (SELECT started_at FROM last_session)
         GROUP BY bucket ORDER BY bucket
     """)
@@ -866,7 +866,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: overhead fraction (CUDA+Driver only — excluding HOST to avoid inflated denominator)
     r3 = mcp.run_sql("""
         SELECT
-            SUM(CASE WHEN source=1 AND op=4 THEN duration ELSE 0 END) as memcpy_dur,
+            SUM(CASE WHEN source=1 AND op IN (4,7) THEN duration ELSE 0 END) as memcpy_dur,
             SUM(CASE WHEN (source=1 AND op=3) OR (source=4 AND op=1) THEN duration ELSE 0 END) as launch_dur,
             SUM(duration) as total_dur
         FROM events WHERE source IN (1, 4)
@@ -922,7 +922,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         JOIN ops o ON e.source=o.source_id AND e.op=o.op_id
         CROSS JOIN t0
         WHERE e.timestamp < t0.ts + 15000000000
-          AND ((e.source=1 AND e.op IN (1,4)) OR (e.source=4 AND e.op=5))
+          AND ((e.source=1 AND e.op IN (1,4,7)) OR (e.source=4 AND e.op=5))
         GROUP BY o.name
     """)
     rows1 = sql_to_dicts(r1)
@@ -1118,7 +1118,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 3: first memcpy H2D (model weight transfer)
     r3 = mcp.run_sql("""
         SELECT duration/1000 as dur_us, arg0 as bytes, arg1 as direction
-        FROM events WHERE source=1 AND op=4 AND arg1=1
+        FROM events WHERE source=1 AND op IN (4,7) AND arg1=1
         ORDER BY timestamp LIMIT 5
     """)
     rows3 = sql_to_dicts(r3)
@@ -1317,7 +1317,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             AVG(arg0) as avg_bytes,
             AVG(duration)/1000 as avg_us,
             SUM(duration) as total_dur
-        FROM events WHERE source=1 AND op=4
+        FROM events WHERE source=1 AND op IN (4,7)
         GROUP BY arg1
     """)
     rows1 = sql_to_dicts(r1)
@@ -1327,7 +1327,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # Action 2: memcpy wall-time percentage
     r2 = mcp.run_sql("""
         SELECT
-            SUM(CASE WHEN source=1 AND op=4 THEN duration ELSE 0 END) as memcpy_dur,
+            SUM(CASE WHEN source=1 AND op IN (4,7) THEN duration ELSE 0 END) as memcpy_dur,
             SUM(duration) as total_dur
         FROM events WHERE source IN (1, 4)
     """)
@@ -1340,7 +1340,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         SELECT
             CASE arg1 WHEN 1 THEN 'H2D' WHEN 2 THEN 'D2H' WHEN 3 THEN 'D2D' ELSE 'unknown' END as dir,
             SUM(arg0) / (SUM(duration) / 1e9 + 0.001) / 1e9 as bw_gbps
-        FROM events WHERE source=1 AND op=4 AND duration > 0
+        FROM events WHERE source=1 AND op IN (4,7) AND duration > 0
         GROUP BY arg1
     """)
     rows3 = sql_to_dicts(r3)

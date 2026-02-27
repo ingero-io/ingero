@@ -32,7 +32,7 @@ type driverTraceCudaEvent struct {
 	GpuId      uint32
 }
 
-type driverTraceDriverEntryState struct {
+type driverTraceEntryState struct {
 	_           structs.HostLayout
 	TimestampNs uint64
 	Op          uint8

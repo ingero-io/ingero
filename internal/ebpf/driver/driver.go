@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -25,6 +24,9 @@ type Tracer struct {
 	reader       *ringbuf.Reader
 	eventCh      chan events.Event
 	dropped      atomic.Uint64
+	readErrors   atomic.Uint64  // ring buffer read errors
+	parseErrors  atomic.Uint64  // event parse failures
+	closed       atomic.Bool    // prevents double-close
 }
 
 // probeSpec defines a uprobe/uretprobe pair for a driver API function.
@@ -64,7 +66,13 @@ func (t *Tracer) Attach() error {
 	}
 
 	var closeFn func()
-	closeFn = func() { t.objs.Close() }
+	closeFn = func() {
+		for _, l := range t.links {
+			l.Close()
+		}
+		t.links = nil
+		t.objs.Close()
+	}
 	defer func() {
 		if closeFn != nil {
 			closeFn()
@@ -157,11 +165,13 @@ func (t *Tracer) Run(ctx context.Context) {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return
 			}
+			t.readErrors.Add(1)
 			continue
 		}
 
 		evt, err := parseEvent(record.RawSample)
 		if err != nil {
+			t.parseErrors.Add(1)
 			continue
 		}
 
@@ -200,54 +210,34 @@ func parseEvent(raw []byte) (events.Event, error) {
 
 	// Check for stack event (576 bytes).
 	if len(raw) >= stackEventSize {
-		evt.Stack = parseStackIPs(raw, baseSize)
+		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}
 
 	return evt, nil
 }
 
-// parseStackIPs extracts stack frames from the stack section of a cuda_event_stack.
-func parseStackIPs(raw []byte, baseOffset int) []events.StackFrame {
-	if len(raw) < baseOffset+8 {
-		return nil
-	}
-
-	depth := binary.LittleEndian.Uint16(raw[baseOffset : baseOffset+2])
-	if depth == 0 || depth > 64 {
-		return nil
-	}
-
-	ipsOffset := baseOffset + 8
-	frames := make([]events.StackFrame, 0, depth)
-	for i := uint16(0); i < depth; i++ {
-		off := ipsOffset + int(i)*8
-		if off+8 > len(raw) {
-			break
-		}
-		ip := binary.LittleEndian.Uint64(raw[off : off+8])
-		if ip == 0 {
-			break
-		}
-		frames = append(frames, events.StackFrame{IP: ip})
-	}
-	return frames
-}
-
-// Close releases all eBPF resources.
+// Close releases all eBPF resources. Safe to call multiple times (idempotent).
 func (t *Tracer) Close() error {
-	if t.reader != nil {
-		t.reader.Close()
+	if t.closed.Swap(true) {
+		return nil
 	}
 
+	var errs []error
+	if t.reader != nil {
+		if err := t.reader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, l := range t.links {
-		l.Close()
+		if err := l.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	t.links = nil
-
 	if err := t.objs.Close(); err != nil {
-		return fmt.Errorf("closing driver eBPF objects: %w", err)
+		errs = append(errs, fmt.Errorf("closing driver eBPF objects: %w", err))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // LibPath returns the path to the libcuda.so being traced.
@@ -263,4 +253,14 @@ func (t *Tracer) ProbeCount() int {
 // Dropped returns the number of events dropped due to a full channel.
 func (t *Tracer) Dropped() uint64 {
 	return t.dropped.Load()
+}
+
+// ReadErrors returns the number of ring buffer read errors.
+func (t *Tracer) ReadErrors() uint64 {
+	return t.readErrors.Load()
+}
+
+// ParseErrors returns the number of malformed events that failed to parse.
+func (t *Tracer) ParseErrors() uint64 {
+	return t.parseErrors.Load()
 }

@@ -72,6 +72,7 @@ const (
 	CUDAMemcpy       CUDAOp = 4
 	CUDAStreamSync   CUDAOp = 5
 	CUDADeviceSync   CUDAOp = 6
+	CUDAMemcpyAsync  CUDAOp = 7
 )
 
 // String returns a human-readable name for the CUDA operation.
@@ -89,6 +90,8 @@ func (op CUDAOp) String() string {
 		return "cudaStreamSync"
 	case CUDADeviceSync:
 		return "cudaDeviceSync"
+	case CUDAMemcpyAsync:
+		return "cudaMemcpyAsync"
 	default:
 		return fmt.Sprintf("unknown(%d)", op)
 	}
@@ -191,6 +194,7 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		"cudamemcpy":       CUDAMemcpy,
 		"cudastreamsync":   CUDAStreamSync,
 		"cudadevicesync":   CUDADeviceSync,
+		"cudamemcpyasync":  CUDAMemcpyAsync,
 	}
 	for k, v := range cudaOps {
 		if lower == k {

@@ -123,8 +123,8 @@ func TestLookupTablesCreated(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM ops").Scan(&opsCount); err != nil {
 		t.Fatalf("ops query: %v", err)
 	}
-	if opsCount != 18 {
-		t.Errorf("ops: got %d rows, want 18", opsCount)
+	if opsCount != 19 {
+		t.Errorf("ops: got %d rows, want 19", opsCount)
 	}
 
 	// Check schema_info.
@@ -231,8 +231,8 @@ func TestOpDescriptions(t *testing.T) {
 	defer s.Close()
 
 	descs := s.OpDescriptions()
-	if len(descs) != 18 {
-		t.Errorf("OpDescriptions: got %d, want 18", len(descs))
+	if len(descs) != 19 {
+		t.Errorf("OpDescriptions: got %d, want 19", len(descs))
 	}
 	if descs["cudaMalloc"] != "GPU memory allocation" {
 		t.Errorf("cudaMalloc desc = %q", descs["cudaMalloc"])
