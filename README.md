@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.67**
+**Version: 0.6.68**
 
 *"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
 
@@ -102,6 +102,7 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 ## Install
 
+<!--
 ### Binary Release (recommended)
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
@@ -119,6 +120,7 @@ VERSION=0.7.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
+-->
 
 ### Build from Source
 
