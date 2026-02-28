@@ -1132,6 +1132,6 @@ func formatAggregateStats(ops []store.AggregateOpStats, tsc bool, opDescs map[st
 		result += fmt.Sprintf(": count=%d avg=%dµs min=%dµs max=%dµs\n",
 			op.Count, avgUs, op.MinDur/1000, op.MaxDur/1000)
 	}
-	result += fmt.Sprintf("\nNote: Use run_sql for percentiles or detailed per-event analysis.")
+	result += "\nNote: Use run_sql for percentiles or detailed per-event analysis."
 	return result
 }
