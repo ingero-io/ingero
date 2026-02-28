@@ -1,6 +1,10 @@
-# ML Engineer AI-Assisted GPU Investigation Session
+# ML Engineer AI-Assisted GPU Investigation Sessions
 
-> Real investigation session using Ingero's MCP server against a 120-second PyTorch training trace on an A100 SXM4 40GB GPU. The AI assistant uses **only** the Ingero MCP tools — no shell access, no direct database queries. This is how it works in production: the assistant connects to the MCP server on the remote GPU machine and answers the engineer's questions.
+> Real investigation sessions using Ingero's MCP server against PyTorch training traces. The AI assistant uses **only** the Ingero MCP tools — no shell access, no direct database queries. This is how it works in production: the assistant connects to the MCP server on the remote GPU machine and answers the engineer's questions.
+
+---
+
+# Session 1: A100 SXM4 (x86_64)
 
 **Setup**: `ingero mcp --db gpu-investigation.db --http :8090`
 **DB size**: 7.7 MB (2.64M events traced, 50K stored via stack sampling)
@@ -238,3 +242,185 @@ Load average peaked at **16.9** — roughly 17 runnable threads competing for CP
 | `get_causal_chains` | 2 | Root cause analysis, severity breakdown |
 | `get_stacks` | 4 | Call stack analysis for cudaStreamSync, cudaLaunchKernel, cuLaunchKernel, cudaMalloc, cudaFree |
 | `run_sql` | 2 | Malloc/free aggregate balance, scheduling events per process |
+
+---
+
+# Session 2: GH200 (ARM64/aarch64)
+
+**Setup**: `ingero mcp --db gpu-investigation.db --http :8090`
+**DB size**: 22 MB (1.71M events traced, 265K stored via stack sampling)
+**GPU**: NVIDIA GH200 480GB (Grace Hopper, ARM64), Lambda Labs
+
+---
+
+## Q1: "How did my training go?"
+
+**MCP tools used**: `get_trace_stats`, `get_causal_chains`
+
+**Answer**:
+
+Ingero traced **1.71 million** events during the training run, storing 265K sampled events for investigation.
+
+**The GPU was fast** — driver-level kernel launches (cuBLAS/cuDNN path) clocked at p50 = **19µs** with 1.07M total launches. Memory sync operations were healthy (cudaDeviceSync p50 = 18µs).
+
+**But Ingero flagged 138 causal chain issues — 47 HIGH severity.** All pointing to the same root cause:
+
+**CPU contention is hammering CUDA calls.** The GH200 has 64 vCPUs, but load average hit **31.0**. This caused:
+
+| CUDA Operation | p50 (normal) | p99 (worst) | Tail ratio | Impact |
+|---|---|---|---|---|
+| cudaLaunchKernel | 21µs | **3.3ms** | **160x** | Kernel launches delayed |
+| cudaMalloc | 1.5ms | **20.7ms** | 13.5x | Memory allocs stalling |
+| cuMemAlloc | 1.5ms | **20.6ms** | 13.6x | Driver allocs too |
+| cuLaunchKernel | 6µs | 37µs | 6.5x | Driver launches less affected |
+| cudaFree | 43µs | 257µs | 6x | Frees slowed |
+
+Ingero also spotted a memory pressure chain: **10,408 page allocations (1.2 GB)** coinciding with CPU saturation and kernel launch delays.
+
+**Memory balance**: 10,937 mallocs vs 10,937 frees — **perfectly balanced**, no leaks.
+
+---
+
+## Q2: "Show me the call stacks for cudaLaunchKernel"
+
+**MCP tools used**: `get_stacks` (source=1, op="cudaLaunchKernel")
+
+**Answer**:
+
+Top 10 `cudaLaunchKernel` code paths, ranked by call frequency:
+
+| # | PyTorch Operation | Calls | Avg | Max | Status |
+|---|---|---|---|---|---|
+| **1** | **Tensor add (int64)** — `at::native::add_kernel` | 536 | 1.2ms | **16ms** | Worst hit |
+| **2** | **ReLU activation** — `at::native::relu_` | 520 | 977µs | 11ms | Bad |
+| **3** | **ReLU backward** — `threshold_backward` | 296 | 1.7ms | 6ms | Bad |
+| **4** | **Tensor add (float)** — `at::native::add_kernel` | 241 | 647µs | 9.4ms | Moderate |
+| **5** | **Tensor add (float)** — different callsite | 166 | 1.1ms | 6ms | Moderate |
+| **6** | **Tensor add (int64)** — different callsite | 134 | 358µs | 4ms | Lighter |
+| **7** | **Tensor add (int64)** — third callsite | 121 | 408µs | 7.6ms | Spikey |
+| **8** | **Softmax forward** — `log_softmax_cuda` | 113 | 139µs | 7ms | Fast normally, spikes |
+| **9** | **Mean reduction** — `gpu_reduce_kernel<MeanOps>` | 113 | 187µs | 4ms | OK |
+| **10** | **Fill (zero_grad)** — `fill_kernel_cuda` | 112 | 146µs | 4ms | OK |
+
+The training loop is dominated by **tensor addition** (gradient accumulation) and **ReLU forward/backward** passes — the ResNet-50 signature. All paths go through `python3` → `_PyEval_EvalFrameDefault` → `libtorch_python.so` → `libtorch_cuda.so` — standard PyTorch eager-mode on ARM64.
+
+---
+
+## Q3: "What lines of my code caused issues?"
+
+**MCP tools used**: `get_stacks` (cudaMalloc, cudaLaunchKernel, cudaFree)
+
+**Answer**:
+
+### `alloc_stress.py` — 3 functions, all rooted at `main()` line 114
+
+| File | Line | Function | Impact | Avg Latency | Max Latency |
+|---|---|---|---|---|---|
+| **alloc_stress.py** | **46** | `direct_cuda_alloc_free()` | 621 mallocs, **41ms spikes** | 9ms | 41.3ms |
+| **alloc_stress.py** | **74** | `fragmentation_pattern()` | 346 mallocs + 438 frees, **22ms spikes** | 12ms | 22.4ms |
+| **alloc_stress.py** | **63** | `sequential_alloc()` | 328 frees (healthy) | 42µs | 66µs |
+| **alloc_stress.py** | **114** | `main()` | Orchestrator — calls all 3 above | — | — |
+| torch/cuda/memory.py | 210 | `empty_cache()` | Called from line 74, triggers bulk realloc | 9ms | 41.4ms |
+
+**Python frames confirmed working on ARM64** — Ingero's DWARF-based CPython frame walker resolved exact source files, function names, and line numbers on aarch64.
+
+---
+
+## Q4: "Show me the scheduling storms"
+
+**MCP tools used**: `get_causal_chains`, `run_sql` (scheduling events per minute, context switches per PID)
+
+**Answer**:
+
+### Storm Timeline
+
+| Minute | Context Switches | Wakeups | Page Allocs | Memory |
+|---|---|---|---|---|
+| Minute 1 (warmup) | 650 | 5 | 1,032 | 4 MB |
+| **Minute 2 (training)** | **145,240** | **2,688** | **87,993** | **9.5 GB** |
+
+A **223x increase** in context switches in minute 2.
+
+### Who's Getting Hit
+
+| Process | PID | Switches | Off-CPU Time | Role |
+|---|---|---|---|---|
+| **python3** (main) | 17074 | **237,394** | **62 seconds** | Training loop — GPU owner |
+| python3 (child) | 17076 | 2,450 | 15ms | Secondary process |
+| pt_data_worker | 17215 | 115 | 13.0s | DataLoader worker |
+| pt_data_worker | 17217 | 110 | 12.8s | DataLoader worker |
+| pt_data_worker | 17216 | 110 | 12.8s | DataLoader worker |
+| pt_data_worker | 17214 | 110 | 12.9s | DataLoader worker |
+
+**The main training process was descheduled 237,394 times — 1,977/sec — and spent 62 seconds off-CPU.**
+
+### Storm Escalation (from causal chains)
+
+| Phase | Sched Switches/window | Load Avg | Memory Pressure | CUDA Effect |
+|---|---|---|---|---|
+| Early | 44,605 | **31.0** | — | cudaMalloc 13.5x |
+| Building | 53,853 | **27.7** | — | cudaLaunchKernel 160x |
+| Peak CPU | 56,046 | **24.2** | + 2.2 GB page allocs | Dual pressure |
+| **Peak storm** | **111,146** | 12.6 | — | All CUDA ops affected |
+| Late + memory | 92,795 | — | + 1.2 GB page allocs | cudaFree 6x |
+
+Load average *decreased* (31→12.6) as the storm intensified (44K→111K switches) — processes were finishing, but survivors fought harder for CPU.
+
+---
+
+## Q5: "Show me the memory alloc/free balance"
+
+**MCP tools used**: `run_sql` (aggregate counts, per-minute breakdown), `get_stacks` (cudaMalloc with sum_arg0)
+
+**Answer**:
+
+### Overall Balance
+
+| Operation | Total Calls | Total Allocated |
+|---|---|---|
+| **cudaMalloc** (runtime) | 10,937 | 151.1 GB |
+| **cuMemAlloc** (driver) | 10,937 | 151.1 GB |
+| **cudaFree** | 10,937 | — |
+
+**Perfectly balanced — 10,937 mallocs, 10,937 frees. Zero leak.**
+
+### Allocation by Code Path
+
+| Function | Line | Calls | Avg Latency | Max Latency | Total Allocated |
+|---|---|---|---|---|---|
+| `direct_cuda_alloc_free()` | 46 | 621 | **9.0ms** | **41.3ms** | 61.1 GB |
+| `fragmentation_pattern()` | 74 | 346 | **12.2ms** | 22.4ms | 48.5 GB |
+| `empty_cache()` (via line 74) | 210 | 120 | **9.1ms** | **41.4ms** | 12.0 GB |
+| `main()` | 114 | 4 | **39.8ms** | 40.3ms | 2.0 GB |
+
+`fragmentation_pattern()` defeats the CUDA caching allocator by calling `empty_cache()` then reallocating from scratch — forcing fresh driver allocations during CPU contention.
+
+---
+
+## Session 2 Summary
+
+| Metric | Value |
+|---|---|
+| Total events traced | 1.71 million |
+| Events stored (sampled) | 265,514 |
+| DB size | 22 MB |
+| Unique stacks | 218 (100% resolved, 32 with Python frames) |
+| Causal chains | 138 (47 HIGH, 91 MEDIUM) |
+| MCP calls used | 8 |
+| Architecture | **ARM64 (aarch64)** — GH200 Grace Hopper |
+
+### Key Findings
+1. **GPU is healthy** — kernel launches fast, memory perfectly balanced (10,937/10,937)
+2. **CPU is the bottleneck** — 237K context switches, 62s off-CPU, load avg 31
+3. **cudaLaunchKernel worst affected** — 160x tail latency inflation
+4. **No memory leaks** — zero net unfreed allocations
+5. **Python frames work on ARM64** — DWARF-based CPython walker resolves exact source lines on aarch64
+6. **Memory pressure compounds CPU contention** — 9.5 GB page allocations during peak storm
+
+### MCP Tools Used
+| Tool | Calls | Purpose |
+|---|---|---|
+| `get_trace_stats` | 1 | Session overview, per-op latency percentiles |
+| `get_causal_chains` | 2 | Root cause analysis, storm escalation |
+| `get_stacks` | 3 | Call stacks for cudaLaunchKernel, cudaMalloc, cudaFree with Python frames |
+| `run_sql` | 2 | Malloc/free aggregates, scheduling events per process |
