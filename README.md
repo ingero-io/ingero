@@ -2,15 +2,19 @@
 
 **Version: 0.6.68**
 
-*"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
+**The only GPU observability tool your AI assistant can talk to.**
 
-Ingero is a production-grade eBPF agent that assembles **causal chains** to answer that question. It bridges the gap between the Linux kernel and your CUDA code — with **<2% overhead**, **zero code changes**, and **one binary**.
+*"What caused the GPU stall?" → "`forward()` at `train.py:142` — cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
 
-- **The "Why":** Correlate a `cudaStreamSync` spike with a `sched_switch` event — the host kernel preempted your training thread.
-- **The "Where":** Map low-level CUDA calls back to **Python source lines** in your PyTorch `forward()` pass.
-- **The "Hidden Kernels":** Trace the CUDA Driver API to see kernel launches by cuBLAS/cuDNN that bypass standard runtime profilers.
+Ingero is a production-grade eBPF agent that traces the full chain — from Linux kernel events through CUDA API calls to your Python source lines — with **<2% overhead**, **zero code changes**, and **one binary**.
+
+- **The "Why":** Correlate a `cudaStreamSync` spike with `sched_switch` events — the host kernel preempted your thread.
+- **The "Where":** Map CUDA calls back to **Python source lines** in your PyTorch `forward()` pass.
+- **The "Hidden Kernels":** Trace the CUDA Driver API to see kernel launches by cuBLAS/cuDNN that bypass standard profilers.
 
 No ClickHouse, no PostgreSQL, no MinIO — just one statically linked Go binary and embedded SQLite.
+
+See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md) — an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL — just questions and answers.
 
 ## What It Does
 
@@ -76,7 +80,7 @@ Things no other GPU tool can show you.
 
 **"Your host is swapping and your GPU doesn't know it."** System Context shows Swap 2.1 GB. cudaMalloc p99 rises from 0.02ms to 8.4ms. No GPU tool shows this — nvidia-smi says GPU memory is fine, but host-side CUDA bookkeeping is hitting swap.
 
-**"Ask your AI."** Claude queries Ingero via MCP: "At 15:41:22, mm_page_alloc latency spiked while CPU was at 94%. cudaMalloc p99 rose 600x. Another process allocated 6GB of RAM." The engineer never reads logs again.
+**"Ask your AI: what line of my code caused the GPU stall?"** Your AI assistant calls Ingero's MCP server and answers in one shot: "The issue is in `forward()` at `train.py:142`, calling cudaMalloc through PyTorch. 9,829 calls, avg 3.1ms but spiking to 48.3ms during CPU contention." Resolved Python source lines, native symbols, timing stats — no logs, no manual SQL, no hex addresses. The engineer asks questions in plain English and gets production root causes back.
 
 ## See It In Action
 
@@ -139,8 +143,6 @@ sudo make install # copies binary to /usr/local/bin/ingero
 - Root / `CAP_BPF` + `CAP_PERFMON` (eBPF requires elevated privileges)
 - Tested on: GH200, H100, A100, A10, RTX 4090, RTX 3090 (x86_64 and aarch64)
 
-**Only `trace` needs sudo** — it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
-
 ## Commands
 
 ### `ingero check`
@@ -189,6 +191,8 @@ sudo ingero trace --max-db 0               # unlimited (no size-based pruning)
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 ```
+
+**Only `trace` needs sudo** — it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
 
 **Process targeting:**
 - **Default** (no flags): traces all CUDA processes owned by the invoking user (via `SUDO_USER`). On single-user boxes, this means all CUDA processes.
@@ -456,7 +460,7 @@ Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azu
 
 ## What Ingero Addresses Today (v0.6)
 
-Ingero v0.6 addresses 23 of 32 documented GPU problems across training, inference, and AI agent workloads.
+Ingero addresses 23 documented GPU problems across training, inference, and AI agent workloads.
 
 | # | GPU Problem | Severity | How Ingero Detects It |
 |---|-------------|----------|----------------------|
