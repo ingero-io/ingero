@@ -4,8 +4,9 @@
 // Field names are abbreviated: "timestamp" → "t", "duration_us" → "d_us", etc.
 // Enabled by default (--tsc flag, default: true). Per-request override: {"tsc": false}.
 //
-// Call chain: MCP tool handlers → formatStatsSnapshot/formatAggregateStats →
-//   tscFieldMap applied if tsc=true → compact JSON response
+// Call chain: MCP tool handlers → formatStatsSnapshot/formatAggregateStats/
+//   formatCausalChains/formatStoredChains → TSCMap() applies tscFieldMap if tsc=true.
+//   Note: get_stacks uses Go struct tags (json.Marshal), not TSCMap — field names are fixed.
 package mcp
 
 // tscFieldMap maps verbose field names to abbreviated TSC equivalents.
@@ -38,11 +39,6 @@ var tscFieldMap = map[string]string{
 	"wall_percent":    "w%",
 	"command":         "cmd",
 	"process_name":    "pn",
-	"avg_us":          "avg",
-	"min_us":          "min",
-	"max_us":          "max",
-	"sum_arg0":        "sa0",
-	"processes":       "procs",
 }
 
 // tscReverseMap maps abbreviated names back to verbose names.
