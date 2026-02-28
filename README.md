@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.55**
+**Version: 0.6.56**
 
 *"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
 
@@ -257,10 +257,8 @@ ingero mcp --http :8080           # HTTPS/TLS 1.3 (self-signed cert)
 | Tool | Description |
 |------|-------------|
 | `get_check` | System diagnostics (kernel, BTF, NVIDIA, CUDA, GPU model) |
-| `get_trace_stats` | CUDA + host statistics with p50/p95/p99 latency |
-| `query_events` | Query stored events by time range, PID, operation |
+| `get_trace_stats` | CUDA + host statistics (p50/p95/p99 or aggregate fallback for large DBs) |
 | `get_causal_chains` | Causal chains with severity ranking and root cause |
-| `get_sessions` | Trace session metadata (GPU, CPU, driver, OS, versions) |
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
 | `run_sql` | Execute read-only SQL for ad-hoc analysis |

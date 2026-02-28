@@ -1664,6 +1664,66 @@ func (s *Store) QueryAggregateTotals(q QueryParams) (AggregateTotals, error) {
 	return result, rows.Err()
 }
 
+// AggregateOpStats holds per-operation aggregate statistics from the
+// event_aggregates table. Used by MCP get_trace_stats for large DBs where
+// loading all individual events would time out.
+type AggregateOpStats struct {
+	Source uint8  // event source ID
+	Op     uint8  // operation ID
+	OpName string // human-readable name (e.g., "cudaMemcpy")
+	Count  int64  // total events
+	SumDur int64  // sum of durations (nanos)
+	MinDur int64  // minimum duration (nanos)
+	MaxDur int64  // maximum duration (nanos)
+}
+
+// QueryAggregatePerOp returns per-operation aggregate statistics from the
+// event_aggregates table. Groups by (source, op) and returns count, sum_dur,
+// min_dur, max_dur for each operation. Supports PID filtering via QueryParams.
+//
+// This is the "fast path" for get_trace_stats on large DBs (>500K events):
+// instead of loading all events into memory for percentile calculation, it
+// reads pre-computed aggregates and returns count/avg/min/max.
+func (s *Store) QueryAggregatePerOp(q QueryParams) ([]AggregateOpStats, error) {
+	query := `SELECT source, op, SUM(count), SUM(sum_dur), MIN(min_dur), MAX(max_dur)
+		FROM event_aggregates WHERE 1=1`
+	var args []interface{}
+
+	if !q.From.IsZero() {
+		query += " AND bucket >= ?"
+		args = append(args, q.From.UnixNano())
+	} else if q.Since > 0 {
+		query += " AND bucket >= ?"
+		args = append(args, time.Now().Add(-q.Since).UnixNano())
+	}
+	if !q.To.IsZero() {
+		query += " AND bucket <= ?"
+		args = append(args, q.To.UnixNano())
+	}
+	query, args = appendPIDFilter(query, args, q, "")
+
+	query += " GROUP BY source, op ORDER BY SUM(count) DESC"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying aggregate per-op: %w", err)
+	}
+	defer rows.Close()
+
+	var result []AggregateOpStats
+	for rows.Next() {
+		var a AggregateOpStats
+		if err := rows.Scan(&a.Source, &a.Op, &a.Count, &a.SumDur, &a.MinDur, &a.MaxDur); err != nil {
+			return nil, fmt.Errorf("scanning aggregate per-op row: %w", err)
+		}
+		// Resolve human-readable op name.
+		evt := events.Event{Source: events.Source(a.Source), Op: a.Op}
+		a.OpName = evt.OpName()
+		result = append(result, a)
+	}
+	return result, rows.Err()
+}
+
 // QuerySessions retrieves sessions, optionally filtered by time range.
 func (s *Store) QuerySessions(since time.Duration) ([]Session, error) {
 	query := `SELECT id, started_at, stopped_at, gpu_model, gpu_driver,

@@ -4,7 +4,7 @@
 // Field names are abbreviated: "timestamp" → "t", "duration_us" → "d_us", etc.
 // Enabled by default (--tsc flag, default: true). Per-request override: {"tsc": false}.
 //
-// Call chain: MCP tool handlers → formatEventList/formatStatsSnapshot →
+// Call chain: MCP tool handlers → formatStatsSnapshot/formatAggregateStats →
 //   tscFieldMap applied if tsc=true → compact JSON response
 package mcp
 

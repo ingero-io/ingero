@@ -3,7 +3,7 @@
 
 Investigates all 28 GPU problems Ingero can detect by querying the database
 exclusively through MCP tool calls (run_sql, get_causal_chains, get_trace_stats,
-get_sessions). Simulates how an AI agent would investigate GPU issues.
+run_sql). Simulates how an AI agent would investigate GPU issues.
 
 Each investigation:
   1. Poses a human question ("My GPU is slow, why?")
@@ -114,8 +114,8 @@ class MCPClient:
         return self.call("get_trace_stats", {"since": since, "tsc": False}, timeout=120)
 
     def get_sessions(self, since: str = "0") -> dict:
-        """Get trace sessions."""
-        return self.call("get_sessions", {"since": since, "tsc": False})
+        """Get trace sessions via run_sql (get_sessions tool was removed)."""
+        return self.call("run_sql", {"query": "SELECT * FROM sessions ORDER BY started_at DESC", "limit": 100}, timeout=30)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1047,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     r1 = _cached_sessions  # cached
     sessions_text = r1.get("text", str(r1.get("data", "")))
-    inv.add_action("get_sessions", "GPU, driver, CUDA, kernel versions",
+    inv.add_action("run_sql", "GPU, driver, CUDA, kernel versions",
                    "compatibility check")
 
     # Verdict: successful trace = compatible
@@ -1477,7 +1477,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     # Action 2: session process names (cached)
     r2 = _cached_sessions
-    inv.add_action("get_sessions", "process names", "check for Triton/vLLM")
+    inv.add_action("run_sql", "process names", "check for Triton/vLLM")
 
     # Verdict: HEALTHY (no Triton in workload)
     sessions_text = str(r2.get("text", r2.get("data", "")))
@@ -1709,7 +1709,6 @@ def generate_report(investigations: list[Investigation], mcp: MCPClient,
 
     # Get session info for header (use cached if available)
     sessions_resp = cached_sessions or mcp.get_sessions("0")
-    sessions_text = sessions_resp.get("text", str(sessions_resp.get("data", "")))
 
     # Get total event count
     total_resp = mcp.run_sql("SELECT COUNT(*) FROM events")
@@ -1723,13 +1722,25 @@ def generate_report(investigations: list[Investigation], mcp: MCPClient,
     lines.append(sep)
     lines.append("")
 
-    # Parse GPU info from session text
+    # Parse GPU info from session data (run_sql returns {columns, data})
     gpu_info = "Unknown"
-    if "GPU:" in sessions_text:
-        for part in sessions_text.split("\n"):
-            if "GPU:" in part:
-                gpu_info = part.strip()
-                break
+    sess_data = sessions_resp.get("data", {})
+    if isinstance(sess_data, dict):
+        cols = sess_data.get("columns", [])
+        rows_data = sess_data.get("data", [])
+        if rows_data and cols:
+            row = rows_data[0]
+            col_map = {c: i for i, c in enumerate(cols)}
+            if "gpu_model" in col_map:
+                gpu_info = str(row[col_map["gpu_model"]])
+    else:
+        # Fallback: search string representation
+        sessions_text = str(sess_data)
+        if "GPU:" in sessions_text:
+            for part in sessions_text.split("\n"):
+                if "GPU:" in part:
+                    gpu_info = part.strip()
+                    break
 
     lines.append(f"DB: {db_path}")
     lines.append(f"Events: {total_events:,}")

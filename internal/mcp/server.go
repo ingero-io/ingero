@@ -1,11 +1,9 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes eight tools to AI agents:
+// The MCP server exposes six tools to AI agents:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
-//   - get_trace_stats: Get recent CUDA/host stats from the SQLite database
-//   - query_events: Query stored events with filters
+//   - get_trace_stats: Get CUDA/host stats (p50/p95/p99 or aggregate fallback)
 //   - get_causal_chains: Analyze events and return causal chains with severity
-//   - get_sessions: Query trace session metadata (GPU, CPU, driver, OS, versions)
 //   - run_demo: Run a synthetic demo scenario
 //   - get_test_report: Return the GPU integration test report (JSON)
 //   - run_sql: Execute read-only SQL for ad-hoc analysis
@@ -242,14 +240,14 @@ func (s *Server) registerTools() {
 
 	// Tool 2: get_trace_stats
 	type traceStatsInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range to query, e.g. 1m, 5m, 1h. Default: 1m"`
+		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m, 1h. Default: all data (0 = no time filter)"`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true). Set false for verbose output."`
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_trace_stats",
-		Description: "Get CUDA and host operation statistics from stored events. Returns p50/p95/p99 latency, time fractions, and anomaly counts.",
+		Description: "Get CUDA and host operation statistics. Returns p50/p95/p99 for small DBs (≤500K events), count/avg/min/max from aggregates for large DBs.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input traceStatsInput) (*gomcp.CallToolResult, struct{}, error) {
-		since := 1 * time.Minute
+		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
 			if err == nil {
@@ -265,7 +263,36 @@ func (s *Server) registerTools() {
 			}, struct{}{}, nil
 		}
 
-		evts, err := s.store.Query(store.QueryParams{Since: since, Limit: -1})
+		tsc := input.TSC == nil || *input.TSC
+		opDescs := s.store.OpDescriptions()
+		qparams := store.QueryParams{Since: since, Limit: -1}
+
+		// Check event count to decide full-fidelity vs aggregate path.
+		// On Count() error, default to aggregate path (fail-safe: cheaper).
+		count, countErr := s.store.Count()
+		if countErr != nil || count > 500_000 {
+			// Large DB: use pre-computed aggregates (count/avg/min/max).
+			ops, err := s.store.QueryAggregatePerOp(qparams)
+			if err != nil {
+				return nil, struct{}{}, fmt.Errorf("querying aggregates: %w", err)
+			}
+			if len(ops) == 0 {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: "No events found in the database."},
+					},
+				}, struct{}{}, nil
+			}
+			text := formatAggregateStats(ops, tsc, opDescs)
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: text},
+				},
+			}, struct{}{}, nil
+		}
+
+		// Small DB: full-fidelity path with percentiles.
+		evts, err := s.store.Query(qparams)
 		if err != nil {
 			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
 		}
@@ -273,7 +300,7 @@ func (s *Server) registerTools() {
 		if len(evts) == 0 {
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: fmt.Sprintf("No events found in the last %s. Is 'ingero trace' running?", since)},
+					&gomcp.TextContent{Text: "No events found in the database."},
 				},
 			}, struct{}{}, nil
 		}
@@ -283,16 +310,9 @@ func (s *Server) registerTools() {
 			collector.Record(evt)
 		}
 		snap := collector.Snapshot()
-		tsc := input.TSC == nil || *input.TSC
-
-		// Enrich stats with op descriptions from lookup tables.
-		var opDescs map[string]string
-		if s.store != nil {
-			opDescs = s.store.OpDescriptions()
-		}
 
 		// Query aggregate totals for accurate counts (selective storage).
-		aggTotals, _ := s.store.QueryAggregateTotals(store.QueryParams{Since: since})
+		aggTotals, _ := s.store.QueryAggregateTotals(qparams)
 		text := formatStatsSnapshot(snap, since, len(evts), tsc, opDescs, &aggTotals)
 
 		return &gomcp.CallToolResult{
@@ -302,88 +322,10 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 3: query_events
-	type queryInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 5m, 1h. Default: 1h"`
-		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
-		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
-		Op    string `json:"op,omitempty" jsonschema:"filter by operation name, e.g. cudaMemcpy, sched_switch"`
-		Limit int    `json:"limit,omitempty" jsonschema:"max results. Default: 100"`
-		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
-	}
-	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
-		Name:        "query_events",
-		Description: "Query raw events from the Ingero database. Returns individual event records with timestamps, durations, and operation details.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input queryInput) (*gomcp.CallToolResult, struct{}, error) {
-		since := 1 * time.Hour
-		if input.Since != "" {
-			d, err := time.ParseDuration(input.Since)
-			if err == nil {
-				since = d
-			}
-		}
-
-		limit := 100
-		if input.Limit > 0 {
-			limit = input.Limit
-		}
-
-		if s.store == nil {
-			return &gomcp.CallToolResult{
-				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
-				},
-			}, struct{}{}, nil
-		}
-
-		params := store.QueryParams{
-			Since: since,
-			Limit: limit,
-		}
-		// Op filter: resolve human-readable name to (source, op) pair.
-		if input.Op != "" {
-			source, op, ok := events.ResolveOp(input.Op)
-			if !ok {
-				return &gomcp.CallToolResult{
-					Content: []gomcp.Content{
-						&gomcp.TextContent{Text: fmt.Sprintf("Unknown operation %q. Examples: cudaMemcpy, cuLaunchKernel, sched_switch", input.Op)},
-					},
-					IsError: true,
-				}, struct{}{}, nil
-			}
-			params.Source = uint8(source)
-			params.Op = op
-		}
-		// PIDs takes precedence over deprecated PID field.
-		if len(input.PIDs) > 0 {
-			pids := make([]uint32, 0, len(input.PIDs))
-			for _, p := range input.PIDs {
-				if p > 0 {
-					pids = append(pids, uint32(p))
-				}
-			}
-			params.PIDs = pids
-		} else if input.PID > 0 {
-			params.PID = uint32(input.PID)
-		}
-
-		richEvts, err := s.store.QueryRich(params)
-		if err != nil {
-			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
-		}
-
-		tsc := input.TSC == nil || *input.TSC
-		text := formatEventList(richEvts, since, tsc)
-		return &gomcp.CallToolResult{
-			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
-			},
-		}, struct{}{}, nil
-	})
-
-	// Tool 4: get_causal_chains — returns active causal chains with severity.
+	// Tool 3: get_causal_chains — returns causal chains with severity.
+	// Stored-chains-first: checks pre-computed chains before attempting replay.
 	type chainsInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m. Default: 1m"`
+		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m. Default: all data (0 = no time filter)"`
 		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
 		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
@@ -392,7 +334,7 @@ func (s *Server) registerTools() {
 		Name:        "get_causal_chains",
 		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. AI-first: TSC-compressed by default.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input chainsInput) (*gomcp.CallToolResult, struct{}, error) {
-		since := 1 * time.Minute
+		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
 			if err == nil {
@@ -408,8 +350,38 @@ func (s *Server) registerTools() {
 			}, struct{}{}, nil
 		}
 
-		// Build query params. PIDs takes precedence over deprecated PID.
-		// Limit: -1 = scan all events for accurate chain analysis.
+		tsc := input.TSC == nil || *input.TSC
+		hasPIDFilter := len(input.PIDs) > 0 || input.PID > 0
+
+		// Fast path: check stored chains first (pre-computed during live trace).
+		// Skip when PID filter is active — stored chains don't have PID info.
+		if !hasPIDFilter {
+			stored, err := s.store.QueryChains(since)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: querying stored chains: %v\n", err)
+			}
+			if len(stored) > 0 {
+				text := formatStoredChains(stored, tsc)
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: text},
+					},
+				}, struct{}{}, nil
+			}
+		}
+
+		// No stored chains — check if replay is feasible.
+		// On Count() error, refuse replay (fail-safe: avoid loading unknown amount of data).
+		count, countErr := s.store.Count()
+		if countErr != nil || count > 500_000 {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf("No stored causal chains found. DB has %d events — too large for replay. Use run_sql to query the causal_chains table directly, or use get_trace_stats for aggregate statistics.", count)},
+				},
+			}, struct{}{}, nil
+		}
+
+		// Small DB: replay events through the chain engine.
 		qparams := store.QueryParams{Since: since, Limit: -1}
 		var corrPID uint32
 		if len(input.PIDs) > 0 {
@@ -436,7 +408,7 @@ func (s *Server) registerTools() {
 		if len(evts) == 0 {
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: "No events found. Is 'ingero trace' running?"},
+					&gomcp.TextContent{Text: "No events found in the database."},
 				},
 			}, struct{}{}, nil
 		}
@@ -461,34 +433,7 @@ func (s *Server) registerTools() {
 			corr.SetSystemSnapshot(correlate.PeakSystemContext(sysCtxs))
 		}
 
-		// Incremental replay: process events chronologically and snapshot
-		// chains at 1-second boundaries. Preserves temporal dynamics so
-		// baseline→anomaly transitions produce high tail ratios (matching
-		// live trace behavior). Single-pass replay averages them away.
 		chains := correlate.ReplayEventsForChains(evts, collector, corr, corrPID)
-		tsc := input.TSC == nil || *input.TSC
-
-		// Fallback: if replay produces 0 chains, check stored chains in DB.
-		// The replay can miss chains on very large DBs (>1M events) where the
-		// rolling collector's window dilutes anomalies, or when time.Now()-based
-		// query bounds exclude relevant events. Use since=0 to query all stored
-		// chains — the event time range may not align with chain detection time
-		// (chains use DetectedAt from time.Now() at detection, not event timestamps).
-		if len(chains) == 0 {
-			stored, err := s.store.QueryChains(0)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: querying stored chains: %v\n", err)
-			}
-			if err == nil && len(stored) > 0 {
-				text := formatStoredChains(stored, tsc)
-				return &gomcp.CallToolResult{
-					Content: []gomcp.Content{
-						&gomcp.TextContent{Text: text},
-					},
-				}, struct{}{}, nil
-			}
-		}
-
 		text := formatCausalChains(chains, tsc)
 
 		return &gomcp.CallToolResult{
@@ -498,51 +443,7 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 5: get_sessions — query trace session metadata.
-	type sessionsInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1h, 24h, 7d. Default: 24h. Use 0 for all sessions."`
-		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
-	}
-	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
-		Name:        "get_sessions",
-		Description: "Query trace session metadata: GPU model, driver, CPU, memory, kernel, OS, CUDA/Python/Ingero versions, PID filter, and trace flags. Each session represents one 'ingero trace' invocation. Use this to understand what hardware and software context a trace was recorded on.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sessionsInput) (*gomcp.CallToolResult, struct{}, error) {
-		if s.store == nil {
-			return &gomcp.CallToolResult{
-				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
-				},
-			}, struct{}{}, nil
-		}
-
-		since := 24 * time.Hour
-		if input.Since != "" {
-			// Support "0" for all sessions.
-			if input.Since == "0" {
-				since = 0
-			} else {
-				d, err := time.ParseDuration(input.Since)
-				if err == nil {
-					since = d
-				}
-			}
-		}
-
-		sessions, err := s.store.QuerySessions(since)
-		if err != nil {
-			return nil, struct{}{}, fmt.Errorf("querying sessions: %w", err)
-		}
-
-		tsc := input.TSC == nil || *input.TSC
-		text := formatSessions(sessions, tsc)
-		return &gomcp.CallToolResult{
-			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
-			},
-		}, struct{}{}, nil
-	})
-
-	// Tool 6: run_demo — runs a synthetic scenario and returns results.
+	// Tool 4: run_demo — runs a synthetic scenario and returns results.
 	type runDemoInput struct {
 		Scenario string `json:"scenario,omitempty" jsonschema:"scenario name: incident, cold-start, memcpy-bottleneck, periodic-spike, cpu-contention, gpu-steal"`
 	}
@@ -588,7 +489,7 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 7: get_test_report — returns the JSON test report from gpu-test.sh.
+	// Tool 5: get_test_report — returns the JSON test report from gpu-test.sh.
 	type testReportInput struct {
 		TSC *bool `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
 	}
@@ -634,9 +535,9 @@ func (s *Server) registerTools() {
 		}, struct{}{}, nil
 	})
 
-	// Tool 8: run_sql — execute read-only SQL for ad-hoc analysis.
+	// Tool 6: run_sql — execute read-only SQL for ad-hoc analysis.
 	//
-	// Why this exists: the 7 fixed tools answer pre-anticipated questions.
+	// Why this exists: the 5 fixed tools answer pre-anticipated questions.
 	// When an AI needs temporal bucketing, threshold analysis, per-PID breakdowns,
 	// or cross-operation correlation, it hits a wall. run_sql lets the AI generate
 	// ad-hoc SQL, turning it from a dashboard reader into a full analyst.
@@ -873,8 +774,10 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 		}
 		result := map[string]interface{}{
 			TSCKey("count", true): eventCount,
-			"since":              since.String(),
 			"ops":                ops,
+		}
+		if since > 0 {
+			result["since"] = since.String()
 		}
 		if agg != nil {
 			result["total_events"] = agg.TotalEvents
@@ -894,10 +797,18 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 
 	// Verbose text format for human consumption.
 	var result string
-	if agg != nil {
-		result = fmt.Sprintf("Stats for last %s (%d stored of %d total events):\n\n", since, eventCount, agg.TotalEvents)
+	if since > 0 {
+		if agg != nil {
+			result = fmt.Sprintf("Stats for last %s (%d stored of %d total events):\n\n", since, eventCount, agg.TotalEvents)
+		} else {
+			result = fmt.Sprintf("Stats for last %s (%d events):\n\n", since, eventCount)
+		}
 	} else {
-		result = fmt.Sprintf("Stats for last %s (%d events):\n\n", since, eventCount)
+		if agg != nil {
+			result = fmt.Sprintf("Stats (%d stored of %d total events):\n\n", eventCount, agg.TotalEvents)
+		} else {
+			result = fmt.Sprintf("Stats (%d events):\n\n", eventCount)
+		}
 	}
 
 	for _, op := range snap.Ops {
@@ -934,131 +845,66 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 	return result
 }
 
-func formatEventList(evts []store.RichEvent, since time.Duration, tsc bool) string {
-	if len(evts) == 0 {
-		return fmt.Sprintf("No events found in the last %s.", since)
-	}
-
+// formatAggregateStats formats per-operation aggregate statistics for large DBs
+// where loading all events for percentile computation would time out.
+// Returns count/avg/min/max per operation (percentiles are unavailable).
+func formatAggregateStats(ops []store.AggregateOpStats, tsc bool, opDescs map[string]string) string {
 	if tsc {
-		// Compact TSC JSON — abbreviated keys, enriched with lookup table data.
-		var output []map[string]interface{}
-		for _, evt := range evts {
+		opsOut := make([]map[string]interface{}, 0, len(ops))
+		var totalCount int64
+		for _, op := range ops {
+			avgUs := int64(0)
+			if op.Count > 0 {
+				avgUs = (op.SumDur / op.Count) / 1000 // nanos → µs
+			}
 			m := TSCMap(true,
-				"ts", evt.Timestamp.Format("15:04:05"),
-				"pid", evt.PID,
-				"src", evt.SourceName,
-				"op", evt.OpName,
-				"dur_us", evt.Duration.Microseconds(),
+				"operation", op.OpName,
+				"count", op.Count,
+				"avg_us", avgUs,
+				"min_us", op.MinDur/1000,
+				"max_us", op.MaxDur/1000,
 			)
-			if evt.ProcessName != "" {
-				m[TSCKey("process_name", true)] = evt.ProcessName
+			if desc := opDescs[op.OpName]; desc != "" {
+				m["d"] = desc
 			}
-			if evt.OpDesc != "" {
-				m["d"] = evt.OpDesc
-			}
-			output = append(output, m)
+			opsOut = append(opsOut, m)
+			totalCount += op.Count
 		}
-		data, _ := json.Marshal(output)
-		return string(data)
-	}
-
-	// Verbose JSON — full field names, enriched with lookup table descriptions.
-	type jsonEvt struct {
-		Timestamp   string `json:"timestamp"`
-		PID         uint32 `json:"pid"`
-		ProcessName string `json:"process_name,omitempty"`
-		Source      string `json:"source"`
-		SourceDesc  string `json:"source_desc"`
-		Op          string `json:"op"`
-		OpDesc      string `json:"op_desc"`
-		DurationUs  int64  `json:"duration_us"`
-	}
-
-	var output []jsonEvt
-	for _, evt := range evts {
-		output = append(output, jsonEvt{
-			Timestamp:   evt.Timestamp.Format(time.RFC3339Nano),
-			PID:         evt.PID,
-			ProcessName: evt.ProcessName,
-			Source:      evt.SourceName,
-			SourceDesc:  evt.SourceDesc,
-			Op:          evt.OpName,
-			OpDesc:      evt.OpDesc,
-			DurationUs:  evt.Duration.Microseconds(),
-		})
-	}
-
-	data, _ := json.MarshalIndent(output, "", "  ")
-	return string(data)
-}
-
-func formatSessions(sessions []store.Session, tsc bool) string {
-	if len(sessions) == 0 {
-		return "No trace sessions found. Run 'ingero trace' to create a session."
-	}
-
-	if tsc {
-		var out []map[string]interface{}
-		for _, sess := range sessions {
-			m := TSCMap(true,
-				"id", sess.ID,
-				"started", sess.StartedAt.Format("2006-01-02 15:04:05"),
-				"gpu", sess.GPUModel,
-				"driver", sess.GPUDriver,
-				"cpu", sess.CPUModel,
-				"cores", sess.CPUCores,
-				"mem_mb", sess.MemTotal,
-				"kernel", sess.Kernel,
-				"os", sess.OSRelease,
-				"cuda", sess.CUDAVer,
-				"python", sess.PythonVer,
-				"ingero", sess.IngeroVer,
-			)
-			if !sess.StoppedAt.IsZero() {
-				dur := sess.StoppedAt.Sub(sess.StartedAt)
-				m["dur"] = fmt.Sprintf("%.0fs", dur.Seconds())
-			} else {
-				m["dur"] = "running"
-			}
-			if sess.PIDFilter != "" {
-				m["pids"] = sess.PIDFilter
-			}
-			if sess.Flags != "" {
-				m["flags"] = sess.Flags
-			}
-			out = append(out, m)
+		result := map[string]interface{}{
+			"mode":         "aggregate",
+			"note":         "Percentiles unavailable for large DBs. Use run_sql for detailed analysis.",
+			"total_events": totalCount,
+			"ops":          opsOut,
 		}
-		data, _ := json.Marshal(out)
+		data, _ := json.Marshal(result)
 		return string(data)
 	}
 
 	// Verbose text format.
-	result := fmt.Sprintf("%d trace session(s):\n\n", len(sessions))
-	for _, sess := range sessions {
-		result += fmt.Sprintf("Session #%d\n", sess.ID)
-		result += fmt.Sprintf("  Started:    %s\n", sess.StartedAt.Format(time.RFC3339))
-		if !sess.StoppedAt.IsZero() {
-			dur := sess.StoppedAt.Sub(sess.StartedAt)
-			result += fmt.Sprintf("  Stopped:    %s (duration: %s)\n", sess.StoppedAt.Format(time.RFC3339), dur.Round(time.Second))
-		} else {
-			result += "  Stopped:    (still running)\n"
-		}
-		result += fmt.Sprintf("  GPU:        %s\n", sess.GPUModel)
-		result += fmt.Sprintf("  Driver:     %s\n", sess.GPUDriver)
-		result += fmt.Sprintf("  CPU:        %s (%d cores)\n", sess.CPUModel, sess.CPUCores)
-		result += fmt.Sprintf("  Memory:     %d MB\n", sess.MemTotal)
-		result += fmt.Sprintf("  Kernel:     %s\n", sess.Kernel)
-		result += fmt.Sprintf("  OS:         %s\n", sess.OSRelease)
-		result += fmt.Sprintf("  CUDA:       %s\n", sess.CUDAVer)
-		result += fmt.Sprintf("  Python:     %s\n", sess.PythonVer)
-		result += fmt.Sprintf("  Ingero:     %s\n", sess.IngeroVer)
-		if sess.PIDFilter != "" {
-			result += fmt.Sprintf("  PID filter: %s\n", sess.PIDFilter)
-		}
-		if sess.Flags != "" {
-			result += fmt.Sprintf("  Flags:      %s\n", sess.Flags)
-		}
-		result += "\n"
+	var totalCount int64
+	for _, op := range ops {
+		totalCount += op.Count
 	}
+	result := fmt.Sprintf("Aggregate stats (%d total events, percentiles unavailable for large DBs):\n\n", totalCount)
+	for _, op := range ops {
+		source := "CUDA"
+		switch events.Source(op.Source) {
+		case events.SourceHost:
+			source = "Host"
+		case events.SourceDriver:
+			source = "Driver"
+		}
+		avgUs := int64(0)
+		if op.Count > 0 {
+			avgUs = (op.SumDur / op.Count) / 1000
+		}
+		result += fmt.Sprintf("[%s] %s", source, op.OpName)
+		if desc := opDescs[op.OpName]; desc != "" {
+			result += fmt.Sprintf(" (%s)", desc)
+		}
+		result += fmt.Sprintf(": count=%d avg=%dµs min=%dµs max=%dµs\n",
+			op.Count, avgUs, op.MinDur/1000, op.MaxDur/1000)
+	}
+	result += fmt.Sprintf("\nNote: Use run_sql for percentiles or detailed per-event analysis.")
 	return result
 }

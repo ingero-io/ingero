@@ -849,35 +849,19 @@ else
         fi
     fi
 
-    # MCP Tool 3: query_events with op filter
-    QUERY_RESP=$(mcp_call "query_events" '{"since":"5m","op":"cudaStreamSync","limit":20}')
-    echo "MCP query_events op=cudaStreamSync: ${QUERY_RESP:0:300}" >> logs/ml-mcp-debug.log
+    # MCP Tool 3: run_sql with op filter (replaces query_events)
+    QUERY_RESP=$(mcp_call "run_sql" '{"query":"SELECT e.id, e.duration, e.pid FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id WHERE o.name='\''cudaStreamSync'\'' ORDER BY e.id DESC LIMIT 20"}')
+    echo "MCP run_sql op=cudaStreamSync: ${QUERY_RESP:0:300}" >> logs/ml-mcp-debug.log
 
-    # T22g: MCP query_events op filter returns only cudaStreamSync (or empty if none)
-    if echo "$QUERY_RESP" | grep -qi 'cudaStreamSync\|StreamSync\|stream_sync'; then
-        MCP_SYNC_COUNT=$(echo "$QUERY_RESP" | { grep -oi 'cudaStreamSync\|StreamSync' || true; } | wc -l)
-        # Verify no other ops leaked through the filter
-        LEAKED_OPS=$(echo "$QUERY_RESP" | { grep -oi 'cuLaunchKernel\|sched_switch\|cudaMalloc\|cudaMemcpy\|cuMemcpy' || true; } | head -1)
-        if [[ -n "$LEAKED_OPS" ]]; then
-            echo -e "$(ts)   → MCP query_events: ${MCP_SYNC_COUNT} sync refs but leaked: ${LEAKED_OPS}"
-            record "FAIL" "T22g: MCP op filter" "filter returned sync events but also leaked ${LEAKED_OPS}"
-        else
-            echo -e "$(ts)   → MCP query_events op=cudaStreamSync: ${MCP_SYNC_COUNT} refs"
-            record "PASS" "T22g: MCP op filter" "cudaStreamSync only, no leaked ops"
-        fi
-    elif echo "$QUERY_RESP" | grep -qi 'No events\|no events\|0 events\|empty'; then
-        # No sync events in DB is OK — the filter worked, just nothing matched
-        echo -e "$(ts)   → MCP query_events: no cudaStreamSync events (filter works, no data)"
-        record "PASS" "T22g: MCP op filter" "filter works, no cudaStreamSync in window"
-    elif echo "$QUERY_RESP" | grep -q 'op.*d_us\|cuda'; then
-        # Got events but not specifically cudaStreamSync — check if filter worked
-        if echo "$QUERY_RESP" | grep -qi 'cuLaunchKernel\|sched_switch\|cudaMalloc'; then
-            record "FAIL" "T22g: MCP op filter" "returned mixed ops (filter not applied)"
-        else
-            record "PASS" "T22g: MCP op filter" "events returned (op name may be compressed)"
-        fi
+    # T22g: MCP run_sql op filter returns only cudaStreamSync events (or empty)
+    if echo "$QUERY_RESP" | grep -q '"data"'; then
+        ROW_COUNT=$(echo "$QUERY_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('meta',{}).get('rows',0))" 2>/dev/null || echo "0")
+        echo -e "$(ts)   → MCP run_sql op=cudaStreamSync: ${ROW_COUNT} rows"
+        record "PASS" "T22g: MCP SQL op filter" "cudaStreamSync: ${ROW_COUNT} rows via run_sql"
+    elif echo "$QUERY_RESP" | grep -qi 'SQL error\|error'; then
+        record "FAIL" "T22g: MCP SQL op filter" "SQL error: ${QUERY_RESP:0:150}"
     else
-        record "FAIL" "T22g: MCP op filter" "unexpected: ${QUERY_RESP:0:150}"
+        record "FAIL" "T22g: MCP SQL op filter" "unexpected: ${QUERY_RESP:0:150}"
     fi
 
     # Kill MCP server
@@ -987,7 +971,7 @@ fi
     echo ""
     echo "## Q4: \"Can an AI agent diagnose this via MCP?\""
     echo ""
-    echo "**Tools**: MCP \`get_trace_stats\` + \`get_causal_chains\` + \`query_events\`"
+    echo "**Tools**: MCP \`get_trace_stats\` + \`get_causal_chains\` + \`run_sql\`"
     echo ""
     echo "- MCP server: port ${MCP_PORT}, DB=${ML_DB}"
     echo "- Same findings available via structured JSON for AI consumption."
