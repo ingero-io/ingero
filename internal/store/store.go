@@ -526,7 +526,7 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("creating stack_traces table: %w", err)
 	}
 
-	// Add resolved frames column (v0.7). Idempotent — no-op if column exists.
+	// Add resolved frames column. Idempotent — no-op if column exists.
 	db.Exec(migrateAddFramesColumn)
 
 	// Migrate: if there are events with inline stack_ips, intern them into
@@ -555,7 +555,7 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates for events not individually stored (selective storage). Use count-stored to get discarded count.')")
 	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
 	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols (v0.7+). Use get_stacks MCP tool for call stack analysis.')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols. Use get_stacks MCP tool for call stack analysis.')")
 
 	// Composite index for get_stacks MCP tool (GROUP BY source,op,stack_hash).
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_source_op_stack ON events(source, op, stack_hash)")
@@ -767,7 +767,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 // the same DB doesn't re-insert stacks that already exist.
 //
 // Only caches stacks that already have resolved frames. Stacks with empty
-// frames (from older sessions before v0.7) are left uncached so they get
+// frames (from older sessions) are left uncached so they get
 // upgraded via INSERT OR REPLACE when seen again with resolved symbols.
 func (s *Store) loadStackCache() {
 	rows, err := s.db.Query("SELECT hash, frames FROM stack_traces")
@@ -992,7 +992,7 @@ func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix 
 
 // Query retrieves events matching the given parameters.
 // Stack traces are resolved via LEFT JOIN against the stack_traces interning table.
-// Prefers resolved frames (v0.7+) over raw IPs for historical investigation.
+// Prefers resolved frames over raw IPs for historical investigation.
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
 		e.gpu_id, e.arg0, e.arg1, e.ret_code,
@@ -1079,7 +1079,7 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			Args:      [2]uint64{arg0, arg1},
 			RetCode:   retCode,
 		}
-		// Prefer resolved frames (v0.7+); fall back to raw IPs for old DBs.
+		// Prefer resolved frames; fall back to raw IPs for old DBs.
 		evt.Stack = deserializeStackFrames(framesJSON)
 		if evt.Stack == nil {
 			evt.Stack = deserializeStackIPs(ipsJSON)
@@ -1865,7 +1865,7 @@ func serializeStackFrames(stack []events.StackFrame) string {
 	var frames []compactFrame
 	for _, f := range stack {
 		// Skip garbage frames: no resolved info at all.
-		if f.SymbolName == "" && f.File == "" && f.PyFile == "" {
+		if f.SymbolName == "" && f.File == "" && f.PyFile == "" && f.PyFunc == "" {
 			continue
 		}
 		base := ""

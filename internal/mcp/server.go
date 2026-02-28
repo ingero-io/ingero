@@ -647,7 +647,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_stacks",
-		Description: "Get resolved call stacks for CUDA/driver operations. Returns top stacks by frequency with symbol names, source files, and timing stats. One call answers 'what code path caused this operation?' For pre-v0.7 DBs, falls back to raw IPs (hex addresses).",
+		Description: "Get resolved call stacks for CUDA/driver operations. Returns top stacks by frequency with symbol names, source files, and timing stats. One call answers 'what code path caused this operation?' For older DBs without resolved symbols, falls back to raw IPs (hex addresses).",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input stacksInput) (*gomcp.CallToolResult, struct{}, error) {
 		if s.store == nil {
 			return &gomcp.CallToolResult{

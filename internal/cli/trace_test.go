@@ -615,7 +615,7 @@ func chainSummaries(chains []correlate.CausalChain) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Stack sampling + garbage stack tests (v0.7)
+// Stack sampling + garbage stack tests
 // ---------------------------------------------------------------------------
 
 func TestIsStackResolved(t *testing.T) {
