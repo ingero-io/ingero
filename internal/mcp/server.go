@@ -678,10 +678,16 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		if input.Op != "" {
 			// ResolveOp determines the source, so skip the user-supplied Source filter.
 			src, op, ok := events.ResolveOp(input.Op)
-			if ok {
-				query += " AND e.source = ? AND e.op = ?"
-				args = append(args, uint8(src), op)
+			if !ok {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("Unknown operation %q. Use CUDA ops (cudaMalloc, cudaLaunchKernel, ...) or driver ops (cuLaunchKernel, cuMemAlloc, ...).", input.Op)},
+					},
+					IsError: true,
+				}, struct{}{}, nil
 			}
+			query += " AND e.source = ? AND e.op = ?"
+			args = append(args, uint8(src), op)
 		} else if input.Source > 0 {
 			query += " AND e.source = ?"
 			args = append(args, input.Source)

@@ -1219,12 +1219,27 @@ else
         echo ""
         echo ""
 
-        # Step 5: run_demo (synthetic scenario)
+        # Step 5: get_stacks (resolved call stacks)
         echo "========================================"
-        echo ">> Step 5: ML Engineer: Run a demo scenario."
+        echo ">> Step 5: ML Engineer: What call stacks hit cudaMalloc?"
         echo "========================================"
         echo ""
-        REQ='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_demo","arguments":{"scenario":"incident"}}}'
+        REQ='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_stacks","arguments":{"op":"cudaMalloc","limit":5}}}'
+        echo "REQUEST:"
+        echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
+        echo ""
+        RESP=$(mcp_call "get_stacks" '{"op":"cudaMalloc","limit":5}')
+        echo "RESPONSE:"
+        echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+        echo ""
+        echo ""
+
+        # Step 6: run_demo (synthetic scenario)
+        echo "========================================"
+        echo ">> Step 6: ML Engineer: Run a demo scenario."
+        echo "========================================"
+        echo ""
+        REQ='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_demo","arguments":{"scenario":"incident"}}}'
         echo "REQUEST:"
         echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
         echo ""
@@ -1234,12 +1249,12 @@ else
         echo ""
         echo ""
 
-        # Step 6: get_test_report
+        # Step 7: get_test_report
         echo "========================================"
-        echo ">> Step 6: ML Engineer: Show me the test report."
+        echo ">> Step 7: ML Engineer: Show me the test report."
         echo "========================================"
         echo ""
-        REQ='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_test_report","arguments":{}}}'
+        REQ='{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_test_report","arguments":{}}}'
         echo "REQUEST:"
         echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
         echo ""
