@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.60**
+**Version: 0.6.67**
 
 *"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
 
@@ -16,7 +16,7 @@ No ClickHouse, no PostgreSQL, no MinIO — just one statically linked Go binary 
 
 Ingero uses eBPF to trace GPU workloads at three layers, reads system metrics from `/proc`, and assembles causal chains that explain root causes:
 
-1. **CUDA Runtime uprobes** — traces `cudaMalloc`, `cudaLaunchKernel`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaStreamSync` / `cudaDeviceSynchronize` via uprobes on `libcudart.so`
+1. **CUDA Runtime uprobes** — traces `cudaMalloc`, `cudaFree`, `cudaLaunchKernel`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaStreamSync` / `cudaDeviceSynchronize` via uprobes on `libcudart.so`
 2. **CUDA Driver uprobes** — traces `cuLaunchKernel`, `cuMemcpy`, `cuMemcpyAsync`, `cuCtxSynchronize`, `cuMemAlloc` via uprobes on `libcuda.so`. Captures kernel launches from cuBLAS/cuDNN that bypass the runtime API.
 3. **Host tracepoints** — traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
 4. **System context** — reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
@@ -29,7 +29,7 @@ $ sudo ingero trace
   Ingero Trace — Live CUDA Event Stream
   Target: PID 4821 (python3)
   Library: /usr/lib/x86_64-linux-gnu/libcudart.so.12
-  CUDA probes: 12 attached
+  CUDA probes: 14 attached
   Driver probes: 10 attached
   Host probes: 7 attached
 
