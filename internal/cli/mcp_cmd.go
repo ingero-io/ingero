@@ -20,11 +20,11 @@ var mcpCmd = &cobra.Command{
 
 The MCP server exposes six tools to AI agents (e.g., Claude):
   - get_check: Run system diagnostics
-  - get_trace_stats: Get recent CUDA/host statistics
-  - query_events: Query stored events with filters
-  - get_causal_chains: Analyze events and return causal chains
+  - get_trace_stats: CUDA/host statistics (p50/p95/p99 or aggregate fallback)
+  - get_causal_chains: Causal chains with severity and root cause
   - run_demo: Run a synthetic demo scenario
-  - get_test_report: Return the GPU integration test report
+  - get_test_report: GPU integration test report (JSON)
+  - run_sql: Execute read-only SQL for ad-hoc analysis
 
 By default, runs on stdio for Claude Code / MCP clients.
 Use --http to start an HTTPS server (TLS 1.3) for curl and remote agents.
@@ -76,8 +76,8 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open database if it exists. Tools that don't need the store (get_check,
-	// run_demo) work without it; tools that do (get_trace_stats, query_events,
-	// get_causal_chains) return a helpful error.
+	// run_demo) work without it; tools that do (get_trace_stats,
+	// get_causal_chains, run_sql) return a helpful error.
 	var s *store.Store
 	if _, err := os.Stat(dbPath); err == nil {
 		s, err = store.New(dbPath)

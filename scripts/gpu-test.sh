@@ -1091,15 +1091,15 @@ else
         record "FAIL" "T19b: MCP get_trace_stats" "unexpected response: ${RESP:0:200}"
     fi
 
-    # T19c: query_events
+    # T19c: run_sql (replaces query_events — use SQL for ad-hoc event queries)
     _test_start=$SECONDS
-    log "Test 19c: MCP query_events"
-    RESP=$(mcp_call "query_events" '{"since":"30m","limit":10}')
+    log "Test 19c: MCP run_sql"
+    RESP=$(mcp_call "run_sql" '{"query":"SELECT e.id, o.name AS op, e.duration, e.pid FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id ORDER BY e.id DESC LIMIT 10"}')
     echo "T19c RESP: ${RESP:0:300}" >> logs/mcp-debug.log
-    if echo "$RESP" | grep -q 'op.*d_us\|cuda.*Duration\|cuLaunchKernel\|cudaDeviceSync\|cudaMalloc'; then
-        record "PASS" "T19c: MCP query_events" "events returned"
+    if echo "$RESP" | grep -q 'columns\|data\|cuLaunchKernel\|cudaDeviceSync\|cudaMalloc\|sched_switch'; then
+        record "PASS" "T19c: MCP run_sql" "events returned via SQL"
     else
-        record "FAIL" "T19c: MCP query_events" "no events returned: ${RESP:0:200}"
+        record "FAIL" "T19c: MCP run_sql" "no events returned: ${RESP:0:200}"
     fi
 
     # T19d: get_causal_chains
@@ -1189,16 +1189,16 @@ else
         echo ""
         echo ""
 
-        # Step 3: query_events (TSC on — default)
+        # Step 3: run_sql — ad-hoc event query (replaces query_events)
         echo "========================================"
-        echo ">> Step 3: ML Engineer: Show me recent events."
+        echo ">> Step 3: ML Engineer: Show me recent events (via SQL)."
         echo "========================================"
         echo ""
-        REQ='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_events","arguments":{"since":"30m","limit":20}}}'
+        REQ='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_sql","arguments":{"query":"SELECT e.id, o.name AS op, e.duration, e.pid FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id ORDER BY e.id DESC LIMIT 20"}}}'
         echo "REQUEST:"
         echo "$REQ" | python3 -m json.tool 2>/dev/null || echo "$REQ"
         echo ""
-        RESP=$(mcp_call "query_events" '{"since":"30m","limit":20}')
+        RESP=$(mcp_call "run_sql" '{"query":"SELECT e.id, o.name AS op, e.duration, e.pid FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id ORDER BY e.id DESC LIMIT 20"}')
         echo "RESPONSE:"
         echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
         echo ""
@@ -1254,13 +1254,13 @@ else
         echo "========================================"
         echo ""
         echo "This session demonstrated all 6 MCP tools with TSC on (default):"
-        echo "  1. tools/list — discover available tools"
-        echo "  2. get_check — system health check"
-        echo "  3. get_trace_stats — GPU operation statistics (TSC compressed)"
-        echo "  4. query_events — raw event query (TSC compressed)"
-        echo "  5. get_causal_chains — root cause analysis (TSC compressed)"
-        echo "  6. run_demo — synthetic scenario"
-        echo "  7. get_test_report — integration test results"
+        echo "  0. tools/list — discover available tools"
+        echo "  1. get_check — system health check"
+        echo "  2. get_trace_stats — GPU operation statistics (TSC compressed)"
+        echo "  3. run_sql — ad-hoc event query via SQL"
+        echo "  4. get_causal_chains — root cause analysis (TSC compressed)"
+        echo "  5. run_demo — synthetic scenario"
+        echo "  6. get_test_report — integration test results"
     } > "$SESSION_FILE"
 
     if [ -s "$SESSION_FILE" ]; then
