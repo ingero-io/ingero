@@ -4,38 +4,46 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
+// Compile-time size assertion: ensures bpf2go-generated struct matches 48 bytes.
+var _ [48 - unsafe.Sizeof(hostTraceHostEvent{})]byte
+
 // buildHostEventBytes constructs a raw byte buffer matching the C struct host_event layout:
 //
-//	struct ingero_event_hdr {   // 20 bytes
+//	struct ingero_event_hdr {   // 32 bytes (v0.7)
 //	    __u64 timestamp_ns;     // offset 0
 //	    __u32 pid;              // offset 8
 //	    __u32 tid;              // offset 12
 //	    __u8  source;           // offset 16
 //	    __u8  op;               // offset 17
 //	    __u16 _pad;             // offset 18
-//	};                          // + 4 bytes alignment padding to reach offset 24
+//	    __u32 _pad2;            // offset 20
+//	    __u64 cgroup_id;        // offset 24
+//	};
 //	struct host_event {
-//	    struct ingero_event_hdr hdr;  // offset 0-23
-//	    __u64 duration_ns;           // offset 24
-//	    __u32 cpu;                   // offset 32
-//	    __u32 target_pid;            // offset 36
-//	};                               // total: 40 bytes
-func buildHostEventBytes(tsNs uint64, pid, tid uint32, source, op uint8, durationNs uint64, cpu, targetPID uint32) []byte {
-	buf := make([]byte, 40)
+//	    struct ingero_event_hdr hdr;  // offset 0-31
+//	    __u64 duration_ns;           // offset 32
+//	    __u32 cpu;                   // offset 40
+//	    __u32 target_pid;            // offset 44
+//	};                               // total: 48 bytes
+func buildHostEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
+	durationNs uint64, cpu, targetPID uint32, cgroupID uint64) []byte {
+	buf := make([]byte, 48)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
 	buf[16] = source
 	buf[17] = op
 	// buf[18:20] = _pad (zeros)
-	// buf[20:24] = alignment padding (zeros)
-	binary.LittleEndian.PutUint64(buf[24:32], durationNs)
-	binary.LittleEndian.PutUint32(buf[32:36], cpu)
-	binary.LittleEndian.PutUint32(buf[36:40], targetPID)
+	// buf[20:24] = _pad2 (zeros)
+	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
+	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
+	binary.LittleEndian.PutUint32(buf[40:44], cpu)
+	binary.LittleEndian.PutUint32(buf[44:48], targetPID)
 	return buf
 }
 
@@ -45,6 +53,7 @@ func TestParseEventSchedSwitch(t *testing.T) {
 		5000000, // 5ms off-CPU duration
 		2,       // cpu
 		1234,    // target_pid
+		77,      // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)
@@ -70,6 +79,9 @@ func TestParseEventSchedSwitch(t *testing.T) {
 	if evt.Args[1] != 1234 {
 		t.Errorf("Args[1] (target_pid) = %d, want 1234", evt.Args[1])
 	}
+	if evt.CGroupID != 77 {
+		t.Errorf("CGroupID = %d, want 77", evt.CGroupID)
+	}
 	if evt.Timestamp != events.KtimeToWallClock(tsNs) {
 		t.Errorf("Timestamp = %v, want %v", evt.Timestamp, events.KtimeToWallClock(tsNs))
 	}
@@ -81,6 +93,7 @@ func TestParseEventPageAlloc(t *testing.T) {
 		allocBytes, // duration_ns carries alloc_bytes for page_alloc
 		0,          // cpu
 		0,          // target_pid
+		0,          // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)
@@ -105,6 +118,7 @@ func TestParseEventOOMKill(t *testing.T) {
 		0,    // no duration
 		3,    // cpu
 		9999, // victim PID
+		0,    // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)
@@ -125,6 +139,7 @@ func TestParseEventSchedWakeup(t *testing.T) {
 		0,    // no duration for wakeup
 		1,    // cpu
 		5678, // wakee PID
+		0,    // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)

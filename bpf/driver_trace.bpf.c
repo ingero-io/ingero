@@ -17,8 +17,8 @@
 #include "common.bpf.h"
 
 // Ring buffer for sending driver events to userspace (separate from CUDA runtime).
-// 8MB: with --stack (576-byte events), ~14,500 events buffer. Without --stack
-// (56-byte events), ~149,000 events. cuBLAS can fire 17K+ launches/sec.
+// 8MB: with --stack (584-byte events, v0.7), ~14,300 events buffer. Without --stack
+// (64-byte events), ~131,000 events. cuBLAS can fire 17K+ launches/sec.
 // Increased from 2MB after H100 testing showed 3.5% stack coverage at high rates.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -77,6 +77,8 @@ static __always_inline void driver_emit_event(struct pt_regs *ctx,
 		sevt->hdr.source = EVENT_SRC_DRIVER;
 		sevt->hdr.op = entry->op;
 		sevt->hdr._pad = 0;
+		sevt->hdr._pad2 = 0;
+		sevt->hdr.cgroup_id = bpf_get_current_cgroup_id();
 		sevt->duration_ns = now - entry->timestamp_ns;
 		sevt->arg0 = entry->arg0;
 		sevt->arg1 = entry->arg1;
@@ -111,6 +113,8 @@ fallback:;
 	evt->hdr.source = EVENT_SRC_DRIVER;
 	evt->hdr.op = entry->op;
 	evt->hdr._pad = 0;
+	evt->hdr._pad2 = 0;
+	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
 	evt->duration_ns = now - entry->timestamp_ns;
 	evt->arg0 = entry->arg0;
 	evt->arg1 = entry->arg1;

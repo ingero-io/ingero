@@ -41,7 +41,7 @@ type probeSpec struct {
 
 // WithStackCapture enables userspace stack trace capture in eBPF.
 // When enabled, uretprobes call bpf_get_stack(BPF_F_USER_STACK) and emit
-// 576-byte events (vs 56-byte base). Adds ~1us/event eBPF overhead.
+// 584-byte events (vs 64-byte base). Adds ~1us/event eBPF overhead.
 func WithStackCapture(enabled bool) Option {
 	return func(t *Tracer) {
 		t.stackEnabled = enabled
@@ -180,16 +180,17 @@ func (t *Tracer) Run(ctx context.Context) {
 	}
 }
 
-// stackEventSize is sizeof(cuda_event_stack) — base event + stack section.
-// Layout: 56 (base) + 2 (stack_depth) + 6 (pad) + 512 (64 * uint64 IPs) = 576.
-const stackEventSize = 576
+// stackEventSize is sizeof(cuda_event_stack) — derived from the bpf2go-generated
+// base struct size to prevent silent misparsing when BPF struct sizes change.
+// Layout: base (64) + 2 (stack_depth) + 6 (pad) + 512 (64 * uint64 IPs) = 584.
+var stackEventSize = int(unsafe.Sizeof(cudaTraceCudaEvent{})) + 8 + 512 // base + depth/pad + ips
 
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (56 bytes) and stack events (576 bytes).
+// Handles both base events (64 bytes) and stack events (584 bytes).
 //
 // The Go parser distinguishes by record length:
-//   - 56 bytes  → cuda_event (no stack)
-//   - 576 bytes → cuda_event_stack (with stack trace)
+//   - 64 bytes  → cuda_event (no stack)
+//   - 584 bytes → cuda_event_stack (with stack trace)
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(cudaTraceCudaEvent{}))
 	if len(raw) < baseSize {
@@ -209,9 +210,10 @@ func parseEvent(raw []byte) (events.Event, error) {
 		GPUID:     ce.GpuId,
 		Args:      [2]uint64{ce.Arg0, ce.Arg1},
 		RetCode:   ce.ReturnCode,
+		CGroupID:  ce.Hdr.CgroupId,
 	}
 
-	// Check for stack event (576 bytes).
+	// Check for stack event (584 bytes).
 	if len(raw) >= stackEventSize {
 		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}

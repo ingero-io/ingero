@@ -23,7 +23,8 @@ type driverTraceCudaEvent struct {
 		Source      uint8
 		Op          uint8
 		Pad         uint16
-		_           [4]byte
+		Pad2        uint32
+		CgroupId    uint64
 	}
 	DurationNs uint64
 	Arg0       uint64

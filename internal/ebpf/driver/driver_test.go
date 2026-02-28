@@ -4,25 +4,31 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
+// Compile-time size assertion: ensures bpf2go-generated struct matches 64 bytes.
+var _ [64 - unsafe.Sizeof(driverTraceCudaEvent{})]byte
+
 // buildDriverEventBytes constructs a raw byte buffer matching the C struct cuda_event layout
-// (reused for driver events with source=EVENT_SRC_DRIVER). Same 56-byte layout as CUDA events.
+// (reused for driver events with source=EVENT_SRC_DRIVER). Same 64-byte layout as CUDA events.
 func buildDriverEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
-	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32) []byte {
-	buf := make([]byte, 56)
+	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32, cgroupID uint64) []byte {
+	buf := make([]byte, 64)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
 	buf[16] = source
 	buf[17] = op
-	binary.LittleEndian.PutUint64(buf[24:32], durationNs)
-	binary.LittleEndian.PutUint64(buf[32:40], arg0)
-	binary.LittleEndian.PutUint64(buf[40:48], arg1)
-	binary.LittleEndian.PutUint32(buf[48:52], uint32(retCode))
-	binary.LittleEndian.PutUint32(buf[52:56], gpuID)
+	// buf[18:24] = padding (zeros)
+	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
+	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
+	binary.LittleEndian.PutUint64(buf[40:48], arg0)
+	binary.LittleEndian.PutUint64(buf[48:56], arg1)
+	binary.LittleEndian.PutUint32(buf[56:60], uint32(retCode))
+	binary.LittleEndian.PutUint32(buf[60:64], gpuID)
 	return buf
 }
 
@@ -34,6 +40,7 @@ func TestParseEventDriverLaunchKernel(t *testing.T) {
 		0xCAFEBABE, // function handle
 		0,
 		0, 0,
+		55, // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)
@@ -56,6 +63,9 @@ func TestParseEventDriverLaunchKernel(t *testing.T) {
 	if evt.Args[0] != 0xCAFEBABE {
 		t.Errorf("Args[0] = 0x%x, want 0xCAFEBABE", evt.Args[0])
 	}
+	if evt.CGroupID != 55 {
+		t.Errorf("CGroupID = %d, want 55", evt.CGroupID)
+	}
 }
 
 func TestParseEventDriverTooShort(t *testing.T) {
@@ -70,8 +80,9 @@ func TestParseEventDriverWithStack(t *testing.T) {
 		uint8(events.SourceDriver), uint8(events.DriverMemcpy),
 		15000, 65536, 0,
 		0, 0,
+		0, // cgroup_id
 	)
-	stackSection := make([]byte, 576-56)
+	stackSection := make([]byte, 584-64)
 	binary.LittleEndian.PutUint16(stackSection[0:2], 2)
 	binary.LittleEndian.PutUint64(stackSection[8:16], 0x7f1001000)
 	binary.LittleEndian.PutUint64(stackSection[16:24], 0x7f1002000)
@@ -95,6 +106,7 @@ func TestParseEventDriverTruncatedStack(t *testing.T) {
 		uint8(events.SourceDriver), uint8(events.DriverMemcpyAsync),
 		500, 2048, 0,
 		0, 0,
+		0, // cgroup_id
 	)
 	buf = append(buf, 0, 0, 0, 0)
 
