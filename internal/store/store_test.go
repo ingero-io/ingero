@@ -1728,7 +1728,7 @@ func TestExecuteReadOnly_SqliteMasterAllowed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Frame serialization / deserialization tests (v0.7)
+// Frame serialization / deserialization tests
 // ---------------------------------------------------------------------------
 
 func TestSerializeStackFramesRoundTrip(t *testing.T) {
