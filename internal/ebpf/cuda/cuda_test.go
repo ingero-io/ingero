@@ -85,6 +85,32 @@ func TestParseEventCUDAMalloc(t *testing.T) {
 	}
 }
 
+func TestParseEventCUDAFree(t *testing.T) {
+	raw := buildCUDAEventBytes(1000000000, 1234, 1235,
+		uint8(events.SourceCUDA), uint8(events.CUDAFree),
+		2000,           // 2µs
+		0x7f0a00001000, // devPtr being freed
+		0,              // no arg1
+		0,              // success
+		0,              // gpu 0
+	)
+
+	evt, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent() error: %v", err)
+	}
+
+	if evt.Op != uint8(events.CUDAFree) {
+		t.Errorf("Op = %d, want %d (CUDAFree)", evt.Op, events.CUDAFree)
+	}
+	if evt.Args[0] != 0x7f0a00001000 {
+		t.Errorf("Args[0] = %#x, want 0x7f0a00001000 (devPtr)", evt.Args[0])
+	}
+	if evt.Duration != 2*time.Microsecond {
+		t.Errorf("Duration = %v, want 2µs", evt.Duration)
+	}
+}
+
 func TestParseEventTooShort(t *testing.T) {
 	_, err := parseEvent([]byte{1, 2, 3})
 	if err == nil {

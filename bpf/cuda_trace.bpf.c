@@ -147,6 +147,38 @@ int uretprobe_cuda_malloc(struct pt_regs *ctx)
 	return 0;
 }
 
+// ---- cudaFree uprobes ----
+// cudaError_t cudaFree(void* devPtr)
+// arg0 = devPtr (device pointer being freed — matches cudaMalloc return value)
+
+SEC("uprobe/cudaFree")
+int uprobe_cuda_free(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 dev_ptr = (__u64)PT_REGS_PARM1(ctx);
+
+	save_entry(tid, CUDA_OP_FREE, dev_ptr, 0);
+	return 0;
+}
+
+SEC("uretprobe/cudaFree")
+int uretprobe_cuda_free(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	__s32 ret = (__s32)PT_REGS_RC(ctx);
+	emit_event(ctx, pid, tid, entry, ret);
+
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
 // ---- cudaLaunchKernel uprobes ----
 // arg0 = GPU kernel function pointer
 

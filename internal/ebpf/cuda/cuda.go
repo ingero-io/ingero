@@ -92,6 +92,7 @@ func (t *Tracer) Attach() error {
 	// Define all probes to attach.
 	specs := []probeSpec{
 		{"cudaMalloc", t.objs.UprobeCudaMalloc, t.objs.UretprobeCudaMalloc},
+		{"cudaFree", t.objs.UprobeCudaFree, t.objs.UretprobeCudaFree},
 		{"cudaLaunchKernel", t.objs.UprobeCudaLaunchKernel, t.objs.UretprobeCudaLaunchKernel},
 		{"cudaMemcpy", t.objs.UprobeCudaMemcpy, t.objs.UretprobeCudaMemcpy},
 		{"cudaMemcpyAsync", t.objs.UprobeCudaMemcpyAsync, t.objs.UretprobeCudaMemcpyAsync},

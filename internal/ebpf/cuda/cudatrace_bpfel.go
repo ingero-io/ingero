@@ -90,12 +90,14 @@ type cudaTraceSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaTraceProgramSpecs struct {
 	UprobeCudaDeviceSync      *ebpf.ProgramSpec `ebpf:"uprobe_cuda_device_sync"`
+	UprobeCudaFree            *ebpf.ProgramSpec `ebpf:"uprobe_cuda_free"`
 	UprobeCudaLaunchKernel    *ebpf.ProgramSpec `ebpf:"uprobe_cuda_launch_kernel"`
 	UprobeCudaMalloc          *ebpf.ProgramSpec `ebpf:"uprobe_cuda_malloc"`
 	UprobeCudaMemcpy          *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy"`
 	UprobeCudaMemcpyAsync     *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy_async"`
 	UprobeCudaStreamSync      *ebpf.ProgramSpec `ebpf:"uprobe_cuda_stream_sync"`
 	UretprobeCudaDeviceSync   *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_device_sync"`
+	UretprobeCudaFree         *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_free"`
 	UretprobeCudaLaunchKernel *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_launch_kernel"`
 	UretprobeCudaMalloc       *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_malloc"`
 	UretprobeCudaMemcpy       *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_memcpy"`
@@ -168,12 +170,14 @@ type cudaTraceVariables struct {
 // It can be passed to loadCudaTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaTracePrograms struct {
 	UprobeCudaDeviceSync      *ebpf.Program `ebpf:"uprobe_cuda_device_sync"`
+	UprobeCudaFree            *ebpf.Program `ebpf:"uprobe_cuda_free"`
 	UprobeCudaLaunchKernel    *ebpf.Program `ebpf:"uprobe_cuda_launch_kernel"`
 	UprobeCudaMalloc          *ebpf.Program `ebpf:"uprobe_cuda_malloc"`
 	UprobeCudaMemcpy          *ebpf.Program `ebpf:"uprobe_cuda_memcpy"`
 	UprobeCudaMemcpyAsync     *ebpf.Program `ebpf:"uprobe_cuda_memcpy_async"`
 	UprobeCudaStreamSync      *ebpf.Program `ebpf:"uprobe_cuda_stream_sync"`
 	UretprobeCudaDeviceSync   *ebpf.Program `ebpf:"uretprobe_cuda_device_sync"`
+	UretprobeCudaFree         *ebpf.Program `ebpf:"uretprobe_cuda_free"`
 	UretprobeCudaLaunchKernel *ebpf.Program `ebpf:"uretprobe_cuda_launch_kernel"`
 	UretprobeCudaMalloc       *ebpf.Program `ebpf:"uretprobe_cuda_malloc"`
 	UretprobeCudaMemcpy       *ebpf.Program `ebpf:"uretprobe_cuda_memcpy"`
@@ -184,12 +188,14 @@ type cudaTracePrograms struct {
 func (p *cudaTracePrograms) Close() error {
 	return _CudaTraceClose(
 		p.UprobeCudaDeviceSync,
+		p.UprobeCudaFree,
 		p.UprobeCudaLaunchKernel,
 		p.UprobeCudaMalloc,
 		p.UprobeCudaMemcpy,
 		p.UprobeCudaMemcpyAsync,
 		p.UprobeCudaStreamSync,
 		p.UretprobeCudaDeviceSync,
+		p.UretprobeCudaFree,
 		p.UretprobeCudaLaunchKernel,
 		p.UretprobeCudaMalloc,
 		p.UretprobeCudaMemcpy,

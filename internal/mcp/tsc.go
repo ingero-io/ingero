@@ -38,6 +38,11 @@ var tscFieldMap = map[string]string{
 	"wall_percent":    "w%",
 	"command":         "cmd",
 	"process_name":    "pn",
+	"avg_us":          "avg",
+	"min_us":          "min",
+	"max_us":          "max",
+	"sum_arg0":        "sa0",
+	"processes":       "procs",
 }
 
 // tscReverseMap maps abbreviated names back to verbose names.
