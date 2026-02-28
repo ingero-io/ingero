@@ -730,13 +730,21 @@ func (s *Store) flushBatch(batch []events.Event) {
 		if len(evt.Stack) > 0 {
 			h := events.HashStackIPs(evt.Stack)
 			stackHash = int64(h)
-			if !s.stackCache[h] {
-				// New stack — serialize and insert. Only pay the JSON
-				// serialization cost once per unique stack.
+			cached, known := s.stackCache[h]
+			if !known {
+				// Brand new stack — serialize and insert.
 				ipsJSON := serializeStackIPs(evt.Stack)
 				framesJSON := serializeStackFrames(evt.Stack)
 				stackStmt.Exec(stackHash, ipsJSON, framesJSON)
-				s.stackCache[h] = true
+				s.stackCache[h] = framesJSON != ""
+			} else if !cached {
+				// Known stack without resolved frames — try to upgrade.
+				framesJSON := serializeStackFrames(evt.Stack)
+				if framesJSON != "" {
+					ipsJSON := serializeStackIPs(evt.Stack)
+					stackStmt.Exec(stackHash, ipsJSON, framesJSON)
+					s.stackCache[h] = true
+				}
 			}
 		}
 		evtStmt.Exec(
@@ -767,8 +775,11 @@ func (s *Store) flushBatch(batch []events.Event) {
 // the same DB doesn't re-insert stacks that already exist.
 //
 // Only caches stacks that already have resolved frames. Stacks with empty
-// frames (from older sessions) are left uncached so they get
-// upgraded via INSERT OR REPLACE when seen again with resolved symbols.
+// loadStackCache populates the in-memory cache of known stack hashes.
+// Stacks with resolved frames are marked as fully cached (true).
+// Stacks without frames (from older sessions) are marked as needing
+// upgrade (false), so INSERT OR REPLACE runs once when resolved symbols
+// become available — but not repeatedly for stacks that stay unresolved.
 func (s *Store) loadStackCache() {
 	rows, err := s.db.Query("SELECT hash, frames FROM stack_traces")
 	if err != nil {
@@ -778,8 +789,8 @@ func (s *Store) loadStackCache() {
 	for rows.Next() {
 		var h int64
 		var frames string
-		if err := rows.Scan(&h, &frames); err == nil && frames != "" {
-			s.stackCache[uint64(h)] = true
+		if err := rows.Scan(&h, &frames); err == nil {
+			s.stackCache[uint64(h)] = frames != ""
 		}
 	}
 }
