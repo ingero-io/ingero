@@ -263,4 +263,5 @@ type Event struct {
 	Args      [2]uint64     // operation-specific arguments (size, direction, etc.)
 	RetCode   int32         // CUDA return code (0 = success)
 	Stack     []StackFrame  // userspace stack trace (nil when --stack not enabled)
+	CGroupID  uint64        // cgroup v2 inode ID (0 or 1 = no meaningful cgroup)
 }

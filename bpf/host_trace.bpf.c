@@ -13,8 +13,8 @@
 #include "common.bpf.h"
 
 // Separate ring buffer from CUDA — independent reader avoids head-of-line blocking.
-// 1MB: host events are 40 bytes each (struct host_event with alignment padding);
-// at heavy contention (~100K mm_page_alloc/sec), ~26,200 events fit (262ms buffer).
+// 1MB: host events are 48 bytes each (struct host_event, v0.7 with cgroup_id);
+// at heavy contention (~100K mm_page_alloc/sec), ~21,800 events fit (218ms buffer).
 // Sized smaller than CUDA/driver buffers since host events have lower per-PID throughput.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -30,6 +30,16 @@ struct {
 	__type(value, __u8);  // presence = "trace this PID"
 } target_pids SEC(".maps");
 
+// In-kernel cgroup filter. Parallel to target_pids — allows filtering by
+// cgroup v2 ID for K8s container scoping without fragile PID enumeration.
+// 128 entries covers typical K8s nodes (one container per entry).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 128);
+	__type(key, __u64);   // cgroup_id (from bpf_get_current_cgroup_id)
+	__type(value, __u8);  // presence flag
+} target_cgroups SEC(".maps");
+
 // Off-CPU timestamp tracking for sched_switch duration computation.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -38,6 +48,20 @@ struct {
 	__type(value, __u64);    // off-cpu timestamp
 } sched_off_map SEC(".maps");
 
+// is_target checks if a process should be traced.
+// Dual filter: match either by PID or by cgroup ID.
+// When target_cgroups is empty (bare-metal mode), falls back to PID-only.
+static __always_inline bool is_target(__u32 pid, __u64 cgroup_id)
+{
+	if (bpf_map_lookup_elem(&target_pids, &pid) != NULL)
+		return true;
+	if (bpf_map_lookup_elem(&target_cgroups, &cgroup_id) != NULL)
+		return true;
+	return false;
+}
+
+// is_target_pid is the PID-only check for sched events where we only have
+// the PID from the tracepoint context (not the current task's cgroup).
 static __always_inline bool is_target_pid(__u32 pid)
 {
 	return bpf_map_lookup_elem(&target_pids, &pid) != NULL;
@@ -59,6 +83,8 @@ static __always_inline void emit_host_event(__u32 pid, __u32 tid,
 	evt->hdr.source = EVENT_SRC_HOST;
 	evt->hdr.op = op;
 	evt->hdr._pad = 0;
+	evt->hdr._pad2 = 0;
+	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
 	evt->duration_ns = duration_ns;
 	evt->cpu = cpu;
 	evt->target_pid = target_pid;
@@ -68,6 +94,13 @@ static __always_inline void emit_host_event(__u32 pid, __u32 tid,
 
 // ---- sched_switch ----
 // Record off-CPU start for outgoing target; compute off-CPU duration for incoming.
+//
+// NOTE on cgroup_id: Uses is_target_pid() (PID-only filter), not is_target(),
+// because prev_pid/next_pid come from the tracepoint context — they are NOT
+// the "current task" from the kernel's perspective. bpf_get_current_cgroup_id()
+// would return the scheduler's cgroup (wrong). The emitted cgroup_id in the
+// event header still reflects the current task (the scheduler context), so
+// Go-side code should NOT rely on it for container attribution of sched events.
 SEC("tp/sched/sched_switch")
 int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 {
@@ -118,14 +151,18 @@ int handle_sched_wakeup(struct trace_event_raw_sched_wakeup_template *ctx)
 
 // ---- mm_page_alloc ----
 // Alloc size passed in duration_ns field; Go side interprets by op type.
+// Uses is_target() (dual PID+cgroup filter) because the current task IS the
+// allocating process — bpf_get_current_cgroup_id() correctly identifies the
+// container. Same applies to process_exec and process_exit below.
 SEC("tp/kmem/mm_page_alloc")
 int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-	if (!is_target_pid(tgid))
+	if (!is_target(tgid, cgroup_id))
 		return 0;
 
 	__u64 alloc_bytes = (__u64)4096 << ctx->order;
@@ -160,8 +197,9 @@ int handle_process_exec(struct trace_event_raw_sched_process_exec *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-	if (!is_target_pid(tgid))
+	if (!is_target(tgid, cgroup_id))
 		return 0;
 
 	emit_host_event(tgid, tid,
@@ -178,8 +216,9 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-	if (!is_target_pid(tgid))
+	if (!is_target(tgid, cgroup_id))
 		return 0;
 
 	emit_host_event(tgid, tid,

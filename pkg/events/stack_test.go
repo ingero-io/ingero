@@ -6,8 +6,8 @@ import (
 )
 
 func TestParseStackIPs_Valid(t *testing.T) {
-	// Build a buffer: 56-byte base + stack section with 3 IPs.
-	base := 56
+	// Build a buffer: 64-byte base (v0.7) + stack section with 3 IPs.
+	base := 64
 	buf := make([]byte, base+8+3*8) // header(8) + 3 IPs
 
 	binary.LittleEndian.PutUint16(buf[base:], 3)   // depth = 3
@@ -25,7 +25,7 @@ func TestParseStackIPs_Valid(t *testing.T) {
 }
 
 func TestParseStackIPs_DepthZero(t *testing.T) {
-	base := 56
+	base := 64
 	buf := make([]byte, base+8+8)
 	binary.LittleEndian.PutUint16(buf[base:], 0) // depth = 0
 
@@ -35,7 +35,7 @@ func TestParseStackIPs_DepthZero(t *testing.T) {
 }
 
 func TestParseStackIPs_DepthTooLarge(t *testing.T) {
-	base := 56
+	base := 64
 	buf := make([]byte, base+8+8)
 	binary.LittleEndian.PutUint16(buf[base:], 65) // depth > MAX_STACK_DEPTH (64)
 
@@ -46,16 +46,16 @@ func TestParseStackIPs_DepthTooLarge(t *testing.T) {
 
 func TestParseStackIPs_BufferTooShort(t *testing.T) {
 	// Buffer shorter than baseOffset + 8 (stack header).
-	buf := make([]byte, 60) // base=56, need 64 minimum
+	buf := make([]byte, 68) // base=64, need 72 minimum
 
-	if frames := ParseStackIPs(buf, 56); frames != nil {
+	if frames := ParseStackIPs(buf, 64); frames != nil {
 		t.Errorf("short buffer should return nil, got %d frames", len(frames))
 	}
 }
 
 func TestParseStackIPs_Truncated(t *testing.T) {
 	// Depth claims 4 IPs but only 2 fit in the buffer.
-	base := 56
+	base := 64
 	buf := make([]byte, base+8+2*8) // header + 2 IPs only
 	binary.LittleEndian.PutUint16(buf[base:], 4)   // claims 4
 	binary.LittleEndian.PutUint64(buf[base+8:], 0x1111)
@@ -69,7 +69,7 @@ func TestParseStackIPs_Truncated(t *testing.T) {
 
 func TestParseStackIPs_ZeroIPTerminates(t *testing.T) {
 	// Depth claims 3 but second IP is zero — stops early.
-	base := 56
+	base := 64
 	buf := make([]byte, base+8+3*8)
 	binary.LittleEndian.PutUint16(buf[base:], 3)
 	binary.LittleEndian.PutUint64(buf[base+8:], 0xDEAD)
@@ -87,7 +87,7 @@ func TestParseStackIPs_ZeroIPTerminates(t *testing.T) {
 
 func TestParseStackIPs_MaxDepth(t *testing.T) {
 	// Boundary test: depth == 64 (MAX_STACK_DEPTH) should be accepted.
-	base := 56
+	base := 64
 	buf := make([]byte, base+8+64*8) // header + 64 IPs
 	binary.LittleEndian.PutUint16(buf[base:], 64)
 	for i := 0; i < 64; i++ {

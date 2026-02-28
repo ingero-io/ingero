@@ -146,6 +146,25 @@ func (t *Tracer) RemoveTargetPID(pid uint32) error {
 	return nil
 }
 
+// SetTargetCGroup adds a cgroup ID to the in-kernel cgroup filter map.
+// Parallel to SetTargetPID — allows K8s container scoping by cgroup v2 ID
+// without fragile PID enumeration. The eBPF program checks both maps.
+func (t *Tracer) SetTargetCGroup(cgroupID uint64) error {
+	var val uint8 = 1
+	if err := t.objs.TargetCgroups.Put(cgroupID, val); err != nil {
+		return fmt.Errorf("setting target cgroup %d: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// RemoveTargetCGroup removes a cgroup ID from the in-kernel filter map.
+func (t *Tracer) RemoveTargetCGroup(cgroupID uint64) error {
+	if err := t.objs.TargetCgroups.Delete(cgroupID); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("removing target cgroup %d: %w", cgroupID, err)
+	}
+	return nil
+}
+
 // Events returns the channel on which parsed host events are delivered.
 func (t *Tracer) Events() <-chan events.Event {
 	return t.eventCh
@@ -219,6 +238,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		GPUID:     0,
 		Args:      args,
 		RetCode:   0,
+		CGroupID:  he.Hdr.CgroupId,
 	}, nil
 }
 

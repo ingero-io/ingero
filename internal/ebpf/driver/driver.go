@@ -183,11 +183,12 @@ func (t *Tracer) Run(ctx context.Context) {
 	}
 }
 
-// stackEventSize is sizeof(cuda_event_stack) = 576 bytes.
-const stackEventSize = 576
+// stackEventSize is sizeof(cuda_event_stack) — derived from the bpf2go-generated
+// base struct size to prevent silent misparsing when BPF struct sizes change.
+var stackEventSize = int(unsafe.Sizeof(driverTraceCudaEvent{})) + 8 + 512
 
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (56 bytes) and stack events (576 bytes).
+// Handles both base events (64 bytes) and stack events (584 bytes).
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(driverTraceCudaEvent{}))
 	if len(raw) < baseSize {
@@ -206,9 +207,10 @@ func parseEvent(raw []byte) (events.Event, error) {
 		GPUID:     ce.GpuId,
 		Args:      [2]uint64{ce.Arg0, ce.Arg1},
 		RetCode:   ce.ReturnCode,
+		CGroupID:  ce.Hdr.CgroupId,
 	}
 
-	// Check for stack event (576 bytes).
+	// Check for stack event (584 bytes).
 	if len(raw) >= stackEventSize {
 		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}

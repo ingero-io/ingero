@@ -4,42 +4,53 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
+// Compile-time size assertion: ensures the bpf2go-generated struct matches
+// the expected 64 bytes (v0.7: 32-byte header with cgroup_id + 32 bytes payload).
+// Fails compilation immediately if the struct size changes, preventing silent
+// misparsing of ring buffer events.
+var _ [64 - unsafe.Sizeof(cudaTraceCudaEvent{})]byte
+
 // buildCUDAEventBytes constructs a raw byte buffer matching the C struct cuda_event layout:
 //
-//	struct ingero_event_hdr {   // 20 bytes
+//	struct ingero_event_hdr {   // 32 bytes (v0.7)
 //	    __u64 timestamp_ns;     // offset 0
 //	    __u32 pid;              // offset 8
 //	    __u32 tid;              // offset 12
 //	    __u8  source;           // offset 16
 //	    __u8  op;               // offset 17
 //	    __u16 _pad;             // offset 18
-//	};                          // + 4 bytes alignment padding → offset 24
+//	    __u32 _pad2;            // offset 20 (explicit alignment padding)
+//	    __u64 cgroup_id;        // offset 24
+//	};
 //	struct cuda_event {
-//	    struct ingero_event_hdr hdr;  // 0-23
-//	    __u64 duration_ns;           // 24
-//	    __u64 arg0;                  // 32
-//	    __u64 arg1;                  // 40
-//	    __s32 return_code;           // 48
-//	    __u32 gpu_id;                // 52
-//	};                               // total: 56 bytes
+//	    struct ingero_event_hdr hdr;  // 0-31
+//	    __u64 duration_ns;           // 32
+//	    __u64 arg0;                  // 40
+//	    __u64 arg1;                  // 48
+//	    __s32 return_code;           // 56
+//	    __u32 gpu_id;                // 60
+//	};                               // total: 64 bytes
 func buildCUDAEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
-	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32) []byte {
-	buf := make([]byte, 56)
+	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32, cgroupID uint64) []byte {
+	buf := make([]byte, 64)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
 	buf[16] = source
 	buf[17] = op
-	// buf[18:24] = pad (zeros)
-	binary.LittleEndian.PutUint64(buf[24:32], durationNs)
-	binary.LittleEndian.PutUint64(buf[32:40], arg0)
-	binary.LittleEndian.PutUint64(buf[40:48], arg1)
-	binary.LittleEndian.PutUint32(buf[48:52], uint32(retCode))
-	binary.LittleEndian.PutUint32(buf[52:56], gpuID)
+	// buf[18:20] = _pad (zeros)
+	// buf[20:24] = _pad2 (zeros)
+	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
+	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
+	binary.LittleEndian.PutUint64(buf[40:48], arg0)
+	binary.LittleEndian.PutUint64(buf[48:56], arg1)
+	binary.LittleEndian.PutUint32(buf[56:60], uint32(retCode))
+	binary.LittleEndian.PutUint32(buf[60:64], gpuID)
 	return buf
 }
 
@@ -52,6 +63,7 @@ func TestParseEventCUDAMalloc(t *testing.T) {
 		0,    // no arg1
 		0,    // success
 		0,    // gpu 0
+		42,   // cgroup_id
 	)
 
 	evt, err := parseEvent(raw)
@@ -80,6 +92,9 @@ func TestParseEventCUDAMalloc(t *testing.T) {
 	if evt.RetCode != 0 {
 		t.Errorf("RetCode = %d, want 0", evt.RetCode)
 	}
+	if evt.CGroupID != 42 {
+		t.Errorf("CGroupID = %d, want 42", evt.CGroupID)
+	}
 	if evt.Stack != nil {
 		t.Errorf("Stack should be nil for base event")
 	}
@@ -93,6 +108,7 @@ func TestParseEventCUDAFree(t *testing.T) {
 		0,              // no arg1
 		0,              // success
 		0,              // gpu 0
+		0,              // bare-metal (no cgroup)
 	)
 
 	evt, err := parseEvent(raw)
@@ -109,6 +125,9 @@ func TestParseEventCUDAFree(t *testing.T) {
 	if evt.Duration != 2*time.Microsecond {
 		t.Errorf("Duration = %v, want 2µs", evt.Duration)
 	}
+	if evt.CGroupID != 0 {
+		t.Errorf("CGroupID = %d, want 0", evt.CGroupID)
+	}
 }
 
 func TestParseEventTooShort(t *testing.T) {
@@ -119,15 +138,16 @@ func TestParseEventTooShort(t *testing.T) {
 }
 
 func TestParseEventWithStack(t *testing.T) {
-	// Build a 576-byte stack event: 56 base + 2 depth + 6 pad + 512 IPs.
+	// Build a 584-byte stack event: 64 base + 2 depth + 6 pad + 512 IPs.
 	buf := buildCUDAEventBytes(2000000000, 5678, 5679,
 		uint8(events.SourceCUDA), uint8(events.CUDALaunchKernel),
 		10000, // 10µs
 		0xDEADBEEF, 0,
 		0, 0,
+		99, // cgroup_id
 	)
-	// Extend to 576 bytes.
-	stackSection := make([]byte, 576-56)
+	// Extend to 584 bytes.
+	stackSection := make([]byte, 584-64)
 	// stack_depth = 3 at offset 0 of stack section.
 	binary.LittleEndian.PutUint16(stackSection[0:2], 3)
 	// IPs start at offset 8 of stack section.
@@ -150,6 +170,9 @@ func TestParseEventWithStack(t *testing.T) {
 	if evt.Stack[2].IP != 0x7f0003000 {
 		t.Errorf("Stack[2].IP = 0x%x, want 0x7f0003000", evt.Stack[2].IP)
 	}
+	if evt.CGroupID != 99 {
+		t.Errorf("CGroupID = %d, want 99", evt.CGroupID)
+	}
 }
 
 func TestParseEventTruncatedStack(t *testing.T) {
@@ -158,6 +181,7 @@ func TestParseEventTruncatedStack(t *testing.T) {
 		uint8(events.SourceCUDA), uint8(events.CUDAMemcpy),
 		1000, 1024, 1, // 1KB H2D copy
 		0, 0,
+		0, // cgroup_id
 	)
 	// Only 4 extra bytes — not enough for stack section.
 	buf = append(buf, 0, 0, 0, 0)

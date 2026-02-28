@@ -53,7 +53,21 @@ struct entry_state {
  */
 #define MAX_STACK_DEPTH 64
 
-/* Base event header — all events start with this */
+/* Base event header — all events start with this.
+ *
+ * Layout with explicit padding (32 bytes total):
+ *   offset 0:  timestamp_ns  (u64)
+ *   offset 8:  pid           (u32)
+ *   offset 12: tid           (u32)
+ *   offset 16: source        (u8)
+ *   offset 17: op            (u8)
+ *   offset 18: _pad          (u16)
+ *   offset 20: _pad2         (u32) — explicit; replaces implicit compiler padding
+ *   offset 24: cgroup_id     (u64) — bpf_get_current_cgroup_id() for K8s container scoping
+ *
+ * v0.6 header was 24 bytes (20 explicit + 4 implicit padding).
+ * v0.7 adds cgroup_id at offset 24, making the header 32 bytes (+8 net).
+ */
 struct ingero_event_hdr {
 	__u64 timestamp_ns;
 	__u32 pid;
@@ -61,9 +75,11 @@ struct ingero_event_hdr {
 	__u8  source;       /* EVENT_SRC_* */
 	__u8  op;           /* operation type */
 	__u16 _pad;
+	__u32 _pad2;        /* explicit alignment padding (was implicit in v0.6) */
+	__u64 cgroup_id;    /* cgroup v2 inode ID; 0 or 1 = no meaningful cgroup */
 };
 
-/* CUDA runtime event */
+/* CUDA runtime event (64 bytes, was 56 in v0.6) */
 struct cuda_event {
 	struct ingero_event_hdr hdr;
 	__u64 duration_ns;
@@ -82,7 +98,7 @@ struct nvidia_event {
 	__u32 context_id;
 };
 
-/* Host kernel event */
+/* Host kernel event (48 bytes, was 40 in v0.6) */
 struct host_event {
 	struct ingero_event_hdr hdr;
 	__u64 duration_ns;
@@ -104,18 +120,18 @@ struct ingero_config {
  *
  * When config.capture_stack == 1, the uretprobe emits this instead of the
  * base cuda_event. The Go parser distinguishes by record length:
- *   56 bytes  → cuda_event (no stack)
- *   576 bytes → cuda_event_stack (with stack)
+ *   64 bytes  → cuda_event (no stack)
+ *   584 bytes → cuda_event_stack (with stack)
  *
  * stack_ips[] is filled by bpf_get_stack(BPF_F_USER_STACK). The helper
  * writes raw instruction pointers (IPs) from the userspace call chain.
  * Symbol resolution happens in Go, not in eBPF.
  *
  * This struct is allocated via bpf_ringbuf_reserve(), NOT on the eBPF
- * stack (which is limited to 512 bytes). 576 bytes in ring buffer is fine.
+ * stack (which is limited to 512 bytes). 584 bytes in ring buffer is fine.
  */
 struct cuda_event_stack {
-	struct ingero_event_hdr hdr;       /* 20 bytes */
+	struct ingero_event_hdr hdr;       /* 32 bytes (was 20+4pad in v0.6) */
 	__u64 duration_ns;                 /* 8 */
 	__u64 arg0;                        /* 8 */
 	__u64 arg1;                        /* 8 */
@@ -126,6 +142,17 @@ struct cuda_event_stack {
 	__u16 _stack_pad[3];               /* 6: align stack_ips to 8-byte boundary */
 	__u64 stack_ips[MAX_STACK_DEPTH];  /* 512: raw instruction pointers */
 };
-/* Total: 20 + 4(implicit pad) + 8+8+8+4+4 + 2+6+512 = 576 bytes */
+/* Total: 32 + 8+8+8+4+4 + 2+6+512 = 584 bytes (was 576 in v0.6) */
+
+/*
+ * target_cgroups — in-kernel cgroup filter map.
+ *
+ * Parallel to target_pids in host_trace.bpf.c. When populated by Go userspace,
+ * allows filtering events by cgroup v2 ID — essential for K8s container scoping
+ * without fragile PID enumeration.
+ *
+ * 128 entries covers typical K8s nodes (one entry per container on node).
+ * Defined here in the header so all 3 BPF programs can reference it.
+ */
 
 #endif /* __INGERO_COMMON_BPF_H */

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
@@ -42,6 +44,7 @@ var (
 	traceDBPath       string // Custom DB path (default: ~/.ingero/ingero.db).
 	traceMaxDB        string // Max DB size (e.g., "10g"). 0 = unlimited.
 	traceStackSamples int    // Max events stored per unique call stack (0 = unlimited).
+	traceLogPath      string // Log output file path (debug, no rotation).
 )
 
 var traceCmd = &cobra.Command{
@@ -73,6 +76,7 @@ func init() {
 	traceCmd.Flags().StringVar(&traceDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	traceCmd.Flags().StringVar(&traceMaxDB, "max-db", "10g", "max database size (e.g., 10g, 500m, 1t). 0 = unlimited")
 	traceCmd.Flags().IntVar(&traceStackSamples, "stack-samples", 100, "max events stored per unique call stack (0 = unlimited)")
+	traceCmd.Flags().StringVar(&traceLogPath, "log", "", "write log output to file (append, no rotation)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -82,6 +86,19 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func traceRunE(cmd *cobra.Command, args []string) error {
+	// --log: redirect log output (stderr-style debug messages) to a file.
+	// Append mode, no rotation — intended for debugging, not production logging.
+	// Production deployments should use systemd journal or kubectl logs.
+	if traceLogPath != "" {
+		f, err := os.OpenFile(traceLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("opening log file %s: %w", traceLogPath, err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+		fmt.Fprintf(os.Stderr, "  Logging to %s\n", traceLogPath)
+	}
+
 	// Step 1: Resolve targets — find libcudart.so and target PIDs.
 	//
 	// Three modes:
@@ -809,6 +826,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 	// Stack sampling: per-stack event counter to limit DB redundancy.
 	stackSamples := make(map[uint64]int)
 
+	// Cgroup cache: cgroup_id → container_id (lazy, populated on first event).
+	cgroupCache := make(map[uint64]string)
+
 	// System context collector (CPU/mem/load from /proc).
 	sysColl := sysinfo.New()
 	sysColl.Start()
@@ -875,6 +895,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			if pidFilter != nil && !pidFilter[evt.PID] {
 				continue
 			}
+
+			// Resolve cgroup → container ID for K8s container correlation.
+			resolveCGroup(&evt, cgroupCache, eventStore)
 
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
@@ -1185,6 +1208,7 @@ type jsonEvent struct {
 	GPUID      uint32           `json:"gpu_id"`
 	Args       [2]uint64        `json:"args"`
 	ReturnCode int32            `json:"return_code"`
+	CGroupID   uint64           `json:"cgroup_id,omitempty"`
 	Anomaly    bool             `json:"anomaly"`
 	Stack      []jsonStackFrame `json:"stack,omitempty"`
 }
@@ -1210,6 +1234,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 
 	// Stack sampling: per-stack event counter (same as table mode).
 	stackSamples := make(map[uint64]int)
+
+	// Cgroup cache: cgroup_id → container_id (lazy, populated on first event).
+	cgroupCache := make(map[uint64]string)
 
 	// System context collector — needed for exporter snapshots and for
 	// recording system snapshots to SQLite (post-hoc causal chain replay).
@@ -1278,6 +1305,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				continue
 			}
 
+			// Resolve cgroup → container ID for K8s container correlation.
+			resolveCGroup(&evt, cgroupCache, eventStore)
+
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
 				resolver.ResolveStack(&evt)
@@ -1332,6 +1362,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				GPUID:      evt.GPUID,
 				Args:       evt.Args,
 				ReturnCode: evt.RetCode,
+				CGroupID:   evt.CGroupID,
 				Anomaly:    collector.IsAnomaly(evt),
 			}
 
@@ -1453,6 +1484,37 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 	}
 
 	fmt.Fprintln(w)
+}
+
+// resolveCGroup looks up the container ID for an event's cgroup and stores
+// the metadata. Uses a cache to avoid repeated /proc reads. CGroupID == 1
+// means root cgroup (bare-metal or cgroup v1 only) — skip resolution.
+func resolveCGroup(evt *events.Event, cache map[uint64]string, eventStore *store.Store) {
+	if evt.CGroupID <= 1 {
+		return
+	}
+	if _, cached := cache[evt.CGroupID]; cached {
+		return
+	}
+
+	// Mark as seen (empty string = resolved but no container ID found).
+	cgroupPath, err := cgroup.ReadCGroupPath(evt.PID)
+	if err != nil {
+		debugf("cgroup: failed to read /proc/%d/cgroup: %v", evt.PID, err)
+		cache[evt.CGroupID] = ""
+		return
+	}
+
+	containerID := cgroup.ParseContainerID(cgroupPath)
+	cache[evt.CGroupID] = containerID
+
+	if eventStore != nil && (containerID != "" || cgroupPath != "") {
+		eventStore.StoreCGroupMetadata(evt.CGroupID, containerID, cgroupPath)
+	}
+
+	if containerID != "" {
+		debugf("cgroup: PID %d → cgroup_id=%d container=%s", evt.PID, evt.CGroupID, containerID[:12])
+	}
 }
 
 // formatDuration formats a duration with 1-2 significant digits per unit tier.

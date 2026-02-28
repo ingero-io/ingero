@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -55,6 +56,7 @@ var (
 	mcpHTTPAddr string
 	mcpTLSCert  string
 	mcpTLSKey   string
+	mcpLogPath  string
 )
 
 func init() {
@@ -62,10 +64,21 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpHTTPAddr, "http", "", "HTTPS listen address (e.g. :8080). If set, serves over HTTPS (TLS 1.3) instead of stdio")
 	mcpCmd.Flags().StringVar(&mcpTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted with --http, a self-signed cert is generated")
 	mcpCmd.Flags().StringVar(&mcpTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
+	mcpCmd.Flags().StringVar(&mcpLogPath, "log", "", "write log output to file (append, no rotation)")
 	rootCmd.AddCommand(mcpCmd)
 }
 
 func mcpRunE(cmd *cobra.Command, args []string) error {
+	// --log: redirect log output to a file (debug, no rotation).
+	if mcpLogPath != "" {
+		f, err := os.OpenFile(mcpLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("opening log file %s: %w", mcpLogPath, err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
+
 	// Validate TLS flags: both or neither.
 	if (mcpTLSCert == "") != (mcpTLSKey == "") {
 		return fmt.Errorf("--tls-cert and --tls-key must be specified together")

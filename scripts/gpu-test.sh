@@ -981,9 +981,9 @@ print()
 
 # Ring buffer comparison
 print("Ring buffer overhead:")
-print(f"  Without --stack: ~56 bytes/event (struct only)")
-print(f"  With --stack:    ~576 bytes/event (struct + 64 stack frames × 8 bytes)")
-print(f"  Ratio: ~10.3x more data per event")
+print(f"  Without --stack: ~64 bytes/event (struct only, v0.7)")
+print(f"  With --stack:    ~584 bytes/event (struct + 64 stack frames × 8 bytes)")
+print(f"  Ratio: ~9.1x more data per event")
 print()
 
 # Stack coverage (per-source: HOST tracepoints have no userspace stacks by design)

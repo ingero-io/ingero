@@ -85,6 +85,21 @@ const migrateAddFramesColumn = `ALTER TABLE stack_traces ADD COLUMN frames TEXT 
 // Idempotent: fails silently if column already exists (new DBs have it from schema).
 const migrateAddSumArg0 = `ALTER TABLE event_aggregates ADD COLUMN sum_arg0 INTEGER NOT NULL DEFAULT 0`
 
+// migrateAddCGroupID adds the cgroup_id column to the events table (v0.7).
+// cgroup v2 inode ID from bpf_get_current_cgroup_id(). 0 = no meaningful cgroup.
+// Idempotent: fails silently if column already exists.
+const migrateAddCGroupID = `ALTER TABLE events ADD COLUMN cgroup_id INTEGER NOT NULL DEFAULT 0`
+
+// cgroupMetadataSchema stores cgroup_id → container_id mappings.
+// One row per cgroup — populated lazily during tracing when cgroup_id > 1.
+const cgroupMetadataSchema = `
+CREATE TABLE IF NOT EXISTS cgroup_metadata (
+	cgroup_id    INTEGER PRIMARY KEY,  -- bpf_get_current_cgroup_id() value
+	container_id TEXT NOT NULL DEFAULT '',  -- 64-char hex container ID
+	cgroup_path  TEXT NOT NULL DEFAULT ''   -- raw cgroup path from /proc/[pid]/cgroup
+);
+`
+
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
 	id              TEXT PRIMARY KEY,       -- e.g. "chain-001"
@@ -604,6 +619,23 @@ func New(dbPath string) (*Store, error) {
 	// Add sum_arg0 column for mm_page_alloc total bytes. Idempotent.
 	db.Exec(migrateAddSumArg0)
 
+	// v0.7: Add cgroup_id column to events table. Idempotent.
+	db.Exec(migrateAddCGroupID)
+
+	// Partial index on cgroup_id — only indexes non-zero values (container events).
+	// Sparse: bare-metal events (cgroup_id=0) don't bloat the index.
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_cgroup ON events(cgroup_id) WHERE cgroup_id != 0")
+
+	// v0.7: Create cgroup_metadata table (cgroup_id → container_id mapping).
+	if _, err := db.Exec(cgroupMetadataSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating cgroup_metadata table: %w", err)
+	}
+
+	// Update schema version to 0.7.
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.7')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id → container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
+
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
 	if dbPath != ":memory:" {
@@ -724,8 +756,8 @@ func (s *Store) flushBatch(batch []events.Event) {
 	}
 
 	// Prepare: event insert uses stack_hash (integer FK) instead of inline JSON.
-	evtStmt, err := tx.Prepare(`INSERT INTO events (timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	evtStmt, err := tx.Prepare(`INSERT INTO events (timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -783,6 +815,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 			evt.Args[1],
 			evt.RetCode,
 			stackHash,
+			evt.CGroupID,
 		)
 	}
 
@@ -815,6 +848,13 @@ func (s *Store) loadStackCache() {
 			s.stackCache[uint64(h)] = frames != ""
 		}
 	}
+}
+
+// StoreCGroupMetadata stores a cgroup_id → container_id/path mapping.
+// Idempotent — uses INSERT OR REPLACE so repeated calls update the row.
+func (s *Store) StoreCGroupMetadata(cgroupID uint64, containerID, cgroupPath string) {
+	s.db.Exec("INSERT OR REPLACE INTO cgroup_metadata (cgroup_id, container_id, cgroup_path) VALUES (?, ?, ?)",
+		cgroupID, containerID, cgroupPath)
 }
 
 // prune performs size-based pruning. When --max-db is set and the DB exceeds
@@ -1029,7 +1069,8 @@ func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix 
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
 		e.gpu_id, e.arg0, e.arg1, e.ret_code,
-		COALESCE(st.frames, ''), COALESCE(st.ips, '')
+		COALESCE(st.frames, ''), COALESCE(st.ips, ''),
+		e.cgroup_id
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	WHERE 1=1`
@@ -1097,8 +1138,9 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			retCode    int32
 			framesJSON string
 			ipsJSON    string
+			cgroupID   uint64
 		)
-		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON); err != nil {
+		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON, &cgroupID); err != nil {
 			return nil, fmt.Errorf("scanning event row: %w", err)
 		}
 		evt := events.Event{
@@ -1111,6 +1153,7 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			GPUID:     gpuID,
 			Args:      [2]uint64{arg0, arg1},
 			RetCode:   retCode,
+			CGroupID:  cgroupID,
 		}
 		// Prefer resolved frames; fall back to raw IPs for old DBs.
 		evt.Stack = deserializeStackFrames(framesJSON)
@@ -1152,7 +1195,8 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		COALESCE(s.description, ''),
 		COALESCE(o.name, 'OP_' || e.op),
 		COALESCE(o.description, ''),
-		COALESCE(pn.name, '')
+		COALESCE(pn.name, ''),
+		e.cgroup_id
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	LEFT JOIN sources s ON e.source = s.id
@@ -1214,10 +1258,11 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			ipsJSON    string
 			srcName, srcDesc, opName, opDesc string
 			procName   string
+			cgroupID   uint64
 		)
 		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos,
 			&gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON,
-			&srcName, &srcDesc, &opName, &opDesc, &procName); err != nil {
+			&srcName, &srcDesc, &opName, &opDesc, &procName, &cgroupID); err != nil {
 			return nil, fmt.Errorf("scanning rich event: %w", err)
 		}
 		re := RichEvent{
@@ -1231,6 +1276,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 				GPUID:     gpuID,
 				Args:      [2]uint64{arg0, arg1},
 				RetCode:   retCode,
+				CGroupID:  cgroupID,
 			},
 			SourceName:  srcName,
 			SourceDesc:  srcDesc,

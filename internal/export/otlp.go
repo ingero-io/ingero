@@ -341,13 +341,13 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			Resource: otlpResource{
 				Attributes: []otlpKeyValue{
 					{Key: "service.name", Value: stringVal("ingero")},
-					{Key: "service.version", Value: stringVal("0.6.0")},
+					{Key: "service.version", Value: stringVal("0.7.0")},
 				},
 			},
 			ScopeMetrics: []otlpScopeMetrics{{
 				Scope: otlpScope{
 					Name:    "ingero",
-					Version: "0.6.0",
+					Version: "0.7.0",
 				},
 				Metrics: metrics,
 			}},
