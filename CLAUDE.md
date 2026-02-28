@@ -42,6 +42,18 @@ tests/              Integration tests and GPU workloads
 * **No CGO.** SQLite uses `modernc.org/sqlite` (pure Go). The binary must stay statically linkable.
 * **eBPF structs mirrored.** Event structs in `bpf/common.bpf.h` must stay in sync with `pkg/events/types.go`.
 
+## Pre-Edit Remote Check
+
+Before modifying any local file, check the remote repository for new commits or open PRs:
+
+```bash
+git fetch origin --quiet
+git log HEAD..origin/main --oneline   # new commits on main
+gh pr list --state open --limit 5     # open PRs
+```
+
+If there are new remote commits or relevant open PRs, **suggest pulling latest changes** (`git pull`) before proceeding with edits. This avoids working on stale code and prevents merge conflicts.
+
 ## Progressive Context
 
 Do not guess how the system works. Read the relevant source files when needed. All commits require DCO sign-off (`git commit -s`) — see `CONTRIBUTING.md`.
