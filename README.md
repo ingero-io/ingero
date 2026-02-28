@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.59**
+**Version: 0.6.60**
 
 *"Why is my H100 at 98% utilization but training throughput dropped 30%?"*
 
