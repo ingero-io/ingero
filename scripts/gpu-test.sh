@@ -1253,14 +1253,15 @@ else
         echo ">> Session Complete"
         echo "========================================"
         echo ""
-        echo "This session demonstrated all 6 MCP tools with TSC on (default):"
+        echo "This session demonstrated all 7 MCP tools with TSC on (default):"
         echo "  0. tools/list — discover available tools"
         echo "  1. get_check — system health check"
         echo "  2. get_trace_stats — GPU operation statistics (TSC compressed)"
         echo "  3. run_sql — ad-hoc event query via SQL"
         echo "  4. get_causal_chains — root cause analysis (TSC compressed)"
-        echo "  5. run_demo — synthetic scenario"
-        echo "  6. get_test_report — integration test results"
+        echo "  5. get_stacks — resolved call stacks"
+        echo "  6. run_demo — synthetic scenario"
+        echo "  7. get_test_report — integration test results"
     } > "$SESSION_FILE"
 
     if [ -s "$SESSION_FILE" ]; then

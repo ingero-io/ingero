@@ -99,7 +99,13 @@ func queryOutputJSON(evts []events.Event) error {
 	enc.SetIndent("", "  ")
 
 	type jsonStackFrame struct {
-		IP string `json:"ip"`
+		IP     string `json:"ip,omitempty"`
+		Symbol string `json:"symbol,omitempty"`
+		File   string `json:"file,omitempty"`
+		Line   int    `json:"line,omitempty"`
+		PyFile string `json:"py_file,omitempty"`
+		PyFunc string `json:"py_func,omitempty"`
+		PyLine int    `json:"py_line,omitempty"`
 	}
 	type jsonEvt struct {
 		Timestamp  string           `json:"timestamp"`
@@ -132,7 +138,18 @@ func queryOutputJSON(evts []events.Event) error {
 		if len(evt.Stack) > 0 {
 			je.Stack = make([]jsonStackFrame, len(evt.Stack))
 			for i, f := range evt.Stack {
-				je.Stack[i] = jsonStackFrame{IP: fmt.Sprintf("0x%x", f.IP)}
+				je.Stack[i] = jsonStackFrame{
+					Symbol: f.SymbolName,
+					File:   f.File,
+					Line:   f.Line,
+					PyFile: f.PyFile,
+					PyFunc: f.PyFunc,
+					PyLine: f.PyLine,
+				}
+				// Include IP only if no symbol resolved (raw IPs from old DBs).
+				if f.SymbolName == "" && f.IP != 0 {
+					je.Stack[i].IP = fmt.Sprintf("0x%x", f.IP)
+				}
 			}
 		}
 		output = append(output, je)

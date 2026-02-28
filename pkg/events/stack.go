@@ -1,6 +1,9 @@
 package events
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"hash/fnv"
+)
 
 // ParseStackIPs extracts stack frames from the stack section of a cuda_event_stack.
 // The stack section starts at baseOffset (byte 56 for CUDA/driver events):
@@ -34,4 +37,20 @@ func ParseStackIPs(raw []byte, baseOffset int) []StackFrame {
 		frames = append(frames, StackFrame{IP: ip})
 	}
 	return frames
+}
+
+// HashStackIPs computes an FNV-64a hash of a stack trace's raw instruction
+// pointers. Two stacks with the same IPs in the same order produce the same
+// hash. Used as the primary key in the stack_traces interning table and for
+// stack sampling deduplication in trace.go.
+//
+// Hashes raw uint64 bytes directly — no JSON serialization or hex formatting.
+func HashStackIPs(stack []StackFrame) uint64 {
+	h := fnv.New64a()
+	var buf [8]byte
+	for _, f := range stack {
+		binary.LittleEndian.PutUint64(buf[:], f.IP)
+		h.Write(buf[:])
+	}
+	return h.Sum64()
 }

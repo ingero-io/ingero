@@ -18,10 +18,11 @@ var mcpCmd = &cobra.Command{
 	Short: "Start MCP server for AI agent integration",
 	Long: `Start an MCP (Model Context Protocol) server.
 
-The MCP server exposes six tools to AI agents (e.g., Claude):
+The MCP server exposes seven tools to AI agents (e.g., Claude):
   - get_check: Run system diagnostics
   - get_trace_stats: CUDA/host statistics (p50/p95/p99 or aggregate fallback)
   - get_causal_chains: Causal chains with severity and root cause
+  - get_stacks: Resolved call stacks for CUDA/driver operations
   - run_demo: Run a synthetic demo scenario
   - get_test_report: GPU integration test report (JSON)
   - run_sql: Execute read-only SQL for ad-hoc analysis
