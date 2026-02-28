@@ -293,7 +293,7 @@ func populateLookupTables(db *sql.DB) {
 
 	// Schema info — units, version, helpful context
 	info := []struct{ k, v string }{
-		{"version", "0.6"},
+		{"version", "0.7"},
 		{"timestamp_unit", "nanoseconds (Unix epoch)"},
 		{"duration_unit", "nanoseconds"},
 		{"arg0_note", "Operation-specific: byte size for alloc/memcpy, kernel function pointer for launch"},
@@ -574,7 +574,7 @@ func New(dbPath string) (*Store, error) {
 	// Ensure schema_info reflects the running binary, even for databases
 	// created by an older version (populateLookupTables skips inserts when
 	// tables are already populated).
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.6')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.7')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates. sum_arg0 tracks mm_page_alloc total bytes (chain engine threshold: >1GB). count-stored = discarded count.')")

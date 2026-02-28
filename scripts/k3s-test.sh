@@ -7,8 +7,8 @@
 #   3. Deploy a PyTorch training pod
 #   4. Verify ingero captures events with cgroup_id != 0
 #   5. Verify cgroup_metadata table has container_id
-#   6. Run bare-metal regression tests (existing 62 tests)
-#   7. Cleanup
+#   6. Cleanup DaemonSet (before bare-metal regression to avoid uprobe conflicts)
+#   7. Run bare-metal regression tests (existing 62 tests)
 #
 # Usage:
 #   bash scripts/k3s-test.sh
@@ -17,6 +17,7 @@
 set -euo pipefail
 
 KUBECTL="sudo k3s kubectl"
+INGERO_DB="/var/lib/ingero/ingero.db"
 PASS=0
 FAIL=0
 SKIP=0
@@ -110,7 +111,8 @@ echo ""
 echo "--- Step 4: Verify cgroup_id in events ---"
 sleep 5  # Allow time for events to flush to SQLite
 
-CGROUP_COUNT=$($KUBECTL exec -n ingero-system "$INGERO_POD" -- ingero query --json --since 5m 2>/dev/null | grep -c '"cgroup_id":[1-9]' || echo "0")
+# Query the host-mounted SQLite DB directly (ingero stores at /var/lib/ingero/ingero.db).
+CGROUP_COUNT=$(sudo sqlite3 "$INGERO_DB" "SELECT COUNT(*) FROM events WHERE cgroup_id > 1" 2>/dev/null || echo "0")
 if [ "$CGROUP_COUNT" -gt "0" ]; then
     pass "Events with non-zero cgroup_id: $CGROUP_COUNT"
 else
@@ -120,25 +122,39 @@ fi
 # --- Step 5: Check cgroup_metadata table ---
 echo ""
 echo "--- Step 5: Verify cgroup_metadata table ---"
-METADATA=$($KUBECTL exec -n ingero-system "$INGERO_POD" -- ingero query --sql "SELECT COUNT(*) FROM cgroup_metadata WHERE container_id != ''" 2>/dev/null || echo "error")
-echo "  cgroup_metadata rows with container_id: $METADATA"
+METADATA=$(sudo sqlite3 "$INGERO_DB" "SELECT COUNT(*) FROM cgroup_metadata WHERE container_id != ''" 2>/dev/null || echo "0")
+if [ "$METADATA" -gt "0" ]; then
+    pass "cgroup_metadata rows with container_id: $METADATA"
+else
+    skip "No cgroup_metadata entries found (container resolution may need longer trace)"
+fi
 
-# --- Step 6: Bare-metal regression ---
+# --- Step 6: Cleanup DaemonSet ---
+# Remove DaemonSet BEFORE bare-metal regression to avoid duplicate uprobe conflicts.
+# Both the DaemonSet pod and gpu-test.sh attach uprobes to libcudart.so/libcuda.so.
 echo ""
-echo "--- Step 6: Bare-metal regression (gpu-test.sh) ---"
+echo "--- Step 6: Cleanup DaemonSet ---"
+$KUBECTL delete pod pytorch-test --ignore-not-found
+$KUBECTL delete -f deploy/k8s/daemonset.yaml --ignore-not-found
+echo "  Waiting for ingero pod to terminate..."
+for i in $(seq 1 30); do
+    REMAINING=$($KUBECTL get pods -n ingero-system -l app.kubernetes.io/name=ingero --no-headers 2>/dev/null | wc -l || echo "0")
+    if [ "$REMAINING" = "0" ]; then
+        break
+    fi
+    sleep 1
+done
+echo "  DaemonSet removed (namespace + RBAC kept for re-runs)"
+
+# --- Step 7: Bare-metal regression ---
+echo ""
+echo "--- Step 7: Bare-metal regression (gpu-test.sh) ---"
 echo "  Running standard integration tests..."
 if bash scripts/gpu-test.sh; then
     pass "Bare-metal regression tests passed"
 else
     fail "Bare-metal regression tests failed"
 fi
-
-# --- Step 7: Cleanup ---
-echo ""
-echo "--- Step 7: Cleanup ---"
-$KUBECTL delete pod pytorch-test --ignore-not-found
-$KUBECTL delete -f deploy/k8s/daemonset.yaml --ignore-not-found
-echo "  Cleaned up test resources (namespace + RBAC kept for re-runs)"
 
 # --- Summary ---
 echo ""
