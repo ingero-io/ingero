@@ -252,9 +252,15 @@ func (s *Server) registerTools() {
 		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
-			if err == nil {
-				since = d
+			if err != nil {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
+					},
+					IsError: true,
+				}, struct{}{}, nil
 			}
+			since = d
 		}
 
 		if s.store == nil {
@@ -339,9 +345,15 @@ func (s *Server) registerTools() {
 		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
-			if err == nil {
-				since = d
+			if err != nil {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
+					},
+					IsError: true,
+				}, struct{}{}, nil
 			}
+			since = d
 		}
 
 		if s.store == nil {
@@ -811,6 +823,9 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		}
 		if len(stacks) == limit {
 			output["note"] = fmt.Sprintf("Showing top %d stacks. Use limit parameter or run_sql for custom analysis.", limit)
+		}
+		if scanErrs > 0 {
+			output["warning"] = fmt.Sprintf("%d rows failed to parse. Results may be incomplete.", scanErrs)
 		}
 
 		var data []byte

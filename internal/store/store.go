@@ -770,12 +770,10 @@ func (s *Store) flushBatch(batch []events.Event) {
 	s.pruneBySize()
 }
 
-// loadStackCache pre-populates the in-memory stack cache from the stack_traces
-// table. Called once at Run() startup so that a restarted trace session against
-// the same DB doesn't re-insert stacks that already exist.
+// loadStackCache populates the in-memory cache of known stack hashes from the
+// stack_traces table. Called once at Run() startup so that a restarted trace
+// session against the same DB doesn't re-insert stacks that already exist.
 //
-// Only caches stacks that already have resolved frames. Stacks with empty
-// loadStackCache populates the in-memory cache of known stack hashes.
 // Stacks with resolved frames are marked as fully cached (true).
 // Stacks without frames (from older sessions) are marked as needing
 // upgrade (false), so INSERT OR REPLACE runs once when resolved symbols
