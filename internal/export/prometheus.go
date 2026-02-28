@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"github.com/ingero-io/ingero/internal/stats"
-	"github.com/ingero-io/ingero/pkg/events"
 )
 
 // PrometheusServer serves /metrics for Prometheus scraping.
@@ -109,10 +108,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	b.WriteString("# TYPE gpu_cuda_operation_duration_microseconds gauge\n")
 
 	for _, op := range snap.Ops {
-		source := "cuda"
-		if op.Source == events.SourceHost {
-			source = "host"
-		}
+		source := op.Source.String()
 		labels := fmt.Sprintf(`source="%s",operation="%s"`, source, op.Op)
 
 		fmt.Fprintf(&b, "gpu_cuda_operation_duration_microseconds{%s,percentile=\"p50\"} %f\n", labels, float64(op.P50.Microseconds()))
@@ -123,10 +119,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	b.WriteString("# HELP gpu_cuda_operation_count Total event count per operation\n")
 	b.WriteString("# TYPE gpu_cuda_operation_count counter\n")
 	for _, op := range snap.Ops {
-		source := "cuda"
-		if op.Source == events.SourceHost {
-			source = "host"
-		}
+		source := op.Source.String()
 		fmt.Fprintf(&b, "gpu_cuda_operation_count{source=\"%s\",operation=\"%s\"} %d\n", source, op.Op, op.Count)
 	}
 

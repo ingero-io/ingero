@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
-	"github.com/ingero-io/ingero/pkg/events"
 )
 
 // OTLPConfig configures the OTLP exporter.
@@ -280,13 +279,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 
 	// Per-operation metrics.
 	for _, op := range snap.Ops {
-		source := "cuda"
-		switch op.Source {
-		case events.SourceHost:
-			source = "host"
-		case events.SourceDriver:
-			source = "driver"
-		}
+		source := op.Source.String()
 
 		labels := []otlpKeyValue{
 			{Key: "source", Value: stringVal(source)},
