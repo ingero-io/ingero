@@ -41,15 +41,54 @@ func ParseStackIPs(raw []byte, baseOffset int) []StackFrame {
 
 // HashStackIPs computes an FNV-64a hash of a stack trace's raw instruction
 // pointers. Two stacks with the same IPs in the same order produce the same
-// hash. Used as the primary key in the stack_traces interning table and for
-// stack sampling deduplication in trace.go.
+// hash. Used as the primary key in the stack_traces interning table.
 //
 // Hashes raw uint64 bytes directly — no JSON serialization or hex formatting.
+//
+// WARNING: ASLR makes this unsuitable for cross-process deduplication.
+// Each process maps shared libraries at different virtual addresses, so
+// logically identical call stacks (same symbols, same code paths) produce
+// different hashes. Use HashStackSymbols for sampling/dedup across PIDs.
 func HashStackIPs(stack []StackFrame) uint64 {
 	h := fnv.New64a()
 	var buf [8]byte
 	for _, f := range stack {
 		binary.LittleEndian.PutUint64(buf[:], f.IP)
+		h.Write(buf[:])
+	}
+	return h.Sum64()
+}
+
+// HashStackSymbols computes an FNV-64a hash of a stack trace's resolved
+// symbol names, ignoring raw instruction pointers. This is ASLR-independent:
+// the same logical call path across different processes (with different library
+// base addresses) produces the same hash.
+//
+// Used for stack sampling deduplication in trace.go, where the goal is to limit
+// stored events per *logical* call path, not per *physical* IP sequence.
+//
+// Hashes: SymbolName, File (full path from /proc/[pid]/maps), PyFile, PyFunc, PyLine.
+// Raw IPs are excluded (they vary with ASLR). Each field is null-separated
+// to prevent "ab"+"c" colliding with "a"+"bc" (same technique Git uses
+// for tree entry hashing).
+//
+// Note: File is the full path, not basename. This is correct for same-host
+// multi-process (ASLR) dedup. For v0.7 container support, consider using
+// filepath.Base(File) to handle container vs host path differences.
+func HashStackSymbols(stack []StackFrame) uint64 {
+	h := fnv.New64a()
+	var buf [4]byte
+	sep := []byte{0}
+	for _, f := range stack {
+		h.Write([]byte(f.SymbolName))
+		h.Write(sep)
+		h.Write([]byte(f.File))
+		h.Write(sep)
+		h.Write([]byte(f.PyFile))
+		h.Write(sep)
+		h.Write([]byte(f.PyFunc))
+		h.Write(sep)
+		binary.LittleEndian.PutUint32(buf[:], uint32(f.PyLine))
 		h.Write(buf[:])
 	}
 	return h.Sum64()
