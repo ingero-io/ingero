@@ -274,7 +274,7 @@ func TestShouldStoreHierarchy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldStore(tt.evt, tt.start, tt.recAll, collector)
+			got := shouldStore(tt.evt, tt.start, tt.recAll, collector, 0, nil)
 			if got != tt.wantStore {
 				t.Errorf("shouldStore() = %v, want %v", got, tt.wantStore)
 			}
@@ -375,7 +375,7 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 		if i%50 == 49 {
 			liveCollector.Snapshot()
 		}
-		if shouldStore(evt, sessionStart, false, liveCollector) {
+		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil) {
 			storedEvents = append(storedEvents, evt)
 		}
 	}
@@ -521,7 +521,7 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		if i%30 == 29 {
 			liveCollector.Snapshot()
 		}
-		if shouldStore(evt, sessionStart, false, liveCollector) {
+		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil) {
 			storedEvents = append(storedEvents, evt)
 		}
 	}
@@ -612,4 +612,131 @@ func chainSummaries(chains []correlate.CausalChain) []string {
 		ss = append(ss, ch.Severity+"["+strings.Join(ops, " → ")+"]")
 	}
 	return ss
+}
+
+// ---------------------------------------------------------------------------
+// Stack sampling + garbage stack tests (v0.7)
+// ---------------------------------------------------------------------------
+
+func TestIsStackResolved(t *testing.T) {
+	// Resolved: at least one frame has symbol info.
+	resolved := []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0x1234, SymbolName: "cudaMalloc", File: "libcudart.so"},
+	}
+	if !isStackResolved(resolved) {
+		t.Error("expected resolved stack to be detected")
+	}
+
+	// Python frame counts as resolved.
+	pyResolved := []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0x5678, PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+	}
+	if !isStackResolved(pyResolved) {
+		t.Error("expected Python-resolved stack to be detected")
+	}
+
+	// All garbage: no symbol, no file, no Python info.
+	garbage := []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0xbeef},
+	}
+	if isStackResolved(garbage) {
+		t.Error("expected garbage stack to NOT be resolved")
+	}
+
+	// Empty stack.
+	if isStackResolved(nil) {
+		t.Error("expected nil stack to NOT be resolved")
+	}
+}
+
+func TestShouldStoreStackSampling(t *testing.T) {
+	collector := stats.New()
+	sessionStart := time.Now().Add(-1 * time.Minute) // past bootstrap
+
+	stack := []events.StackFrame{
+		{IP: 0x1234, SymbolName: "cudaMalloc"},
+	}
+	stackHash := events.HashStackIPs(stack)
+
+	// Create an event with a stack.
+	evt := events.Event{
+		Timestamp: time.Now(),
+		PID:       1234,
+		Source:    events.SourceCUDA,
+		Op:        uint8(events.CUDAMalloc),
+		Duration:  100 * time.Microsecond,
+		Stack:     stack,
+	}
+
+	// With maxStackSamples=3, first 3 should store.
+	samples := make(map[uint64]int)
+	for i := 0; i < 3; i++ {
+		if !shouldStore(evt, sessionStart, true, collector, 3, samples) {
+			t.Errorf("event %d should store (under limit)", i)
+		}
+		samples[stackHash]++
+	}
+
+	// 4th should be rejected (limit reached, not an anomaly).
+	if shouldStore(evt, sessionStart, true, collector, 3, samples) {
+		t.Error("event 4 should NOT store (over stack sample limit)")
+	}
+
+	// With maxStackSamples=0 (unlimited), always stores.
+	if !shouldStore(evt, sessionStart, true, collector, 0, samples) {
+		t.Error("should store with unlimited stack samples")
+	}
+
+	// Events without stacks are unaffected by sampling.
+	noStackEvt := evt
+	noStackEvt.Stack = nil
+	if !shouldStore(noStackEvt, sessionStart, true, collector, 3, samples) {
+		t.Error("no-stack events should be unaffected by sampling")
+	}
+}
+
+func TestShouldStoreStackSamplingAnomalyBypass(t *testing.T) {
+	// Feed enough events to establish a p50 baseline, then verify that
+	// an anomaly bypasses the stack sample limit.
+	collector := stats.New()
+	sessionStart := time.Now().Add(-1 * time.Minute)
+
+	stack := []events.StackFrame{
+		{IP: 0x1234, SymbolName: "cudaMalloc"},
+	}
+	stackHash := events.HashStackIPs(stack)
+
+	baseEvt := events.Event{
+		Timestamp: time.Now(),
+		PID:       1234,
+		Source:    events.SourceCUDA,
+		Op:        uint8(events.CUDAMalloc),
+		Duration:  100 * time.Microsecond,
+		Stack:     stack,
+	}
+
+	// Record 20 events to establish a p50 baseline in the collector.
+	for i := 0; i < 20; i++ {
+		collector.Record(baseEvt)
+	}
+	collector.Snapshot() // updates cachedP50
+
+	// Fill up the stack sample limit.
+	samples := make(map[uint64]int)
+	samples[stackHash] = 5 // already at limit
+
+	// A normal event should be rejected (over limit, not anomaly).
+	if shouldStore(baseEvt, sessionStart, true, collector, 5, samples) {
+		t.Error("normal event should be rejected when over stack sample limit")
+	}
+
+	// An anomaly (100x duration) should bypass the limit.
+	anomaly := baseEvt
+	anomaly.Duration = 100 * time.Millisecond // 1000x the p50 of 100µs
+	if !shouldStore(anomaly, sessionStart, true, collector, 5, samples) {
+		t.Error("anomaly should bypass stack sample limit")
+	}
 }

@@ -1,12 +1,13 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes six tools to AI agents:
+// The MCP server exposes seven tools to AI agents:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
 //   - get_trace_stats: Get CUDA/host stats (p50/p95/p99 or aggregate fallback)
 //   - get_causal_chains: Analyze events and return causal chains with severity
 //   - run_demo: Run a synthetic demo scenario
 //   - get_test_report: Return the GPU integration test report (JSON)
 //   - run_sql: Execute read-only SQL for ad-hoc analysis
+//   - get_stacks: Get resolved call stacks for operations (symbol names, source files)
 //
 // Usage:
 //
@@ -25,6 +26,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -548,12 +550,14 @@ func (s *Server) registerTools() {
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name: "run_sql",
-		Description: `Execute read-only SQL on the Ingero database. For ad-hoc analysis the fixed tools can't do: temporal bucketing, threshold queries, per-PID breakdowns, throughput calculations. Timeout: 5s.
+		Description: `Execute read-only SQL on the Ingero database. For ad-hoc analysis the fixed tools can't do: temporal bucketing, threshold queries, per-PID breakdowns, throughput calculations. Timeout: 30s.
 
-Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash), system_snapshots(id, timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur), stack_traces(hash, ips TEXT JSON), schema_info(key, value).
+Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash), system_snapshots(id, timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur), stack_traces(hash, ips TEXT JSON, frames TEXT JSON resolved symbols), schema_info(key, value).
 
 JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), events.stack_hash=stack_traces.hash.
-Sources: 1=CUDA, 3=HOST, 4=DRIVER. Ops: CUDA(cudaMalloc,cudaFree,cudaLaunchKernel,cudaMemcpy,cudaStreamSync,cudaDeviceSync,cudaMemcpyAsync), HOST(sched_switch,sched_wakeup,mm_page_alloc,oom_kill,process_exec,process_exit,process_fork), DRIVER(cuLaunchKernel,cuMemcpy,cuMemcpyAsync,cuCtxSynchronize,cuMemAlloc). cudaMemcpy/cudaMemcpyAsync arg0=bytes,arg1=direction(1=H2D,2=D2H,3=D2D). Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).`,
+Sources: 1=CUDA, 3=HOST, 4=DRIVER. Ops: CUDA(cudaMalloc,cudaFree,cudaLaunchKernel,cudaMemcpy,cudaStreamSync,cudaDeviceSync,cudaMemcpyAsync), HOST(sched_switch,sched_wakeup,mm_page_alloc,oom_kill,process_exec,process_exit,process_fork), DRIVER(cuLaunchKernel,cuMemcpy,cuMemcpyAsync,cuCtxSynchronize,cuMemAlloc). cudaMemcpy/cudaMemcpyAsync arg0=bytes,arg1=direction(1=H2D,2=D2H,3=D2D). Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).
+
+Performance: events can have millions of rows. For large DBs, query event_aggregates (per-minute stats, always small) or stack_traces (deduplicated, always small) instead of scanning events. Use get_stacks tool for call stack analysis instead of manual SQL JOINs.`,
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sqlInput) (*gomcp.CallToolResult, struct{}, error) {
 		if s.store == nil {
 			return &gomcp.CallToolResult{
@@ -580,17 +584,22 @@ Sources: 1=CUDA, 3=HOST, 4=DRIVER. Ops: CUDA(cudaMalloc,cudaFree,cudaLaunchKerne
 			limit = 10000
 		}
 
-		// 5-second timeout to prevent runaway queries.
-		queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		// 30-second timeout — allows complex JOINs while preventing truly runaway queries.
+		// With stack sampling reducing events to ~300K, most queries complete in <5s.
+		queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
 		start := time.Now()
 		cols, rows, truncated, err := s.store.ExecuteReadOnly(queryCtx, input.Query, limit)
 		elapsed := time.Since(start)
 		if err != nil {
+			msg := fmt.Sprintf("SQL error: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				msg += "\n\nQuery timed out (30s). Tips: add LIMIT, avoid full-table JOINs on events (use event_aggregates or stack_traces directly), filter by timestamp/source/op first, or use get_stacks tool for call stack analysis."
+			}
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: fmt.Sprintf("SQL error: %v", err)},
+					&gomcp.TextContent{Text: msg},
 				},
 				IsError: true,
 			}, struct{}{}, nil
@@ -612,6 +621,174 @@ Sources: 1=CUDA, 3=HOST, 4=DRIVER. Ops: CUDA(cudaMalloc,cudaFree,cudaLaunchKerne
 		}
 
 		tsc := input.TSC == nil || *input.TSC
+		var data []byte
+		if tsc {
+			data, _ = json.Marshal(output)
+		} else {
+			data, _ = json.MarshalIndent(output, "", "  ")
+		}
+
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: string(data)},
+			},
+		}, struct{}{}, nil
+	})
+
+	// Tool 7: get_stacks — resolved call stacks grouped by operation.
+	// Directly answers "what code paths hit this operation?" without manual SQL.
+	type stacksInput struct {
+		Source int    `json:"source,omitempty" jsonschema:"Source filter: 1=CUDA, 3=HOST, 4=DRIVER"`
+		Op     string `json:"op,omitempty" jsonschema:"Operation name (e.g. cudaMalloc, cuLaunchKernel)"`
+		PID    int    `json:"pid,omitempty" jsonschema:"Process ID filter"`
+		Since  string `json:"since,omitempty" jsonschema:"Time window (e.g. 5m, 1h). Default: all data"`
+		Limit  int    `json:"limit,omitempty" jsonschema:"Max stacks returned (default 10)"`
+		TSC    *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+	}
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name:        "get_stacks",
+		Description: "Get resolved call stacks for CUDA/driver operations. Returns top stacks by frequency with symbol names, source files, and timing stats. One call answers 'what code path caused this operation?' For pre-v0.7 DBs, falls back to raw IPs (hex addresses).",
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input stacksInput) (*gomcp.CallToolResult, struct{}, error) {
+		if s.store == nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
+				},
+			}, struct{}{}, nil
+		}
+
+		limit := input.Limit
+		if limit <= 0 {
+			limit = 10
+		}
+		if limit > 100 {
+			limit = 100
+		}
+
+		// Build WHERE clause from filters.
+		query := `SELECT e.stack_hash, COALESCE(st.frames, ''), COALESCE(st.ips, ''),
+			COUNT(*) as n,
+			MIN(e.duration) as min_dur, MAX(e.duration) as max_dur,
+			SUM(e.duration)/COUNT(*) as avg_dur
+		FROM events e
+		JOIN stack_traces st ON e.stack_hash = st.hash
+		WHERE e.stack_hash != 0`
+		var args []interface{}
+
+		if input.Op != "" {
+			// ResolveOp determines the source, so skip the user-supplied Source filter.
+			src, op, ok := events.ResolveOp(input.Op)
+			if ok {
+				query += " AND e.source = ? AND e.op = ?"
+				args = append(args, uint8(src), op)
+			}
+		} else if input.Source > 0 {
+			query += " AND e.source = ?"
+			args = append(args, input.Source)
+		}
+
+		if input.PID > 0 {
+			query += " AND e.pid = ?"
+			args = append(args, input.PID)
+		}
+
+		if input.Since != "" {
+			d, err := time.ParseDuration(input.Since)
+			if err == nil && d > 0 {
+				query += " AND e.timestamp >= ?"
+				args = append(args, time.Now().Add(-d).UnixNano())
+			}
+		}
+
+		query += " GROUP BY e.stack_hash ORDER BY n DESC LIMIT ?"
+		args = append(args, limit)
+
+		// 30s timeout — this query can be expensive on large pre-sampling DBs.
+		queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		rows, err := s.store.DB().QueryContext(queryCtx, query, args...)
+		if err != nil {
+			msg := fmt.Sprintf("query error: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				msg += "\n\nTimed out. Try narrowing with source/op/pid/since filters."
+			}
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: msg},
+				},
+				IsError: true,
+			}, struct{}{}, nil
+		}
+		defer rows.Close()
+
+		tsc := input.TSC == nil || *input.TSC
+		type stackResult struct {
+			Hash     int64       `json:"hash"`
+			Count    int64       `json:"n"`
+			AvgUS    int64       `json:"avg_us"`
+			MinUS    int64       `json:"min_us"`
+			MaxUS    int64       `json:"max_us"`
+			Frames   interface{} `json:"frames"` // compact frames or raw IPs
+		}
+
+		var stacks []stackResult
+		for rows.Next() {
+			var (
+				hash                    int64
+				framesJSON, ipsJSON     string
+				count, minDur, maxDur   int64
+				avgDur                  int64
+			)
+			if err := rows.Scan(&hash, &framesJSON, &ipsJSON, &count, &minDur, &maxDur, &avgDur); err != nil {
+				continue
+			}
+			sr := stackResult{
+				Hash:  hash,
+				Count: count,
+				AvgUS: avgDur / 1000,
+				MinUS: minDur / 1000,
+				MaxUS: maxDur / 1000,
+			}
+			// Prefer resolved frames; fall back to raw IPs for old DBs.
+			if framesJSON != "" {
+				var frames json.RawMessage
+				if json.Unmarshal([]byte(framesJSON), &frames) == nil {
+					sr.Frames = frames
+				}
+			}
+			if sr.Frames == nil && ipsJSON != "" {
+				var ips json.RawMessage
+				if json.Unmarshal([]byte(ipsJSON), &ips) == nil {
+					sr.Frames = ips
+				}
+			}
+			stacks = append(stacks, sr)
+		}
+		if err := rows.Err(); err != nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf("row iteration error: %v", err)},
+				},
+				IsError: true,
+			}, struct{}{}, nil
+		}
+
+		if len(stacks) == 0 {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No stacks found. Ensure trace was run with --stack (default: on)."},
+				},
+			}, struct{}{}, nil
+		}
+
+		output := map[string]interface{}{
+			"stacks": stacks,
+		}
+		if len(stacks) == limit {
+			output["note"] = fmt.Sprintf("Showing top %d stacks. Use limit parameter or run_sql for custom analysis.", limit)
+		}
+
 		var data []byte
 		if tsc {
 			data, _ = json.Marshal(output)

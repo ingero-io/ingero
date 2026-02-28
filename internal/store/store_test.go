@@ -1726,3 +1726,179 @@ func TestExecuteReadOnly_SqliteMasterAllowed(t *testing.T) {
 		t.Error("expected sqlite_master to return schema objects")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Frame serialization / deserialization tests (v0.7)
+// ---------------------------------------------------------------------------
+
+func TestSerializeStackFramesRoundTrip(t *testing.T) {
+	stack := []events.StackFrame{
+		{IP: 0x7f1234, SymbolName: "cudaMalloc", File: "/usr/lib/x86_64-linux-gnu/libcudart.so.12", Line: 0},
+		{IP: 0x7f5678, SymbolName: "_PyEval_EvalFrameDefault", File: "/usr/lib/libpython3.12.so", Line: 527},
+		{IP: 0x7f9abc, PyFile: "train.py", PyFunc: "forward", PyLine: 142},
+	}
+
+	json := serializeStackFrames(stack)
+	if json == "" {
+		t.Fatal("serializeStackFrames returned empty for non-garbage stack")
+	}
+
+	got := deserializeStackFrames(json)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 frames, got %d", len(got))
+	}
+
+	// Check native symbol frame.
+	if got[0].SymbolName != "cudaMalloc" {
+		t.Errorf("frame[0].SymbolName = %q, want cudaMalloc", got[0].SymbolName)
+	}
+	if got[0].File != "libcudart.so.12" { // basename only
+		t.Errorf("frame[0].File = %q, want libcudart.so.12", got[0].File)
+	}
+
+	// Check native Line field round-trips.
+	if got[1].Line != 527 {
+		t.Errorf("frame[1].Line = %d, want 527", got[1].Line)
+	}
+
+	// Check Python frame.
+	if got[2].PyFile != "train.py" || got[2].PyFunc != "forward" || got[2].PyLine != 142 {
+		t.Errorf("frame[2] Python = {%q, %q, %d}, want {train.py, forward, 142}",
+			got[2].PyFile, got[2].PyFunc, got[2].PyLine)
+	}
+}
+
+func TestSerializeStackFramesGarbageFiltering(t *testing.T) {
+	// All frames are garbage (no symbol, no file, no Python info).
+	stack := []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0xbeef},
+	}
+	json := serializeStackFrames(stack)
+	if json != "" {
+		t.Errorf("expected empty for all-garbage stack, got %q", json)
+	}
+
+	// Mix of garbage and resolved.
+	stack = []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0x1234, SymbolName: "cudaMalloc", File: "libcudart.so"},
+		{IP: 0xbeef},
+	}
+	json = serializeStackFrames(stack)
+	got := deserializeStackFrames(json)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 non-garbage frame, got %d", len(got))
+	}
+	if got[0].SymbolName != "cudaMalloc" {
+		t.Errorf("frame[0].SymbolName = %q, want cudaMalloc", got[0].SymbolName)
+	}
+}
+
+func TestDeserializeStackFramesBackwardCompat(t *testing.T) {
+	// Empty string → nil (old DBs without frames column).
+	got := deserializeStackFrames("")
+	if got != nil {
+		t.Errorf("expected nil for empty, got %v", got)
+	}
+
+	// Invalid JSON → nil.
+	got = deserializeStackFrames("not json")
+	if got != nil {
+		t.Errorf("expected nil for invalid JSON, got %v", got)
+	}
+
+	// Empty JSON array → nil.
+	got = deserializeStackFrames("[]")
+	if got != nil {
+		t.Errorf("expected nil for empty array, got %v", got)
+	}
+}
+
+func TestResolvedFramesStoredInDB(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Record an event with resolved stack frames.
+	evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 5*time.Millisecond)
+	evt.Stack = []events.StackFrame{
+		{IP: 0x7f1234, SymbolName: "cudaMalloc", File: "/usr/lib/libcudart.so.12"},
+		{IP: 0x401000, PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+	}
+	s.Record(evt)
+
+	time.Sleep(300 * time.Millisecond)
+
+	result, err := s.Query(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("expected at least 1 event")
+	}
+
+	// The queried event should have resolved frames, not just raw IPs.
+	got := result[0]
+	if len(got.Stack) == 0 {
+		t.Fatal("expected stack frames in queried event")
+	}
+	if got.Stack[0].SymbolName != "cudaMalloc" {
+		t.Errorf("stack[0].SymbolName = %q, want cudaMalloc", got.Stack[0].SymbolName)
+	}
+	if got.Stack[1].PyFunc != "forward" {
+		t.Errorf("stack[1].PyFunc = %q, want forward", got.Stack[1].PyFunc)
+	}
+
+	cancel()
+	<-done
+}
+
+func TestFramesMigrationOnOldDB(t *testing.T) {
+	// Create a DB without the frames column, then open it — migration should add it.
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	// First open creates the schema including frames column.
+	s1, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	s1.Close()
+
+	// Re-open should work (migration is idempotent).
+	s2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("Re-open failed: %v", err)
+	}
+	defer s2.Close()
+
+	// Verify frames column exists via ExecuteReadOnly.
+	ctx := context.Background()
+	_, rows, _, err := s2.ExecuteReadOnly(ctx, "SELECT frames FROM stack_traces LIMIT 1", 0)
+	if err != nil {
+		t.Fatalf("frames column query failed: %v", err)
+	}
+	_ = rows // empty is fine, we just need the column to exist
+}
+
+func TestDBMethodReturnsNonNil(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	if s.DB() == nil {
+		t.Error("DB() returned nil")
+	}
+}

@@ -29,18 +29,19 @@ import (
 
 // Flag variables for the trace command.
 var (
-	tracePIDs      []int
-	traceUser      string
-	traceDuration  time.Duration
-	traceJSON      bool
-	traceVerbose   bool
-	traceOTLP      string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
-	traceProm      string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
-	traceRecord    bool   // Record events to SQLite (default true).
-	traceRecordAll bool   // Store every event (disable selective storage).
-	traceStack     bool   // Capture userspace stack traces per event.
-	traceDBPath    string // Custom DB path (default: ~/.ingero/ingero.db).
-	traceMaxDB     string // Max DB size (e.g., "10g"). 0 = unlimited.
+	tracePIDs         []int
+	traceUser         string
+	traceDuration     time.Duration
+	traceJSON         bool
+	traceVerbose      bool
+	traceOTLP         string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
+	traceProm         string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
+	traceRecord       bool   // Record events to SQLite (default true).
+	traceRecordAll    bool   // Store every event (disable selective storage).
+	traceStack        bool   // Capture userspace stack traces per event.
+	traceDBPath       string // Custom DB path (default: ~/.ingero/ingero.db).
+	traceMaxDB        string // Max DB size (e.g., "10g"). 0 = unlimited.
+	traceStackSamples int    // Max events stored per unique call stack (0 = unlimited).
 )
 
 var traceCmd = &cobra.Command{
@@ -71,6 +72,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
 	traceCmd.Flags().StringVar(&traceDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	traceCmd.Flags().StringVar(&traceMaxDB, "max-db", "10g", "max database size (e.g., 10g, 500m, 1t). 0 = unlimited")
+	traceCmd.Flags().IntVar(&traceStackSamples, "stack-samples", 100, "max events stored per unique call stack (0 = unlimited)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -444,6 +446,7 @@ type aggValue struct {
 // detection and causal chain analysis.
 //
 // Decision hierarchy (first match wins):
+//  0. Stack sampling limit reached → skip (unless anomaly)
 //  1. --record-all mode → always store
 //  2. Bootstrap (first 10s of session) → store (builds baseline in DB)
 //  3. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
@@ -451,7 +454,22 @@ type aggValue struct {
 //  5. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
 //  6. Anomalous (duration > 3x p50) → store (the interesting stuff)
 //  7. Everything else → aggregate only (cuLaunchKernel, sched_wakeup, etc.)
-func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool, collector *stats.Collector) bool {
+func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
+	collector *stats.Collector, maxStackSamples int, stackSamples map[uint64]int) bool {
+
+	// Stack sampling: limit events per unique call stack.
+	// Even with --record-all, 10K copies of the same stack are redundant.
+	// Anomalies bypass the limit (different timing = real investigation value).
+	// Host events (sched_switch, mm_page_alloc) have no stacks → unaffected.
+	if maxStackSamples > 0 && len(evt.Stack) > 0 {
+		h := events.HashStackIPs(evt.Stack)
+		if stackSamples[h] >= maxStackSamples {
+			if collector == nil || !collector.IsAnomaly(evt) {
+				return false
+			}
+		}
+	}
+
 	if recordAll {
 		return true
 	}
@@ -495,6 +513,18 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool, colle
 	}
 
 	// Everything else: aggregate only.
+	return false
+}
+
+// isStackResolved returns true if at least one frame has resolved symbol info.
+// Stacks where every frame is unresolved (no symbol, no file, no Python info)
+// are garbage from bpf_get_stack() bottom-of-stack artifacts — not worth storing.
+func isStackResolved(stack []events.StackFrame) bool {
+	for _, f := range stack {
+		if f.SymbolName != "" || f.File != "" || f.PyFunc != "" {
+			return true
+		}
+	}
 	return false
 }
 
@@ -762,6 +792,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
 
+	// Stack sampling: per-stack event counter to limit DB redundancy.
+	stackSamples := make(map[uint64]int)
+
 	// System context collector (CPU/mem/load from /proc).
 	sysColl := sysinfo.New()
 	sysColl.Start()
@@ -832,6 +865,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
 				resolver.ResolveStack(&evt)
+				if !isStackResolved(evt.Stack) {
+					evt.Stack = nil // all garbage, don't store
+				}
 				debugLogStack(&evt)
 			}
 
@@ -841,10 +877,15 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
-				stored := shouldStore(evt, sessionStart, traceRecordAll, collector)
+				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
+					traceStackSamples, stackSamples)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
+					// Track stack sample count for dedup limiting.
+					if len(evt.Stack) > 0 {
+						stackSamples[events.HashStackIPs(evt.Stack)]++
+					}
 				}
 				recordAggregate(aggs, evt, stored)
 			}
@@ -1109,7 +1150,7 @@ func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bo
 
 // jsonStackFrame is the JSON-serializable stack frame.
 type jsonStackFrame struct {
-	IP     string `json:"ip"`
+	IP     string `json:"ip,omitempty"`
 	Symbol string `json:"symbol,omitempty"`
 	File   string `json:"file,omitempty"`
 	Line   int    `json:"line,omitempty"`
@@ -1151,6 +1192,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 	// Selective storage: aggregate map for events not individually stored.
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
+
+	// Stack sampling: per-stack event counter (same as table mode).
+	stackSamples := make(map[uint64]int)
 
 	// System context collector — needed for exporter snapshots and for
 	// recording system snapshots to SQLite (post-hoc causal chain replay).
@@ -1222,6 +1266,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
 				resolver.ResolveStack(&evt)
+				if !isStackResolved(evt.Stack) {
+					evt.Stack = nil // all garbage, don't store
+				}
 				debugLogStack(&evt)
 			}
 
@@ -1231,10 +1278,15 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
-				stored := shouldStore(evt, sessionStart, traceRecordAll, collector)
+				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
+					traceStackSamples, stackSamples)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
+					// Track stack sample count for dedup limiting.
+					if len(evt.Stack) > 0 {
+						stackSamples[events.HashStackIPs(evt.Stack)]++
+					}
 				}
 				recordAggregate(aggs, evt, stored)
 			}
@@ -1271,8 +1323,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			if len(evt.Stack) > 0 {
 				je.Stack = make([]jsonStackFrame, len(evt.Stack))
 				for i, f := range evt.Stack {
-					je.Stack[i] = jsonStackFrame{
-						IP:     fmt.Sprintf("0x%x", f.IP),
+					sf := jsonStackFrame{
 						Symbol: f.SymbolName,
 						File:   f.File,
 						Line:   f.Line,
@@ -1280,6 +1331,11 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 						PyFunc: f.PyFunc,
 						PyLine: f.PyLine,
 					}
+					// Only emit IP when we have no symbol (partial resolution).
+					if f.SymbolName == "" && f.IP != 0 {
+						sf.IP = fmt.Sprintf("0x%x", f.IP)
+					}
+					je.Stack[i] = sf
 				}
 			}
 

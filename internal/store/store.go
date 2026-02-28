@@ -8,10 +8,8 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
@@ -69,10 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_events_source_op ON events(source, op);
 // inline storage = ~658MB/4min; with interning = ~13MB/4min (~50x reduction).
 const stackTracesSchema = `
 CREATE TABLE IF NOT EXISTS stack_traces (
-	hash INTEGER PRIMARY KEY,  -- FNV-64 of raw IP bytes (no AUTOINCREMENT needed)
-	ips  TEXT    NOT NULL       -- JSON array of hex IPs: ["0x7f1234","0x7f5678"]
+	hash   INTEGER PRIMARY KEY,  -- FNV-64 of raw IP bytes (no AUTOINCREMENT needed)
+	ips    TEXT    NOT NULL,      -- JSON array of hex IPs: ["0x7f1234","0x7f5678"]
+	frames TEXT    NOT NULL DEFAULT ''  -- resolved symbols JSON (compact): [{"s":"cudaMalloc","f":"libcudart.so"}]
 );
 `
+
+// migrateAddFramesColumn adds the resolved frames column to stack_traces.
+// Idempotent: fails silently if column already exists (new DBs have it from schema).
+const migrateAddFramesColumn = `ALTER TABLE stack_traces ADD COLUMN frames TEXT NOT NULL DEFAULT ''`
 
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
@@ -272,7 +275,7 @@ func populateLookupTables(db *sql.DB) {
 		{"arg0_note", "Operation-specific: byte size for alloc/memcpy, kernel function pointer for launch"},
 		{"arg1_note", "Operation-specific: memcpy direction for cudaMemcpy/cudaMemcpyAsync, unused for most ops"},
 		{"ret_code_note", "CUDA return code (0 = cudaSuccess). Host events always 0."},
-		{"stack_traces_note", "Deduplicated stacks: events.stack_hash → stack_traces.hash. Query: SELECT e.*, st.ips FROM events e LEFT JOIN stack_traces st ON e.stack_hash = st.hash"},
+		{"stack_traces_note", "Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols. Use get_stacks MCP tool for call stack analysis."},
 		{"example_query", "SELECT e.id, s.name AS source, o.name AS op, e.duration/1000 AS dur_us, e.pid FROM events e JOIN sources s ON e.source = s.id JOIN ops o ON e.source = o.source_id AND e.op = o.op_id ORDER BY e.timestamp DESC LIMIT 20"},
 		{"system_snapshots_note", "System metrics sampled every 1s during recording. Replay with correlator for post-hoc causal chain analysis."},
 		{"sessions_note", "One row per 'ingero trace' invocation. Correlate with events via time range."},
@@ -523,6 +526,9 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("creating stack_traces table: %w", err)
 	}
 
+	// Add resolved frames column (v0.7). Idempotent — no-op if column exists.
+	db.Exec(migrateAddFramesColumn)
+
 	// Migrate: if there are events with inline stack_ips, intern them into
 	// the stack_traces table. No-op for new databases.
 	migrateInlineStacks(db)
@@ -549,7 +555,10 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates for events not individually stored (selective storage). Use count-stored to get discarded count.')")
 	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
 	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. Query: SELECT e.*, st.ips FROM events e LEFT JOIN stack_traces st ON e.stack_hash = st.hash')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols (v0.7+). Use get_stacks MCP tool for call stack analysis.')")
+
+	// Composite index for get_stacks MCP tool (GROUP BY source,op,stack_hash).
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_source_op_stack ON events(source, op, stack_hash)")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {
@@ -705,9 +714,11 @@ func (s *Store) flushBatch(batch []events.Event) {
 	}
 	defer evtStmt.Close()
 
-	// Prepare: stack insert uses INSERT OR IGNORE — safe for hash collisions
-	// with existing rows (astronomically unlikely with FNV-64, but correct).
-	stackStmt, err := tx.Prepare(`INSERT OR IGNORE INTO stack_traces (hash, ips) VALUES (?, ?)`)
+	// Prepare: stack insert uses INSERT OR REPLACE so that stacks from older
+	// sessions (which had empty frames) get upgraded with resolved symbols.
+	// REPLACE is a DELETE+INSERT in SQLite — safe because stack_traces has no
+	// foreign key constraints (events reference stack_hash by value, not FK).
+	stackStmt, err := tx.Prepare(`INSERT OR REPLACE INTO stack_traces (hash, ips, frames) VALUES (?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -717,13 +728,14 @@ func (s *Store) flushBatch(batch []events.Event) {
 	for _, evt := range batch {
 		var stackHash int64
 		if len(evt.Stack) > 0 {
-			h := hashStackIPs(evt.Stack)
+			h := events.HashStackIPs(evt.Stack)
 			stackHash = int64(h)
 			if !s.stackCache[h] {
 				// New stack — serialize and insert. Only pay the JSON
 				// serialization cost once per unique stack.
 				ipsJSON := serializeStackIPs(evt.Stack)
-				stackStmt.Exec(stackHash, ipsJSON)
+				framesJSON := serializeStackFrames(evt.Stack)
+				stackStmt.Exec(stackHash, ipsJSON, framesJSON)
 				s.stackCache[h] = true
 			}
 		}
@@ -753,15 +765,20 @@ func (s *Store) flushBatch(batch []events.Event) {
 // loadStackCache pre-populates the in-memory stack cache from the stack_traces
 // table. Called once at Run() startup so that a restarted trace session against
 // the same DB doesn't re-insert stacks that already exist.
+//
+// Only caches stacks that already have resolved frames. Stacks with empty
+// frames (from older sessions before v0.7) are left uncached so they get
+// upgraded via INSERT OR REPLACE when seen again with resolved symbols.
 func (s *Store) loadStackCache() {
-	rows, err := s.db.Query("SELECT hash FROM stack_traces")
+	rows, err := s.db.Query("SELECT hash, frames FROM stack_traces")
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var h int64
-		if err := rows.Scan(&h); err == nil {
+		var frames string
+		if err := rows.Scan(&h, &frames); err == nil && frames != "" {
 			s.stackCache[uint64(h)] = true
 		}
 	}
@@ -975,9 +992,11 @@ func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix 
 
 // Query retrieves events matching the given parameters.
 // Stack traces are resolved via LEFT JOIN against the stack_traces interning table.
+// Prefers resolved frames (v0.7+) over raw IPs for historical investigation.
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
-		e.gpu_id, e.arg0, e.arg1, e.ret_code, COALESCE(st.ips, '')
+		e.gpu_id, e.arg0, e.arg1, e.ret_code,
+		COALESCE(st.frames, ''), COALESCE(st.ips, '')
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	WHERE 1=1`
@@ -1043,9 +1062,10 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			gpuID      uint32
 			arg0, arg1 uint64
 			retCode    int32
-			stackJSON  string
+			framesJSON string
+			ipsJSON    string
 		)
-		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &stackJSON); err != nil {
+		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON); err != nil {
 			return nil, fmt.Errorf("scanning event row: %w", err)
 		}
 		evt := events.Event{
@@ -1059,7 +1079,11 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			Args:      [2]uint64{arg0, arg1},
 			RetCode:   retCode,
 		}
-		evt.Stack = deserializeStackIPs(stackJSON)
+		// Prefer resolved frames (v0.7+); fall back to raw IPs for old DBs.
+		evt.Stack = deserializeStackFrames(framesJSON)
+		if evt.Stack == nil {
+			evt.Stack = deserializeStackIPs(ipsJSON)
+		}
 		result = append(result, evt)
 	}
 	if err := rows.Err(); err != nil {
@@ -1089,7 +1113,8 @@ type RichEvent struct {
 // Use this for AI/MCP output where self-describing data matters.
 func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
-		e.gpu_id, e.arg0, e.arg1, e.ret_code, COALESCE(st.ips, ''),
+		e.gpu_id, e.arg0, e.arg1, e.ret_code,
+		COALESCE(st.frames, ''), COALESCE(st.ips, ''),
 		COALESCE(s.name, 'SRC_' || e.source),
 		COALESCE(s.description, ''),
 		COALESCE(o.name, 'OP_' || e.op),
@@ -1152,12 +1177,13 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			gpuID      uint32
 			arg0, arg1 uint64
 			retCode    int32
-			stackJSON  string
+			framesJSON string
+			ipsJSON    string
 			srcName, srcDesc, opName, opDesc string
 			procName   string
 		)
 		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos,
-			&gpuID, &arg0, &arg1, &retCode, &stackJSON,
+			&gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON,
 			&srcName, &srcDesc, &opName, &opDesc, &procName); err != nil {
 			return nil, fmt.Errorf("scanning rich event: %w", err)
 		}
@@ -1179,7 +1205,11 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			OpDesc:      opDesc,
 			ProcessName: procName,
 		}
-		re.Event.Stack = deserializeStackIPs(stackJSON)
+		// Prefer resolved frames; fall back to raw IPs for old DBs.
+		re.Event.Stack = deserializeStackFrames(framesJSON)
+		if re.Event.Stack == nil {
+			re.Event.Stack = deserializeStackIPs(ipsJSON)
+		}
 		result = append(result, re)
 	}
 	if err := rows.Err(); err != nil {
@@ -1233,6 +1263,12 @@ func (s *Store) Count() (int64, error) {
 	var count int64
 	err := s.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&count)
 	return count, err
+}
+
+// DB returns the underlying *sql.DB for direct queries (e.g., MCP get_stacks).
+// Callers must not Close() the returned DB — the Store owns the lifecycle.
+func (s *Store) DB() *sql.DB {
+	return s.db
 }
 
 // Close closes the database connection.
@@ -1801,21 +1837,90 @@ func deserializeStackIPs(s string) []events.StackFrame {
 	return frames
 }
 
-// hashStackIPs computes an FNV-64a hash of a stack trace's raw instruction
-// pointers. Two stacks with the same IPs in the same order produce the same
-// hash. Used as the primary key in the stack_traces interning table.
-//
-// We hash raw uint64 bytes directly instead of serializing to JSON first —
-// this avoids allocations and hex formatting for the common case where the
-// stack is already in the cache.
+// hashStackIPs delegates to the exported events.HashStackIPs. Kept as a
+// package-local alias for backward compat with callers inside store.
 func hashStackIPs(stack []events.StackFrame) uint64 {
-	h := fnv.New64a()
-	var buf [8]byte
-	for _, f := range stack {
-		binary.LittleEndian.PutUint64(buf[:], f.IP)
-		h.Write(buf[:])
+	return events.HashStackIPs(stack)
+}
+
+// compactFrame is a space-efficient JSON representation of a resolved stack frame.
+// Short keys save ~60% compared to full field names when stored in SQLite.
+type compactFrame struct {
+	IP     string `json:"i,omitempty"`   // hex IP
+	Symbol string `json:"s,omitempty"`   // resolved native symbol
+	File   string `json:"f,omitempty"`   // .so basename (not full path)
+	Line   int    `json:"l,omitempty"`   // source line (if DWARF)
+	PyFile string `json:"pf,omitempty"`  // Python source file
+	PyFunc string `json:"pfn,omitempty"` // Python function name
+	PyLine int    `json:"pl,omitempty"`  // Python source line
+}
+
+// serializeStackFrames converts resolved stack frames to compact JSON for storage.
+// Skips garbage frames (no symbol, no file, no Python info). Returns "" if all
+// frames are garbage or the stack is empty.
+func serializeStackFrames(stack []events.StackFrame) string {
+	if len(stack) == 0 {
+		return ""
 	}
-	return h.Sum64()
+	var frames []compactFrame
+	for _, f := range stack {
+		// Skip garbage frames: no resolved info at all.
+		if f.SymbolName == "" && f.File == "" && f.PyFile == "" {
+			continue
+		}
+		base := ""
+		if f.File != "" {
+			base = filepath.Base(f.File)
+		}
+		cf := compactFrame{
+			Symbol: f.SymbolName,
+			File:   base,
+			Line:   f.Line,
+			PyFile: f.PyFile,
+			PyFunc: f.PyFunc,
+			PyLine: f.PyLine,
+		}
+		// Only store IP if we have no symbol (partial resolution).
+		if f.SymbolName == "" && f.IP != 0 {
+			cf.IP = fmt.Sprintf("0x%x", f.IP)
+		}
+		frames = append(frames, cf)
+	}
+	if len(frames) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(frames)
+	return string(b)
+}
+
+// deserializeStackFrames parses compact JSON back to StackFrame slice.
+// Returns nil for empty strings or parse errors (backward compat with old DBs).
+func deserializeStackFrames(s string) []events.StackFrame {
+	if s == "" {
+		return nil
+	}
+	var frames []compactFrame
+	if err := json.Unmarshal([]byte(s), &frames); err != nil {
+		return nil
+	}
+	if len(frames) == 0 {
+		return nil
+	}
+	result := make([]events.StackFrame, len(frames))
+	for i, cf := range frames {
+		result[i] = events.StackFrame{
+			SymbolName: cf.Symbol,
+			File:       cf.File,
+			Line:       cf.Line,
+			PyFile:     cf.PyFile,
+			PyFunc:     cf.PyFunc,
+			PyLine:     cf.PyLine,
+		}
+		if cf.IP != "" {
+			fmt.Sscanf(cf.IP, "0x%x", &result[i].IP)
+		}
+	}
+	return result
 }
 
 // migrateInlineStacks migrates events that have inline stack_ips (TEXT) but no
