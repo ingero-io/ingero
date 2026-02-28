@@ -567,7 +567,7 @@ func (s *Server) registerTools() {
 Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash), system_snapshots(id, timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur, sum_arg0), stack_traces(hash, ips TEXT JSON, frames TEXT JSON resolved symbols), schema_info(key, value).
 
 JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), events.stack_hash=stack_traces.hash.
-Sources: 1=CUDA, 3=HOST, 4=DRIVER. Ops: CUDA(cudaMalloc,cudaFree,cudaLaunchKernel,cudaMemcpy,cudaStreamSync,cudaDeviceSync,cudaMemcpyAsync), HOST(sched_switch,sched_wakeup,mm_page_alloc,oom_kill,process_exec,process_exit,process_fork), DRIVER(cuLaunchKernel,cuMemcpy,cuMemcpyAsync,cuCtxSynchronize,cuMemAlloc). cudaMemcpy/cudaMemcpyAsync arg0=bytes,arg1=direction(1=H2D,2=D2H,3=D2D). Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).
+Sources: 1=CUDA, 3=HOST, 4=DRIVER. CUDA ops: 1=cudaMalloc, 2=cudaFree, 3=cudaLaunchKernel, 4=cudaMemcpy, 5=cudaStreamSync, 6=cudaDeviceSync, 7=cudaMemcpyAsync. HOST ops: 1=sched_switch, 2=sched_wakeup, 3=mm_page_alloc, 4=oom_kill, 5=process_exec, 6=process_exit, 7=process_fork. DRIVER ops: 1=cuLaunchKernel, 2=cuMemcpy, 3=cuMemcpyAsync, 4=cuCtxSynchronize, 5=cuMemAlloc. arg0/arg1 per op: cudaMalloc arg0=size_bytes, cudaFree arg0=devPtr, cudaLaunchKernel arg0=kernel_func_ptr, cudaMemcpy/cudaMemcpyAsync arg0=bytes arg1=direction(1=H2D,2=D2H,3=D2D), cudaStreamSync arg0=stream_handle, mm_page_alloc arg0=page_order(size=4KB<<order), cuMemAlloc arg0=size_bytes. sum_arg0 in event_aggregates = sum of arg0 across bucket. Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).
 
 Performance: events can have millions of rows. For large DBs, query event_aggregates (per-minute stats, always small) or stack_traces (deduplicated, always small) instead of scanning events. Use get_stacks tool for call stack analysis instead of manual SQL JOINs.`,
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sqlInput) (*gomcp.CallToolResult, struct{}, error) {
@@ -681,9 +681,12 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		query := `SELECT e.stack_hash, COALESCE(st.frames, ''), COALESCE(st.ips, ''),
 			COUNT(*) as n,
 			MIN(e.duration) as min_dur, MAX(e.duration) as max_dur,
-			SUM(e.duration)/COUNT(*) as avg_dur
+			SUM(e.duration)/COUNT(*) as avg_dur,
+			SUM(e.arg0) as sum_arg0,
+			GROUP_CONCAT(DISTINCT pn.name) as proc_names
 		FROM events e
 		JOIN stack_traces st ON e.stack_hash = st.hash
+		LEFT JOIN process_names pn ON e.pid = pn.pid
 		WHERE e.stack_hash != 0`
 		var args []interface{}
 
@@ -750,12 +753,14 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 
 		tsc := input.TSC == nil || *input.TSC
 		type stackResult struct {
-			Hash     int64       `json:"hash"`
-			Count    int64       `json:"n"`
-			AvgUS    int64       `json:"avg_us"`
-			MinUS    int64       `json:"min_us"`
-			MaxUS    int64       `json:"max_us"`
-			Frames   interface{} `json:"frames"` // compact frames or raw IPs
+			Hash      int64       `json:"hash"`
+			Count     int64       `json:"n"`
+			AvgUS     int64       `json:"avg_us"`
+			MinUS     int64       `json:"min_us"`
+			MaxUS     int64       `json:"max_us"`
+			SumArg0   int64       `json:"sum_arg0,omitempty"`
+			Processes string      `json:"processes,omitempty"`
+			Frames    interface{} `json:"frames"` // compact frames or raw IPs
 		}
 
 		stacks := make([]stackResult, 0)
@@ -766,17 +771,23 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 				framesJSON, ipsJSON     string
 				count, minDur, maxDur   int64
 				avgDur                  int64
+				sumArg0                 int64
+				procNames               *string
 			)
-			if err := rows.Scan(&hash, &framesJSON, &ipsJSON, &count, &minDur, &maxDur, &avgDur); err != nil {
+			if err := rows.Scan(&hash, &framesJSON, &ipsJSON, &count, &minDur, &maxDur, &avgDur, &sumArg0, &procNames); err != nil {
 				scanErrs++
 				continue
 			}
 			sr := stackResult{
-				Hash:  hash,
-				Count: count,
-				AvgUS: avgDur / 1000,
-				MinUS: minDur / 1000,
-				MaxUS: maxDur / 1000,
+				Hash:    hash,
+				Count:   count,
+				AvgUS:   avgDur / 1000,
+				MinUS:   minDur / 1000,
+				MaxUS:   maxDur / 1000,
+				SumArg0: sumArg0,
+			}
+			if procNames != nil {
+				sr.Processes = *procNames
 			}
 			// Prefer resolved frames; fall back to raw IPs for old DBs.
 			if framesJSON != "" {
