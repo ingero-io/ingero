@@ -77,8 +77,8 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open database if it exists. Tools that don't need the store (get_check,
-	// run_demo) work without it; tools that do (get_trace_stats,
-	// get_causal_chains, run_sql) return a helpful error.
+	// run_demo, get_test_report) work without it; tools that do (get_trace_stats,
+	// get_causal_chains, get_stacks, run_sql) return a helpful error.
 	var s *store.Store
 	if _, err := os.Stat(dbPath); err == nil {
 		s, err = store.New(dbPath)

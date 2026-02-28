@@ -700,7 +700,15 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
-			if err == nil && d > 0 {
+			if err != nil {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
+					},
+					IsError: true,
+				}, struct{}{}, nil
+			}
+			if d > 0 {
 				query += " AND e.timestamp >= ?"
 				args = append(args, time.Now().Add(-d).UnixNano())
 			}
@@ -738,7 +746,8 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			Frames   interface{} `json:"frames"` // compact frames or raw IPs
 		}
 
-		var stacks []stackResult
+		stacks := make([]stackResult, 0)
+		var scanErrs int
 		for rows.Next() {
 			var (
 				hash                    int64
@@ -747,6 +756,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 				avgDur                  int64
 			)
 			if err := rows.Scan(&hash, &framesJSON, &ipsJSON, &count, &minDur, &maxDur, &avgDur); err != nil {
+				scanErrs++
 				continue
 			}
 			sr := stackResult{
@@ -769,6 +779,9 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					sr.Frames = ips
 				}
 			}
+			if sr.Frames == nil {
+				sr.Frames = json.RawMessage("[]")
+			}
 			stacks = append(stacks, sr)
 		}
 		if err := rows.Err(); err != nil {
@@ -781,10 +794,15 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		}
 
 		if len(stacks) == 0 {
+			msg := "No stacks found. Ensure trace was run with --stack (default: on)."
+			if scanErrs > 0 {
+				msg = fmt.Sprintf("Failed to parse %d stack rows. The database may have an incompatible schema.", scanErrs)
+			}
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: "No stacks found. Ensure trace was run with --stack (default: on)."},
+					&gomcp.TextContent{Text: msg},
 				},
+				IsError: scanErrs > 0,
 			}, struct{}{}, nil
 		}
 
