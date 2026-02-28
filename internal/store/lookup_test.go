@@ -294,3 +294,120 @@ func TestChainsNilSliceJSON(t *testing.T) {
 		t.Error("Timeline should be [] not nil after round-trip")
 	}
 }
+
+func TestCGroupIDRoundTrip(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Record events with non-zero CGroupID.
+	evts := []events.Event{
+		{Timestamp: time.Now(), PID: 100, TID: 100, Source: events.SourceCUDA, Op: uint8(events.CUDAMalloc), Duration: 5 * time.Microsecond, CGroupID: 42},
+		{Timestamp: time.Now(), PID: 200, TID: 200, Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 1 * time.Millisecond, CGroupID: 99},
+		{Timestamp: time.Now(), PID: 300, TID: 300, Source: events.SourceCUDA, Op: uint8(events.CUDALaunchKernel), Duration: 10 * time.Microsecond}, // CGroupID = 0 (bare-metal)
+	}
+	for _, e := range evts {
+		s.Record(e)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Query back and verify CGroupID is preserved.
+	got, err := s.Query(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d events, want 3", len(got))
+	}
+
+	// Events are returned in chronological order.
+	cgroupIDs := map[uint64]bool{}
+	for _, e := range got {
+		cgroupIDs[e.CGroupID] = true
+	}
+	if !cgroupIDs[42] {
+		t.Error("missing CGroupID=42 in Query results")
+	}
+	if !cgroupIDs[99] {
+		t.Error("missing CGroupID=99 in Query results")
+	}
+	if !cgroupIDs[0] {
+		t.Error("missing CGroupID=0 in Query results")
+	}
+
+	// Verify QueryRich also returns CGroupID.
+	rich, err := s.QueryRich(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryRich: %v", err)
+	}
+	richCGroups := map[uint64]bool{}
+	for _, r := range rich {
+		richCGroups[r.CGroupID] = true
+	}
+	if !richCGroups[42] {
+		t.Error("missing CGroupID=42 in QueryRich results")
+	}
+
+	// Verify raw SQL confirms the column.
+	db, _ := sql.Open("sqlite", ":memory:")
+	defer db.Close()
+	var count int
+	s.DB().QueryRow("SELECT COUNT(*) FROM events WHERE cgroup_id = 42").Scan(&count)
+	if count != 1 {
+		t.Errorf("SQL count for cgroup_id=42: got %d, want 1", count)
+	}
+
+	cancel()
+	<-done
+}
+
+func TestStoreCGroupMetadata(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	// Store metadata.
+	s.StoreCGroupMetadata(42, "abc123def456abc123def456abc123def456abc123def456abc123def456abc123de", "/kubepods.slice/cri-containerd-abc123.scope")
+	s.StoreCGroupMetadata(99, "", "/sys/fs/cgroup/system.slice")
+
+	// Verify via raw SQL.
+	var containerID, cgroupPath string
+	err = s.DB().QueryRow("SELECT container_id, cgroup_path FROM cgroup_metadata WHERE cgroup_id = 42").Scan(&containerID, &cgroupPath)
+	if err != nil {
+		t.Fatalf("query cgroup_metadata: %v", err)
+	}
+	if containerID != "abc123def456abc123def456abc123def456abc123def456abc123def456abc123de" {
+		t.Errorf("container_id = %q, want abc123...", containerID)
+	}
+	if cgroupPath != "/kubepods.slice/cri-containerd-abc123.scope" {
+		t.Errorf("cgroup_path = %q", cgroupPath)
+	}
+
+	// Verify idempotent update.
+	s.StoreCGroupMetadata(42, "updated_container_id", "/updated/path")
+	err = s.DB().QueryRow("SELECT container_id FROM cgroup_metadata WHERE cgroup_id = 42").Scan(&containerID)
+	if err != nil {
+		t.Fatalf("query after update: %v", err)
+	}
+	if containerID != "updated_container_id" {
+		t.Errorf("container_id after update = %q, want updated_container_id", containerID)
+	}
+
+	// Count total rows.
+	var total int
+	s.DB().QueryRow("SELECT COUNT(*) FROM cgroup_metadata").Scan(&total)
+	if total != 2 {
+		t.Errorf("total cgroup_metadata rows = %d, want 2", total)
+	}
+}

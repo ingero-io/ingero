@@ -109,6 +109,7 @@ func queryOutputJSON(evts []events.Event) error {
 		GPUID      uint32           `json:"gpu_id,omitempty"`
 		Args       [2]uint64        `json:"args"`
 		RetCode    int32            `json:"return_code,omitempty"`
+		CGroupID   uint64           `json:"cgroup_id,omitempty"`
 		Stack      []jsonStackFrame `json:"stack,omitempty"`
 	}
 
@@ -125,6 +126,7 @@ func queryOutputJSON(evts []events.Event) error {
 			GPUID:      evt.GPUID,
 			Args:       evt.Args,
 			RetCode:    evt.RetCode,
+			CGroupID:   evt.CGroupID,
 		}
 		if len(evt.Stack) > 0 {
 			je.Stack = make([]jsonStackFrame, len(evt.Stack))
