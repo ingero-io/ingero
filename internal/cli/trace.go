@@ -431,11 +431,12 @@ type aggKey struct {
 
 // aggValue accumulates stats for one aggKey.
 type aggValue struct {
-	Count  int64
-	Stored int64
-	SumDur int64
-	MinDur int64
-	MaxDur int64
+	Count   int64
+	Stored  int64
+	SumDur  int64
+	MinDur  int64
+	MaxDur  int64
+	SumArg0 int64 // sum of arg0 values (e.g., mm_page_alloc bytes)
 }
 
 // shouldStore decides whether an individual event should be persisted to SQLite.
@@ -446,23 +447,39 @@ type aggValue struct {
 // detection and causal chain analysis.
 //
 // Decision hierarchy (first match wins):
-//  0. Stack sampling limit reached → skip (unless anomaly)
-//  1. --record-all mode → always store
-//  2. Bootstrap (first 10s of session) → store (builds baseline in DB)
-//  3. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
-//  4. sched_switch + mm_page_alloc → store (causal chain critical)
-//  5. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
-//  6. Anomalous (duration > 3x p50) → store (the interesting stuff)
-//  7. Everything else → aggregate only (cuLaunchKernel, sched_wakeup, etc.)
+//  0. mm_page_alloc → aggregate only (always, even during bootstrap/record-all)
+//  1. Stack sampling limit reached → skip (unless anomaly)
+//  2. --record-all mode → always store
+//  3. Bootstrap (first 10s of session) → store (builds baseline in DB)
+//  4. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
+//  5. sched_switch → store (causal chain critical)
+//  6. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
+//  7. Anomalous (duration > 3x p50) → store (the interesting stuff)
+//  8. Everything else → aggregate only (cuLaunchKernel, sched_wakeup, etc.)
 func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 	collector *stats.Collector, maxStackSamples int, stackSamples map[uint64]int) bool {
+
+	// mm_page_alloc: always aggregate, never store individually.
+	// Must be checked BEFORE bootstrap and --record-all gates.
+	// Each event has duration=0 and no stack — zero per-event investigation
+	// value. The causal chain engine needs COUNT + SUM(arg0) > 1GB, which it
+	// gets from the live event stream (correlator sees ALL events). Stored
+	// chains capture the result. The aggregate table's sum_arg0 preserves
+	// total bytes for historical queries via run_sql.
+	if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostPageAlloc {
+		return false
+	}
 
 	// Stack sampling: limit events per unique call stack.
 	// Even with --record-all, 10K copies of the same stack are redundant.
 	// Anomalies bypass the limit (different timing = real investigation value).
-	// Host events (sched_switch, mm_page_alloc) have no stacks → unaffected.
+	// Host events (sched_switch) have no stacks → unaffected.
+	//
+	// Uses HashStackSymbols (not HashStackIPs) so that ASLR doesn't defeat
+	// dedup: each process maps libraries at different addresses, but the
+	// resolved symbol names are identical across PIDs.
 	if maxStackSamples > 0 && len(evt.Stack) > 0 {
-		h := events.HashStackIPs(evt.Stack)
+		h := events.HashStackSymbols(evt.Stack)
 		if stackSamples[h] >= maxStackSamples {
 			if collector == nil || !collector.IsAnomaly(evt) {
 				return false
@@ -486,12 +503,6 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 			return true
 		case events.HostSchedSwitch:
 			// sched_switch is causal chain critical — always store.
-			return true
-		case events.HostPageAlloc:
-			// mm_page_alloc is causal chain critical — the chain engine sums
-			// Args[0] (allocation bytes) across individual events to detect
-			// memory pressure (>1GB threshold). Aggregates don't preserve Args,
-			// so individual events must be stored for replay (explain/MCP).
 			return true
 		}
 	}
@@ -550,15 +561,16 @@ func flushAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store, now tim
 			continue
 		}
 		batch = append(batch, store.Aggregate{
-			Bucket: k.Bucket,
-			Source: k.Source,
-			Op:     k.Op,
-			PID:    k.PID,
-			Count:  v.Count,
-			Stored: v.Stored,
-			SumDur: v.SumDur,
-			MinDur: v.MinDur,
-			MaxDur: v.MaxDur,
+			Bucket:  k.Bucket,
+			Source:  k.Source,
+			Op:      k.Op,
+			PID:     k.PID,
+			Count:   v.Count,
+			Stored:  v.Stored,
+			SumDur:  v.SumDur,
+			MinDur:  v.MinDur,
+			MaxDur:  v.MaxDur,
+			SumArg0: v.SumArg0,
 		})
 		delete(aggs, k)
 	}
@@ -578,15 +590,16 @@ func flushAllAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store) {
 	batch := make([]store.Aggregate, 0, len(aggs))
 	for k, v := range aggs {
 		batch = append(batch, store.Aggregate{
-			Bucket: k.Bucket,
-			Source: k.Source,
-			Op:     k.Op,
-			PID:    k.PID,
-			Count:  v.Count,
-			Stored: v.Stored,
-			SumDur: v.SumDur,
-			MinDur: v.MinDur,
-			MaxDur: v.MaxDur,
+			Bucket:  k.Bucket,
+			Source:  k.Source,
+			Op:      k.Op,
+			PID:     k.PID,
+			Count:   v.Count,
+			Stored:  v.Stored,
+			SumDur:  v.SumDur,
+			MinDur:  v.MinDur,
+			MaxDur:  v.MaxDur,
+			SumArg0: v.SumArg0,
 		})
 	}
 
@@ -623,6 +636,7 @@ func recordAggregate(aggs map[aggKey]*aggValue, evt events.Event, stored bool) {
 	if durNanos > v.MaxDur {
 		v.MaxDur = durNanos
 	}
+	v.SumArg0 += int64(evt.Args[0])
 	if stored {
 		v.Stored++
 	}
@@ -883,8 +897,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					eventStore.Record(evt)
 					storedEventCount++
 					// Track stack sample count for dedup limiting.
+					// Uses HashStackSymbols (ASLR-independent) to match shouldStore().
 					if len(evt.Stack) > 0 {
-						stackSamples[events.HashStackIPs(evt.Stack)]++
+						stackSamples[events.HashStackSymbols(evt.Stack)]++
 					}
 				}
 				recordAggregate(aggs, evt, stored)
@@ -1284,8 +1299,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 					eventStore.Record(evt)
 					storedEventCount++
 					// Track stack sample count for dedup limiting.
+					// Uses HashStackSymbols (ASLR-independent) to match shouldStore().
 					if len(evt.Stack) > 0 {
-						stackSamples[events.HashStackIPs(evt.Stack)]++
+						stackSamples[events.HashStackSymbols(evt.Stack)]++
 					}
 				}
 				recordAggregate(aggs, evt, stored)

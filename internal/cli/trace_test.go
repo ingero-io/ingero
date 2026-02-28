@@ -198,15 +198,30 @@ func TestShouldStoreHierarchy(t *testing.T) {
 			wantStore: true,
 		},
 
-		// Tier 4b: mm_page_alloc always stored (causal chain critical for
-		// memory pressure detection — chain engine needs Args[0] bytes).
-		// Real mm_page_alloc events have Duration=0; alloc bytes in Args[0].
+		// mm_page_alloc → always aggregate, never store individually.
+		// Checked BEFORE bootstrap and --record-all gates.
+		// Chain engine gets COUNT + SUM(arg0) from the live event stream.
+		// Aggregate table preserves sum_arg0 for historical queries.
 		{
 			name:      "mm_page_alloc",
 			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 0, PID: 1000, Args: [2]uint64{16 * 1024 * 1024, 0}},
 			start:     pastBootstrap,
 			recAll:    false,
-			wantStore: true,
+			wantStore: false,
+		},
+		{
+			name:      "mm_page_alloc_during_bootstrap",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 0, PID: 1000, Args: [2]uint64{4096, 0}},
+			start:     time.Now(), // during bootstrap (< 10s)
+			recAll:    false,
+			wantStore: false, // aggregate even during bootstrap
+		},
+		{
+			name:      "mm_page_alloc_record_all",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostPageAlloc), Duration: 0, PID: 1000, Args: [2]uint64{4096, 0}},
+			start:     pastBootstrap,
+			recAll:    true,
+			wantStore: false, // aggregate even with --record-all
 		},
 
 		// Tier 5: Sync ops always stored (latency symptoms).
@@ -440,29 +455,33 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 	}
 }
 
-// TestSelectiveStoragePreservesPageAllocChain verifies that mm_page_alloc
-// events are preserved for memory pressure causal chain detection during replay.
+// TestPageAllocAggregateOnly verifies that mm_page_alloc events are aggregated,
+// not individually stored. The live correlator detects memory pressure chains
+// from the event stream (sees ALL events); stored chains preserve the results.
 //
-// Teaching note: The causal chain engine counts mm_page_alloc events and sums
-// their Args[0] (bytes). If totalAllocBytes > 1GB, it triggers a memory
-// pressure chain. The aggregate table does NOT preserve Args, so individual
-// events must be stored. Without the shouldStore fix for mm_page_alloc,
-// replay would miss memory pressure chains entirely — a silent correctness gap.
-//
-// The symptom op is cudaStreamSync (always-stored as a sync op), not cudaMalloc,
-// because both baseline AND anomalous events must survive selective storage for
-// the chain engine to see a meaningful p99/p50 ratio. Sync ops are always
-// stored, so they naturally preserve the full latency distribution.
-func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
+// Teaching note: mm_page_alloc events have duration=0 and no stacks. The chain
+// engine only needs COUNT + SUM(arg0) > 1GB, which it gets from the live event
+// stream. Storing 240K zero-duration events wastes ~29% of DB with zero
+// investigation value. The aggregate table now has sum_arg0 for historical queries.
+func TestPageAllocAggregateOnly(t *testing.T) {
 	pid := uint32(1000)
 	now := time.Now()
 
 	liveCollector := stats.New()
+	liveCorr := correlate.New(correlate.WithMaxAge(0))
+
+	// Set system context with memory pressure (mem >95%, swap >0 → HIGH severity).
+	liveCorr.SetSystemSnapshot(&correlate.SystemContext{
+		CPUPercent: 40.0,
+		MemUsedPct: 96.0,
+		MemAvailMB: 200,
+		SwapUsedMB: 500,
+		LoadAvg1:   4.0,
+	})
 
 	var allEvents []events.Event
 
 	// 100 mm_page_alloc events, 16MB each (total = 1.6GB > 1GB threshold).
-	// Real mm_page_alloc events have Duration=0; alloc bytes in Args[0].
 	for i := 0; i < 100; i++ {
 		allEvents = append(allEvents, events.Event{
 			Timestamp: now.Add(time.Duration(i) * 10 * time.Millisecond),
@@ -475,20 +494,7 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		})
 	}
 
-	// 100 normal cuLaunchKernel (bulk, should be aggregated — verifies that
-	// selective storage actually filters something in this test).
-	for i := 0; i < 100; i++ {
-		allEvents = append(allEvents, events.Event{
-			Timestamp: now.Add(time.Duration(1000+i) * time.Millisecond),
-			PID:       pid,
-			TID:       pid,
-			Source:    events.SourceCUDA,
-			Op:        uint8(events.CUDALaunchKernel),
-			Duration:  10 * time.Microsecond,
-		})
-	}
-
-	// 50 normal cudaStreamSync (baseline at 1ms — always stored as sync op).
+	// 50 normal cudaStreamSync (baseline at 1ms).
 	for i := 0; i < 50; i++ {
 		allEvents = append(allEvents, events.Event{
 			Timestamp: now.Add(time.Duration(1100+i*10) * time.Millisecond),
@@ -512,12 +518,15 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		})
 	}
 
-	// Filter through shouldStore.
+	// Simulate live trace: correlator sees ALL events, shouldStore filters.
 	sessionStart := now.Add(-1 * time.Minute) // past bootstrap
 	var storedEvents []events.Event
 
 	for i, evt := range allEvents {
 		liveCollector.Record(evt)
+		if evt.Source == events.SourceHost {
+			liveCorr.RecordHost(evt) // correlator sees ALL events
+		}
 		if i%30 == 29 {
 			liveCollector.Snapshot()
 		}
@@ -526,56 +535,31 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		}
 	}
 
-	// Verify mm_page_alloc events are preserved and filtering happened.
+	// Verify mm_page_alloc events are NOT individually stored.
 	counts := countEventsByType(storedEvents)
-	t.Logf("stored: %d/%d total, mm_page_alloc=%d, cudaStreamSync=%d, cudaLaunchKernel=%d",
-		len(storedEvents), len(allEvents),
-		counts["mm_page_alloc"], counts["cudaStreamSync"], counts["cudaLaunchKernel"])
+	t.Logf("stored: %d/%d total, mm_page_alloc=%d, cudaStreamSync=%d",
+		len(storedEvents), len(allEvents), counts["mm_page_alloc"], counts["cudaStreamSync"])
 
-	if counts["mm_page_alloc"] == 0 {
-		t.Fatal("mm_page_alloc events must be stored for memory pressure chain detection; " +
-			"shouldStore() must always-store mm_page_alloc (chain-critical)")
+	if counts["mm_page_alloc"] != 0 {
+		t.Errorf("mm_page_alloc should NOT be individually stored (aggregate only), got %d", counts["mm_page_alloc"])
 	}
-	if counts["mm_page_alloc"] != 100 {
-		t.Errorf("mm_page_alloc: stored=%d, want 100 (always-store rule)", counts["mm_page_alloc"])
-	}
-	// All cudaStreamSync stored (sync op always-store rule).
 	if counts["cudaStreamSync"] != 70 {
-		t.Errorf("cudaStreamSync: stored=%d, want 70", counts["cudaStreamSync"])
-	}
-	// Verify filtering actually happened (cuLaunchKernel should be aggregated).
-	if len(storedEvents) >= len(allEvents) {
-		t.Errorf("selective storage should filter events: stored=%d total=%d",
-			len(storedEvents), len(allEvents))
+		t.Errorf("cudaStreamSync: stored=%d, want 70 (always-store sync ops)", counts["cudaStreamSync"])
 	}
 
-	// Replay stored events through chain engine.
-	// Use default stats.New() (window=1000) to match real callers.
-	replayCollector := stats.New()
-	replayCorr := correlate.New(correlate.WithMaxAge(0))
-
-	// Set system context with memory pressure (mem >95%, swap >0 → HIGH severity).
-	replayCorr.SetSystemSnapshot(&correlate.SystemContext{
-		CPUPercent: 40.0,
-		MemUsedPct: 96.0,
-		MemAvailMB: 200,
-		SwapUsedMB: 500,
-		LoadAvg1:   4.0,
-	})
-
-	chains := correlate.ReplayEventsForChains(storedEvents, replayCollector, replayCorr, pid)
+	// Verify the live correlator detected the memory pressure chain.
+	snap := liveCollector.Snapshot()
+	chains := liveCorr.SnapshotCausalChains(snap.Ops, pid)
 
 	if len(chains) == 0 {
-		t.Fatal("replay should detect memory pressure causal chain from stored mm_page_alloc events")
+		t.Fatal("live correlator should detect memory pressure chain (>1.6GB page allocs)")
 	}
 
-	// Verify a mm_page_alloc chain was found with correct severity.
 	foundPageAllocChain := false
 	for _, ch := range chains {
 		for _, te := range ch.Timeline {
 			if te.Layer == "HOST" && strings.Contains(te.Op, "mm_page_alloc") {
 				foundPageAllocChain = true
-				// mem 96% > 95% + swap > 0 → severity must be HIGH.
 				if ch.Severity != "HIGH" {
 					t.Errorf("page_alloc chain severity = %q, want HIGH (mem 96%%)", ch.Severity)
 				}
@@ -583,7 +567,7 @@ func TestSelectiveStoragePreservesPageAllocChain(t *testing.T) {
 		}
 	}
 	if !foundPageAllocChain {
-		t.Errorf("expected mm_page_alloc chain in replay, got %d chains: %v",
+		t.Errorf("expected mm_page_alloc chain from live correlator, got %d chains: %v",
 			len(chains), chainSummaries(chains))
 	}
 }
@@ -668,7 +652,8 @@ func TestShouldStoreStackSampling(t *testing.T) {
 	stack := []events.StackFrame{
 		{IP: 0x1234, SymbolName: "cudaMalloc"},
 	}
-	stackHash := events.HashStackIPs(stack)
+	// shouldStore uses HashStackSymbols (ASLR-independent), so tests must match.
+	stackHash := events.HashStackSymbols(stack)
 
 	// Create an event with a stack.
 	evt := events.Event{
@@ -705,6 +690,21 @@ func TestShouldStoreStackSampling(t *testing.T) {
 	if !shouldStore(noStackEvt, sessionStart, true, collector, 3, samples) {
 		t.Error("no-stack events should be unaffected by sampling")
 	}
+
+	// ASLR test: same symbols, different IPs → same symbol hash.
+	// Two processes with different ASLR bases should share the same sample bucket.
+	stackPID1 := []events.StackFrame{
+		{IP: 0x7f1234, SymbolName: "cudaMalloc", File: "libcudart.so"},
+	}
+	stackPID2 := []events.StackFrame{
+		{IP: 0x7f9999, SymbolName: "cudaMalloc", File: "libcudart.so"},
+	}
+	if events.HashStackSymbols(stackPID1) != events.HashStackSymbols(stackPID2) {
+		t.Error("HashStackSymbols should produce same hash for same symbols across PIDs")
+	}
+	if events.HashStackIPs(stackPID1) == events.HashStackIPs(stackPID2) {
+		t.Error("HashStackIPs should produce different hashes for different IPs")
+	}
 }
 
 func TestShouldStoreStackSamplingAnomalyBypass(t *testing.T) {
@@ -716,7 +716,7 @@ func TestShouldStoreStackSamplingAnomalyBypass(t *testing.T) {
 	stack := []events.StackFrame{
 		{IP: 0x1234, SymbolName: "cudaMalloc"},
 	}
-	stackHash := events.HashStackIPs(stack)
+	stackHash := events.HashStackSymbols(stack)
 
 	baseEvt := events.Event{
 		Timestamp: time.Now(),

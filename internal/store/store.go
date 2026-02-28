@@ -55,8 +55,11 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_pid ON events(pid);
-CREATE INDEX IF NOT EXISTS idx_events_source_op ON events(source, op);
 `
+// Note: idx_events_source_op is NOT created here — it's redundant with
+// idx_events_source_op_stack (created below). SQLite uses leftmost-prefix
+// matching, so (source, op, stack_hash) covers all (source, op) queries.
+// Dropping it saves ~10 MB per 1M events.
 
 // stackTracesSchema stores deduplicated stack traces. Each unique call stack
 // (sequence of instruction pointers) is stored once, keyed by FNV-64 hash.
@@ -76,6 +79,11 @@ CREATE TABLE IF NOT EXISTS stack_traces (
 // migrateAddFramesColumn adds the resolved frames column to stack_traces.
 // Idempotent: fails silently if column already exists (new DBs have it from schema).
 const migrateAddFramesColumn = `ALTER TABLE stack_traces ADD COLUMN frames TEXT NOT NULL DEFAULT ''`
+
+// migrateAddSumArg0 adds the sum_arg0 column to event_aggregates.
+// Used for mm_page_alloc total bytes (chain engine needs SUM(arg0) > 1GB).
+// Idempotent: fails silently if column already exists (new DBs have it from schema).
+const migrateAddSumArg0 = `ALTER TABLE event_aggregates ADD COLUMN sum_arg0 INTEGER NOT NULL DEFAULT 0`
 
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
@@ -160,15 +168,16 @@ CREATE TABLE IF NOT EXISTS process_names (
 // summarized in minute-granularity buckets.
 const aggregatesSchema = `
 CREATE TABLE IF NOT EXISTS event_aggregates (
-	bucket   INTEGER NOT NULL,  -- minute-truncated unix nanos
-	source   INTEGER NOT NULL,
-	op       INTEGER NOT NULL,
-	pid      INTEGER NOT NULL DEFAULT 0,
-	count    INTEGER NOT NULL DEFAULT 0,
-	stored   INTEGER NOT NULL DEFAULT 0,
-	sum_dur  INTEGER NOT NULL DEFAULT 0,
-	min_dur  INTEGER NOT NULL DEFAULT 0,
-	max_dur  INTEGER NOT NULL DEFAULT 0,
+	bucket    INTEGER NOT NULL,  -- minute-truncated unix nanos
+	source    INTEGER NOT NULL,
+	op        INTEGER NOT NULL,
+	pid       INTEGER NOT NULL DEFAULT 0,
+	count     INTEGER NOT NULL DEFAULT 0,
+	stored    INTEGER NOT NULL DEFAULT 0,
+	sum_dur   INTEGER NOT NULL DEFAULT 0,
+	min_dur   INTEGER NOT NULL DEFAULT 0,
+	max_dur   INTEGER NOT NULL DEFAULT 0,
+	sum_arg0  INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (bucket, source, op, pid)
 );
 CREATE INDEX IF NOT EXISTS idx_aggregates_bucket ON event_aggregates(bucket);
@@ -367,6 +376,7 @@ type Aggregate struct {
 	SumDur  int64  // sum of durations (nanos) — for computing mean
 	MinDur  int64  // minimum duration (nanos) in this bucket
 	MaxDur  int64  // maximum duration (nanos) in this bucket
+	SumArg0 int64  // sum of arg0 values — for mm_page_alloc (total bytes allocated)
 }
 
 // AggregateTotals summarizes event counts across all aggregates for a time range.
@@ -552,13 +562,18 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.6')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
-	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates for events not individually stored (selective storage). Use count-stored to get discarded count.')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates. sum_arg0 tracks mm_page_alloc total bytes (chain engine threshold: >1GB). count-stored = discarded count.')")
 	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
 	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols. Use get_stacks MCP tool for call stack analysis.')")
 
 	// Composite index for get_stacks MCP tool (GROUP BY source,op,stack_hash).
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_source_op_stack ON events(source, op, stack_hash)")
+
+	// Drop redundant idx_events_source_op — the composite idx_events_source_op_stack
+	// covers all (source, op) queries via SQLite leftmost-prefix matching.
+	// Old DBs created before this optimization carry the redundant index (~10MB/1M events).
+	db.Exec("DROP INDEX IF EXISTS idx_events_source_op")
 
 	// Create system_snapshots table (metrics sampled every 1s during recording).
 	if _, err := db.Exec(snapshotsSchema); err != nil {
@@ -585,6 +600,9 @@ func New(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating event_aggregates table: %w", err)
 	}
+
+	// Add sum_arg0 column for mm_page_alloc total bytes. Idempotent.
+	db.Exec(migrateAddSumArg0)
 
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
@@ -733,16 +751,22 @@ func (s *Store) flushBatch(batch []events.Event) {
 			cached, known := s.stackCache[h]
 			if !known {
 				// Brand new stack — serialize and insert.
-				ipsJSON := serializeStackIPs(evt.Stack)
 				framesJSON := serializeStackFrames(evt.Stack)
+				// Skip ips when frames are resolved — frames already contain
+				// the IP as the "i" field, so ips is redundant. Saves ~30% of
+				// stack_traces storage. Keep ips for unresolved stacks (fallback).
+				ipsJSON := ""
+				if framesJSON == "" {
+					ipsJSON = serializeStackIPs(evt.Stack)
+				}
 				stackStmt.Exec(stackHash, ipsJSON, framesJSON)
 				s.stackCache[h] = framesJSON != ""
 			} else if !cached {
 				// Known stack without resolved frames — try to upgrade.
 				framesJSON := serializeStackFrames(evt.Stack)
 				if framesJSON != "" {
-					ipsJSON := serializeStackIPs(evt.Stack)
-					stackStmt.Exec(stackHash, ipsJSON, framesJSON)
+					// Upgrading: clear ips (now redundant with resolved frames).
+					stackStmt.Exec(stackHash, "", framesJSON)
 					s.stackCache[h] = true
 				}
 			}
@@ -1644,8 +1668,8 @@ func (s *Store) RecordAggregates(aggs []Aggregate) {
 	}
 
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO event_aggregates
-		(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur, sum_arg0)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -1653,7 +1677,7 @@ func (s *Store) RecordAggregates(aggs []Aggregate) {
 	defer stmt.Close()
 
 	for _, a := range aggs {
-		stmt.Exec(a.Bucket, a.Source, a.Op, a.PID, a.Count, a.Stored, a.SumDur, a.MinDur, a.MaxDur)
+		stmt.Exec(a.Bucket, a.Source, a.Op, a.PID, a.Count, a.Stored, a.SumDur, a.MinDur, a.MaxDur, a.SumArg0)
 	}
 
 	tx.Commit()

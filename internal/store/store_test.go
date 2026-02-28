@@ -771,6 +771,46 @@ func TestRecordAndQueryAggregates(t *testing.T) {
 	}
 }
 
+func TestAggregatesSumArg0(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	bucket := time.Now().Truncate(time.Minute).UnixNano()
+
+	// Simulate mm_page_alloc aggregates: 100 events, each 16MB = 1.6GB total.
+	aggs := []Aggregate{
+		{
+			Bucket:  bucket,
+			Source:  3, // HOST
+			Op:      3, // mm_page_alloc
+			PID:     100,
+			Count:   100,
+			Stored:  0, // no individual events stored
+			SumDur:  0, // duration is always 0 for mm_page_alloc
+			MinDur:  0,
+			MaxDur:  0,
+			SumArg0: 100 * 16 * 1024 * 1024, // 1.6 GB total
+		},
+	}
+
+	s.RecordAggregates(aggs)
+
+	// Verify sum_arg0 persists via direct SQL (the intended read path for
+	// post-hoc analysis is run_sql, not a dedicated Go function).
+	var sumArg0 int64
+	err = s.db.QueryRow("SELECT sum_arg0 FROM event_aggregates WHERE source=3 AND op=3").Scan(&sumArg0)
+	if err != nil {
+		t.Fatalf("QueryRow sum_arg0 failed: %v", err)
+	}
+	want := int64(100 * 16 * 1024 * 1024)
+	if sumArg0 != want {
+		t.Errorf("sum_arg0 = %d, want %d (1.6 GB)", sumArg0, want)
+	}
+}
+
 func TestAggregatesPrunedBySize(t *testing.T) {
 	// Size-based pruning only works with on-disk DBs (stat() checks file size).
 	// Use a temp file to test the actual pruning path.

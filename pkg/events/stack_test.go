@@ -102,3 +102,162 @@ func TestParseStackIPs_MaxDepth(t *testing.T) {
 		t.Errorf("boundary IPs wrong: first=%#x last=%#x", frames[0].IP, frames[63].IP)
 	}
 }
+
+// TestHashStackSymbols_ASLRIndependent verifies that HashStackSymbols produces
+// the same hash for logically identical stacks across PIDs with different ASLR
+// bases, while HashStackIPs produces different hashes.
+//
+// Teaching note: ASLR (Address Space Layout Randomization) maps shared libraries
+// at random virtual addresses per process. Two processes calling cudaMalloc from
+// the same source line get different instruction pointers (IPs) but identical
+// symbol names. HashStackIPs (raw IPs) → different hashes. HashStackSymbols
+// (resolved names) → same hash. This is why stack sampling must use symbol-based
+// hashing to correctly deduplicate across processes.
+func TestHashStackSymbols_ASLRIndependent(t *testing.T) {
+	// Same logical stack: cudaMalloc → _PyEval_EvalFrameDefault → forward
+	// Process A: libraries at 0x7f1000...
+	stackA := []StackFrame{
+		{IP: 0x7f1234, SymbolName: "cudaMalloc", File: "libcudart.so.12"},
+		{IP: 0x7f5678, SymbolName: "_PyEval_EvalFrameDefault", File: "libpython3.12.so"},
+		{IP: 0x7f9abc, PyFile: "train.py", PyFunc: "forward", PyLine: 142},
+	}
+	// Process B: same libraries at 0x7e9000... (different ASLR base)
+	stackB := []StackFrame{
+		{IP: 0x7e9234, SymbolName: "cudaMalloc", File: "libcudart.so.12"},
+		{IP: 0x7ed678, SymbolName: "_PyEval_EvalFrameDefault", File: "libpython3.12.so"},
+		{IP: 0x7f1abc, PyFile: "train.py", PyFunc: "forward", PyLine: 142},
+	}
+
+	// HashStackIPs: different (raw IPs differ due to ASLR)
+	ipHashA := HashStackIPs(stackA)
+	ipHashB := HashStackIPs(stackB)
+	if ipHashA == ipHashB {
+		t.Error("HashStackIPs should differ for different ASLR bases")
+	}
+
+	// HashStackSymbols: same (symbols are identical)
+	symHashA := HashStackSymbols(stackA)
+	symHashB := HashStackSymbols(stackB)
+	if symHashA != symHashB {
+		t.Errorf("HashStackSymbols should match across ASLR bases: %d != %d", symHashA, symHashB)
+	}
+}
+
+func TestHashStackSymbols_DifferentSymbols(t *testing.T) {
+	stackA := []StackFrame{
+		{IP: 0x1234, SymbolName: "cudaMalloc", File: "libcudart.so.12"},
+	}
+	stackB := []StackFrame{
+		{IP: 0x1234, SymbolName: "cudaFree", File: "libcudart.so.12"},
+	}
+
+	if HashStackSymbols(stackA) == HashStackSymbols(stackB) {
+		t.Error("HashStackSymbols should differ for different symbol names")
+	}
+}
+
+func TestHashStackSymbols_EmptyStack(t *testing.T) {
+	h := HashStackSymbols(nil)
+	if h == 0 {
+		t.Error("HashStackSymbols(nil) should return the FNV offset basis, not 0")
+	}
+}
+
+func TestHashStackSymbols_UnresolvedFrames(t *testing.T) {
+	// Stacks with no resolved symbols hash based on empty strings + depth.
+	// This is correct: we can't distinguish unresolved frames at the same depth.
+	stack1 := []StackFrame{{IP: 0x1111}, {IP: 0x2222}}
+	stack2 := []StackFrame{{IP: 0x3333}, {IP: 0x4444}}
+
+	// Same depth, all unresolved → same symbol hash (correct for sampling)
+	if HashStackSymbols(stack1) != HashStackSymbols(stack2) {
+		t.Error("unresolved stacks of same depth should have same symbol hash")
+	}
+
+	// Different depth → different hash
+	stack3 := []StackFrame{{IP: 0x5555}}
+	if HashStackSymbols(stack1) == HashStackSymbols(stack3) {
+		t.Error("stacks of different depth should have different symbol hashes")
+	}
+}
+
+func TestHashStackSymbols_MixedResolvedUnresolved(t *testing.T) {
+	// Real-world pattern: some frames resolved (CUDA, Python), some not (stripped libs).
+	// Two stacks with same resolved frames but different unresolved IPs → same hash.
+	stackA := []StackFrame{
+		{IP: 0x7f1234, SymbolName: "cudaMalloc", File: "libcudart.so.12"},
+		{IP: 0x7f5000, File: "libcudnn_ops.so.9"},         // stripped: file but no symbol
+		{IP: 0x7f9000},                                      // fully unresolved
+		{IP: 0x400100, PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+	}
+	stackB := []StackFrame{
+		{IP: 0x7e1234, SymbolName: "cudaMalloc", File: "libcudart.so.12"},
+		{IP: 0x7e5000, File: "libcudnn_ops.so.9"},         // same file, different IP
+		{IP: 0x7e9000},                                      // different IP, still unresolved
+		{IP: 0x500100, PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+	}
+
+	if HashStackSymbols(stackA) != HashStackSymbols(stackB) {
+		t.Error("mixed resolved/unresolved stacks with same symbols should have same hash")
+	}
+}
+
+func TestHashStackSymbols_SymbolOffset(t *testing.T) {
+	// The resolver produces names like "cudaMalloc+0x1a". Different offsets within
+	// the same function are different call sites → should produce different hashes.
+	stackA := []StackFrame{
+		{IP: 0x1234, SymbolName: "cudaMalloc+0x1a", File: "libcudart.so.12"},
+	}
+	stackB := []StackFrame{
+		{IP: 0x1250, SymbolName: "cudaMalloc+0x2f", File: "libcudart.so.12"},
+	}
+
+	if HashStackSymbols(stackA) == HashStackSymbols(stackB) {
+		t.Error("different symbol offsets should produce different hashes")
+	}
+}
+
+func TestHashStackSymbols_SameSymbolDifferentFiles(t *testing.T) {
+	// Same symbol name in different libraries → different logical stacks.
+	stackA := []StackFrame{
+		{IP: 0x1234, SymbolName: "malloc", File: "libc.so.6"},
+	}
+	stackB := []StackFrame{
+		{IP: 0x1234, SymbolName: "malloc", File: "libcudart.so.12"},
+	}
+
+	if HashStackSymbols(stackA) == HashStackSymbols(stackB) {
+		t.Error("same symbol in different files should produce different hashes")
+	}
+}
+
+func TestHashStackSymbols_FileOnlyFrame(t *testing.T) {
+	// Stripped library: File populated but SymbolName empty.
+	// Must differ from a completely unresolved frame.
+	withFile := []StackFrame{
+		{IP: 0x1234, File: "libcudnn_ops.so.9"},
+	}
+	noFile := []StackFrame{
+		{IP: 0x1234},
+	}
+
+	if HashStackSymbols(withFile) == HashStackSymbols(noFile) {
+		t.Error("file-only frame should differ from fully unresolved frame")
+	}
+}
+
+func TestHashStackSymbols_PythonOnly(t *testing.T) {
+	// Pure Python stack (CPython frames only, no native symbols).
+	stackA := []StackFrame{
+		{PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+		{PyFile: "model.py", PyFunc: "__call__", PyLine: 100},
+	}
+	stackB := []StackFrame{
+		{PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+		{PyFile: "model.py", PyFunc: "__call__", PyLine: 101}, // different line
+	}
+
+	if HashStackSymbols(stackA) == HashStackSymbols(stackB) {
+		t.Error("Python stacks with different line numbers should differ")
+	}
+}
