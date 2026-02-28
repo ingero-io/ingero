@@ -98,15 +98,6 @@ func queryOutputJSON(evts []events.Event) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 
-	type jsonStackFrame struct {
-		IP     string `json:"ip,omitempty"`
-		Symbol string `json:"symbol,omitempty"`
-		File   string `json:"file,omitempty"`
-		Line   int    `json:"line,omitempty"`
-		PyFile string `json:"py_file,omitempty"`
-		PyFunc string `json:"py_func,omitempty"`
-		PyLine int    `json:"py_line,omitempty"`
-	}
 	type jsonEvt struct {
 		Timestamp  string           `json:"timestamp"`
 		PID        uint32           `json:"pid"`

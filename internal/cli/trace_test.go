@@ -637,6 +637,15 @@ func TestIsStackResolved(t *testing.T) {
 		t.Error("expected Python-resolved stack to be detected")
 	}
 
+	// PyFile-only frame counts as resolved (CPython walker edge case).
+	pyFileOnly := []events.StackFrame{
+		{IP: 0xdead},
+		{IP: 0x9abc, PyFile: "train.py"},
+	}
+	if !isStackResolved(pyFileOnly) {
+		t.Error("expected PyFile-only stack to be detected as resolved")
+	}
+
 	// All garbage: no symbol, no file, no Python info.
 	garbage := []events.StackFrame{
 		{IP: 0xdead},

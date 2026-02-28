@@ -521,7 +521,7 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 // are garbage from bpf_get_stack() bottom-of-stack artifacts — not worth storing.
 func isStackResolved(stack []events.StackFrame) bool {
 	for _, f := range stack {
-		if f.SymbolName != "" || f.File != "" || f.PyFunc != "" {
+		if f.SymbolName != "" || f.File != "" || f.PyFile != "" || f.PyFunc != "" {
 			return true
 		}
 	}
