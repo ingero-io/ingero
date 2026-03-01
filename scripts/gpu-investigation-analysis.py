@@ -1287,21 +1287,24 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
 
     # Action 1: mm_page_alloc bursts >100MB in 5s windows
     # arg0 already stores bytes (host_trace.bpf.c: 4096 << order), not page count.
+    # mm_page_alloc is aggregate-only (never stored in events table).
+    # Query event_aggregates: bucket is minute-truncated unix nanos,
+    # sum_arg0 tracks total bytes per minute bucket.
     r1 = mcp.run_sql("""
-        SELECT CAST(timestamp / 5000000000 AS INT) * 5 as bucket,
-               COUNT(*) as page_events,
-               SUM(arg0) / 1e6 as total_mb
-        FROM events WHERE source=3 AND op=3
-        GROUP BY bucket HAVING total_mb > 100
-        ORDER BY total_mb DESC
+        SELECT bucket / 60000000000 as bucket,
+               count as page_events,
+               sum_arg0 / 1e6 as total_mb
+        FROM event_aggregates WHERE source=3 AND op=3
+          AND sum_arg0 > 100000000
+        ORDER BY sum_arg0 DESC
     """)
     rows1 = sql_to_dicts(r1)
     inv.add_action("run_sql", "mm_page_alloc bursts >100MB per 5s window",
                    f"{len(rows1)} spike windows")
 
-    # Action 2: sync spikes in same windows
+    # Action 2: sync spikes in same minute windows (aligned with event_aggregates)
     r2 = mcp.run_sql("""
-        SELECT CAST(timestamp / 5000000000 AS INT) * 5 as bucket,
+        SELECT CAST(timestamp / 60000000000 AS INT) as bucket,
                COUNT(*) as sync_cnt,
                MAX(duration)/1000 as max_sync_us
         FROM events
@@ -1327,7 +1330,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         f"{len(rows1)} memory spike windows >100MB (no sync correlation)")
     else:
         # Check if there are any page alloc events at all
-        r3 = mcp.run_sql("SELECT COUNT(*) as cnt FROM events WHERE source=3 AND op=3")
+        r3 = mcp.run_sql("SELECT SUM(count) as cnt FROM event_aggregates WHERE source=3 AND op=3")
         page_cnt = sql_first_val(r3, 0)
         if page_cnt > 0:
             inv.set_verdict("HEALTHY", f"{page_cnt} page alloc events, no >100MB spikes")
