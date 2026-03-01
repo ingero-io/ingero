@@ -45,18 +45,40 @@ if [ -f "$K3S_CONTAINERD_CONFIG" ] && grep -q "nvidia" "$K3S_CONTAINERD_CONFIG";
 else
     echo "[CONFIGURE] Setting up nvidia-container-runtime for k3s..."
     sudo mkdir -p "$(dirname "$K3S_CONTAINERD_CONFIG")"
+    # Config version 2 required for k3s v1.34+ (containerd v2.1).
+    # default_runtime_name ensures nvidia runtime is used for ALL containers,
+    # including the device plugin itself (which needs GPU access to enumerate devices).
     sudo tee "$K3S_CONTAINERD_CONFIG" > /dev/null <<'CONTAINERD_EOF'
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes."nvidia"]
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  default_runtime_name = "nvidia"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
   privileged_without_host_devices = false
-  runtime_engine = ""
-  runtime_root = ""
   runtime_type = "io.containerd.runc.v2"
-  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes."nvidia".options]
-    BinaryName = "/usr/bin/nvidia-container-runtime"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+  BinaryName = "/usr/bin/nvidia-container-runtime"
 CONTAINERD_EOF
     echo "[OK] nvidia runtime configured, restarting k3s..."
     sudo systemctl restart k3s
     sleep 5
+fi
+
+# 2b. Ensure CNI plugins are at /opt/cni/bin (k3s containerd expects them there).
+# Some Lambda Labs images ship CNI plugins only in /usr/lib/cni/ or /var/lib/rancher/k3s/data/cni/.
+if [ ! -f /opt/cni/bin/bridge ]; then
+    echo "[FIX] CNI plugins missing from /opt/cni/bin, copying..."
+    sudo mkdir -p /opt/cni/bin
+    # Prefer k3s bundled CNI, then system CNI
+    if [ -d /var/lib/rancher/k3s/data/cni ]; then
+        sudo cp /var/lib/rancher/k3s/data/cni/* /opt/cni/bin/
+    fi
+    if [ -d /usr/lib/cni ]; then
+        sudo cp /usr/lib/cni/* /opt/cni/bin/
+    fi
+    echo "[OK] CNI plugins installed at /opt/cni/bin"
 fi
 
 # 3. Install NVIDIA device plugin (makes nvidia.com/gpu resource available)
@@ -95,6 +117,14 @@ else
     echo "[INSTALL] Installing docker.io (needed for image build)..."
     sudo apt-get update -qq && sudo apt-get install -y -qq docker.io
     echo "[OK] docker installed"
+fi
+
+# 6b. Add current user to docker group (avoids sudo for docker build in k3s-test.sh)
+if groups | grep -q docker; then
+    echo "[OK] User $(whoami) already in docker group"
+else
+    sudo usermod -aG docker "$(whoami)"
+    echo "[OK] Added $(whoami) to docker group"
 fi
 
 # 7. Install sqlite3 (needed for test assertion queries against ingero.db)

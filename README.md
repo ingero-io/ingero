@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.88**
+**Version: 0.6.94**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -499,12 +499,12 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 
 ## Roadmap
 
-**v0.7 — K8s Ready:**
-- Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod/namespace)
-- Noisy neighbor detection (per-cgroup scheduler latency)
-- Helm chart + DaemonSet deployment
-- Auto-discover GPU pods on node
-- GPU device ↔ pod mapping
+**v0.7 — K8s Ready** (shipped):
+- Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod/namespace via K8s API)
+- Auto-discover GPU pods on node (`nvidia.com/gpu` resource detection)
+- DaemonSet + RBAC + Helm chart deployment (`deploy/k8s/`, `deploy/helm/`)
+- Systemd unit file (`make install` / `make uninstall`)
+- `--log <path>` flag for file output
 
 **v0.8 — K8s Insights + I/O Tracing:**
 - HTTP/gRPC inference serving tracing (vLLM, Triton)

@@ -96,14 +96,19 @@ header() {
 cleanup_pids=()
 cleanup_sudo_pids=()
 cleanup() {
+    # Kill sudo-spawned PIDs first (never wait — sudo creates separate process tree)
+    for pid in "${cleanup_sudo_pids[@]}"; do
+        sudo kill "$pid" 2>/dev/null || true
+    done
+    # Safety net: kill any lingering ingero/OTLP processes
+    sudo pkill -f 'ingero mcp' 2>/dev/null || true
+    sudo pkill -f 'ingero trace' 2>/dev/null || true
+    pkill -f 'otlp_receiver.py' 2>/dev/null || true
+    # Kill and reap direct children (safe to wait)
     for pid in "${cleanup_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    for pid in "${cleanup_sudo_pids[@]}"; do
-        sudo kill "$pid" 2>/dev/null || true
-    done
-    sudo pkill -f 'ingero mcp' 2>/dev/null || true
     rm -rf "${TEST_TMP:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -803,7 +808,7 @@ sleep 1
 sudo ./bin/ingero trace --otlp localhost:4318 --json --duration 15s > logs/combined-events.json 2> logs/combined-debug.log
 wait "$WL_PID" 2>/dev/null || true
 sleep 2
-sudo kill "$OTLP_PID2" 2>/dev/null || true
+kill "$OTLP_PID2" 2>/dev/null || true
 sleep 1
 
 COMBINED_COUNT=$(count_events logs/combined-events.json)
@@ -833,13 +838,17 @@ WL_PID=$(start_workload 18)
 sleep 1
 sudo ./bin/ingero trace --prometheus :9090 --json --duration 12s > logs/prom-events.json 2> logs/prom-debug.log &
 PROM_PID=$!
-cleanup_pids+=("$PROM_PID")
+cleanup_sudo_pids+=("$PROM_PID")
 sleep 5
 
 PROM_OUT=$(curl -s localhost:9090/metrics 2>&1)
 echo "$PROM_OUT" > logs/prom-metrics.txt
 
-wait "$PROM_PID" 2>/dev/null || true
+# Poll instead of wait — PROM_PID is sudo-spawned, bash wait would hang.
+for _i in $(seq 1 20); do
+    if ! sudo kill -0 "$PROM_PID" 2>/dev/null; then break; fi
+    sleep 1
+done
 wait "$WL_PID" 2>/dev/null || true
 
 if echo "$PROM_OUT" | grep -q "system_cpu_utilization"; then

@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ingero.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ingero.labels" . | nindent 4 }}
+spec:
+  updateStrategy:
+    type: {{ .Values.updateStrategy.type }}
+  selector:
+    matchLabels:
+      {{- include "ingero.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ingero.labels" . | nindent 8 }}
+    spec:
+      hostPID: true
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      containers:
+        - name: ingero
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          args:
+            - "trace"
+            {{- if .Values.trace.record }}
+            - "--record"
+            {{- end }}
+            - "--db"
+            - {{ .Values.trace.dbPath | quote }}
+            - "--max-db"
+            - {{ .Values.trace.maxDb | quote }}
+            {{- range .Values.trace.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: proc
+              mountPath: /proc
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+            - name: data
+              mountPath: {{ dir .Values.trace.dbPath }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+        - name: data
+          hostPath:
+            path: {{ dir .Values.trace.dbPath }}
+            type: DirectoryOrCreate
