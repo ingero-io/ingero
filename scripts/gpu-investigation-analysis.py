@@ -248,6 +248,24 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     _cached_stats = mcp.get_trace_stats("10m")
     _cached_sessions = mcp.get_sessions("0")
 
+    # Detect unified-memory GPUs (GH200, GH100) where cold-start latency is
+    # negligible due to NVLink-C2C coherent memory. On these architectures,
+    # Phase 1 cold-start provocation doesn't produce a measurable effect, so
+    # T23m/T23q should not be marked as provoked (HEALTHY is correct behavior).
+    _gpu_name = ""
+    try:
+        sess_data = _cached_sessions.get("data", {})
+        if isinstance(sess_data, dict):
+            cols = sess_data.get("columns", [])
+            rows_data = sess_data.get("data", [])
+            if rows_data and cols:
+                col_map = {c: i for i, c in enumerate(cols)}
+                if "gpu_model" in col_map:
+                    _gpu_name = str(rows_data[0][col_map["gpu_model"]]).upper()
+    except Exception:
+        pass
+    _unified_memory = "GH200" in _gpu_name or "GH100" in _gpu_name
+
     # =========================================================================
     # T23a: #1 NCCL Hangs — NOT provoked (requires multi-GPU / NCCL)
     # Single-GPU systems detect scheduling contention as a proxy signal.
@@ -968,7 +986,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # T23m: #13 Model Swap Latency — provoked via Phase 1
     # =========================================================================
     inv = Investigation("T23m", 13, "Model swap latency", "HIGH",
-                        provoked=True,
+                        provoked=not _unified_memory,
                         question="Is model loading causing latency?")
 
     # Action 1: first 15s events: alloc + memcpy
@@ -1146,7 +1164,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # T23q: #17 Cold Start — provoked via Phase 1
     # =========================================================================
     inv = Investigation("T23q", 17, "Cold start", "MEDIUM",
-                        provoked=True,
+                        provoked=not _unified_memory,
                         question="How long is the cold start? What's the init penalty?")
 
     # Action 1: first 10 events
