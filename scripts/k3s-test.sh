@@ -259,7 +259,7 @@ $KUBECTL apply -f deploy/k8s/rbac.yaml
 # Apply DaemonSet with patched image reference and imagePullPolicy
 # docker save exports with docker.io/library/ prefix — must match exactly.
 sed "s|ghcr.io/ingero-io/ingero:v0.7|${INGERO_IMAGE}|g" deploy/k8s/daemonset.yaml | \
-    sed '/image: docker.io\/library\/ingero:v0.7-test/a\          imagePullPolicy: Never' | \
+    sed 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|g' | \
     $KUBECTL apply -f -
 
 log "DaemonSet applied, waiting for pod Running..."
@@ -471,7 +471,7 @@ else
     if [ "$CHAIN_COUNT" -gt 0 ]; then
         log "Top chains by severity:"
         sudo sqlite3 "$INGERO_DB" \
-            "SELECT severity, chain_type, summary FROM causal_chains ORDER BY severity DESC LIMIT 10" \
+            "SELECT severity, cuda_op, summary FROM causal_chains ORDER BY severity DESC LIMIT 10" \
             2>/dev/null | while IFS= read -r line; do
             log "  $line"
         done
@@ -481,7 +481,7 @@ else
         SYNC_STALLS=$(sudo sqlite3 "$INGERO_DB" \
             "SELECT COUNT(*) FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id
              WHERE o.name IN ('cudaDeviceSynchronize','cudaStreamSynchronize','cuCtxSynchronize')
-             AND e.duration_ns > 1000000" 2>/dev/null || echo "0")
+             AND e.duration > 1000000" 2>/dev/null || echo "0")
         log "Sync stalls > 1ms (chain-eligible): $SYNC_STALLS"
 
         if [ "$SYNC_STALLS" -gt 0 ]; then
