@@ -174,7 +174,7 @@ fi
 exec > >(tee logs/integration-report.log) 2>&1
 
 echo "================================================================"
-echo "  Ingero v0.6 GPU Integration Test — $(date)"
+echo "  Ingero v0.7 GPU Integration Test — $(date)"
 echo "  $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo 'No GPU')"
 echo "================================================================"
 
@@ -1380,7 +1380,7 @@ log "GPU investigation: ingested $ML_INGESTED test results"
 ################################################################################
 # Final Report
 ################################################################################
-header "v0.6 Integration Test Report"
+header "v0.7 Integration Test Report"
 
 TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
 SCRIPT_DURATION=$((SECONDS - SCRIPT_START))
@@ -1389,7 +1389,7 @@ echo -e "$(ts)   ${GREEN}PASS: $PASS_COUNT${NC}  ${RED}FAIL: $FAIL_COUNT${NC}  $
 echo ""
 
 {
-    echo "Ingero v0.6 Integration Test Report"
+    echo "Ingero v0.7 Integration Test Report"
     echo "===================================="
     echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "Host: $(hostname)"
