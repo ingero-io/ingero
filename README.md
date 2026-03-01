@@ -503,6 +503,7 @@ Ingero addresses 23 documented GPU problems across training, inference, and AI a
 **v0.8 — K8s Insights:**
 - HTTP/gRPC inference serving tracing (vLLM, Triton)
 - Pod lifecycle correlation (eviction, OOM-kill, restart)
+- `cudaMallocManaged` / `cuMemAllocManaged` tracing (Unified Memory page migration latency diagnosis)
 - Block I/O tracing (block_rq_issue/complete)
 - RAG pipeline GPU contention diagnosis (per-process CUDA API breakdown)
 
