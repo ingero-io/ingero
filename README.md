@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.75**
+**Version: 0.6.76**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -253,8 +253,11 @@ Start an MCP (Model Context Protocol) server for AI agent integration.
 
 ```bash
 ingero mcp                        # stdio (for Claude Code / MCP clients)
-ingero mcp --http :8080           # HTTPS/TLS 1.3 (self-signed cert)
+ingero mcp --http :8080           # HTTPS on port 8080 (TLS 1.3, auto-generated self-signed cert)
+ingero mcp --http :8080 --tls-cert cert.pem --tls-key key.pem  # custom TLS certificate
 ```
+
+> **Note:** The `--http` flag enables the Streamable HTTP transport — all connections use **TLS 1.3 only** (no plain HTTP). When no `--tls-cert`/`--tls-key` is provided, ingero auto-generates an ephemeral self-signed ECDSA P-256 certificate. Use `curl -k` to skip certificate verification for self-signed certs.
 
 **AI-first analysis**: MCP responses use telegraphic compression (TSC) by default, reducing token count by ~60%. Set `{"tsc": false}` per request for verbose output.
 

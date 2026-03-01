@@ -87,11 +87,40 @@ done
 NODE_NAME=$(sudo k3s kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
 sudo k3s kubectl label node "$NODE_NAME" nvidia.com/gpu.present=true --overwrite
 
+# 6. Install docker (needed for building ingero test image in k3s-test.sh)
+# Lambda Labs AMD64 VMs have docker via nvidia-container-toolkit; ARM64 (GH200) may not.
+if command -v docker &>/dev/null; then
+    echo "[OK] docker already installed: $(docker --version)"
+else
+    echo "[INSTALL] Installing docker.io (needed for image build)..."
+    sudo apt-get update -qq && sudo apt-get install -y -qq docker.io
+    echo "[OK] docker installed"
+fi
+
+# 7. Install sqlite3 (needed for test assertion queries against ingero.db)
+if command -v sqlite3 &>/dev/null; then
+    echo "[OK] sqlite3 already installed"
+else
+    echo "[INSTALL] Installing sqlite3..."
+    sudo apt-get install -y -qq sqlite3
+    echo "[OK] sqlite3 installed"
+fi
+
+# 8. Pre-pull PyTorch image (~15GB multi-arch, avoids timeout in test pods)
+# Uses k3s's built-in ctr to put the image in the correct containerd namespace.
+if sudo k3s ctr images ls -q | grep -q "nvcr.io/nvidia/pytorch:24.01-py3"; then
+    echo "[OK] PyTorch image already pulled"
+else
+    echo "[PULL] Pulling nvcr.io/nvidia/pytorch:24.01-py3 (this may take 5-10 min)..."
+    sudo k3s ctr images pull nvcr.io/nvidia/pytorch:24.01-py3
+    echo "[OK] PyTorch image pulled"
+fi
+
 echo ""
 echo "=== k3s GPU Setup Complete ==="
 echo "  Node:    $NODE_NAME"
 echo "  GPUs:    $GPU_COUNT"
 echo ""
 echo "Next steps:"
-echo "  sudo k3s kubectl apply -f deploy/k8s/  # Deploy ingero DaemonSet"
-echo "  sudo k3s kubectl get pods -n ingero-system  # Check status"
+echo "  bash scripts/k3s-test.sh  # Run K8s integration tests"
+echo "  # or: make gpu-k3s-test / make lambda-k3s-test (from WSL)"
