@@ -1285,7 +1285,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=True,
                         question="Are checkpoint operations causing memory spikes?")
 
-    # Action 1: mm_page_alloc bursts >100MB in 5s windows
+    # Action 1: mm_page_alloc bursts >100MB per minute window
     # arg0 already stores bytes (host_trace.bpf.c: 4096 << order), not page count.
     # mm_page_alloc is aggregate-only (never stored in events table).
     # Query event_aggregates: bucket is minute-truncated unix nanos,
