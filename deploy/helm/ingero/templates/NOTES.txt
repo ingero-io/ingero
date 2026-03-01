@@ -1,0 +1,12 @@
+Ingero GPU observability agent deployed as DaemonSet.
+
+Pods will schedule on nodes with label: nvidia.com/gpu.present=true
+
+Query the agent:
+  kubectl exec -n {{ .Release.Namespace }} ds/{{ include "ingero.fullname" . }} -- ingero explain --since 5m
+  kubectl exec -n {{ .Release.Namespace }} ds/{{ include "ingero.fullname" . }} -- ingero query --since 1m --json
+
+MCP access via port-forward:
+  kubectl port-forward -n {{ .Release.Namespace }} ds/{{ include "ingero.fullname" . }} 8080:8080
+
+Database location (on host): {{ .Values.trace.dbPath }}

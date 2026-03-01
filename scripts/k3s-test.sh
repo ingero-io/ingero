@@ -230,10 +230,13 @@ else
     exit 1
 fi
 
-# Verify image is in k3s containerd
-if sudo k3s ctr images ls | grep -q "ingero:v0.7-test"; then
+# Verify image is in k3s containerd.
+# Note: capture output first to avoid SIGPIPE from grep -q under set -o pipefail.
+CTR_IMAGES=$(sudo k3s ctr images ls -q 2>/dev/null)
+if echo "$CTR_IMAGES" | grep -q "ingero:v0.7-test"; then
     log "Image confirmed in k3s containerd"
 else
+    echo "$CTR_IMAGES" >> logs/kt01-image-build.log
     record "FAIL" "KT01: Container image build & load" "image not found in k3s containerd"
     exit 1
 fi

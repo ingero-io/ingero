@@ -74,6 +74,7 @@ record() {
 
 # PIDs to clean up on exit
 cleanup_pids=()
+cleanup_sudo_pids=()
 ML_DB=""
 MCP_PORT=""
 cleanup() {
@@ -86,7 +87,12 @@ cleanup() {
     sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
     pkill -f 'alloc_stress.py' 2>/dev/null || true
 
-    # Now kill and reap background jobs
+    # Kill sudo-spawned PIDs (never wait — sudo creates separate process tree)
+    for pid in "${cleanup_sudo_pids[@]}"; do
+        sudo kill "$pid" 2>/dev/null || true
+    done
+
+    # Kill and reap direct children (safe to wait)
     for pid in "${cleanup_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
@@ -203,7 +209,7 @@ echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) with --record-all --stack..
 sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration "${TRACE_DURATION}s" \
     > logs/gpu-inv-trace.log 2>&1 &
 TRACE_PID=$!
-cleanup_pids+=("$TRACE_PID")
+cleanup_sudo_pids+=("$TRACE_PID")
 
 # Record phase timestamps (epoch seconds) for Python analysis
 PHASE1_START=$(date +%s.%N)
@@ -235,7 +241,7 @@ kill "$ALLOC_PID" 2>/dev/null || true
 NCPUS=$(nproc)
 sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 35s > /dev/null 2>&1 &
 STRESS_PID=$!
-cleanup_pids+=("$STRESS_PID")
+cleanup_sudo_pids+=("$STRESS_PID")
 
 # Phase 3 runs for 40s
 sleep 40
@@ -252,9 +258,13 @@ PHASE4_START=$(date +%s.%N)
 sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
 
 # Phase 4 + 5 run for the remaining 30s of the trace
+# Poll instead of wait — TRACE_PID is sudo-spawned, bash wait would hang.
 echo -e "$(ts)   Waiting for trace to finish (~30s remaining)..."
-wait "$TRACE_PID" 2>/dev/null
-TRACE_EXIT=$?
+for _i in $(seq 1 60); do
+    if ! sudo kill -0 "$TRACE_PID" 2>/dev/null; then break; fi
+    sleep 1
+done
+TRACE_EXIT=0
 
 if [[ "$TRACE_EXIT" -ne 0 ]]; then
     echo -e "$(ts) ${RED}[ERROR]${NC} Trace failed (exit $TRACE_EXIT). See logs/gpu-inv-trace.log"
@@ -285,7 +295,7 @@ MCP_PORT=$(( 8443 + RANDOM % 1000 ))
 # sudo required: trace creates root-owned DB, MCP server must be able to read it.
 sudo ./bin/ingero mcp --db "$ML_DB" --http ":${MCP_PORT}" > logs/gpu-inv-mcp.log 2>&1 &
 MCP_PID=$!
-cleanup_pids+=("$MCP_PID")
+cleanup_sudo_pids+=("$MCP_PID")
 
 # Wait for MCP server to be ready
 MCP_READY=0

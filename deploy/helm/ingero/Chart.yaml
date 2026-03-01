@@ -1,0 +1,18 @@
+apiVersion: v2
+name: ingero
+description: eBPF-based GPU causal observability agent
+type: application
+version: 0.7.0
+appVersion: "0.7.0"
+keywords:
+  - gpu
+  - ebpf
+  - observability
+  - cuda
+  - nvidia
+  - mcp
+home: https://github.com/ingero-io/ingero
+sources:
+  - https://github.com/ingero-io/ingero
+maintainers:
+  - name: ingero-io

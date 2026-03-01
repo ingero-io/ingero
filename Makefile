@@ -139,7 +139,7 @@ gpu-validate:
 # Sync code to GPU VM and run full integration tests (one-shot)
 # Runs make generate && make build first to regenerate eBPF objects for the VM's kernel
 gpu-test: gpu-sync
-	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
+	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
 # Transfer logs from TensorDock GPU VM to local logs/<datetime_provider_gpu>/ directory
 gpu-logs:
@@ -190,7 +190,7 @@ lambda-validate:
 # Sync code to Lambda Labs VM and run full integration tests (one-shot)
 # Runs make generate && make build first to regenerate eBPF objects for the VM's kernel
 lambda-test: lambda-sync
-	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
+	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
 # Transfer logs from Lambda Labs VM to local logs/<datetime_provider_gpu>/ directory
 lambda-logs:
@@ -257,7 +257,7 @@ azure-validate:
 
 # Sync code to Azure VM and run full integration tests (one-shot)
 azure-test: azure-sync
-	bash scripts/azure/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
+	bash scripts/azure/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
 
 # Transfer logs from Azure VM to local logs/<datetime_provider_gpu>/ directory
 azure-logs:
@@ -312,15 +312,15 @@ gpu-sync:
 # k3s setup + test targets (run on GPU VM after sync)
 # Install k3s + NVIDIA container toolkit + GPU device plugin
 gpu-k3s-setup: gpu-sync
-	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-setup.sh'
+	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-setup.sh'
 
 # Run k3s integration tests (deploy DaemonSet, run workload, verify cgroup_id)
 gpu-k3s-test: gpu-sync
-	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-test.sh'
+	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-test.sh'
 
 # Lambda Labs k3s targets
 lambda-k3s-setup: lambda-sync
-	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-setup.sh'
+	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-setup.sh'
 
 lambda-k3s-test: lambda-sync
-	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-test.sh'
+	bash scripts/lambdalabs/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && bash scripts/k3s-test.sh'
