@@ -103,7 +103,7 @@ cleanup() {
     # Safety net: kill any lingering ingero/OTLP processes
     sudo pkill -f 'ingero mcp' 2>/dev/null || true
     sudo pkill -f 'ingero trace' 2>/dev/null || true
-    pkill -f 'otlp_receiver.py' 2>/dev/null || true
+    pkill -9 -f 'otlp_receiver.py' 2>/dev/null || true
     # Kill and reap direct children (safe to wait)
     for pid in "${cleanup_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
@@ -696,10 +696,13 @@ sleep 1
 sudo ./bin/ingero trace --otlp localhost:4318 --debug --json --duration 20s > logs/otlp-events.json 2> logs/otlp-debug.log
 wait "$WL_PID" 2>/dev/null || true
 
-# Give receiver time to flush
+# Give receiver time to flush, then kill. Use SIGTERM first (allows flush),
+# then SIGKILL as fallback (Python HTTP servers may ignore SIGTERM).
 sleep 2
 kill "$OTLP_PID" 2>/dev/null || true
-sleep 2
+sleep 1
+kill -9 "$OTLP_PID" 2>/dev/null || true
+sleep 1
 
 # Analyze received payloads
 if [ -f $TEST_TMP/otlp_received.json ]; then
@@ -809,6 +812,8 @@ sudo ./bin/ingero trace --otlp localhost:4318 --json --duration 15s > logs/combi
 wait "$WL_PID" 2>/dev/null || true
 sleep 2
 kill "$OTLP_PID2" 2>/dev/null || true
+sleep 1
+kill -9 "$OTLP_PID2" 2>/dev/null || true
 sleep 1
 
 COMBINED_COUNT=$(count_events logs/combined-events.json)
