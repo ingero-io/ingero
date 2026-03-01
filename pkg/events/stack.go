@@ -6,7 +6,7 @@ import (
 )
 
 // ParseStackIPs extracts stack frames from the stack section of a cuda_event_stack.
-// The stack section starts at baseOffset (byte 56 for CUDA/driver events):
+// The stack section starts at baseOffset (byte 64 for CUDA/driver events):
 //
 //	offset baseOffset+0: stack_depth (uint16 LE) — number of valid IPs
 //	offset baseOffset+2: _stack_pad[3] (6 bytes)

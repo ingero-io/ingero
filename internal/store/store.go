@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS cgroup_metadata (
 	container_id TEXT NOT NULL DEFAULT '',  -- 64-char hex container ID
 	cgroup_path  TEXT NOT NULL DEFAULT ''   -- raw cgroup path from /proc/[pid]/cgroup
 );
+CREATE INDEX IF NOT EXISTS idx_cgroup_metadata_container_id ON cgroup_metadata(container_id) WHERE container_id != '';
 `
 
 const chainsSchema = `
