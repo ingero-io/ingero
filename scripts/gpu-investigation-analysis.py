@@ -1299,7 +1299,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         ORDER BY sum_arg0 DESC
     """)
     rows1 = sql_to_dicts(r1)
-    inv.add_action("run_sql", "mm_page_alloc bursts >100MB per 5s window",
+    inv.add_action("run_sql", "mm_page_alloc bursts >100MB per minute window",
                    f"{len(rows1)} spike windows")
 
     # Action 2: sync spikes in same minute windows (aligned with event_aggregates)
@@ -1312,7 +1312,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         GROUP BY bucket ORDER BY bucket
     """)
     rows2 = sql_to_dicts(r2)
-    inv.add_action("run_sql", "sync spikes per 5s window",
+    inv.add_action("run_sql", "sync spikes per minute window",
                    f"{len(rows2)} buckets")
 
     # Verdict: correlation between page alloc bursts and sync spikes
