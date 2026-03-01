@@ -65,6 +65,11 @@ spec:
         - name: ingero
           image: ghcr.io/ingero-io/ingero:v0.7
           imagePullPolicy: IfNotPresent
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           args:
             - "trace"
             - "--record"

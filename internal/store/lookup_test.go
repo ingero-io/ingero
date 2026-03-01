@@ -375,13 +375,13 @@ func TestStoreCGroupMetadata(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Store metadata.
-	s.StoreCGroupMetadata(42, "abc123def456abc123def456abc123def456abc123def456abc123def456abc123de", "/kubepods.slice/cri-containerd-abc123.scope")
-	s.StoreCGroupMetadata(99, "", "/sys/fs/cgroup/system.slice")
+	// Store metadata (with pod name/namespace for K8s, empty for bare metal).
+	s.StoreCGroupMetadata(42, "abc123def456abc123def456abc123def456abc123def456abc123def456abc123de", "/kubepods.slice/cri-containerd-abc123.scope", "training-job-0", "ml-team")
+	s.StoreCGroupMetadata(99, "", "/sys/fs/cgroup/system.slice", "", "")
 
-	// Verify via raw SQL.
-	var containerID, cgroupPath string
-	err = s.DB().QueryRow("SELECT container_id, cgroup_path FROM cgroup_metadata WHERE cgroup_id = 42").Scan(&containerID, &cgroupPath)
+	// Verify via raw SQL (including pod_name and namespace).
+	var containerID, cgroupPath, podName, namespace string
+	err = s.DB().QueryRow("SELECT container_id, cgroup_path, pod_name, namespace FROM cgroup_metadata WHERE cgroup_id = 42").Scan(&containerID, &cgroupPath, &podName, &namespace)
 	if err != nil {
 		t.Fatalf("query cgroup_metadata: %v", err)
 	}
@@ -391,9 +391,15 @@ func TestStoreCGroupMetadata(t *testing.T) {
 	if cgroupPath != "/kubepods.slice/cri-containerd-abc123.scope" {
 		t.Errorf("cgroup_path = %q", cgroupPath)
 	}
+	if podName != "training-job-0" {
+		t.Errorf("pod_name = %q, want training-job-0", podName)
+	}
+	if namespace != "ml-team" {
+		t.Errorf("namespace = %q, want ml-team", namespace)
+	}
 
 	// Verify idempotent update.
-	s.StoreCGroupMetadata(42, "updated_container_id", "/updated/path")
+	s.StoreCGroupMetadata(42, "updated_container_id", "/updated/path", "new-pod", "new-ns")
 	err = s.DB().QueryRow("SELECT container_id FROM cgroup_metadata WHERE cgroup_id = 42").Scan(&containerID)
 	if err != nil {
 		t.Fatalf("query after update: %v", err)
