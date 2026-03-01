@@ -17,6 +17,7 @@ import (
 	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/k8s"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
@@ -99,6 +100,33 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "  Logging to %s\n", traceLogPath)
 	}
 
+	// Step 0: Set up graceful shutdown context early — PodCache needs it.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Step 0b: K8s pod metadata enrichment (no-op on bare metal).
+	// Initialize early so GPU pod auto-discovery is available for resolveTargets.
+	// PodCache polls the K8s API every 30s for pods on this node.
+	// Single Run() goroutine with the signal-aware context — no double-start.
+	var podCache *k8s.PodCache
+	if k8s.IsInCluster() {
+		kClient, kErr := k8s.NewInCluster()
+		if kErr != nil {
+			fmt.Fprintf(os.Stderr, "  K8s API: %v (pod metadata disabled)\n", kErr)
+		} else {
+			podCache = k8s.NewPodCache(kClient)
+			if debugMode {
+				podCache.SetDebugLog(debugf)
+			}
+			go podCache.Run(ctx)
+			if err := podCache.WaitReady(ctx, 5*time.Second); err != nil {
+				debugf("K8s pod cache not ready: %v (continuing without pod metadata)", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "  K8s: pod metadata enrichment enabled\n")
+			}
+		}
+	}
+
 	// Step 1: Resolve targets — find libcudart.so and target PIDs.
 	//
 	// Three modes:
@@ -142,6 +170,20 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "  User %q: tracing %d CUDA process(es)\n", traceUser, len(pids))
 		} else {
 			fmt.Fprintf(os.Stderr, "  User %q: no CUDA processes yet — probes will trace all processes\n", traceUser)
+		}
+	}
+
+	// K8s GPU pod auto-discovery: when running in K8s with no --pid, find
+	// PIDs in GPU-requesting pods. Complements CUDA library scanning — catches
+	// processes that haven't loaded CUDA yet (e.g., during initialization).
+	if podCache != nil && len(tracePIDs) == 0 && len(targetPIDs) == 0 {
+		gpuPIDs, gpuErr := k8s.FindGPUPodPIDs(podCache)
+		if gpuErr != nil {
+			debugf("K8s GPU pod discovery: %v", gpuErr)
+		} else if len(gpuPIDs) > 0 {
+			targetPIDs = gpuPIDs
+			processNames = resolveProcessNames(gpuPIDs)
+			fmt.Fprintf(os.Stderr, "  K8s: discovered %d PIDs in GPU pods\n", len(gpuPIDs))
 		}
 	}
 
@@ -326,10 +368,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		resolver = symtab.NewResolver()
 	}
 
-	// Step 5: Set up graceful shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
+	// Step 5: Apply --duration timeout to the signal-aware context.
 	if traceDuration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, traceDuration)
@@ -428,9 +467,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +841,7 @@ func resolveProcessNames(pids []int) []string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -897,7 +936,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			}
 
 			// Resolve cgroup → container ID for K8s container correlation.
-			resolveCGroup(&evt, cgroupCache, eventStore)
+			resolveCGroup(&evt, cgroupCache, eventStore, podCache)
 
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
@@ -1215,7 +1254,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1306,7 +1345,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			}
 
 			// Resolve cgroup → container ID for K8s container correlation.
-			resolveCGroup(&evt, cgroupCache, eventStore)
+			resolveCGroup(&evt, cgroupCache, eventStore, podCache)
 
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
@@ -1489,7 +1528,10 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 // resolveCGroup looks up the container ID for an event's cgroup and stores
 // the metadata. Uses a cache to avoid repeated /proc reads. CGroupID == 1
 // means root cgroup (bare-metal or cgroup v1 only) — skip resolution.
-func resolveCGroup(evt *events.Event, cache map[uint64]string, eventStore *store.Store) {
+//
+// When podCache is non-nil (K8s mode), also enriches with pod name/namespace
+// by looking up the container ID in the PodCache.
+func resolveCGroup(evt *events.Event, cache map[uint64]string, eventStore *store.Store, podCache *k8s.PodCache) {
 	if evt.CGroupID <= 1 {
 		return
 	}
@@ -1508,12 +1550,25 @@ func resolveCGroup(evt *events.Event, cache map[uint64]string, eventStore *store
 	containerID := cgroup.ParseContainerID(cgroupPath)
 	cache[evt.CGroupID] = containerID
 
+	// Enrich with pod name/namespace from K8s API (no-op on bare metal).
+	var podName, namespace string
+	if podCache != nil && containerID != "" {
+		if info := podCache.Lookup(containerID); info != nil {
+			podName = info.Name
+			namespace = info.Namespace
+		}
+	}
+
 	if eventStore != nil && (containerID != "" || cgroupPath != "") {
-		eventStore.StoreCGroupMetadata(evt.CGroupID, containerID, cgroupPath)
+		eventStore.StoreCGroupMetadata(evt.CGroupID, containerID, cgroupPath, podName, namespace)
 	}
 
 	if containerID != "" {
-		debugf("cgroup: PID %d → cgroup_id=%d container=%s", evt.PID, evt.CGroupID, containerID[:12])
+		if podName != "" {
+			debugf("cgroup: PID %d → cgroup_id=%d container=%s pod=%s/%s", evt.PID, evt.CGroupID, containerID[:12], namespace, podName)
+		} else {
+			debugf("cgroup: PID %d → cgroup_id=%d container=%s", evt.PID, evt.CGroupID, containerID[:12])
+		}
 	}
 }
 

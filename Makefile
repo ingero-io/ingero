@@ -1,4 +1,4 @@
-.PHONY: all build generate clean test test-ci lint install wsl-setup gpu-deploy gpu-start gpu-stop gpu-destroy gpu-status gpu-ssh gpu-info gpu-validate gpu-logs lambda-deploy lambda-destroy lambda-status lambda-ssh lambda-info lambda-sync lambda-test lambda-validate lambda-logs azure-deploy azure-start azure-stop azure-destroy azure-status azure-ssh azure-info azure-sync azure-test azure-validate azure-logs fmt dev gpu-k3s-setup gpu-k3s-test lambda-k3s-setup lambda-k3s-test
+.PHONY: all build generate clean test test-ci lint install uninstall wsl-setup gpu-deploy gpu-start gpu-stop gpu-destroy gpu-status gpu-ssh gpu-info gpu-validate gpu-logs lambda-deploy lambda-destroy lambda-status lambda-ssh lambda-info lambda-sync lambda-test lambda-validate lambda-logs azure-deploy azure-start azure-stop azure-destroy azure-status azure-ssh azure-info azure-sync azure-test azure-validate azure-logs fmt dev gpu-k3s-setup gpu-k3s-test lambda-k3s-setup lambda-k3s-test
 
 # Variables
 # Mono-repo root is one level above agent/.
@@ -66,9 +66,22 @@ clean:
 	rm -f internal/ebpf/**/*_bpfel.go
 	rm -f internal/ebpf/**/*_bpfel.o
 
-# Install to /usr/local/bin
+# Install binary + systemd service
 install: build
 	sudo cp $(BINARY) /usr/local/bin/
+	sudo mkdir -p /var/lib/ingero
+	sudo cp deploy/systemd/ingero.service /etc/systemd/system/
+	sudo systemctl daemon-reload
+	@echo "Installed. Enable: sudo systemctl enable --now ingero"
+
+# Uninstall binary + systemd service (preserves data at /var/lib/ingero/)
+uninstall:
+	-sudo systemctl stop ingero 2>/dev/null
+	-sudo systemctl disable ingero 2>/dev/null
+	sudo rm -f /etc/systemd/system/ingero.service
+	sudo rm -f /usr/local/bin/ingero
+	sudo systemctl daemon-reload
+	@echo "Uninstalled. Data preserved at /var/lib/ingero/"
 
 # Generate vmlinux.h from running kernel BTF
 # Prefer bpftool matching the running kernel (avoids BTF version mismatch on GPU VMs

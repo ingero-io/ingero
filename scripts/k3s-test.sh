@@ -413,10 +413,10 @@ else
     if [ -z "$K8S_CONTAINER_ID" ]; then
         record "SKIP" "KT05: Container ID resolution" "could not get container ID from K8s API"
     else
-        # Query cgroup_metadata table
+        # Query cgroup_metadata table (including pod_name/namespace from K8s API enrichment)
         log "cgroup_metadata entries:"
         sudo sqlite3 "$INGERO_DB" \
-            "SELECT cgroup_id, container_id, cgroup_path FROM cgroup_metadata WHERE container_id != ''" \
+            "SELECT cgroup_id, container_id, pod_name, namespace, cgroup_path FROM cgroup_metadata WHERE container_id != ''" \
             2>/dev/null | while IFS= read -r line; do
             log "  $line"
         done
@@ -436,8 +436,27 @@ else
                 2>/dev/null || echo "0")
             log "cgroup_id=$CGROUP_ID has $EVENT_COUNT events"
 
+            # Verify pod_name and namespace enrichment (populated by PodCache in K8s mode)
+            DB_POD_NAME=$(sudo sqlite3 "$INGERO_DB" \
+                "SELECT pod_name FROM cgroup_metadata WHERE container_id = '$K8S_CONTAINER_ID' LIMIT 1" \
+                2>/dev/null || echo "")
+            DB_NAMESPACE=$(sudo sqlite3 "$INGERO_DB" \
+                "SELECT namespace FROM cgroup_metadata WHERE container_id = '$K8S_CONTAINER_ID' LIMIT 1" \
+                2>/dev/null || echo "")
+            log "pod_name=$DB_POD_NAME namespace=$DB_NAMESPACE"
+
             if [ "$EVENT_COUNT" -gt 0 ]; then
-                record "PASS" "KT05: Container ID resolution" "K8s container_id matched, $EVENT_COUNT events"
+                # Pod name/namespace may be empty on bare-metal or if PodCache isn't running.
+                # When running in K8s (DaemonSet), they should be populated.
+                if [ -n "$DB_POD_NAME" ] && [ "$DB_POD_NAME" = "pytorch-matmul-a" ]; then
+                    record "PASS" "KT05: Container ID resolution" "K8s container_id matched, pod=$DB_POD_NAME/$DB_NAMESPACE, $EVENT_COUNT events"
+                elif [ -n "$DB_POD_NAME" ]; then
+                    record "FAIL" "KT05: Container ID resolution" "pod_name mismatch: got '$DB_POD_NAME', want 'pytorch-matmul-a'"
+                else
+                    # Pod name empty — PodCache not running (bare-metal test mode).
+                    # Container ID match alone is still a valid pass.
+                    record "PASS" "KT05: Container ID resolution" "K8s container_id matched, $EVENT_COUNT events (pod metadata not enriched)"
+                fi
             else
                 record "FAIL" "KT05: Container ID resolution" "container_id matched but 0 events for cgroup_id=$CGROUP_ID"
             fi
@@ -447,7 +466,7 @@ else
             warn "Expected: $K8S_CONTAINER_ID"
             warn "Available container_ids:"
             sudo sqlite3 "$INGERO_DB" \
-                "SELECT container_id FROM cgroup_metadata WHERE container_id != ''" \
+                "SELECT container_id, pod_name, namespace FROM cgroup_metadata WHERE container_id != ''" \
                 2>/dev/null | while IFS= read -r line; do
                 warn "  $line"
             done

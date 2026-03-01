@@ -90,16 +90,24 @@ const migrateAddSumArg0 = `ALTER TABLE event_aggregates ADD COLUMN sum_arg0 INTE
 // Idempotent: fails silently if column already exists.
 const migrateAddCGroupID = `ALTER TABLE events ADD COLUMN cgroup_id INTEGER NOT NULL DEFAULT 0`
 
-// cgroupMetadataSchema stores cgroup_id → container_id mappings.
+// cgroupMetadataSchema stores cgroup_id → container_id + pod metadata mappings.
 // One row per cgroup — populated lazily during tracing when cgroup_id > 1.
+// pod_name/namespace are populated when running in K8s (via PodCache lookup).
 const cgroupMetadataSchema = `
 CREATE TABLE IF NOT EXISTS cgroup_metadata (
 	cgroup_id    INTEGER PRIMARY KEY,  -- bpf_get_current_cgroup_id() value
 	container_id TEXT NOT NULL DEFAULT '',  -- 64-char hex container ID
-	cgroup_path  TEXT NOT NULL DEFAULT ''   -- raw cgroup path from /proc/[pid]/cgroup
+	cgroup_path  TEXT NOT NULL DEFAULT '',  -- raw cgroup path from /proc/[pid]/cgroup
+	pod_name     TEXT NOT NULL DEFAULT '',  -- K8s pod name (empty on bare metal)
+	namespace    TEXT NOT NULL DEFAULT ''   -- K8s namespace (empty on bare metal)
 );
 CREATE INDEX IF NOT EXISTS idx_cgroup_metadata_container_id ON cgroup_metadata(container_id) WHERE container_id != '';
 `
+
+// migrateAddPodFields adds pod_name and namespace columns to cgroup_metadata.
+// Idempotent: fails silently if columns already exist (new DBs have them from schema).
+const migrateAddPodName = `ALTER TABLE cgroup_metadata ADD COLUMN pod_name TEXT NOT NULL DEFAULT ''`
+const migrateAddNamespace = `ALTER TABLE cgroup_metadata ADD COLUMN namespace TEXT NOT NULL DEFAULT ''`
 
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
@@ -627,11 +635,16 @@ func New(dbPath string) (*Store, error) {
 	// Sparse: bare-metal events (cgroup_id=0) don't bloat the index.
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_cgroup ON events(cgroup_id) WHERE cgroup_id != 0")
 
-	// v0.7: Create cgroup_metadata table (cgroup_id → container_id mapping).
+	// v0.7: Create cgroup_metadata table (cgroup_id → container_id + pod metadata).
 	if _, err := db.Exec(cgroupMetadataSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating cgroup_metadata table: %w", err)
 	}
+
+	// v0.7: Add pod_name/namespace columns to cgroup_metadata. Idempotent —
+	// no-op for new DBs (schema already has them), adds columns for old DBs.
+	db.Exec(migrateAddPodName)
+	db.Exec(migrateAddNamespace)
 
 	// Update schema version to 0.7.
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.7')")
@@ -851,11 +864,12 @@ func (s *Store) loadStackCache() {
 	}
 }
 
-// StoreCGroupMetadata stores a cgroup_id → container_id/path mapping.
+// StoreCGroupMetadata stores a cgroup_id → container_id/path/pod mapping.
 // Idempotent — uses INSERT OR REPLACE so repeated calls update the row.
-func (s *Store) StoreCGroupMetadata(cgroupID uint64, containerID, cgroupPath string) {
-	s.db.Exec("INSERT OR REPLACE INTO cgroup_metadata (cgroup_id, container_id, cgroup_path) VALUES (?, ?, ?)",
-		cgroupID, containerID, cgroupPath)
+// podName and namespace are empty on bare metal (populated from PodCache in K8s).
+func (s *Store) StoreCGroupMetadata(cgroupID uint64, containerID, cgroupPath, podName, namespace string) {
+	s.db.Exec("INSERT OR REPLACE INTO cgroup_metadata (cgroup_id, container_id, cgroup_path, pod_name, namespace) VALUES (?, ?, ?, ?, ?)",
+		cgroupID, containerID, cgroupPath, podName, namespace)
 }
 
 // prune performs size-based pruning. When --max-db is set and the DB exceeds
