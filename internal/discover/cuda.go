@@ -76,7 +76,7 @@ func findCUDAInMaps(pid int) (string, error) {
 			// Extract the file path (last field on the line)
 			path := extractPathFromMapsLine(line)
 			if path != "" {
-				return path, nil
+				return resolveContainerPath(pid, path), nil
 			}
 		}
 	}
@@ -91,49 +91,90 @@ func extractPathFromMapsLine(line string) string {
 	return libcudartRe.FindString(line)
 }
 
-// FindLibCUDART searches standard paths for libcudart.so.
-// Falls back to Python's nvidia.cuda_runtime package (pip-installed PyTorch).
-func FindLibCUDART() (string, error) {
-	searchPaths := []string{
-		// NVIDIA installer default
-		"/usr/local/cuda/lib64",
-		// Versioned CUDA installs (e.g., CUDA 12.2)
-		"/usr/local/cuda-12/lib64",
-		"/usr/local/cuda-11/lib64",
-		// Ubuntu/Debian package — architecture-specific multiarch paths
-		"/usr/lib/x86_64-linux-gnu",
-		"/usr/lib/aarch64-linux-gnu",
-		// Conda environments
-		"/opt/conda/lib",
-		// Generic
-		"/usr/lib64",
-		"/usr/lib",
-	}
+// cudaSearchPaths are standard locations for CUDA libraries.
+var cudaSearchPaths = []string{
+	// NVIDIA installer default
+	"/usr/local/cuda/lib64",
+	// Versioned CUDA installs (e.g., CUDA 12.2)
+	"/usr/local/cuda-12/lib64",
+	"/usr/local/cuda-11/lib64",
+	// Ubuntu/Debian package — architecture-specific multiarch paths
+	"/usr/lib/x86_64-linux-gnu",
+	"/usr/lib/aarch64-linux-gnu",
+	// Conda environments
+	"/opt/conda/lib",
+	// Generic
+	"/usr/lib64",
+	"/usr/lib",
+}
 
-	for _, dir := range searchPaths {
-		matches, err := filepath.Glob(filepath.Join(dir, "libcudart.so*"))
-		if err != nil {
-			continue
-		}
-		if len(matches) > 0 {
-			// Resolve symlinks to get the actual file
-			// (libcudart.so → libcudart.so.12 → libcudart.so.12.2.140)
-			resolved, err := filepath.EvalSymlinks(matches[0])
-			if err != nil {
-				return matches[0], nil // Return unresolved if symlink resolution fails
-			}
-			return resolved, nil
-		}
+// FindLibCUDART searches standard paths for libcudart.so.
+// Falls back to Python's nvidia.cuda_runtime package, then to host filesystem
+// via /proc/1/root/ (for containerized agents with hostPID: true).
+func FindLibCUDART() (string, error) {
+	if path, err := findLibInPaths(cudaSearchPaths, "libcudart.so*"); err == nil {
+		return path, nil
 	}
 
 	// Fallback: ask Python's nvidia.cuda_runtime package for the library path.
-	// pip-installed PyTorch bundles libcudart.so in a non-standard location like:
-	//   ~/.local/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12
 	if path, err := findLibCUDARTViaPython(); err == nil {
 		return path, nil
 	}
 
+	// Container fallback: search host filesystem via /proc/1/root/ (hostPID).
+	// When ingero runs in a K8s pod with hostPID: true, PID 1 is the host's
+	// init process. /proc/1/root/ is a traversable symlink to the host root.
+	if path, err := findLibOnHost(cudaSearchPaths, "libcudart.so*"); err == nil {
+		return path, nil
+	}
+
 	return "", fmt.Errorf("libcudart.so not found in standard paths or Python packages")
+}
+
+// findLibInPaths searches directories for a glob pattern and returns the
+// resolved (symlink-followed) path of the first match.
+func findLibInPaths(dirs []string, pattern string) (string, error) {
+	for _, dir := range dirs {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			continue
+		}
+		if len(matches) > 0 {
+			resolved, err := filepath.EvalSymlinks(matches[0])
+			if err != nil {
+				return matches[0], nil
+			}
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("not found")
+}
+
+// findLibOnHost searches host filesystem via /proc/1/root/ for a library.
+// Only works when running with hostPID: true (K8s DaemonSet or privileged container).
+func findLibOnHost(dirs []string, pattern string) (string, error) {
+	const hostRoot = "/proc/1/root"
+	// Quick check: is /proc/1/root traversable?
+	if _, err := os.Stat(hostRoot); err != nil {
+		return "", fmt.Errorf("host root not accessible: %w", err)
+	}
+	for _, dir := range dirs {
+		hostDir := filepath.Join(hostRoot, dir)
+		matches, err := filepath.Glob(filepath.Join(hostDir, pattern))
+		if err != nil {
+			continue
+		}
+		if len(matches) > 0 {
+			// Return the /proc/1/root/... path — cilium/ebpf's
+			// link.OpenExecutable() can open it for uprobe attachment.
+			resolved, err := filepath.EvalSymlinks(matches[0])
+			if err != nil {
+				return matches[0], nil
+			}
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("not found on host")
 }
 
 // findLibCUDARTViaPython discovers libcudart.so from Python's nvidia.cuda_runtime package.
@@ -190,34 +231,25 @@ func findLibInDir(dir string) (string, error) {
 	return resolved, nil
 }
 
+// driverSearchPaths are standard locations for the CUDA driver library.
+var driverSearchPaths = []string{
+	"/usr/lib/x86_64-linux-gnu",
+	"/usr/lib/aarch64-linux-gnu",
+	"/usr/local/cuda/lib64",
+	"/usr/local/cuda/compat",
+	"/usr/lib64",
+	"/usr/lib",
+}
+
 // FindLibCUDA searches standard paths for libcuda.so (the CUDA driver API library).
 // This is separate from libcudart.so (the runtime API). cuBLAS, cuDNN, and other
 // NVIDIA math libraries call libcuda.so directly, bypassing the runtime API.
 func FindLibCUDA() (string, error) {
-	searchPaths := []string{
-		"/usr/lib/x86_64-linux-gnu",
-		"/usr/lib/aarch64-linux-gnu",
-		"/usr/local/cuda/lib64",
-		"/usr/local/cuda/compat",
-		"/usr/lib64",
-		"/usr/lib",
+	if path, err := findLibInPaths(driverSearchPaths, "libcuda.so*"); err == nil {
+		return path, nil
 	}
 
-	for _, dir := range searchPaths {
-		matches, err := filepath.Glob(filepath.Join(dir, "libcuda.so*"))
-		if err != nil {
-			continue
-		}
-		if len(matches) > 0 {
-			resolved, err := filepath.EvalSymlinks(matches[0])
-			if err != nil {
-				return matches[0], nil
-			}
-			return resolved, nil
-		}
-	}
-
-	// Also check /proc/*/maps for a running process that has libcuda.so loaded.
+	// Check /proc/*/maps for a running process that has libcuda.so loaded.
 	entries, _ := os.ReadDir("/proc")
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
@@ -227,6 +259,11 @@ func FindLibCUDA() (string, error) {
 		if path, err := findLibInProcMaps(pid, "libcuda.so"); err == nil && path != "" {
 			return path, nil
 		}
+	}
+
+	// Container fallback: search host filesystem via /proc/1/root/.
+	if path, err := findLibOnHost(driverSearchPaths, "libcuda.so*"); err == nil {
+		return path, nil
 	}
 
 	return "", fmt.Errorf("libcuda.so not found")
@@ -254,11 +291,27 @@ func findLibInProcMaps(pid int, substr string) (string, error) {
 		if len(fields) >= 6 {
 			path := fields[len(fields)-1]
 			if strings.Contains(path, substr) {
-				return path, nil
+				return resolveContainerPath(pid, path), nil
 			}
 		}
 	}
 	return "", scanner.Err()
+}
+
+// resolveContainerPath handles library path resolution when ingero runs in a
+// container (e.g., K8s DaemonSet). Paths from /proc/[pid]/maps refer to the
+// target process's mount namespace. If the path doesn't exist in our namespace
+// (container), resolve through /proc/[pid]/root/ which traverses the target's
+// filesystem. On bare metal this is a no-op (direct path always exists).
+func resolveContainerPath(pid int, path string) string {
+	if _, err := os.Stat(path); err == nil {
+		return path // Direct path works (bare metal or shared mount)
+	}
+	altPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
+	if _, err := os.Stat(altPath); err == nil {
+		return altPath
+	}
+	return path // Return original; let caller handle the error
 }
 
 // readProcFile reads a small /proc file and returns its trimmed content.
