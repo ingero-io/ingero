@@ -358,8 +358,6 @@ func TestCGroupIDRoundTrip(t *testing.T) {
 	}
 
 	// Verify raw SQL confirms the column.
-	db, _ := sql.Open("sqlite", ":memory:")
-	defer db.Close()
 	var count int
 	s.DB().QueryRow("SELECT COUNT(*) FROM events WHERE cgroup_id = 42").Scan(&count)
 	if count != 1 {

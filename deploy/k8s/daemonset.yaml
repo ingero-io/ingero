@@ -64,6 +64,7 @@ spec:
       containers:
         - name: ingero
           image: ghcr.io/ingero-io/ingero:v0.7
+          imagePullPolicy: IfNotPresent
           args:
             - "trace"
             - "--record"
