@@ -97,6 +97,7 @@ cleanup() {
     for pid in "${cleanup_sudo_pids[@]}"; do
         sudo kill "$pid" 2>/dev/null || true
     done
+    sudo pkill -f 'ingero mcp' 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -566,7 +567,7 @@ else
         # Helper: call an MCP tool via HTTP and return the response
         mcp_call() {
             local tool="$1" args="$2"
-            curl -skf https://localhost:8080/mcp \
+            curl -skf --max-time 30 https://localhost:8080/mcp \
                 -H 'Content-Type: application/json' \
                 -H 'Accept: application/json, text/event-stream' \
                 -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"${tool}\",\"arguments\":${args}}}" 2>/dev/null
@@ -922,10 +923,12 @@ log "Running standard integration tests (62 tests)..."
 log "This takes ~45 min on A10/A100..."
 echo ""
 
+BARE_METAL_FAIL=0
 if bash scripts/gpu-test.sh; then
     log "Bare-metal regression: PASSED"
 else
     errmsg "Bare-metal regression: FAILED"
+    BARE_METAL_FAIL=1
 fi
 
 ################################################################################
@@ -947,7 +950,7 @@ echo "  logs/k3s-pod-describe.txt     — kubectl describe all pods"
 echo "  logs/k3s-integration-report.log — full test output"
 echo ""
 
-if [ "$FAIL_COUNT" -gt 0 ]; then
+if [ "$FAIL_COUNT" -gt 0 ] || [ "$BARE_METAL_FAIL" -gt 0 ]; then
     exit 1
 fi
 exit 0

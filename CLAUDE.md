@@ -25,7 +25,8 @@ eBPF compilation requires Linux (or WSL). Real GPU tracing requires `sudo` and a
 ```
 cmd/ingero/         CLI entry point
 internal/           Go packages (cli, ebpf/cuda, ebpf/driver, ebpf/host,
-                    correlate, store, mcp, export, stats, sysinfo, symtab, ...)
+                    correlate, store, mcp, export, stats, sysinfo, symtab,
+                    cgroup, k8s, discover, update, version, ...)
 bpf/                eBPF C programs (kernel-space, GPL-2.0 OR BSD-3-Clause)
 pkg/events/         Shared event types
 scripts/            GPU VM lifecycle, setup, integration tests

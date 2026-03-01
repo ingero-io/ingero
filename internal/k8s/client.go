@@ -129,7 +129,10 @@ func (c *Client) Get(path string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit response size to 16MB to prevent OOM on large clusters
+	// (e.g., empty MY_NODE_NAME causes cluster-wide pod listing).
+	const maxResponseSize = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

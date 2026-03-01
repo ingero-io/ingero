@@ -167,11 +167,10 @@ func findLibOnHost(dirs []string, pattern string) (string, error) {
 		if len(matches) > 0 {
 			// Return the /proc/1/root/... path — cilium/ebpf's
 			// link.OpenExecutable() can open it for uprobe attachment.
-			resolved, err := filepath.EvalSymlinks(matches[0])
-			if err != nil {
-				return matches[0], nil
-			}
-			return resolved, nil
+			// Don't EvalSymlinks here: it can resolve to a canonical
+			// host path that escapes the /proc/1/root/ prefix, making
+			// the path unusable inside the container.
+			return matches[0], nil
 		}
 	}
 	return "", fmt.Errorf("not found on host")

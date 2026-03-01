@@ -91,12 +91,19 @@ header() {
 }
 
 # Kill background processes on exit
+# Two arrays: cleanup_pids for direct children (safe to wait), cleanup_sudo_pids
+# for sudo-spawned processes (wait hangs — sudo creates a separate process tree).
 cleanup_pids=()
+cleanup_sudo_pids=()
 cleanup() {
     for pid in "${cleanup_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    for pid in "${cleanup_sudo_pids[@]}"; do
+        sudo kill "$pid" 2>/dev/null || true
+    done
+    sudo pkill -f 'ingero mcp' 2>/dev/null || true
     rm -rf "${TEST_TMP:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -1039,7 +1046,7 @@ sleep 0.5
 # Start MCP server in background
 sudo ./bin/ingero mcp --http :8080 > logs/mcp-server.log 2>&1 &
 MCP_PID=$!
-cleanup_pids+=("$MCP_PID")
+cleanup_sudo_pids+=("$MCP_PID")
 
 # Wait for MCP server to be ready (max 5s)
 MCP_READY=0
