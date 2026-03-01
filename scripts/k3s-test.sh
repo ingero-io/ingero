@@ -480,7 +480,7 @@ else
         # Check for chain-eligible event patterns (sync stalls > 1ms)
         SYNC_STALLS=$(sudo sqlite3 "$INGERO_DB" \
             "SELECT COUNT(*) FROM events e JOIN ops o ON e.source=o.source_id AND e.op=o.op_id
-             WHERE o.name IN ('cudaDeviceSynchronize','cudaStreamSynchronize','cuCtxSynchronize')
+             WHERE o.name IN ('cudaDeviceSync','cudaStreamSync','cuCtxSynchronize')
              AND e.duration > 1000000" 2>/dev/null || echo "0")
         log "Sync stalls > 1ms (chain-eligible): $SYNC_STALLS"
 

@@ -1444,7 +1444,7 @@ with open(results_file) as f:
             })
 
 report = {
-    'version': '0.6',
+    'version': '0.7',
     'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     'duration_s': int(os.environ.get('SCRIPT_DURATION', '0')),
     'system': {
