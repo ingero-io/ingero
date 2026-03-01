@@ -461,35 +461,41 @@ Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azu
 
 34/34 integration tests PASS across all GPUs. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper).
 
-## What Ingero Addresses Today (v0.6)
+## What Ingero Addresses Today (v0.7)
 
-Ingero addresses 23 documented GPU problems across training, inference, and AI agent workloads.
+Ingero addresses 25 of 32 documented GPU problems across training, inference, and AI agent workloads. See the [full problem statement](https://github.com/ingero-io/ingero/blob/main/docs/gpu-problems-statement.md) for sources and competitor analysis.
 
 | # | GPU Problem | Severity | How Ingero Detects It |
 |---|-------------|----------|----------------------|
 | 1 | NCCL hangs & distributed training deadlocks | CRITICAL | `sched_switch` shows blocked rank + CUDA sync timing (single-node) |
 | 2 | GPU underutilization / data pipeline starvation | CRITICAL | Host scheduler + `cudaStreamSync` + `cudaMemcpy` pipeline bubble diagnosis |
-| 3 | CUDA OOM & memory fragmentation | CRITICAL | `cudaMalloc`/`cuMemAlloc` allocation pattern tracing |
+| 3 | CUDA OOM & memory fragmentation | CRITICAL | `cudaMalloc`/`cuMemAlloc` allocation pattern tracing. v0.8: `cudaMallocManaged` adds managed-memory over-subscription detection |
 | 4 | Silent data corruption (SDC) | CRITICAL | Anomalous kernel timing as indirect signal (limited) |
 | 5 | Inference cost explosion (multi-step agents) | CRITICAL | CUDA API burst/idle patterns per agent session |
-| 6 | KV cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption |
+| 6 | KV cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption. v0.8: managed-memory page fault detection |
 | 7 | GPU hardware failures at scale | HIGH | `cudaMemcpy` baseline drift, `sched_switch` frequency anomalies |
 | 8 | CPU bottleneck in GPU serving | HIGH | `sched_switch` on inference process + `cudaStreamSync` idle gaps |
 | 9 | GPU idle waste during agent tool execution | HIGH | CUDA API silence periods correlated with host process activity |
-| 10 | GPU memory leaks in long-running services | HIGH | `cudaMalloc`/`cudaFree` imbalance tracking over time |
+| 10 | GPU memory leaks in long-running services | HIGH | `cudaMalloc`/`cudaFree` imbalance tracking over time, per-container via cgroup |
 | 11 | Mixed precision (AMP) instability | HIGH | Anomalous kernel timing (skipped updates = fast sync) |
 | 12 | Goodput loss (training efficiency gap) | HIGH | Scheduler preemption, memcpy latency, pipeline bubbles |
-| 13 | Model swapping latency (multi-model agents) | HIGH | `cudaMalloc` + `cudaMemcpy` patterns during model load |
-| 14 | CUDA device-side asserts & illegal memory access | MEDIUM | CUDA API call sequence + stack traces before crash |
-| 15 | NVIDIA driver / CUDA version incompatibility | MEDIUM | Uprobe attachment failure = library/driver mismatch signal |
-| 16 | Thermal throttling & power limit throttling | MEDIUM | Kernel duration trending over time |
-| 17 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing |
-| 18 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync |
-| 19 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown |
-| 20 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync` |
-| 21 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration |
-| 22 | Loss spikes (non-AMP) | LOW-MED | System event correlation with loss timing |
-| 23 | Triton Inference Server multi-GPU bugs | LOW-MED | CUDA API tracing on Triton processes |
+| 13 | GPU scheduling & orchestration failures (K8s) | HIGH | Per-cgroup `sched_switch` latency + pod/namespace metadata. Auto-discovers `nvidia.com/gpu` pods **(v0.7)** |
+| 14 | Model swapping latency (multi-model agents) | HIGH | `cudaMalloc` + `cudaMemcpy` patterns during model load |
+| 15 | CUDA device-side asserts & illegal memory access | MEDIUM | CUDA API call sequence + stack traces before crash |
+| 16 | NVIDIA driver / CUDA version incompatibility | MEDIUM | Uprobe attachment failure = library/driver mismatch signal |
+| 17 | Thermal throttling & power limit throttling | MEDIUM | Kernel duration trending over time |
+| 18 | Noisy neighbor / multi-tenant GPU interference | MEDIUM | Per-cgroup `sched_switch` latency + CUDA API latency correlation identifies which co-located workload causes degradation **(v0.7)** |
+| 19 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing |
+| 20 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync |
+| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown |
+| 22 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync` |
+| 23 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration. v0.8: `cudaMallocManaged` page migration detection |
+| 24 | Loss spikes (non-AMP) | LOW-MED | System event correlation with loss timing |
+| 25 | Triton Inference Server multi-GPU bugs | LOW-MED | CUDA API tracing on Triton processes |
+
+**v0.7 adds:** K8s-native detection — per-cgroup tracing with container ID resolution and pod metadata enrichment enables #13 and #18 above.
+
+**v0.8 will add:** `cudaMallocManaged`/`cuMemAllocManaged` tracing for Unified Memory page migration latency. Extends #3 (OOM from managed-memory over-subscription), #6 (KV cache offloading page faults), and #23 (PCIe page migration bottleneck) with causal chains attributing kernel slowdowns to first-touch page faults.
 
 ## Roadmap
 
