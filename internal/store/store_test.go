@@ -990,6 +990,54 @@ func TestStackHashDeterministic(t *testing.T) {
 	}
 }
 
+func TestHashStackResolved(t *testing.T) {
+	// Unresolved stacks (IPs only) use HashStackIPs — same as before.
+	unresolved := makeStack(0xdead, 0xbeef)
+	h1 := hashStack(unresolved)
+	h2 := hashStackIPs(unresolved)
+	if h1 != h2 {
+		t.Errorf("unresolved stack: hashStack != hashStackIPs: %d vs %d", h1, h2)
+	}
+
+	// Resolved stacks (SymbolName set) use HashStackSymbols — ASLR-independent.
+	resolved := []events.StackFrame{
+		{IP: 0xdead, SymbolName: "cudaLaunchKernel", File: "/usr/lib/libcudart.so"},
+		{IP: 0xbeef, SymbolName: "main", File: "/app/train.py"},
+	}
+	h3 := hashStack(resolved)
+	h4 := events.HashStackSymbols(resolved)
+	if h3 != h4 {
+		t.Errorf("resolved stack: hashStack != HashStackSymbols: %d vs %d", h3, h4)
+	}
+
+	// Same symbols with different IPs (ASLR) must produce the same hash.
+	resolvedASLR := []events.StackFrame{
+		{IP: 0x1111, SymbolName: "cudaLaunchKernel", File: "/usr/lib/libcudart.so"},
+		{IP: 0x2222, SymbolName: "main", File: "/app/train.py"},
+	}
+	h5 := hashStack(resolvedASLR)
+	if h3 != h5 {
+		t.Errorf("ASLR-different stacks with same symbols got different hashes: %d vs %d", h3, h5)
+	}
+
+	// Python-only resolution (PyFile/PyFunc set, no native SymbolName/File)
+	// must use HashStackSymbols, not HashStackIPs.
+	pyOnly := []events.StackFrame{
+		{IP: 0xaaaa, PyFile: "train.py", PyFunc: "forward", PyLine: 42},
+		{IP: 0xbbbb, PyFile: "model.py", PyFunc: "linear", PyLine: 10},
+	}
+	h6 := hashStack(pyOnly)
+	h7 := events.HashStackSymbols(pyOnly)
+	if h6 != h7 {
+		t.Errorf("Python-only stack: hashStack != HashStackSymbols: %d vs %d", h6, h7)
+	}
+	// Verify it's NOT using HashStackIPs
+	h8 := events.HashStackIPs(pyOnly)
+	if h6 == h8 {
+		t.Errorf("Python-only stack incorrectly used HashStackIPs")
+	}
+}
+
 func TestStackCachePreload(t *testing.T) {
 	// Test that a second Run() session against the same DB reuses
 	// existing stack_traces (no duplicate inserts).

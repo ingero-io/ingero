@@ -779,7 +779,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 	for _, evt := range batch {
 		var stackHash int64
 		if len(evt.Stack) > 0 {
-			h := events.HashStackIPs(evt.Stack)
+			h := hashStack(evt.Stack)
 			stackHash = int64(h)
 			cached, known := s.stackCache[h]
 			if !known {
@@ -1920,6 +1920,24 @@ func deserializeStackIPs(s string) []events.StackFrame {
 // hashStackIPs delegates to the exported events.HashStackIPs. Kept as a
 // package-local alias for backward compat with callers inside store.
 func hashStackIPs(stack []events.StackFrame) uint64 {
+	return events.HashStackIPs(stack)
+}
+
+// hashStack returns an ASLR-independent hash (HashStackSymbols) when the
+// stack has at least one resolved field (native symbol/file, or Python
+// file/func). Falls back to HashStackIPs for fully-unresolved stacks
+// (e.g. first events before /proc/[pid]/maps is loaded). This fixes 16x
+// stack_traces bloat on x86_64 caused by ASLR giving identical logical
+// stacks different raw IPs per PID.
+//
+// The resolution check mirrors serializeStackFrames: a frame is "resolved"
+// if any of SymbolName, File, PyFile, or PyFunc is non-empty.
+func hashStack(stack []events.StackFrame) uint64 {
+	for _, f := range stack {
+		if f.SymbolName != "" || f.File != "" || f.PyFile != "" || f.PyFunc != "" {
+			return events.HashStackSymbols(stack)
+		}
+	}
 	return events.HashStackIPs(stack)
 }
 

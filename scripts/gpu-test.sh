@@ -377,13 +377,13 @@ fi
 # Regression gate check
 REGRESSION_FAILS=$FAIL_COUNT
 if [[ "$REGRESSION_FAILS" -gt 0 ]]; then
-    fail "Regression gate FAILED ($REGRESSION_FAILS failures). Continuing with v0.6 tests anyway."
+    fail "Regression gate FAILED ($REGRESSION_FAILS failures). Continuing with v0.7 tests anyway."
 fi
 
 ################################################################################
-# Phase 2: v0.6 Stack Tracing Deep Tests
+# Phase 2: v0.7 Stack Tracing Deep Tests
 ################################################################################
-header "Phase 2: v0.6 Stack Tracing"
+header "Phase 2: v0.7 Stack Tracing"
 
 # ── T10+T12 merged: ONE trace session → check both ──
 # --stack and --record are on by default.
@@ -603,9 +603,9 @@ else
 fi
 
 ################################################################################
-# Phase 3: v0.6 OTLP Export Tests
+# Phase 3: v0.7 OTLP Export Tests
 ################################################################################
-header "Phase 3: v0.6 OTLP Export"
+header "Phase 3: v0.7 OTLP Export"
 
 # Test 14: OTLP with Python HTTP receiver
 _test_start=$SECONDS
@@ -952,7 +952,7 @@ avg_nostack = statistics.mean(nostack_counts) if nostack_counts else 0
 avg_stack = statistics.mean(stack_counts) if stack_counts else 0
 
 print("=" * 70)
-print("  Ingero v0.6 Stack Tracing Benchmark Summary")
+print("  Ingero v0.7 Stack Tracing Benchmark Summary")
 print("=" * 70)
 print()
 print("Throughput (events in 20s window):")
