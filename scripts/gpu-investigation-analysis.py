@@ -264,7 +264,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                     _gpu_name = str(rows_data[0][col_map["gpu_model"]]).upper()
     except Exception:
         pass
-    _unified_memory = "GH200" in _gpu_name or "GH100" in _gpu_name
+    _unified_memory = any(tag in _gpu_name for tag in ("GH200", "GH100", "GB200", "GB300"))
 
     # =========================================================================
     # T23a: #1 NCCL Hangs — NOT provoked (requires multi-GPU / NCCL)
