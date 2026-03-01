@@ -85,11 +85,17 @@ record() {
 }
 
 # Cleanup on exit
+# Two arrays: cleanup_pids for direct children (safe to wait), cleanup_sudo_pids
+# for sudo-spawned processes (wait hangs — sudo creates a separate process tree).
 cleanup_pids=()
+cleanup_sudo_pids=()
 cleanup() {
     for pid in "${cleanup_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
+    done
+    for pid in "${cleanup_sudo_pids[@]}"; do
+        sudo kill "$pid" 2>/dev/null || true
     done
 }
 trap cleanup EXIT
@@ -535,7 +541,7 @@ else
     sleep 0.5
     sudo ./bin/ingero mcp --http :8080 --db "$INGERO_DB" > logs/kt07-mcp-server.log 2>&1 &
     MCP_PID=$!
-    cleanup_pids+=("$MCP_PID")
+    cleanup_sudo_pids+=("$MCP_PID")
 
     # Wait for MCP server to be ready (max 5s)
     MCP_READY=0
@@ -614,9 +620,9 @@ else
             MCP_FAIL=$((MCP_FAIL + 1))
         fi
 
-        # Kill MCP server
+        # Kill MCP server (don't wait — sudo-spawned, wait would hang)
         sudo kill "$MCP_PID" 2>/dev/null || true
-        wait "$MCP_PID" 2>/dev/null || true
+        sleep 1
 
         if [ "$MCP_FAIL" -eq 0 ]; then
             record "PASS" "KT07: MCP queries" "$MCP_PASS/4 tools returned valid responses"
