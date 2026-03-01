@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,8 @@ type PodCache struct {
 
 	ready chan struct{} // closed after first successful list
 	once  sync.Once     // ensures ready is closed exactly once
+
+	warnedNodeName bool // true after warning about empty MY_NODE_NAME
 }
 
 // NewPodCache creates a cache that will be populated by Run().
@@ -175,6 +178,11 @@ func (pc *PodCache) listPods() ([]PodInfo, error) {
 	path := "/api/v1/pods"
 	if node := pc.client.NodeName(); node != "" {
 		path += "?fieldSelector=spec.nodeName=" + node
+	} else if !pc.warnedNodeName {
+		// MY_NODE_NAME not set — listing all pods in cluster. This is
+		// expensive on large clusters but functionally correct.
+		fmt.Fprintf(os.Stderr, "  K8s: warning: MY_NODE_NAME not set, listing all pods (set env.MY_NODE_NAME in DaemonSet)\n")
+		pc.warnedNodeName = true
 	}
 
 	data, err := pc.client.Get(path)

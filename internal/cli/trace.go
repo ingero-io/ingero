@@ -1564,10 +1564,14 @@ func resolveCGroup(evt *events.Event, cache map[uint64]string, eventStore *store
 	}
 
 	if containerID != "" {
+		shortID := containerID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
 		if podName != "" {
-			debugf("cgroup: PID %d → cgroup_id=%d container=%s pod=%s/%s", evt.PID, evt.CGroupID, containerID[:12], namespace, podName)
+			debugf("cgroup: PID %d → cgroup_id=%d container=%s pod=%s/%s", evt.PID, evt.CGroupID, shortID, namespace, podName)
 		} else {
-			debugf("cgroup: PID %d → cgroup_id=%d container=%s", evt.PID, evt.CGroupID, containerID[:12])
+			debugf("cgroup: PID %d → cgroup_id=%d container=%s", evt.PID, evt.CGroupID, shortID)
 		}
 	}
 }
