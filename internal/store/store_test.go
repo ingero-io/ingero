@@ -1436,6 +1436,20 @@ func TestPruneBySizeStackCacheRebuild(t *testing.T) {
 		close(done)
 	}()
 
+	// waitFor polls a condition instead of sleeping a fixed duration.
+	// This makes the test deterministic under -race (which adds 2-20x overhead).
+	waitFor := func(msg string, timeout time.Duration, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out after %s waiting for: %s", timeout, msg)
+	}
+
 	// Phase 1: Insert events with a specific stack.
 	stack := makeStack(0xaaa, 0xbbb, 0xccc)
 	baseTime := time.Now().Add(-10 * time.Minute)
@@ -1445,7 +1459,11 @@ func TestPruneBySizeStackCacheRebuild(t *testing.T) {
 		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
 		s.Record(evt)
 	}
-	time.Sleep(500 * time.Millisecond)
+	waitFor("Phase 1 flush", 10*time.Second, func() bool {
+		var cnt int64
+		s.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&cnt)
+		return cnt >= 500
+	})
 
 	// Verify stack exists.
 	var stackCount int64
@@ -1454,20 +1472,42 @@ func TestPruneBySizeStackCacheRebuild(t *testing.T) {
 		t.Fatalf("expected 1 stack trace before prune, got %d", stackCount)
 	}
 
-	// Phase 2: Set tiny maxDBSize and trigger prune via new events.
-	// This should delete old events + orphaned stack traces + rebuild cache.
+	// Phase 2a: Set tiny maxDBSize and trigger prune with stackless events.
+	// The filler events carry no stack, so once old events are deleted the
+	// test stack becomes orphaned and is cleaned up.  The stack cache is
+	// rebuilt without it.
 	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	s.SetMaxDBSize(s.diskUsage() / 4)
 
-	// Insert new events with the SAME stack — after pruning, the stack should
-	// be re-inserted (not skipped by stale cache).
+	for i := 0; i < DefaultBatchSize+1; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
+		evt.Timestamp = time.Now()
+		s.Record(evt)
+	}
+	// Wait for prune to delete the orphaned stack trace.
+	waitFor("Phase 2a prune", 30*time.Second, func() bool {
+		var cnt int64
+		s.db.QueryRow("SELECT COUNT(*) FROM stack_traces").Scan(&cnt)
+		return cnt == 0
+	})
+
+	// Phase 2b: Remove size limit and insert events with the SAME stack.
+	// Because the cache was rebuilt (without the old hash), flushBatch must
+	// re-insert the stack row rather than skipping it as "already in DB".
+	s.SetMaxDBSize(0)
+
 	for i := 0; i < DefaultBatchSize+1; i++ {
 		evt := makeEvt(events.SourceCUDA, uint8(events.CUDALaunchKernel), 10*time.Microsecond)
 		evt.Stack = stack
 		evt.Timestamp = time.Now()
 		s.Record(evt)
 	}
-	time.Sleep(500 * time.Millisecond)
+	// Wait for Phase 2b stack to be re-inserted.
+	waitFor("Phase 2b stack re-inserted", 10*time.Second, func() bool {
+		var cnt int64
+		s.db.QueryRow("SELECT COUNT(*) FROM stack_traces").Scan(&cnt)
+		return cnt >= 1
+	})
 
 	// Phase 3: Query the new events — stacks should be resolved, not empty.
 	result, err := s.Query(QueryParams{Since: 1 * time.Minute})

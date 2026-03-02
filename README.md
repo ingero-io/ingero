@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.94**
+**Version: 0.6.101**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -188,6 +188,8 @@ sudo ingero trace --stack=false            # disable stack traces (saves ~0.4-0.
 sudo ingero trace --max-db 10g             # limit DB to 10 GB (default), prunes oldest events
 sudo ingero trace --max-db 500m            # limit DB to 500 MB (tight disk budget)
 sudo ingero trace --max-db 0               # unlimited (no size-based pruning)
+sudo ingero trace --deadband 5              # suppress idle snapshots (5% threshold)
+sudo ingero trace --deadband 5 --heartbeat 30s  # deadband + force report every 30s
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 ```

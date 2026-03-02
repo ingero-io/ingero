@@ -22,6 +22,7 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
 	"github.com/ingero-io/ingero/internal/export"
+	"github.com/ingero-io/ingero/internal/filter"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/symtab"
@@ -45,7 +46,9 @@ var (
 	traceDBPath       string // Custom DB path (default: ~/.ingero/ingero.db).
 	traceMaxDB        string // Max DB size (e.g., "10g"). 0 = unlimited.
 	traceStackSamples int    // Max events stored per unique call stack (0 = unlimited).
-	traceLogPath      string // Log output file path (debug, no rotation).
+	traceLogPath      string        // Log output file path (debug, no rotation).
+	traceDeadbandPct  float64       // Deadband threshold % (0 = disabled).
+	traceHeartbeat    time.Duration // Heartbeat interval (0 = no heartbeat).
 )
 
 var traceCmd = &cobra.Command{
@@ -78,6 +81,8 @@ func init() {
 	traceCmd.Flags().StringVar(&traceMaxDB, "max-db", "10g", "max database size (e.g., 10g, 500m, 1t). 0 = unlimited")
 	traceCmd.Flags().IntVar(&traceStackSamples, "stack-samples", 100, "max events stored per unique call stack (0 = unlimited)")
 	traceCmd.Flags().StringVar(&traceLogPath, "log", "", "write log output to file (append, no rotation)")
+	traceCmd.Flags().Float64Var(&traceDeadbandPct, "deadband", 0, "suppress snapshot writes when all metrics change < this % (0 = disabled)")
+	traceCmd.Flags().DurationVar(&traceHeartbeat, "heartbeat", 0, "force a snapshot write at least this often even if within deadband (0 = no heartbeat)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -375,8 +380,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		defer cancel()
 	}
 
+	// Deadband filter for system snapshots (nil = disabled / no-op).
+	snapFilter := filter.Config{
+		DeadbandPct:       traceDeadbandPct,
+		HeartbeatInterval: traceHeartbeat,
+	}.NewSnapshotFilter()
+
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount)
+	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount, snapFilter)
 
 	// Step 7: Launch tracers and merge event channels.
 	go cudaTracer.Run(ctx)
@@ -467,9 +478,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -841,7 +852,7 @@ func resolveProcessNames(pids []int) []string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -990,14 +1001,16 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Record system snapshot for post-hoc causal chain replay.
 			if eventStore != nil {
 				sys := sysColl.Snapshot()
-				eventStore.RecordSnapshot(store.SystemSnapshot{
-					Timestamp:  sys.Timestamp,
-					CPUPercent: sys.CPUPercent,
-					MemUsedPct: sys.MemUsedPct,
-					MemAvailMB: sys.MemAvailMB,
-					SwapUsedMB: sys.SwapUsedMB,
-					LoadAvg1:   sys.LoadAvg1,
-				})
+				if snapFilter.ShouldEmit(sys.CPUPercent, sys.MemUsedPct, sys.MemAvailMB, sys.SwapUsedMB, sys.LoadAvg1) {
+					eventStore.RecordSnapshot(store.SystemSnapshot{
+						Timestamp:  sys.Timestamp,
+						CPUPercent: sys.CPUPercent,
+						MemUsedPct: sys.MemUsedPct,
+						MemAvailMB: sys.MemAvailMB,
+						SwapUsedMB: sys.SwapUsedMB,
+						LoadAvg1:   sys.LoadAvg1,
+					})
+				}
 			}
 			// Flush completed minute-buckets to SQLite.
 			flushAggregates(aggs, eventStore, time.Now())
@@ -1254,7 +1267,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1313,14 +1326,16 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Record system snapshot for post-hoc causal chain replay.
 			if eventStore != nil && sysColl != nil {
 				sys := sysColl.Snapshot()
-				eventStore.RecordSnapshot(store.SystemSnapshot{
-					Timestamp:  sys.Timestamp,
-					CPUPercent: sys.CPUPercent,
-					MemUsedPct: sys.MemUsedPct,
-					MemAvailMB: sys.MemAvailMB,
-					SwapUsedMB: sys.SwapUsedMB,
-					LoadAvg1:   sys.LoadAvg1,
-				})
+				if snapFilter.ShouldEmit(sys.CPUPercent, sys.MemUsedPct, sys.MemAvailMB, sys.SwapUsedMB, sys.LoadAvg1) {
+					eventStore.RecordSnapshot(store.SystemSnapshot{
+						Timestamp:  sys.Timestamp,
+						CPUPercent: sys.CPUPercent,
+						MemUsedPct: sys.MemUsedPct,
+						MemAvailMB: sys.MemAvailMB,
+						SwapUsedMB: sys.SwapUsedMB,
+						LoadAvg1:   sys.LoadAvg1,
+					})
+				}
 			}
 			// Flush completed minute-buckets to SQLite.
 			flushAggregates(aggs, eventStore, time.Now())
@@ -1447,7 +1462,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 // contaminating the JSON stream on stdout. This was a known bug through v0.4
 // where the ASCII header mixed with JSONL output, breaking jq, MCP consumers,
 // and any tool expecting valid JSONL on stdout.
-func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int) {
+func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int, snapFilter *filter.SnapshotFilter) {
 	// In JSON mode, redirect header to stderr so stdout is clean JSONL.
 	w := os.Stdout
 	if traceJSON {
@@ -1514,6 +1529,13 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 	}
 	if traceOTLP != "" {
 		fmt.Fprintf(w, "  OTLP: %s\n", traceOTLP)
+	}
+	if snapFilter != nil {
+		if traceHeartbeat > 0 {
+			fmt.Fprintf(w, "  Deadband: %.1f%% threshold, heartbeat %s\n", traceDeadbandPct, traceHeartbeat)
+		} else {
+			fmt.Fprintf(w, "  Deadband: %.1f%% threshold\n", traceDeadbandPct)
+		}
 	}
 
 	if traceDuration > 0 {

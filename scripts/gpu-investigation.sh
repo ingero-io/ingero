@@ -217,9 +217,6 @@ sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration "${TRACE_D
 TRACE_PID=$!
 cleanup_sudo_pids+=("$TRACE_PID")
 
-# Record phase timestamps (epoch seconds) for Python analysis
-PHASE1_START=$(date +%s.%N)
-
 # Phase 1 runs for 20s (trace capturing, alloc_stress in delay/sleep)
 echo -e "$(ts)   Phase 1: baseline (20s)..."
 sleep 20
@@ -235,7 +232,6 @@ if ! kill -0 "$ALLOC_PID" 2>/dev/null; then
     tail -5 logs/gpu-inv-alloc-stress.log 2>/dev/null || true
 fi
 echo -e "$(ts) ${CYAN}[PHASE 2]${NC} alloc_stress.py delay expired, stress active (30s)..."
-PHASE2_START=$(date +%s.%N)
 
 # Phase 2 runs for 30s (alloc_stress does actual work during this window)
 sleep 30
@@ -245,7 +241,6 @@ sleep 30
 ################################################################################
 
 echo -e "$(ts) ${CYAN}[PHASE 3]${NC} Starting stress-ng (40s, $(nproc) workers)..."
-PHASE3_START=$(date +%s.%N)
 
 # Kill alloc_stress if still running (it should have finished its 30s duration by now)
 kill "$ALLOC_PID" 2>/dev/null || true
@@ -263,7 +258,6 @@ sleep 40
 ################################################################################
 
 echo -e "$(ts) ${CYAN}[PHASE 4]${NC} Killing stressors, recovery phase (20s)..."
-PHASE4_START=$(date +%s.%N)
 
 # pkill -f the actual stress-ng workers — sudo kill on the wrapper PID
 # only kills the sudo process, not the stress-ng children it spawned.
@@ -355,10 +349,6 @@ ANALYSIS_OUTPUT=$(python3 scripts/gpu-investigation-analysis.py \
     --mcp-url "https://localhost:${MCP_PORT}/mcp" \
     --db "$ML_DB" \
     --report "$REPORT_FILE" \
-    --phase1-start "$PHASE1_START" \
-    --phase2-start "$PHASE2_START" \
-    --phase3-start "$PHASE3_START" \
-    --phase4-start "$PHASE4_START" \
     2> logs/gpu-inv-analysis-stderr.log)
 ANALYSIS_EXIT=$?
 

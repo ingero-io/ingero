@@ -238,7 +238,7 @@ class Investigation:
         return f"ML_RESULT|{self.tid}|{self.tid}: {self.title}|{self.status}|{detail}|0"
 
 
-def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
+def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]:
     """Run all 28 GPU problem investigations."""
     investigations = []
 
@@ -768,9 +768,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     high_cpu_cnt = r2_rows[0].get("cnt", 0) if r2_rows else 0
     max_cpu = r2_rows[0].get("max_cpu", 0) or 0 if r2_rows else 0
 
-    if high_chains > 0 or high_cpu_cnt > 0:
+    if high_chains >= 3 or high_cpu_cnt >= 3:
         inv.set_verdict("DETECTED",
                         f"{high_chains} HIGH chains, {high_cpu_cnt} snapshots >90% CPU (max={max_cpu:.0f}%)")
+    elif high_chains > 0 or high_cpu_cnt > 0:
+        inv.set_verdict("DETECTED",
+                        f"{high_chains} HIGH chains, {high_cpu_cnt} snapshots >90% CPU (weak signal)")
     elif rows3:
         # Check for sched_switch spikes
         max_sched = max((r.get("sched_cnt", 0) or 0) for r in rows3) if rows3 else 0
@@ -1140,11 +1143,20 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "GPU, driver, CUDA, kernel versions",
                    "compatibility check")
 
-    # Verdict: successful trace = compatible
-    if "GPU" in sessions_text or "gpu" in sessions_text or "driver" in sessions_text.lower():
-        inv.set_verdict("HEALTHY", "trace succeeded — driver and CUDA compatible")
+    # Check for CUDA API errors that indicate driver/runtime mismatch.
+    # ret_code != 0 on CUDA calls = driver rejection (e.g., CUDA_ERROR_NOT_SUPPORTED).
+    r2 = mcp.run_sql("""
+        SELECT COUNT(*) as err_count FROM events
+        WHERE source IN (1, 4) AND ret_code != 0
+    """)
+    err_count = sql_first_val(r2, 0)
+
+    if err_count > 10:
+        inv.set_verdict("DETECTED",
+                        f"{err_count} CUDA API errors (ret_code != 0) — possible driver/runtime mismatch")
     elif sessions_text:
-        inv.set_verdict("HEALTHY", "session metadata available")
+        inv.set_verdict("HEALTHY",
+                        f"trace succeeded, {err_count} API errors — driver and CUDA compatible")
     else:
         inv.set_verdict("INCONCLUSIVE", "no session data")
 
@@ -1438,10 +1450,10 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         page_cnt = sql_first_val(r3, 0)
         rows3 = sql_to_dicts(r3)
         total_bytes = (rows3[0].get("total_bytes", 0) or 0) if rows3 else 0
-        # Require meaningful page activity — >1000 events AND >50MB total.
-        # Routine host allocations produce ~100-500 events; checkpoint bursts
-        # produce thousands with hundreds of MB.
-        if page_cnt > 1000 and total_bytes > 50e6:
+        # Require significant page activity — >5000 events AND >200MB total.
+        # Routine host allocations produce ~100-2000 events with <100MB; real
+        # checkpoint bursts produce tens of thousands with hundreds of MB.
+        if page_cnt > 5000 and total_bytes > 200e6:
             inv.set_verdict("DETECTED",
                             f"{page_cnt} page alloc events, {total_bytes/1e6:.1f}MB total (below spike threshold)")
         else:
@@ -1569,8 +1581,10 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     elif rows1:
         inv.set_verdict("HEALTHY",
                         f"{len(rows1)} high-CPU snapshots but no causal chains — CPU load not impacting GPU")
-    elif chain_count > 0:
+    elif chain_count >= 5:
         inv.set_verdict("DETECTED", f"{chain_count} causal chains detected (no CPU correlation)")
+    elif chain_count > 0:
+        inv.set_verdict("HEALTHY", f"{chain_count} causal chains but no CPU correlation — insufficient evidence")
     else:
         inv.set_verdict("HEALTHY", "no system-CUDA correlation found")
 
@@ -1596,13 +1610,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "per-process CUDA event summary",
                    f"{len(rows1)} processes")
 
-    # Action 2: session process names (cached)
-    r2 = _cached_sessions
-    inv.add_action("run_sql", "process names", "check for Triton/vLLM")
+    # Action 2: check process names for inference servers
+    inv.add_action("run_sql", "process names from events", "check for Triton/vLLM")
 
-    # Verdict: HEALTHY (no Triton in workload)
-    sessions_text = str(r2.get("text", r2.get("data", "")))
-    has_triton = "triton" in sessions_text.lower() or "vllm" in sessions_text.lower()
+    # Verdict: search actual process names from event data, not session metadata
+    proc_names_lower = [str(r.get("name", "")).lower() for r in rows1 if r.get("name")]
+    has_triton = any("triton" in n or "vllm" in n for n in proc_names_lower)
     if has_triton:
         inv.set_verdict("DETECTED", "inference server processes found")
     else:
@@ -1945,19 +1958,6 @@ def main():
     parser.add_argument("--db", required=True, help="Path to ingero.db")
     parser.add_argument("--report", default="logs/gpu-investigation-report.log",
                         help="Report output path")
-    # Phase timestamps are accepted for backwards compatibility with
-    # gpu-investigation.sh, but the analysis uses relative offsets from the
-    # first event timestamp instead. Wall-clock phase boundaries drift due to
-    # probe attachment latency (1-3s), so DB-relative offsets are more reliable.
-    # Phase durations: 20s baseline, 30s alloc_stress, 40s contention, 20s recovery.
-    parser.add_argument("--phase1-start", type=float, default=0,
-                        help="Unused — kept for CLI compat with gpu-investigation.sh")
-    parser.add_argument("--phase2-start", type=float, default=0,
-                        help="Unused — kept for CLI compat with gpu-investigation.sh")
-    parser.add_argument("--phase3-start", type=float, default=0,
-                        help="Unused — kept for CLI compat with gpu-investigation.sh")
-    parser.add_argument("--phase4-start", type=float, default=0,
-                        help="Unused — kept for CLI compat with gpu-investigation.sh")
     args = parser.parse_args()
 
     mcp = MCPClient(args.mcp_url)
