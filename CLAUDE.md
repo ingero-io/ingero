@@ -43,9 +43,9 @@ tests/              Integration tests and GPU workloads
 * **No CGO.** SQLite uses `modernc.org/sqlite` (pure Go). The binary must stay statically linkable.
 * **eBPF structs mirrored.** Event structs in `bpf/common.bpf.h` must stay in sync with `pkg/events/types.go`.
 
-## Pre-Edit Remote Check
+## Remote Sync Check (MUST DO FIRST)
 
-Before modifying any local file, check the remote repository for new commits or open PRs:
+Before taking **any** action in this project — reading code, editing files, running builds, answering questions about the codebase — first check the remote repository for new commits or open PRs:
 
 ```bash
 git fetch origin --quiet
@@ -53,7 +53,17 @@ git log HEAD..origin/main --oneline   # new commits on main
 gh pr list --state open --limit 5     # open PRs
 ```
 
-If there are new remote commits or relevant open PRs, **suggest pulling latest changes** (`git pull`) before proceeding with edits. This avoids working on stale code and prevents merge conflicts.
+If there are new remote commits or relevant open PRs, **recommend pulling latest changes** (`git pull`) before proceeding. This avoids working on stale code, prevents merge conflicts, and ensures answers reflect the current state of the project.
+
+## Testing Rules (CRITICAL)
+
+A bad test is worse than no test. Every test must justify its existence.
+
+* **No flaky tests.** If a test can't pass 100 times in a row, it doesn't belong. No sleeps, no timing-dependent assertions, no order-dependent state. If you need time control, inject a clock.
+* **Test behavior, not coverage.** Do not write tests for the sake of coverage numbers. Each test must assert something meaningful — a real invariant, an edge case that broke before, or a contract between components. "This function was called" is not a useful assertion.
+* **Real implementations over mocks.** No mock frameworks (`gomock`, `testify/mock`, `mockgen`, etc.). Use real implementations with controlled inputs: binary builders for eBPF structs, in-memory SQLite for storage, `httptest.NewServer` for external HTTP boundaries. Mock only at the process boundary (network, filesystem), never internal interfaces.
+* **Table-driven tests with `t.Run()`.** This is the established pattern — use `[]struct{...}` with named subtests for all non-trivial test functions.
+* **Delete tests that test nothing.** If a test only checks that a function "doesn't panic" or returns `nil` error on the happy path with no other assertions, remove it. That's false confidence.
 
 ## Progressive Context
 
