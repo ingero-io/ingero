@@ -290,10 +290,10 @@ sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 15s > logs/trace-clean
 wait "$WL_PID" 2>/dev/null || true
 
 CLEAN_COUNT=$(count_events logs/trace-clean.json)
-if [[ "$CLEAN_COUNT" -gt 100 ]]; then
+if [[ "$CLEAN_COUNT" -gt 1000 ]]; then
     record "PASS" "T03: trace clean" "$CLEAN_COUNT events"
 else
-    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >100)"
+    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >1000)"
 fi
 
 CU_COUNT=$(grep -c '"cuLaunchKernel"' logs/trace-clean.json 2>/dev/null || echo "0")
@@ -312,10 +312,10 @@ sudo ./bin/ingero trace --debug --json --duration 15s > logs/trace-debug.json 2>
 wait "$WL_PID" 2>/dev/null || true
 DEBUG_COUNT=$(count_events logs/trace-debug.json)
 DEBUG_LINES=$(grep -c '\[DEBUG\]' logs/trace-debug.log 2>/dev/null || echo "0")
-if [[ "$DEBUG_COUNT" -gt 100 && "$DEBUG_LINES" -gt 0 ]]; then
+if [[ "$DEBUG_COUNT" -gt 1000 && "$DEBUG_LINES" -gt 0 ]]; then
     record "PASS" "T04: trace --debug" "$DEBUG_COUNT events, $DEBUG_LINES debug lines"
 else
-    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT, debugLines=$DEBUG_LINES"
+    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT (expected >1000), debugLines=$DEBUG_LINES"
 fi
 
 # Test 5: record + query round-trip (recording is default)
@@ -348,10 +348,10 @@ _test_start=$SECONDS
 log "Test 8: demo incident (GPU mode)"
 timeout 120s sudo ./bin/ingero demo incident --json > logs/demo-gpu-incident.json 2> logs/demo-gpu-incident.log
 GPU_DEMO_COUNT=$(count_events logs/demo-gpu-incident.json)
-if [[ "$GPU_DEMO_COUNT" -gt 100 ]]; then
+if [[ "$GPU_DEMO_COUNT" -gt 1000 ]]; then
     record "PASS" "T08: GPU demo incident" "$GPU_DEMO_COUNT events"
 else
-    record "FAIL" "T08: GPU demo incident" "$GPU_DEMO_COUNT events (expected >100)"
+    record "FAIL" "T08: GPU demo incident" "$GPU_DEMO_COUNT events (expected >1000)"
 fi
 
 # ── Collect T02 background results ──
@@ -424,6 +424,7 @@ cuda_driver_with = [e for e in cuda_driver if e.get('stack')]
 host = [e for e in events if e.get('source') == 'host']
 cd_pct = (len(cuda_driver_with) / len(cuda_driver) * 100) if cuda_driver else 0
 print(f'STACK_CUDA_DRIVER={len(cuda_driver_with)}/{len(cuda_driver)} ({cd_pct:.0f}%)')
+print(f'STACK_CD_PCT={cd_pct:.0f}')
 print(f'STACK_HOST={len(host)} (no userspace stacks by design)')
 
 # Check for resolved symbols
@@ -460,21 +461,25 @@ STACK_TOTAL=$(grep 'STACK_TOTAL=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
 STACK_WITH=$(grep 'STACK_WITH_STACK=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
 STACK_PCT=$(grep 'STACK_PCT=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
 STACK_RESOLVED=$(grep 'STACK_RESOLVED=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
+STACK_CD_PCT=$(grep 'STACK_CD_PCT=' $TEST_TMP/stack_analysis.txt | cut -d= -f2)
 
-if [[ "${STACK_TOTAL:-0}" -gt 100 && "${STACK_WITH:-0}" -gt 0 ]]; then
+if [[ "${STACK_TOTAL:-0}" -gt 1000 && "${STACK_CD_PCT:-0}" -gt 30 ]]; then
     record "PASS" "T10: --stack native" "${STACK_WITH}/${STACK_TOTAL} events with stack (${STACK_PCT}%), ${STACK_RESOLVED} resolved symbols"
 else
-    record "FAIL" "T10: --stack native" "total=${STACK_TOTAL:-0}, with_stack=${STACK_WITH:-0}"
+    record "FAIL" "T10: --stack native" "total=${STACK_TOTAL:-0}, with_stack=${STACK_WITH:-0}, cuda+driver=${STACK_CD_PCT:-0}% (need >30%)"
 fi
 
 # T12: query round-trip from same recorded session
 sudo ./bin/ingero query --since 5m --json > logs/stack-query.json 2>/dev/null
 RECORD_COUNT=$(count_events logs/stack-native.json)
 QUERY_COUNT=$(count_events logs/stack-query.json)
-if [[ "$RECORD_COUNT" -gt 100 && "$QUERY_COUNT" -gt 0 ]]; then
+# Query should return a meaningful fraction of recorded events (at least 10%)
+QUERY_MIN=$(( RECORD_COUNT / 10 ))
+if [[ "$QUERY_MIN" -lt 100 ]]; then QUERY_MIN=100; fi
+if [[ "$RECORD_COUNT" -gt 1000 && "$QUERY_COUNT" -gt "$QUERY_MIN" ]]; then
     record "PASS" "T12: stack + record + query" "recorded=$RECORD_COUNT, queried=$QUERY_COUNT (from T10 session)"
 else
-    record "FAIL" "T12: stack + record + query" "recorded=$RECORD_COUNT, queried=$QUERY_COUNT"
+    record "FAIL" "T12: stack + record + query" "recorded=$RECORD_COUNT, queried=$QUERY_COUNT (expected >$QUERY_MIN)"
 fi
 
 # Test 11: CPython frame extraction
@@ -700,7 +705,7 @@ wait "$WL_PID" 2>/dev/null || true
 # then SIGKILL as fallback (Python HTTP servers may ignore SIGTERM).
 sleep 2
 kill "$OTLP_PID" 2>/dev/null || true
-sleep 1
+sleep 3
 kill -9 "$OTLP_PID" 2>/dev/null || true
 sleep 1
 
@@ -782,10 +787,10 @@ OTLP_EXIT=$?
 wait "$WL_PID" 2>/dev/null || true
 CONNREF_COUNT=$(count_events logs/otlp-connrefused.json)
 
-if [[ "$CONNREF_COUNT" -gt 100 ]]; then
+if [[ "$CONNREF_COUNT" -gt 1000 ]]; then
     record "PASS" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (no crash)"
 else
-    record "FAIL" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (expected >100)"
+    record "FAIL" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (expected >1000)"
 fi
 
 if grep -q 'OTLP: push failed\|connection refused\|connect:' logs/otlp-connrefused.log 2>/dev/null; then
@@ -827,10 +832,10 @@ stack_events = [e for e in events if e.get('stack')]
 print(len(stack_events))
 " 2>/dev/null || echo "0")
 
-if [[ "$COMBINED_COUNT" -gt 100 && "$COMBINED_STACK" -gt 0 ]]; then
+if [[ "$COMBINED_COUNT" -gt 1000 && "$COMBINED_STACK" -gt 0 ]]; then
     record "PASS" "T17: stack + OTLP combined" "events=$COMBINED_COUNT, with_stack=$COMBINED_STACK"
 else
-    record "FAIL" "T17: stack + OTLP combined" "events=$COMBINED_COUNT, with_stack=$COMBINED_STACK"
+    record "FAIL" "T17: stack + OTLP combined" "events=$COMBINED_COUNT (expected >1000), with_stack=$COMBINED_STACK"
 fi
 
 # Test 14e: Prometheus /metrics endpoint
@@ -844,9 +849,14 @@ sleep 1
 sudo ./bin/ingero trace --prometheus :9090 --json --duration 12s > logs/prom-events.json 2> logs/prom-debug.log &
 PROM_PID=$!
 cleanup_sudo_pids+=("$PROM_PID")
-sleep 5
 
-PROM_OUT=$(curl -s localhost:9090/metrics 2>&1)
+# Poll for Prometheus readiness (max 10s) instead of fixed sleep
+PROM_OUT=""
+for _i in $(seq 1 20); do
+    PROM_OUT=$(curl -s localhost:9090/metrics 2>/dev/null || true)
+    if echo "$PROM_OUT" | grep -q "system_cpu_utilization" 2>/dev/null; then break; fi
+    sleep 0.5
+done
 echo "$PROM_OUT" > logs/prom-metrics.txt
 
 # Poll instead of wait — PROM_PID is sudo-spawned, bash wait would hang.
@@ -856,20 +866,24 @@ for _i in $(seq 1 20); do
 done
 wait "$WL_PID" 2>/dev/null || true
 
-if echo "$PROM_OUT" | grep -q "system_cpu_utilization"; then
-    record "PASS" "T14e: Prometheus system metrics" "system_cpu_utilization present"
+# Check metric presence AND non-zero values
+PROM_CPU_VAL=$(echo "$PROM_OUT" | grep '^system_cpu_utilization ' | head -1 | awk '{print $2}')
+if [[ -n "$PROM_CPU_VAL" ]] && echo "$PROM_CPU_VAL" | grep -qE '^[0-9]'; then
+    record "PASS" "T14e: Prometheus system metrics" "system_cpu_utilization=$PROM_CPU_VAL"
 else
-    record "FAIL" "T14e: Prometheus system metrics" "system_cpu_utilization missing"
+    record "FAIL" "T14e: Prometheus system metrics" "system_cpu_utilization missing or zero"
 fi
 
-if echo "$PROM_OUT" | grep -q "gpu_cuda_operation_duration_microseconds"; then
+PROM_CUDA_LINE=$(echo "$PROM_OUT" | grep 'gpu_cuda_operation_duration_microseconds' | grep -v '^#' | head -1)
+if [[ -n "$PROM_CUDA_LINE" ]]; then
     record "PASS" "T14e: Prometheus CUDA metrics" "gpu_cuda_operation_duration_microseconds present"
 else
     record "FAIL" "T14e: Prometheus CUDA metrics" "gpu_cuda_operation_duration_microseconds missing"
 fi
 
-if echo "$PROM_OUT" | grep -q "# TYPE"; then
-    record "PASS" "T14e: Prometheus exposition format" "# TYPE lines present"
+TYPE_COUNT=$(echo "$PROM_OUT" | grep -c '# TYPE' || true)
+if [[ "$TYPE_COUNT" -gt 0 ]]; then
+    record "PASS" "T14e: Prometheus exposition format" "$TYPE_COUNT # TYPE lines present"
 else
     record "FAIL" "T14e: Prometheus exposition format" "no # TYPE lines"
 fi
@@ -1038,9 +1052,24 @@ BENCHEOF
 
 cat logs/benchmark-summary.txt
 
-# Record benchmark result
+# Record benchmark result — check both completion AND performance
 if [[ "${#BENCH_NOSTACK_COUNTS[@]}" -eq 2 && "${#BENCH_STACK_COUNTS[@]}" -eq 2 ]]; then
-    record "PASS" "T18: benchmark complete" "2+2 iterations, see logs/benchmark-summary.txt"
+    # Compute average throughput for each mode
+    STACK_AVG=$(( (BENCH_STACK_COUNTS[0] + BENCH_STACK_COUNTS[1]) / 2 ))
+    NOSTACK_AVG=$(( (BENCH_NOSTACK_COUNTS[0] + BENCH_NOSTACK_COUNTS[1]) / 2 ))
+    # Stack overhead: how much throughput drops with stacks enabled
+    if [[ "$NOSTACK_AVG" -gt 0 ]]; then
+        # overhead = (nostack - stack) / nostack * 100, clamped to [0, 100]
+        OVERHEAD=$(( (NOSTACK_AVG - STACK_AVG) * 100 / NOSTACK_AVG ))
+        if [[ "$OVERHEAD" -lt 0 ]]; then OVERHEAD=0; fi
+    else
+        OVERHEAD=0
+    fi
+    if [[ "$OVERHEAD" -lt 50 ]]; then
+        record "PASS" "T18: benchmark complete" "2+2 iterations, overhead=${OVERHEAD}%, see logs/benchmark-summary.txt"
+    else
+        record "FAIL" "T18: benchmark regression" "stack overhead=${OVERHEAD}% (expected <50%), stack_avg=$STACK_AVG, nostack_avg=$NOSTACK_AVG"
+    fi
 else
     record "FAIL" "T18: benchmark incomplete" "nostack=${#BENCH_NOSTACK_COUNTS[@]}, stack=${#BENCH_STACK_COUNTS[@]}"
 fi

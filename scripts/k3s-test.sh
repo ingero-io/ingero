@@ -355,10 +355,15 @@ if [ -f "$INGERO_DB" ]; then
         log "  $line"
     done
 
-    if [ "$TOTAL_EVENTS" -gt 100 ]; then
-        record "PASS" "KT03: Probes attached" "$TOTAL_EVENTS events captured"
+    # Check per-source: at least some CUDA or DRIVER events, not just HOST
+    CUDA_DRIVER_EVENTS=$(sudo sqlite3 "$INGERO_DB" \
+        "SELECT COUNT(*) FROM events WHERE source IN (1,4)" 2>/dev/null || echo "0")
+    log "CUDA+Driver events: $CUDA_DRIVER_EVENTS"
+
+    if [ "$TOTAL_EVENTS" -gt 100 ] && [ "$CUDA_DRIVER_EVENTS" -gt 0 ]; then
+        record "PASS" "KT03: Probes attached" "$TOTAL_EVENTS events ($CUDA_DRIVER_EVENTS CUDA+Driver)"
     elif [ "$TOTAL_EVENTS" -gt 0 ]; then
-        record "PASS" "KT03: Probes attached" "$TOTAL_EVENTS events (low count, but probes working)"
+        record "PASS" "KT03: Probes attached" "$TOTAL_EVENTS events (low count, CUDA+Driver=$CUDA_DRIVER_EVENTS)"
     else
         record "FAIL" "KT03: Probes attached" "0 events in DB — probes may not be attached"
     fi
@@ -397,10 +402,17 @@ else
         log "  $line"
     done
 
-    if [ "$CGROUP_COUNT" -ge 50 ]; then
-        record "PASS" "KT04: cgroup_id in events" "$CGROUP_COUNT events with cgroup_id"
+    # Compute percentage of events with cgroup_id
+    CGROUP_PCT=0
+    if [ "$TOTAL_EVENTS" -gt 0 ] 2>/dev/null; then
+        CGROUP_PCT=$(( CGROUP_COUNT * 100 / TOTAL_EVENTS ))
+    fi
+    log "cgroup coverage: $CGROUP_COUNT/$TOTAL_EVENTS ($CGROUP_PCT%)"
+
+    if [ "$CGROUP_COUNT" -ge 50 ] && [ "$CGROUP_PCT" -ge 10 ]; then
+        record "PASS" "KT04: cgroup_id in events" "$CGROUP_COUNT/$TOTAL_EVENTS events ($CGROUP_PCT%) with cgroup_id"
     elif [ "$CGROUP_COUNT" -gt 0 ]; then
-        record "PASS" "KT04: cgroup_id in events" "$CGROUP_COUNT events with cgroup_id (low but present)"
+        record "PASS" "KT04: cgroup_id in events" "$CGROUP_COUNT events with cgroup_id ($CGROUP_PCT%, low but present)"
     else
         record "FAIL" "KT04: cgroup_id in events" "0 events with non-zero cgroup_id"
     fi
@@ -825,10 +837,10 @@ EVENT_COUNT=$(wc -l < /tmp/kt10-trace.json 2>/dev/null || echo "0")
 log "Bare-metal trace events: $EVENT_COUNT"
 mv /tmp/kt10-trace.json logs/kt10-uprobe-cleanup.log 2>/dev/null || true
 
-if [ "$EVENT_COUNT" -gt 10 ]; then
+if [ "$EVENT_COUNT" -gt 100 ]; then
     record "PASS" "KT10: Uprobe cleanup" "$EVENT_COUNT events in bare-metal trace after DaemonSet removal"
 else
-    record "FAIL" "KT10: Uprobe cleanup" "only $EVENT_COUNT events — uprobes may be stuck"
+    record "FAIL" "KT10: Uprobe cleanup" "only $EVENT_COUNT events (expected >100) — uprobes may be stuck"
 fi
 
 ################################################################################

@@ -242,6 +242,42 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     """Run all 28 GPU problem investigations."""
     investigations = []
 
+    # ── Preflight: validate op ID mapping ────────────────────────────────────
+    # All SQL queries below use hardcoded source/op integer IDs. If the Go code
+    # changes these constants, every investigation silently produces wrong results.
+    # This check catches mapping drift at the start of the run.
+    EXPECTED_OPS = {
+        # (source, op) → name — from pkg/events/types.go
+        (1, 1): "cudaMalloc",      (1, 2): "cudaFree",
+        (1, 3): "cudaLaunchKernel",(1, 4): "cudaMemcpy",
+        (1, 5): "cudaStreamSync",  (1, 6): "cudaDeviceSync",
+        (1, 7): "cudaMemcpyAsync",
+        (3, 1): "sched_switch",    (3, 2): "sched_wakeup",
+        (3, 3): "mm_page_alloc",   (3, 4): "oom_kill",
+        (3, 5): "process_exec",    (3, 6): "process_exit",
+        (3, 7): "process_fork",
+        (4, 1): "cuLaunchKernel",  (4, 2): "cuMemcpy",
+        (4, 3): "cuMemcpyAsync",   (4, 4): "cuCtxSynchronize",
+        (4, 5): "cuMemAlloc",
+    }
+    r_ops = mcp.run_sql(
+        "SELECT source_id, op_id, name FROM ops ORDER BY source_id, op_id")
+    ops_rows = sql_to_dicts(r_ops)
+    if ops_rows:
+        mismatches = []
+        for row in ops_rows:
+            src = row.get("source_id", 0) or 0
+            op = row.get("op_id", 0) or 0
+            name = row.get("name", "")
+            expected = EXPECTED_OPS.get((src, op))
+            if expected and expected != name:
+                mismatches.append(f"({src},{op}): expected={expected}, got={name}")
+        if mismatches:
+            print(f"[FATAL] Op ID mapping mismatch — "
+                  f"DB ops table diverges from hardcoded IDs:\n  "
+                  + "\n  ".join(mismatches), file=sys.stderr)
+            sys.exit(2)
+
     # Pre-fetch expensive MCP calls once (120s timeout each). These are reused
     # across multiple investigations to avoid redundant queries on large DBs.
     _cached_chains = mcp.get_causal_chains("10m")
@@ -325,12 +361,12 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             # Single-PID: CPU scheduling contention, not NCCL
             inv.set_verdict("DETECTED",
                             f"scheduling contention: {sched_count} sched_switch, sync amp {amp:.1f}x (single-PID, not NCCL)")
-        elif sched_count > 500:
-            # Moderate scheduler activity without sync amplification — not NCCL but notable
+        elif sched_count > 5000 and max_sync_us > 1000:
+            # Heavy scheduler activity with sync latency — scheduling pressure
             inv.set_verdict("DETECTED",
                             f"{sched_count} sched_switch events, sync max={max_sync_us:.0f}us")
         else:
-            inv.set_verdict("HEALTHY", f"minimal scheduler preemption ({sched_count} events)")
+            inv.set_verdict("HEALTHY", f"minimal scheduler preemption ({sched_count} events, sync max={max_sync_us:.0f}us)")
     else:
         inv.set_verdict("INCONCLUSIVE", "no scheduler or sync events")
 
@@ -549,25 +585,32 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("run_sql", "CUDA event time range",
                    "detect idle gaps in timeline")
 
-    # Verdict: check for idle seconds and gaps in timeline
-    idle_secs = sum(1 for r in rows1 if (r.get("events", 0) or 0) < 10)
-
-    # Detect missing seconds (no CUDA events at all)
+    # Verdict: check for idle seconds and gaps in timeline.
+    # Exclude the first 5 seconds (probe attachment + CUDA context init always low).
     if rows1 and r2_rows:
-        sec_set = set(r.get("sec", 0) for r in rows1)
         min_s = r2_rows[0].get("min_s", 0) or 0
         max_s = r2_rows[0].get("max_s", 0) or 0
+        startup_cutoff = int(min_s) + 5  # exclude first 5s
+        steady_rows = [r for r in rows1 if (r.get("sec", 0) or 0) >= startup_cutoff]
+        idle_secs = sum(1 for r in steady_rows if (r.get("events", 0) or 0) < 10)
+        # Detect missing seconds (no CUDA events at all) in steady state
         if max_s > min_s:
-            all_secs = set(range(int(min_s), int(max_s) + 1))
+            sec_set = set(r.get("sec", 0) for r in steady_rows)
+            all_secs = set(range(startup_cutoff, int(max_s) + 1))
             missing = len(all_secs - sec_set)
         else:
             missing = 0
+        total_steady = len(all_secs) if max_s > min_s else len(steady_rows)
     else:
+        idle_secs = 0
         missing = 0
+        total_steady = 0
 
-    if missing > 2 or idle_secs > 2:
+    # Require >10% idle time (not just 2 seconds which is noise)
+    idle_pct = safe_div(idle_secs + missing, total_steady) * 100 if total_steady > 0 else 0
+    if idle_pct > 10:
         inv.set_verdict("DETECTED",
-                        f"{missing} empty seconds + {idle_secs} low-activity seconds across {len(rows1)}s")
+                        f"{missing} empty + {idle_secs} low-activity seconds ({idle_pct:.0f}% idle, excluding startup)")
     elif rows1:
         inv.set_verdict("HEALTHY", f"no significant idle gaps across {len(rows1)}s")
     else:
@@ -620,7 +663,9 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         if allocs > 20 and syncs > 20:
             corr_count += 1
 
-    if large_cnt > 0:
+    # Require >10 large allocs — a single cuDNN workspace alloc (>10MB) is normal.
+    # KV cache pressure manifests as many repeated large allocations.
+    if large_cnt > 10:
         inv.set_verdict("DETECTED",
                         f"{large_cnt} large allocs ({total_mb:.0f}MB), {corr_count} correlated spike buckets")
     elif corr_count > 0:
@@ -1260,13 +1305,19 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     else:
         straggler_ratio = 0
 
-    # Verdict
+    # Verdict — require meaningful sync from both PIDs, not just existence
     if len(rows1) >= 2 and straggler_ratio > 3:
         inv.set_verdict("DETECTED",
                         f"{len(rows1)} PIDs, straggler ratio={straggler_ratio:.1f}x")
     elif len(rows1) >= 2:
-        inv.set_verdict("DETECTED",
-                        f"{len(rows1)} PIDs accessing GPU (alloc_stress creates 2nd PID)")
+        # Both PIDs have sync events (>5 each from HAVING clause), but no straggler
+        min_cnt = min(r.get("sync_cnt", 0) or 0 for r in rows1)
+        if min_cnt > 20:
+            inv.set_verdict("DETECTED",
+                            f"{len(rows1)} PIDs with significant sync activity (min={min_cnt} events)")
+        else:
+            inv.set_verdict("HEALTHY",
+                            f"{len(rows1)} PIDs but minimal sync contention (min={min_cnt} events)")
     elif len(rows1) == 1:
         inv.set_verdict("HEALTHY", "single PID — no multi-process contention")
     else:
@@ -1311,7 +1362,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     inv.add_action("computed", "PIDs with > 100 CUDA events",
                    f"{len(active_pids)} active PIDs")
 
-    # Verdict
+    # Verdict — require both PIDs to have meaningful CUDA activity (>100 events)
     if len(active_pids) >= 2:
         pid_details = ", ".join(
             f"PID {r.get('pid', '?')} ({r.get('name', 'unknown')}): {r.get('event_cnt', 0)} events"
@@ -1319,8 +1370,9 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         )
         inv.set_verdict("DETECTED", f"{len(active_pids)} PIDs competing: {pid_details}")
     elif len(rows1) >= 2:
-        inv.set_verdict("DETECTED",
-                        f"{len(rows1)} PIDs with CUDA activity (alloc_stress creates 2nd PID)")
+        # Two PIDs exist but at least one has <100 events — not significant contention
+        inv.set_verdict("HEALTHY",
+                        f"{len(rows1)} PIDs but insufficient CUDA activity for contention detection")
     elif len(rows1) == 1:
         inv.set_verdict("HEALTHY", "single PID — no multi-process contention")
     else:
@@ -1389,11 +1441,15 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         page_cnt = sql_first_val(r3, 0)
         rows3 = sql_to_dicts(r3)
         total_bytes = (rows3[0].get("total_bytes", 0) or 0) if rows3 else 0
-        if page_cnt > 0:
+        # Require meaningful page activity — >1000 events AND >50MB total.
+        # Routine host allocations produce ~100-500 events; checkpoint bursts
+        # produce thousands with hundreds of MB.
+        if page_cnt > 1000 and total_bytes > 50e6:
             inv.set_verdict("DETECTED",
                             f"{page_cnt} page alloc events, {total_bytes/1e6:.1f}MB total (below spike threshold)")
         else:
-            inv.set_verdict("HEALTHY", "no mm_page_alloc events (may be filtered)")
+            inv.set_verdict("HEALTHY",
+                            f"page alloc activity below checkpoint threshold ({page_cnt} events, {total_bytes/1e6:.1f}MB)")
 
     investigations.append(inv)
 
@@ -1502,16 +1558,22 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     chain_count = chains_text.count("[HIGH]") + chains_text.count("[MEDIUM]") + chains_text.count("[LOW]")
     inv.add_action("get_causal_chains", "any chains", f"{chain_count} chains")
 
-    # Verdict
-    if rows1 and chain_count > 0:
+    # Verdict — require BOTH high-CPU snapshots AND chains for DETECTED.
+    # Either alone is insufficient: high-CPU without chains = contention but no
+    # GPU impact; chains without high-CPU = GPU anomaly without system correlation.
+    if rows1 and chain_count > 5:
         max_cpu = max(r.get("cpu_pct", 0) or 0 for r in rows1)
         inv.set_verdict("DETECTED",
                         f"{len(rows1)} high-CPU snapshots (max={max_cpu:.0f}%), {chain_count} causal chains")
-    elif rows1:
+    elif rows1 and chain_count > 0:
+        max_cpu = max(r.get("cpu_pct", 0) or 0 for r in rows1)
         inv.set_verdict("DETECTED",
-                        f"{len(rows1)} high-CPU snapshots correlated with CUDA activity")
+                        f"{len(rows1)} high-CPU snapshots (max={max_cpu:.0f}%), {chain_count} causal chains (weak correlation)")
+    elif rows1:
+        inv.set_verdict("HEALTHY",
+                        f"{len(rows1)} high-CPU snapshots but no causal chains — CPU load not impacting GPU")
     elif chain_count > 0:
-        inv.set_verdict("DETECTED", f"{chain_count} causal chains detected")
+        inv.set_verdict("DETECTED", f"{chain_count} causal chains detected (no CPU correlation)")
     else:
         inv.set_verdict("HEALTHY", "no system-CUDA correlation found")
 
@@ -1877,13 +1939,19 @@ def main():
     parser.add_argument("--db", required=True, help="Path to ingero.db")
     parser.add_argument("--report", default="logs/gpu-investigation-report.log",
                         help="Report output path")
-    # Phase timestamps accepted but unused — the analysis uses relative offsets
-    # from the first event timestamp (more reliable than wall-clock phase
-    # boundaries which drift due to probe attachment time).
-    parser.add_argument("--phase1-start", type=float, default=0)
-    parser.add_argument("--phase2-start", type=float, default=0)
-    parser.add_argument("--phase3-start", type=float, default=0)
-    parser.add_argument("--phase4-start", type=float, default=0)
+    # Phase timestamps are accepted for backwards compatibility with
+    # gpu-investigation.sh, but the analysis uses relative offsets from the
+    # first event timestamp instead. Wall-clock phase boundaries drift due to
+    # probe attachment latency (1-3s), so DB-relative offsets are more reliable.
+    # Phase durations: 20s baseline, 30s alloc_stress, 40s contention, 20s recovery.
+    parser.add_argument("--phase1-start", type=float, default=0,
+                        help="Unused — kept for CLI compat with gpu-investigation.sh")
+    parser.add_argument("--phase2-start", type=float, default=0,
+                        help="Unused — kept for CLI compat with gpu-investigation.sh")
+    parser.add_argument("--phase3-start", type=float, default=0,
+                        help="Unused — kept for CLI compat with gpu-investigation.sh")
+    parser.add_argument("--phase4-start", type=float, default=0,
+                        help="Unused — kept for CLI compat with gpu-investigation.sh")
     args = parser.parse_args()
 
     mcp = MCPClient(args.mcp_url)
