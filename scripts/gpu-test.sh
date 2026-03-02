@@ -290,10 +290,10 @@ sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 15s > logs/trace-clean
 wait "$WL_PID" 2>/dev/null || true
 
 CLEAN_COUNT=$(count_events logs/trace-clean.json)
-if [[ "$CLEAN_COUNT" -gt 1000 ]]; then
+if [[ "$CLEAN_COUNT" -gt 5000 ]]; then
     record "PASS" "T03: trace clean" "$CLEAN_COUNT events"
 else
-    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >1000)"
+    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >5000)"
 fi
 
 CU_COUNT=$(grep -c '"cuLaunchKernel"' logs/trace-clean.json 2>/dev/null || echo "0")
@@ -312,10 +312,10 @@ sudo ./bin/ingero trace --debug --json --duration 15s > logs/trace-debug.json 2>
 wait "$WL_PID" 2>/dev/null || true
 DEBUG_COUNT=$(count_events logs/trace-debug.json)
 DEBUG_LINES=$(grep -c '\[DEBUG\]' logs/trace-debug.log 2>/dev/null || echo "0")
-if [[ "$DEBUG_COUNT" -gt 1000 && "$DEBUG_LINES" -gt 0 ]]; then
+if [[ "$DEBUG_COUNT" -gt 5000 && "$DEBUG_LINES" -gt 100 ]]; then
     record "PASS" "T04: trace --debug" "$DEBUG_COUNT events, $DEBUG_LINES debug lines"
 else
-    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT (expected >1000), debugLines=$DEBUG_LINES"
+    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT (expected >5000), debugLines=$DEBUG_LINES (expected >100)"
 fi
 
 # Test 5: record + query round-trip (recording is default)
@@ -327,10 +327,10 @@ sudo ./bin/ingero trace --json --duration 10s > logs/trace-record.json 2> logs/t
 wait "$WL_PID" 2>/dev/null || true
 QUERY_OUT=$(sudo ./bin/ingero query --since 5m --json 2>/dev/null)
 QUERY_COUNT=$(echo "$QUERY_OUT" | grep -c '"op"' || true)
-if [[ "$QUERY_COUNT" -gt 0 ]]; then
+if [[ "$QUERY_COUNT" -gt 100 ]]; then
     record "PASS" "T05: record + query" "$QUERY_COUNT events retrieved"
 else
-    record "FAIL" "T05: record + query" "query returned 0 events"
+    record "FAIL" "T05: record + query" "query returned $QUERY_COUNT events (expected >100)"
 fi
 
 # Test 6: explain (reads from root's DB since trace runs as sudo)
@@ -348,10 +348,10 @@ _test_start=$SECONDS
 log "Test 8: demo incident (GPU mode)"
 timeout 120s sudo ./bin/ingero demo incident --json > logs/demo-gpu-incident.json 2> logs/demo-gpu-incident.log
 GPU_DEMO_COUNT=$(count_events logs/demo-gpu-incident.json)
-if [[ "$GPU_DEMO_COUNT" -gt 1000 ]]; then
+if [[ "$GPU_DEMO_COUNT" -gt 5000 ]]; then
     record "PASS" "T08: GPU demo incident" "$GPU_DEMO_COUNT events"
 else
-    record "FAIL" "T08: GPU demo incident" "$GPU_DEMO_COUNT events (expected >1000)"
+    record "FAIL" "T08: GPU demo incident" "$GPU_DEMO_COUNT events (expected >5000)"
 fi
 
 # ── Collect T02 background results ──
@@ -787,10 +787,10 @@ OTLP_EXIT=$?
 wait "$WL_PID" 2>/dev/null || true
 CONNREF_COUNT=$(count_events logs/otlp-connrefused.json)
 
-if [[ "$CONNREF_COUNT" -gt 1000 ]]; then
+if [[ "$CONNREF_COUNT" -gt 5000 ]]; then
     record "PASS" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (no crash)"
 else
-    record "FAIL" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (expected >1000)"
+    record "FAIL" "T16: OTLP conn refused: events" "$CONNREF_COUNT events (expected >5000)"
 fi
 
 if grep -q 'OTLP: push failed\|connection refused\|connect:' logs/otlp-connrefused.log 2>/dev/null; then
@@ -832,10 +832,10 @@ stack_events = [e for e in events if e.get('stack')]
 print(len(stack_events))
 " 2>/dev/null || echo "0")
 
-if [[ "$COMBINED_COUNT" -gt 1000 && "$COMBINED_STACK" -gt 0 ]]; then
+if [[ "$COMBINED_COUNT" -gt 5000 && "$COMBINED_STACK" -gt 0 ]]; then
     record "PASS" "T17: stack + OTLP combined" "events=$COMBINED_COUNT, with_stack=$COMBINED_STACK"
 else
-    record "FAIL" "T17: stack + OTLP combined" "events=$COMBINED_COUNT (expected >1000), with_stack=$COMBINED_STACK"
+    record "FAIL" "T17: stack + OTLP combined" "events=$COMBINED_COUNT (expected >5000), with_stack=$COMBINED_STACK"
 fi
 
 # Test 14e: Prometheus /metrics endpoint
@@ -1065,10 +1065,10 @@ if [[ "${#BENCH_NOSTACK_COUNTS[@]}" -eq 2 && "${#BENCH_STACK_COUNTS[@]}" -eq 2 ]
     else
         OVERHEAD=0
     fi
-    if [[ "$OVERHEAD" -lt 50 ]]; then
+    if [[ "$OVERHEAD" -lt 20 ]]; then
         record "PASS" "T18: benchmark complete" "2+2 iterations, overhead=${OVERHEAD}%, see logs/benchmark-summary.txt"
     else
-        record "FAIL" "T18: benchmark regression" "stack overhead=${OVERHEAD}% (expected <50%), stack_avg=$STACK_AVG, nostack_avg=$NOSTACK_AVG"
+        record "FAIL" "T18: benchmark regression" "stack overhead=${OVERHEAD}% (expected <20%), stack_avg=$STACK_AVG, nostack_avg=$NOSTACK_AVG"
     fi
 else
     record "FAIL" "T18: benchmark incomplete" "nostack=${#BENCH_NOSTACK_COUNTS[@]}, stack=${#BENCH_STACK_COUNTS[@]}"
@@ -1469,7 +1469,7 @@ done
 
 SCRIPT_DURATION="$SCRIPT_DURATION" \
   GPU_NAME="$_GPU_NAME" DRIVER_VER="$_DRIVER_VER" KERNEL_VER="$_KERNEL_VER" \
-  PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
+  ARCH="$(uname -m)" PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
   PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" TOTAL="$TOTAL" \
   python3 -c "
 import json, sys, os
@@ -1501,6 +1501,7 @@ report = {
         'gpu': os.environ.get('GPU_NAME', 'N/A'),
         'driver': os.environ.get('DRIVER_VER', 'N/A'),
         'kernel': os.environ.get('KERNEL_VER', 'N/A'),
+        'arch': os.environ.get('ARCH', 'N/A'),
         'pytorch': os.environ.get('PYTORCH_VER', 'N/A'),
         'go': os.environ.get('GO_VER', 'N/A'),
     },
