@@ -199,6 +199,12 @@ if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
     exit 1
 fi
 
+if ! kill -0 "$ALLOC_PID" 2>/dev/null; then
+    echo -e "$(ts) ${YELLOW}[WARN]${NC} alloc_stress.py died early. Phase 2 provocation may not fire."
+    echo -e "$(ts)   See logs/gpu-inv-alloc-stress.log"
+    tail -5 logs/gpu-inv-alloc-stress.log 2>/dev/null || true
+fi
+
 echo -e "$(ts)   Training PID: $TRAIN_PID, Alloc PID: $ALLOC_PID"
 echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) with --record-all --stack..."
 
@@ -239,7 +245,7 @@ PHASE3_START=$(date +%s.%N)
 kill "$ALLOC_PID" 2>/dev/null || true
 
 NCPUS=$(nproc)
-sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 35s > /dev/null 2>&1 &
+sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 40s > /dev/null 2>&1 &
 STRESS_PID=$!
 cleanup_sudo_pids+=("$STRESS_PID")
 
@@ -264,21 +270,22 @@ for _i in $(seq 1 60); do
     if ! sudo kill -0 "$TRACE_PID" 2>/dev/null; then break; fi
     sleep 1
 done
-TRACE_EXIT=0
-
-if [[ "$TRACE_EXIT" -ne 0 ]]; then
-    echo -e "$(ts) ${RED}[ERROR]${NC} Trace failed (exit $TRACE_EXIT). See logs/gpu-inv-trace.log"
-    cat logs/gpu-inv-trace.log
-    record "FAIL" "T23a: trace captured events" "trace exited $TRACE_EXIT"
-    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
-    exit 1
-fi
+# Cannot capture exit status of sudo-spawned process. Validate DB instead.
 
 # Kill training
 kill "$TRAIN_PID" 2>/dev/null || true
 wait "$TRAIN_PID" 2>/dev/null || true
 
-echo -e "$(ts)   Trace complete. DB: $ML_DB"
+# Validate trace produced events — catches ingero trace crashes or probe failures
+DB_EVENTS=$(sudo sqlite3 "$ML_DB" "SELECT COUNT(*) FROM events" 2>/dev/null || echo "0")
+if [[ "$DB_EVENTS" -lt 100 ]]; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Trace captured only $DB_EVENTS events (expected >100). See logs/gpu-inv-trace.log"
+    tail -20 logs/gpu-inv-trace.log
+    record "FAIL" "T23a: trace captured events" "only $DB_EVENTS events in DB (trace may have crashed)"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
+echo -e "$(ts)   Trace complete. DB: $ML_DB ($DB_EVENTS events)"
 
 # Copy DB to logs/ for transfer
 sudo cp "$ML_DB" logs/gpu-investigation.db && sudo chmod 644 logs/gpu-investigation.db
