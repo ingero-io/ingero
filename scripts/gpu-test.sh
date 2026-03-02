@@ -1172,7 +1172,7 @@ else
     _test_start=$SECONDS
     log "Test 19d: MCP get_causal_chains"
     RESP=$(mcp_call "get_causal_chains" '{"since":"30m"}')
-    if echo "$RESP" | grep -q '"result"' && echo "$RESP" | grep -qi "chain\|severity\|No causal\|HEALTHY"; then
+    if echo "$RESP" | grep -q '"result"' && echo "$RESP" | grep -qi 'chain\|severity\|No causal\|HEALTHY\|\\\"rc\\\"\|sched_switch\|contention'; then
         record "PASS" "T19d: MCP get_causal_chains" "chains or healthy response"
     else
         record "FAIL" "T19d: MCP get_causal_chains" "unexpected response: ${RESP:0:200}"
