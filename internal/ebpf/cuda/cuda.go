@@ -117,6 +117,24 @@ func (t *Tracer) Attach() error {
 		t.links = append(t.links, uret)
 	}
 
+	// Optional probes — non-fatal if symbol not found.
+	// cudaMallocManaged: Unified Memory allocations (CUDA 6.0+, not all builds export it).
+	optionalSpecs := []probeSpec{
+		{"cudaMallocManaged", t.objs.UprobeCudaMallocManaged, t.objs.UretprobeCudaMallocManaged},
+	}
+	for _, spec := range optionalSpecs {
+		up, err := exe.Uprobe(spec.symbol, spec.uprobe, nil)
+		if err != nil {
+			continue // symbol not exported — skip silently
+		}
+		uret, err := exe.Uretprobe(spec.symbol, spec.uretprobe, nil)
+		if err != nil {
+			up.Close()
+			continue
+		}
+		t.links = append(t.links, up, uret)
+	}
+
 	// Enable stack capture in the eBPF config map if requested.
 	if t.stackEnabled && t.objs.ConfigMap != nil {
 		// ingero_config: { uint8 capture_stack, uint8[7] pad }

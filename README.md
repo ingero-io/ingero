@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.7.0**
+**Version: 0.7.0.2**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -219,7 +219,32 @@ ingero explain --pid 4821,5032        # filter by multiple processes
 ingero explain --chains               # show stored causal chains (no re-analysis)
 ingero explain --json                 # JSON output for pipelines
 ingero explain --from "15:40" --to "15:45"  # absolute time range
+ingero explain --per-process              # per-process CUDA API breakdown
+ingero explain --per-process --json       # JSON output for pipelines
 ```
+
+#### Per-Process Breakdown
+
+For multi-process GPU workloads (RAG pipelines, model serving with workers, multi-tenant GPU sharing), `--per-process` shows a CUDA API breakdown grouped by process:
+
+```
+$ ingero explain --per-process --since 5m
+
+PER-PROCESS GPU API BREAKDOWN
+
+  PID 4821 (vllm-worker)
+    cuLaunchKernel      12,847 calls   p50=4.8µs   p95=11.2µs   p99=16.1µs
+    cudaMemcpyAsync        892 calls   p50=38µs    p95=124µs    p99=891µs
+    cudaMallocManaged       14 calls   p50=112µs   p95=2.1ms    p99=8.4ms
+
+  PID 5032 (embedding-svc)
+    cuLaunchKernel       3,201 calls   p50=5.1µs   p95=12.8µs   p99=19.4µs
+    cudaMemcpy             448 calls   p50=42µs    p95=98µs     p99=412µs
+
+  ⚠ Multi-process GPU contention: 2 processes sharing GPU with CUDA/Driver ops
+```
+
+This answers "which process is hogging the GPU?" — essential for diagnosing RAG pipeline contention where embedding, retrieval, and generation compete for GPU time.
 
 ```
 INCIDENT REPORT — 2 causal chains found (1 HIGH, 1 MEDIUM)
@@ -487,7 +512,7 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 | 18 | Noisy neighbor / multi-tenant GPU interference | MEDIUM | Per-cgroup `sched_switch` latency + CUDA API latency correlation identifies which co-located workload causes degradation **(v0.7)** |
 | 19 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing. v0.8: Block I/O completes disk→CPU→GPU pipeline |
 | 20 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync. v0.8: TCP retransmit tracing on NCCL ports |
-| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown |
+| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown (`explain --per-process`) — shows which process is hogging GPU time |
 | 22 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync`. v0.8: Block I/O shows actual write latency + NFS timeouts |
 | 23 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration. v0.8: `cudaMallocManaged` page migration + Block I/O shows NVMe-PCIe contention |
 | 24 | Loss spikes (non-AMP) | LOW-MED | System event correlation with loss timing |
@@ -515,6 +540,7 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 - Block I/O tracing (`block_rq_issue`/`block_rq_complete`) — completes I/O+CPU+CUDA causal chains
 - TCP retransmit + connection tracing — NCCL hang diagnosis, tool call attribution
 - Noisy neighbor detection (per-cgroup scheduler latency)
+- Per-process CUDA API breakdown (`explain --per-process`) for RAG pipeline contention diagnosis
 - `process_name` field in JSON output
 - Test hardening (schema validation, investigation coverage, coverage gaps)
 

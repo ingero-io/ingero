@@ -26,6 +26,17 @@ type PodInfo struct {
 	Namespace    string   // namespace (e.g., "default")
 	ContainerIDs []string // 64-char hex IDs, runtime prefix stripped
 	GPURequested bool     // true if any container requests nvidia.com/gpu
+	Phase        string   // current phase: Pending, Running, Succeeded, Failed, Unknown
+	RestartCount int32    // sum of all container restart counts
+}
+
+// PodLifecycleEvent represents a detected pod status transition.
+type PodLifecycleEvent struct {
+	PodName     string
+	Namespace   string
+	EventType   string // "restart", "eviction", "oom_kill", "phase_change"
+	Detail      string // human-readable detail
+	DetectedAt  time.Time
 }
 
 // LogFunc is an optional debug logger. Set via PodCache.SetDebugLog().
@@ -48,18 +59,31 @@ type PodCache struct {
 	mu       sync.RWMutex
 	byContID map[string]*PodInfo // container ID → pod info
 
+	// Pod lifecycle tracking: previous state for transition detection.
+	prevState map[string]podSnapshot // key: namespace/name
+
+	// Lifecycle events detected since last drain.
+	lifecycleEvents []PodLifecycleEvent
+
 	ready chan struct{} // closed after first successful list
 	once  sync.Once     // ensures ready is closed exactly once
 
 	warnedNodeName bool // true after warning about empty MY_NODE_NAME
 }
 
+// podSnapshot captures pod state for diff-based transition detection.
+type podSnapshot struct {
+	Phase        string
+	RestartCount int32
+}
+
 // NewPodCache creates a cache that will be populated by Run().
 func NewPodCache(client *Client) *PodCache {
 	return &PodCache{
-		client:   client,
-		byContID: make(map[string]*PodInfo),
-		ready:    make(chan struct{}),
+		client:    client,
+		byContID:  make(map[string]*PodInfo),
+		prevState: make(map[string]podSnapshot),
+		ready:     make(chan struct{}),
 	}
 }
 
@@ -125,6 +149,16 @@ func (pc *PodCache) Lookup(containerID string) *PodInfo {
 	return pc.byContID[containerID]
 }
 
+// DrainLifecycleEvents returns and clears all accumulated lifecycle events
+// since the last drain. Thread-safe.
+func (pc *PodCache) DrainLifecycleEvents() []PodLifecycleEvent {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	events := pc.lifecycleEvents
+	pc.lifecycleEvents = nil
+	return events
+}
+
 // GPUPods returns all pods on this node that request nvidia.com/gpu.
 func (pc *PodCache) GPUPods() []*PodInfo {
 	pc.mu.RLock()
@@ -147,6 +181,7 @@ func (pc *PodCache) GPUPods() []*PodInfo {
 }
 
 // refresh lists pods from the K8s API and rebuilds the container ID index.
+// Also detects pod lifecycle transitions (restarts, evictions, phase changes).
 func (pc *PodCache) refresh() {
 	pods, err := pc.listPods()
 	if err != nil {
@@ -167,6 +202,51 @@ func (pc *PodCache) refresh() {
 
 	pc.mu.Lock()
 	pc.byContID = index
+
+	// Detect lifecycle transitions by comparing against previous state.
+	now := time.Now()
+	newState := make(map[string]podSnapshot, len(pods))
+	for _, pod := range pods {
+		key := pod.Namespace + "/" + pod.Name
+		snap := podSnapshot{Phase: pod.Phase, RestartCount: pod.RestartCount}
+		newState[key] = snap
+
+		prev, existed := pc.prevState[key]
+		if !existed {
+			continue // first time seeing this pod
+		}
+
+		// Detect restart: restartCount increased.
+		if snap.RestartCount > prev.RestartCount {
+			delta := snap.RestartCount - prev.RestartCount
+			pc.lifecycleEvents = append(pc.lifecycleEvents, PodLifecycleEvent{
+				PodName:    pod.Name,
+				Namespace:  pod.Namespace,
+				EventType:  "restart",
+				Detail:     fmt.Sprintf("container restart detected (count %d → %d, delta %d)", prev.RestartCount, snap.RestartCount, delta),
+				DetectedAt: now,
+			})
+			pc.logf("K8s lifecycle: pod %s/%s restarted (count %d → %d)", pod.Namespace, pod.Name, prev.RestartCount, snap.RestartCount)
+		}
+
+		// Detect phase change (e.g., Running → Failed).
+		if snap.Phase != prev.Phase && prev.Phase != "" {
+			evtType := "phase_change"
+			if snap.Phase == "Failed" {
+				evtType = "eviction" // Failed phase often indicates eviction
+			}
+			pc.lifecycleEvents = append(pc.lifecycleEvents, PodLifecycleEvent{
+				PodName:    pod.Name,
+				Namespace:  pod.Namespace,
+				EventType:  evtType,
+				Detail:     fmt.Sprintf("phase changed: %s → %s", prev.Phase, snap.Phase),
+				DetectedAt: now,
+			})
+			pc.logf("K8s lifecycle: pod %s/%s phase %s → %s", pod.Namespace, pod.Name, prev.Phase, snap.Phase)
+		}
+	}
+	pc.prevState = newState
+
 	pc.mu.Unlock()
 
 	pc.once.Do(func() { close(pc.ready) })
@@ -206,6 +286,7 @@ func parsePodList(data []byte) ([]PodInfo, error) {
 		info := PodInfo{
 			Name:      item.Metadata.Name,
 			Namespace: item.Metadata.Namespace,
+			Phase:     item.Status.Phase,
 		}
 
 		// Check if any container requests GPU.
@@ -216,12 +297,15 @@ func parsePodList(data []byte) ([]PodInfo, error) {
 			}
 		}
 
-		// Extract container IDs from status (runtime prefix stripped).
+		// Extract container IDs and restart count from status.
+		var totalRestarts int32
 		for _, cs := range item.Status.ContainerStatuses {
 			if cid := stripRuntimePrefix(cs.ContainerID); cid != "" {
 				info.ContainerIDs = append(info.ContainerIDs, cid)
 			}
+			totalRestarts += cs.RestartCount
 		}
+		info.RestartCount = totalRestarts
 
 		pods = append(pods, info)
 	}
@@ -275,9 +359,11 @@ type resourceRequirements struct {
 }
 
 type podStatus struct {
+	Phase             string            `json:"phase"` // Pending, Running, Succeeded, Failed, Unknown
 	ContainerStatuses []containerStatus `json:"containerStatuses"`
 }
 
 type containerStatus struct {
-	ContainerID string `json:"containerID"`
+	ContainerID  string `json:"containerID"`
+	RestartCount int32  `json:"restartCount"`
 }

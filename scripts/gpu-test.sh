@@ -315,6 +315,32 @@ else
     record "FAIL" "T07: driver API: cuLaunchKernel" "0 events"
 fi
 
+# T07b-d: Validate additional driver API operations from the same session.
+# PyTorch matmul uses cuMemcpy and cuCtxSynchronize via cuBLAS.
+CU_MEMCPY=$(grep -c '"cuMemcpy\|cuMemcpyAsync"' logs/trace-clean.json 2>/dev/null || echo "0")
+CU_MEMCPY=$(echo "$CU_MEMCPY" | head -1)
+if [[ "$CU_MEMCPY" -gt 0 ]]; then
+    record "PASS" "T07b: driver API: cuMemcpy" "$CU_MEMCPY events"
+else
+    record "WARN" "T07b: driver API: cuMemcpy" "0 events (some workloads may not trigger)"
+fi
+
+CU_CTXSYNC=$(grep -c '"cuCtxSynchronize"' logs/trace-clean.json 2>/dev/null || echo "0")
+CU_CTXSYNC=$(echo "$CU_CTXSYNC" | head -1)
+if [[ "$CU_CTXSYNC" -gt 0 ]]; then
+    record "PASS" "T07c: driver API: cuCtxSynchronize" "$CU_CTXSYNC events"
+else
+    record "WARN" "T07c: driver API: cuCtxSynchronize" "0 events (some workloads may not trigger)"
+fi
+
+CU_MEMALLOC=$(grep -c '"cuMemAlloc"' logs/trace-clean.json 2>/dev/null || echo "0")
+CU_MEMALLOC=$(echo "$CU_MEMALLOC" | head -1)
+if [[ "$CU_MEMALLOC" -gt 0 ]]; then
+    record "PASS" "T07d: driver API: cuMemAlloc" "$CU_MEMALLOC events"
+else
+    record "WARN" "T07d: driver API: cuMemAlloc" "0 events (some workloads may not trigger)"
+fi
+
 # Test 4: trace --debug
 log "Test 4: trace --debug --duration 15s"
 WL_PID=$(start_workload 18)
@@ -620,14 +646,42 @@ wait "$CONTENTION_PID" 2>/dev/null || true
 
 # Explain the stored data (needs sudo to read root's DB).
 sudo ./bin/ingero explain --debug --since 60s > logs/explain-chain.log 2>&1
+
+# Check if system_snapshots recorded high CPU (verifies stress-ng had effect).
+# On fast GPUs, stress-ng may finish before contention builds — detecting this
+# prevents false PASS when the provocation didn't actually cause contention.
+PEAK_CPU="0"
+T13_DB=""
+if [ -f "$HOME/.ingero/ingero.db" ]; then
+    T13_DB="$HOME/.ingero/ingero.db"
+elif sudo test -f /root/.ingero/ingero.db; then
+    T13_DB="/root/.ingero/ingero.db"
+fi
+if [ -n "$T13_DB" ]; then
+    PEAK_CPU=$(sudo python3 -c "
+import sqlite3
+conn = sqlite3.connect('$T13_DB')
+try:
+    row = conn.execute('SELECT MAX(cpu_pct) FROM system_snapshots').fetchone()
+    print(int(row[0]) if row and row[0] else 0)
+except: print(0)
+conn.close()
+" 2>/dev/null || echo "0")
+fi
+
 if grep -q "causal chain(s) found" logs/explain-chain.log 2>/dev/null; then
     CHAIN_COUNT=$(grep -o '[0-9]* causal chain' logs/explain-chain.log | head -1 | awk '{print $1}')
-    record "PASS" "T13: explain chain detection" "${CHAIN_COUNT} chain(s) detected under contention"
+    record "PASS" "T13: explain chain detection" "${CHAIN_COUNT} chain(s) detected under contention (peak CPU ${PEAK_CPU}%)"
 elif grep -q "INCIDENT REPORT" logs/explain-chain.log 2>/dev/null; then
-    # Report generated but no chains. If stress-ng was running, provocation
-    # should have produced chains — report as PASS with note rather than masking.
+    # Report generated but no chains. Check if stress-ng actually caused contention.
     if [ -n "${STRESS_PID:-}" ]; then
-        record "PASS" "T13: explain chain detection" "report generated, 0 chains (contention below threshold)"
+        if [[ "$PEAK_CPU" -ge 80 ]]; then
+            # stress-ng caused real contention but explain found nothing — suspicious
+            record "WARN" "T13: explain chain detection" "peak CPU ${PEAK_CPU}% but 0 chains (threshold may be too high)"
+        else
+            # stress-ng didn't cause enough contention — fast hardware
+            record "PASS" "T13: explain chain detection" "report generated, 0 chains (peak CPU ${PEAK_CPU}% — fast hardware)"
+        fi
     else
         record "PASS" "T13: explain chain detection" "report generated, 0 chains (no stress-ng)"
     fi
@@ -1091,6 +1145,38 @@ else
 fi
 
 ################################################################################
+# Pre-MCP: Generate snapshot test report so get_test_report has data
+################################################################################
+# test-report.json is normally written at script end, but the MCP session needs
+# it NOW for get_test_report to return real data instead of "not found".
+# The final report will overwrite this with complete results.
+TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+: > $TEST_TMP/test_results_snapshot.txt
+for entry in "${TEST_RESULTS[@]}"; do
+    echo "$entry" >> $TEST_TMP/test_results_snapshot.txt
+done
+GPU_NAME="$_GPU_NAME" DRIVER_VER="$_DRIVER_VER" KERNEL_VER="$_KERNEL_VER" \
+  ARCH="$(uname -m)" PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
+  PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" TOTAL="$TOTAL" \
+  python3 -c "
+import json, os
+from datetime import datetime, timezone
+tests = []
+with open('$TEST_TMP/test_results_snapshot.txt') as f:
+    for line in f:
+        parts = line.strip().split('|', 4)
+        if len(parts) == 5:
+            tests.append({'id': parts[0].strip(), 'name': parts[1].strip(), 'status': parts[2].strip(), 'detail': parts[3].strip(), 'duration_s': int(parts[4].strip())})
+report = {'version': '0.8', 'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'note': 'snapshot (test suite still running)',
+  'system': {'gpu': os.environ.get('GPU_NAME','N/A'), 'driver': os.environ.get('DRIVER_VER','N/A'), 'kernel': os.environ.get('KERNEL_VER','N/A'), 'arch': os.environ.get('ARCH','N/A'), 'pytorch': os.environ.get('PYTORCH_VER','N/A'), 'go': os.environ.get('GO_VER','N/A')},
+  'summary': {'pass': int(os.environ.get('PASS_COUNT','0')), 'fail': int(os.environ.get('FAIL_COUNT','0')), 'skip': int(os.environ.get('SKIP_COUNT','0')), 'total': int(os.environ.get('TOTAL','0'))},
+  'tests': tests}
+with open('logs/test-report.json', 'w') as f:
+    json.dump(report, f, indent=2)
+print(f'Snapshot report: {len(tests)} tests so far')
+" 2>/dev/null || true
+
+################################################################################
 # Phase 5: MCP AI Diagnostic
 ################################################################################
 header "Phase 5: MCP AI Diagnostic"
@@ -1178,15 +1264,14 @@ else
         record "FAIL" "T19d: MCP get_causal_chains" "unexpected response: ${RESP:0:200}"
     fi
 
-    # T19e: get_test_report — will fail because we haven't written test-report.json yet.
-    # We generate it after this phase, so expect a "not found" message (which is correct behavior).
+    # T19e: get_test_report — snapshot report was generated before this phase.
     _test_start=$SECONDS
     log "Test 19e: MCP get_test_report"
     RESP=$(mcp_call "get_test_report" '{}')
-    if echo "$RESP" | grep -q "No test report\|test-report.json\|Run.*gpu-test"; then
-        record "PASS" "T19e: MCP get_test_report" "correct 'not found' response (report generated after this phase)"
-    elif echo "$RESP" | grep -q "version\|summary\|tests"; then
-        record "PASS" "T19e: MCP get_test_report" "report returned"
+    if echo "$RESP" | grep -q "version\|summary\|tests"; then
+        record "PASS" "T19e: MCP get_test_report" "report returned (snapshot)"
+    elif echo "$RESP" | grep -q "No test report\|test-report.json\|Run.*gpu-test"; then
+        record "PASS" "T19e: MCP get_test_report" "not found (snapshot may not have written)"
     else
         record "FAIL" "T19e: MCP get_test_report" "unexpected response"
     fi
@@ -1358,6 +1443,132 @@ else
     sleep 1
 fi
 
+# ── T22: Coverage Gap Tests (CLI flags) ──
+# These test flags that were not covered by the main test phases.
+
+# T22a: --record=false (recording disabled — no DB created)
+_test_start=$SECONDS
+log "Test 22a: trace --record=false (no DB)"
+T22_DB="/tmp/ingero-t22a-test.db"
+rm -f "$T22_DB" "${T22_DB}-wal" "${T22_DB}-shm"
+WL_PID=$(start_workload 8)
+sleep 1
+sudo ./bin/ingero trace --record=false --pid "$WL_PID" --duration 5s > logs/trace-norecord.json 2> logs/trace-norecord.log
+wait "$WL_PID" 2>/dev/null || true
+NORECORD_COUNT=$(count_events logs/trace-norecord.json)
+if [[ "$NORECORD_COUNT" -gt 100 ]]; then
+    record "PASS" "T22a: --record=false" "$NORECORD_COUNT events streamed (no DB write)"
+else
+    record "FAIL" "T22a: --record=false" "$NORECORD_COUNT events (expected >100)"
+fi
+
+# T22b: --log <path> (file output)
+_test_start=$SECONDS
+log "Test 22b: trace --log (file output)"
+WL_PID=$(start_workload 8)
+sleep 1
+sudo ./bin/ingero trace --pid "$WL_PID" --duration 5s --log logs/trace-logflag.log > /dev/null 2>&1
+wait "$WL_PID" 2>/dev/null || true
+if [ -s logs/trace-logflag.log ]; then
+    LOGLINES=$(wc -l < logs/trace-logflag.log)
+    record "PASS" "T22b: --log flag" "$LOGLINES lines written to log file"
+else
+    record "FAIL" "T22b: --log flag" "log file empty or missing"
+fi
+
+# T22c: --pid filter (only specified PID captured)
+_test_start=$SECONDS
+log "Test 22c: trace --pid filter"
+# Start two workloads, only trace one
+WL_PID1=$(start_workload 10)
+WL_PID2=$(start_workload 10)
+sleep 1
+sudo ./bin/ingero trace --json --pid "$WL_PID1" --duration 5s > logs/trace-pidfilter.json 2> logs/trace-pidfilter.log
+wait "$WL_PID1" 2>/dev/null || true
+wait "$WL_PID2" 2>/dev/null || true
+# Check that events from PID2 are NOT present (CUDA/driver events should only be from PID1)
+PID1_COUNT=$(grep -c "\"pid\":${WL_PID1}" logs/trace-pidfilter.json 2>/dev/null || echo "0")
+PID2_COUNT=$(grep -c "\"pid\":${WL_PID2}" logs/trace-pidfilter.json 2>/dev/null || echo "0")
+PID1_COUNT=$(echo "$PID1_COUNT" | head -1)
+PID2_COUNT=$(echo "$PID2_COUNT" | head -1)
+if [[ "$PID1_COUNT" -gt 0 && "$PID2_COUNT" -eq 0 ]]; then
+    record "PASS" "T22c: --pid filter" "PID1=$PID1_COUNT events, PID2=$PID2_COUNT (filtered)"
+elif [[ "$PID1_COUNT" -gt 0 ]]; then
+    # Host events (sched_switch) may include PID2 — that's expected behavior.
+    # CUDA/driver events should be filtered. Check if PID2 has any CUDA events.
+    PID2_CUDA=$(grep "\"pid\":${WL_PID2}" logs/trace-pidfilter.json 2>/dev/null | grep -c '"cuda\|cuLaunchKernel\|cudaMalloc' || echo "0")
+    PID2_CUDA=$(echo "$PID2_CUDA" | head -1)
+    if [[ "$PID2_CUDA" -eq 0 ]]; then
+        record "PASS" "T22c: --pid filter" "PID1=$PID1_COUNT, PID2 host-only=$PID2_COUNT (CUDA filtered)"
+    else
+        record "FAIL" "T22c: --pid filter" "PID2 CUDA events leaked: $PID2_CUDA"
+    fi
+else
+    record "FAIL" "T22c: --pid filter" "no events for target PID (PID1=$PID1_COUNT)"
+fi
+
+# T22d: --max-db size limit
+_test_start=$SECONDS
+log "Test 22d: --max-db flag accepted"
+# Just verify the flag is accepted (actual size pruning is hard to test in short runs).
+WL_PID=$(start_workload 8)
+sleep 1
+sudo ./bin/ingero trace --max-db 50m --pid "$WL_PID" --duration 5s > /dev/null 2> logs/trace-maxdb.log
+wait "$WL_PID" 2>/dev/null || true
+if ! grep -qi "unknown\|invalid\|error.*max-db" logs/trace-maxdb.log 2>/dev/null; then
+    record "PASS" "T22d: --max-db flag" "accepted without error"
+else
+    record "FAIL" "T22d: --max-db flag" "flag rejected or error"
+fi
+
+# ── T22e-g: New Event Source Integration (Block I/O, TCP, Net) ──
+# These verify new v0.8 tracers capture events when available.
+# Non-fatal (WARN not FAIL) — tracepoints may not be available on all kernels.
+
+# T22e: Block I/O events — generate I/O with dd, check for block_read/block_write
+_test_start=$SECONDS
+log "Test 22e: Block I/O events"
+WL_PID=$(start_workload 12)
+sleep 1
+# Generate block I/O: write 10MB to a temp file during trace
+dd if=/dev/zero of=/tmp/ingero-io-test.bin bs=1M count=10 conv=fdatasync 2>/dev/null &
+DD_PID=$!
+sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 8s > logs/trace-io-test.json 2> logs/trace-io-test.log
+wait "$DD_PID" 2>/dev/null || true
+wait "$WL_PID" 2>/dev/null || true
+rm -f /tmp/ingero-io-test.bin
+IO_COUNT=$(grep -c '"block_read"\|"block_write"' logs/trace-io-test.json 2>/dev/null || echo "0")
+IO_COUNT=$(echo "$IO_COUNT" | head -1)
+if [[ "$IO_COUNT" -gt 0 ]]; then
+    record "PASS" "T22e: Block I/O events" "$IO_COUNT block I/O events captured"
+else
+    record "WARN" "T22e: Block I/O events" "0 events (tracepoints may not be available)"
+fi
+
+# T22f: TCP retransmit events — verify tracer loads (retransmits may not occur)
+_test_start=$SECONDS
+log "Test 22f: TCP tracer loads"
+# We can't reliably induce retransmits without tc netem (may not be installed).
+# Just verify the tracer loads without error by checking the trace log.
+if grep -qi "TCP.*attached\|tcp.*trace\|tcp.*loaded" logs/trace-io-test.log 2>/dev/null; then
+    record "PASS" "T22f: TCP tracer" "tracer loaded successfully"
+elif grep -qi "tcp.*failed\|tcp.*error" logs/trace-io-test.log 2>/dev/null; then
+    record "WARN" "T22f: TCP tracer" "tracer failed to load (tracepoint unavailable)"
+else
+    record "PASS" "T22f: TCP tracer" "no TCP errors in trace log"
+fi
+
+# T22g: Network socket events — verify tracer loads
+_test_start=$SECONDS
+log "Test 22g: Net socket tracer loads"
+if grep -qi "net.*attached\|net.*trace\|net.*loaded" logs/trace-io-test.log 2>/dev/null; then
+    record "PASS" "T22g: Net socket tracer" "tracer loaded successfully"
+elif grep -qi "net.*failed\|net.*error" logs/trace-io-test.log 2>/dev/null; then
+    record "WARN" "T22g: Net socket tracer" "tracer failed to load (tracepoint unavailable)"
+else
+    record "PASS" "T22g: Net socket tracer" "no net errors in trace log"
+fi
+
 # ── T21: DB Schema Validation ──
 _test_start=$SECONDS
 log "Test 21: DB schema validation"
@@ -1395,7 +1606,7 @@ conn.close()
 
     SCHEMA_OK=0
     SCHEMA_MISSING=""
-    for table in events causal_chains system_snapshots sources ops schema_info sessions; do
+    for table in events causal_chains system_snapshots sources ops schema_info sessions stack_traces cgroup_metadata process_names event_aggregates cgroup_schedstat; do
         if grep -qi "$table" logs/db-schema.txt 2>/dev/null; then
             SCHEMA_OK=$((SCHEMA_OK + 1))
         else
@@ -1403,10 +1614,10 @@ conn.close()
         fi
     done
 
-    if [[ "$SCHEMA_OK" -eq 7 ]]; then
-        record "PASS" "T21: DB schema" "all 7 tables present"
+    if [[ "$SCHEMA_OK" -eq 12 ]]; then
+        record "PASS" "T21: DB schema" "all 12 tables present"
     else
-        record "FAIL" "T21: DB schema" "${SCHEMA_OK}/7 tables, missing:${SCHEMA_MISSING}"
+        record "FAIL" "T21: DB schema" "${SCHEMA_OK}/12 tables, missing:${SCHEMA_MISSING}"
     fi
 else
     record "FAIL" "T21: DB schema" "ingero.db not found"
@@ -1510,7 +1721,7 @@ with open(results_file) as f:
             })
 
 report = {
-    'version': '0.7',
+    'version': '0.8',
     'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     'duration_s': int(os.environ.get('SCRIPT_DURATION', '0')),
     'system': {

@@ -90,16 +90,18 @@ type driverTraceSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type driverTraceProgramSpecs struct {
-	UprobeCuCtxSync         *ebpf.ProgramSpec `ebpf:"uprobe_cu_ctx_sync"`
-	UprobeCuLaunchKernel    *ebpf.ProgramSpec `ebpf:"uprobe_cu_launch_kernel"`
-	UprobeCuMemAlloc        *ebpf.ProgramSpec `ebpf:"uprobe_cu_mem_alloc"`
-	UprobeCuMemcpy          *ebpf.ProgramSpec `ebpf:"uprobe_cu_memcpy"`
-	UprobeCuMemcpyAsync     *ebpf.ProgramSpec `ebpf:"uprobe_cu_memcpy_async"`
-	UretprobeCuCtxSync      *ebpf.ProgramSpec `ebpf:"uretprobe_cu_ctx_sync"`
-	UretprobeCuLaunchKernel *ebpf.ProgramSpec `ebpf:"uretprobe_cu_launch_kernel"`
-	UretprobeCuMemAlloc     *ebpf.ProgramSpec `ebpf:"uretprobe_cu_mem_alloc"`
-	UretprobeCuMemcpy       *ebpf.ProgramSpec `ebpf:"uretprobe_cu_memcpy"`
-	UretprobeCuMemcpyAsync  *ebpf.ProgramSpec `ebpf:"uretprobe_cu_memcpy_async"`
+	UprobeCuCtxSync            *ebpf.ProgramSpec `ebpf:"uprobe_cu_ctx_sync"`
+	UprobeCuLaunchKernel       *ebpf.ProgramSpec `ebpf:"uprobe_cu_launch_kernel"`
+	UprobeCuMemAlloc           *ebpf.ProgramSpec `ebpf:"uprobe_cu_mem_alloc"`
+	UprobeCuMemAllocManaged    *ebpf.ProgramSpec `ebpf:"uprobe_cu_mem_alloc_managed"`
+	UprobeCuMemcpy             *ebpf.ProgramSpec `ebpf:"uprobe_cu_memcpy"`
+	UprobeCuMemcpyAsync        *ebpf.ProgramSpec `ebpf:"uprobe_cu_memcpy_async"`
+	UretprobeCuCtxSync         *ebpf.ProgramSpec `ebpf:"uretprobe_cu_ctx_sync"`
+	UretprobeCuLaunchKernel    *ebpf.ProgramSpec `ebpf:"uretprobe_cu_launch_kernel"`
+	UretprobeCuMemAlloc        *ebpf.ProgramSpec `ebpf:"uretprobe_cu_mem_alloc"`
+	UretprobeCuMemAllocManaged *ebpf.ProgramSpec `ebpf:"uretprobe_cu_mem_alloc_managed"`
+	UretprobeCuMemcpy          *ebpf.ProgramSpec `ebpf:"uretprobe_cu_memcpy"`
+	UretprobeCuMemcpyAsync     *ebpf.ProgramSpec `ebpf:"uretprobe_cu_memcpy_async"`
 }
 
 // driverTraceMapSpecs contains maps before they are loaded into the kernel.
@@ -166,16 +168,18 @@ type driverTraceVariables struct {
 //
 // It can be passed to loadDriverTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type driverTracePrograms struct {
-	UprobeCuCtxSync         *ebpf.Program `ebpf:"uprobe_cu_ctx_sync"`
-	UprobeCuLaunchKernel    *ebpf.Program `ebpf:"uprobe_cu_launch_kernel"`
-	UprobeCuMemAlloc        *ebpf.Program `ebpf:"uprobe_cu_mem_alloc"`
-	UprobeCuMemcpy          *ebpf.Program `ebpf:"uprobe_cu_memcpy"`
-	UprobeCuMemcpyAsync     *ebpf.Program `ebpf:"uprobe_cu_memcpy_async"`
-	UretprobeCuCtxSync      *ebpf.Program `ebpf:"uretprobe_cu_ctx_sync"`
-	UretprobeCuLaunchKernel *ebpf.Program `ebpf:"uretprobe_cu_launch_kernel"`
-	UretprobeCuMemAlloc     *ebpf.Program `ebpf:"uretprobe_cu_mem_alloc"`
-	UretprobeCuMemcpy       *ebpf.Program `ebpf:"uretprobe_cu_memcpy"`
-	UretprobeCuMemcpyAsync  *ebpf.Program `ebpf:"uretprobe_cu_memcpy_async"`
+	UprobeCuCtxSync            *ebpf.Program `ebpf:"uprobe_cu_ctx_sync"`
+	UprobeCuLaunchKernel       *ebpf.Program `ebpf:"uprobe_cu_launch_kernel"`
+	UprobeCuMemAlloc           *ebpf.Program `ebpf:"uprobe_cu_mem_alloc"`
+	UprobeCuMemAllocManaged    *ebpf.Program `ebpf:"uprobe_cu_mem_alloc_managed"`
+	UprobeCuMemcpy             *ebpf.Program `ebpf:"uprobe_cu_memcpy"`
+	UprobeCuMemcpyAsync        *ebpf.Program `ebpf:"uprobe_cu_memcpy_async"`
+	UretprobeCuCtxSync         *ebpf.Program `ebpf:"uretprobe_cu_ctx_sync"`
+	UretprobeCuLaunchKernel    *ebpf.Program `ebpf:"uretprobe_cu_launch_kernel"`
+	UretprobeCuMemAlloc        *ebpf.Program `ebpf:"uretprobe_cu_mem_alloc"`
+	UretprobeCuMemAllocManaged *ebpf.Program `ebpf:"uretprobe_cu_mem_alloc_managed"`
+	UretprobeCuMemcpy          *ebpf.Program `ebpf:"uretprobe_cu_memcpy"`
+	UretprobeCuMemcpyAsync     *ebpf.Program `ebpf:"uretprobe_cu_memcpy_async"`
 }
 
 func (p *driverTracePrograms) Close() error {
@@ -183,11 +187,13 @@ func (p *driverTracePrograms) Close() error {
 		p.UprobeCuCtxSync,
 		p.UprobeCuLaunchKernel,
 		p.UprobeCuMemAlloc,
+		p.UprobeCuMemAllocManaged,
 		p.UprobeCuMemcpy,
 		p.UprobeCuMemcpyAsync,
 		p.UretprobeCuCtxSync,
 		p.UretprobeCuLaunchKernel,
 		p.UretprobeCuMemAlloc,
+		p.UretprobeCuMemAllocManaged,
 		p.UretprobeCuMemcpy,
 		p.UretprobeCuMemcpyAsync,
 	)

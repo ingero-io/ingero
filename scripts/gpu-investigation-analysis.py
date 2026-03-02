@@ -113,6 +113,13 @@ class MCPClient:
         """Get trace statistics (120s timeout — aggregation on large DBs)."""
         return self.call("get_trace_stats", {"since": since, "tsc": False}, timeout=120)
 
+    def get_stacks(self, since: str = "0", op: str = "") -> dict:
+        """Get resolved call stacks (120s timeout — stack aggregation can be slow)."""
+        args = {"since": since, "tsc": False}
+        if op:
+            args["op"] = op
+        return self.call("get_stacks", args, timeout=120)
+
     def get_sessions(self, since: str = "0") -> dict:
         """Get trace sessions via run_sql (get_sessions tool was removed)."""
         return self.call("run_sql", {"query": "SELECT * FROM sessions ORDER BY started_at DESC", "limit": 100}, timeout=30)
@@ -462,6 +469,18 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
     r3_rows = sql_to_dicts(r3)
     inv.add_action("run_sql", "malloc-free balance",
                    f"allocs vs frees")
+
+    # Action 4: allocation call stacks — shows which code paths allocate memory
+    r4 = mcp.get_stacks(op="cudaMalloc")
+    r4_stacks = 0
+    if "data" in r4:
+        d4 = r4["data"]
+        if isinstance(d4, dict):
+            r4_stacks = len(d4.get("stacks", d4.get("s", [])))
+        elif isinstance(d4, list):
+            r4_stacks = len(d4)
+    inv.add_action("get_stacks", "allocation call stacks (cudaMalloc)",
+                   f"{r4_stacks} distinct call stacks")
 
     # Verdict
     if r3_rows and r1_rows:
@@ -872,6 +891,18 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
     rows2 = sql_to_dicts(r2)
     inv.add_action("run_sql", "cumulative malloc-free over time",
                    f"{len(rows2)} buckets")
+
+    # Action 3: allocation call stacks — shows which code paths allocate memory
+    r3_stacks = mcp.get_stacks(op="cudaMalloc")
+    stack_count = 0
+    if "data" in r3_stacks:
+        d = r3_stacks["data"]
+        if isinstance(d, dict):
+            stack_count = len(d.get("stacks", d.get("s", [])))
+        elif isinstance(d, list):
+            stack_count = len(d)
+    inv.add_action("get_stacks", "allocation call stacks",
+                   f"{stack_count} distinct allocation paths")
 
     # Verdict
     mallocs = r1_rows[0].get("mallocs", 0) or 0 if r1_rows else 0

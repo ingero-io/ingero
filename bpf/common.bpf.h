@@ -9,6 +9,9 @@
 #define EVENT_SRC_NVIDIA  2
 #define EVENT_SRC_HOST    3
 #define EVENT_SRC_DRIVER  4
+#define EVENT_SRC_IO      5
+#define EVENT_SRC_TCP     6
+#define EVENT_SRC_NET     7
 
 /* Host kernel operation types */
 #define HOST_OP_SCHED_SWITCH   1
@@ -27,6 +30,7 @@
 #define CUDA_OP_STREAM_SYNC      5
 #define CUDA_OP_DEVICE_SYNC      6
 #define CUDA_OP_MEMCPY_ASYNC     7
+#define CUDA_OP_MALLOC_MANAGED   8
 
 /* CUDA driver operation types (libcuda.so) */
 #define DRIVER_OP_LAUNCH_KERNEL    1
@@ -34,6 +38,19 @@
 #define DRIVER_OP_MEMCPY_ASYNC     3
 #define DRIVER_OP_CTX_SYNC         4
 #define DRIVER_OP_MEM_ALLOC        5
+#define DRIVER_OP_MEM_ALLOC_MANAGED 6
+
+/* Block I/O operation types */
+#define IO_OP_READ       1
+#define IO_OP_WRITE      2
+#define IO_OP_DISCARD    3
+
+/* TCP operation types */
+#define TCP_OP_RETRANSMIT  1
+
+/* Network socket operation types */
+#define NET_OP_SEND   1
+#define NET_OP_RECV   2
 
 /* Per-thread entry state: timestamp + args at CUDA/driver function entry.
  * Shared by cuda_trace.bpf.c and driver_trace.bpf.c.
@@ -104,6 +121,39 @@ struct host_event {
 	__u64 duration_ns;
 	__u32 cpu;
 	__u32 target_pid;    /* for sched events: who was affected */
+};
+
+/* Block I/O event (56 bytes) — block_rq_issue / block_rq_complete.
+ * Prefixed with ingero_ to avoid colliding with kernel's struct io_event in vmlinux.h.
+ */
+struct ingero_io_event {
+	struct ingero_event_hdr hdr;
+	__u64 duration_ns;      /* time from issue to complete */
+	__u32 dev;              /* device major:minor (MKDEV) */
+	__u32 nr_sector;        /* request size in sectors */
+	__u64 sector;           /* starting sector number */
+	__u8  rwbs;             /* R=read, W=write, D=discard */
+	__u8  _pad_io[7];
+};
+
+/* TCP event (56 bytes) — tcp_retransmit_skb */
+struct ingero_tcp_event {
+	struct ingero_event_hdr hdr;
+	__u32 saddr;            /* source IPv4 address */
+	__u32 daddr;            /* destination IPv4 address */
+	__u16 sport;            /* source port */
+	__u16 dport;            /* destination port */
+	__u8  state;            /* TCP state at time of retransmit */
+	__u8  _pad_tcp[3];
+};
+
+/* Network socket event (48 bytes) — sendto/recvfrom syscalls */
+struct ingero_net_event {
+	struct ingero_event_hdr hdr;
+	__u32 fd;               /* socket file descriptor */
+	__u32 bytes;            /* bytes sent or received */
+	__u8  direction;        /* NET_OP_SEND or NET_OP_RECV */
+	__u8  _pad_net[7];
 };
 
 /*

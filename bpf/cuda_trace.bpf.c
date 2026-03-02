@@ -329,6 +329,40 @@ int uretprobe_cuda_device_sync(struct pt_regs *ctx)
 	return 0;
 }
 
+// ---- cudaMallocManaged uprobes ----
+// cudaError_t cudaMallocManaged(void** devPtr, size_t size, unsigned int flags)
+// Unified Memory allocation. arg0 = allocation size (PARM2, same as cudaMalloc).
+// Page faults on first access are invisible latency — tracing the allocation
+// enables causal chains: "kernel slow because first-touch page fault on managed alloc".
+
+SEC("uprobe/cudaMallocManaged")
+int uprobe_cuda_malloc_managed(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 size = (__u64)PT_REGS_PARM2(ctx);
+
+	save_entry(tid, CUDA_OP_MALLOC_MANAGED, size, 0);
+	return 0;
+}
+
+SEC("uretprobe/cudaMallocManaged")
+int uretprobe_cuda_malloc_managed(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	__s32 ret = (__s32)PT_REGS_RC(ctx);
+	emit_event(ctx, pid, tid, entry, ret);
+
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
 // Force BTF type emission for bpf2go code generation.
 const struct cuda_event *_unused_cuda_event_force_btf __attribute__((unused));
 const struct cuda_event_stack *_unused_cuda_event_stack_force_btf __attribute__((unused));
