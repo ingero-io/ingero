@@ -41,7 +41,7 @@ else
   RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
 fi
 
-PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0; WARN_COUNT=0
 REPORT=""
 SCRIPT_START=$SECONDS
 
@@ -79,6 +79,9 @@ record() {
     elif [[ "$status" == "SKIP" ]]; then
         echo -e "$(ts)   ${YELLOW}[SKIP]${NC} $name — $detail"
         SKIP_COUNT=$((SKIP_COUNT + 1))
+    elif [[ "$status" == "WARN" ]]; then
+        echo -e "$(ts)   ${YELLOW}[WARN]${NC} $name — $detail"
+        WARN_COUNT=$((WARN_COUNT + 1))
     fi
     _test_start=$SECONDS
 }
@@ -212,10 +215,18 @@ python3 --version >> logs/uname.log 2>&1
 sudo ./bin/ingero check --debug > logs/check-debug.log 2>&1
 ./bin/ingero version > logs/version.log 2>&1
 
-log "GPU: $(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null)"
-log "Kernel: $(uname -r)"
-log "Go: $(go version | awk '{print $3}')"
-log "PyTorch: $(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo 'N/A')"
+# Capture system info variables early (used by snapshot and final report).
+_GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo "N/A")
+_GPU_NAME=$(echo "$_GPU_INFO" | cut -d',' -f1 | xargs)
+_DRIVER_VER=$(echo "$_GPU_INFO" | cut -d',' -f2 | xargs)
+_KERNEL_VER=$(uname -r)
+_PYTORCH_VER=$(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo "N/A")
+_GO_VER=$(go version 2>/dev/null | awk '{print $3}')
+
+log "GPU: $_GPU_INFO"
+log "Kernel: $_KERNEL_VER"
+log "Go: $_GO_VER"
+log "PyTorch: $_PYTORCH_VER"
 
 ################################################################################
 # Probe Smoke Test — abort early if eBPF probes can't attach
@@ -301,10 +312,10 @@ sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 15s > logs/trace-clean
 wait "$WL_PID" 2>/dev/null || true
 
 CLEAN_COUNT=$(count_events logs/trace-clean.json)
-if [[ "$CLEAN_COUNT" -gt 5000 ]]; then
+if [[ "$CLEAN_COUNT" -gt 20000 ]]; then
     record "PASS" "T03: trace clean" "$CLEAN_COUNT events"
 else
-    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >5000)"
+    record "FAIL" "T03: trace clean" "$CLEAN_COUNT events (expected >20000)"
 fi
 
 CU_COUNT=$(grep -c '"cuLaunchKernel"' logs/trace-clean.json 2>/dev/null || echo "0")
@@ -349,10 +360,10 @@ sudo ./bin/ingero trace --debug --json --duration 15s > logs/trace-debug.json 2>
 wait "$WL_PID" 2>/dev/null || true
 DEBUG_COUNT=$(count_events logs/trace-debug.json)
 DEBUG_LINES=$(grep -c '\[DEBUG\]' logs/trace-debug.log 2>/dev/null || echo "0")
-if [[ "$DEBUG_COUNT" -gt 5000 && "$DEBUG_LINES" -gt 100 ]]; then
+if [[ "$DEBUG_COUNT" -gt 20000 && "$DEBUG_LINES" -gt 500 ]]; then
     record "PASS" "T04: trace --debug" "$DEBUG_COUNT events, $DEBUG_LINES debug lines"
 else
-    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT (expected >5000), debugLines=$DEBUG_LINES (expected >100)"
+    record "FAIL" "T04: trace --debug" "events=$DEBUG_COUNT (expected >20000), debugLines=$DEBUG_LINES (expected >500)"
 fi
 
 # Test 5: record + query round-trip (recording is default)
@@ -378,6 +389,16 @@ if echo "$EXPLAIN_OUT" | grep -q "INCIDENT REPORT"; then
     record "PASS" "T06: explain" "incident report generated"
 else
     record "FAIL" "T06: explain" "no incident report"
+fi
+
+# Test 6b: explain --per-process (per-process breakdown)
+_test_start=$SECONDS
+log "Test 6b: explain --per-process --since 180s"
+EXPLAIN_PP=$(sudo ./bin/ingero explain --per-process --since 180s 2>&1)
+if echo "$EXPLAIN_PP" | grep -qi "per.process\|process.*breakdown\|PID\|python"; then
+    record "PASS" "T06b: explain --per-process" "per-process breakdown present"
+else
+    record "WARN" "T06b: explain --per-process" "no per-process data in output"
 fi
 
 # Test 8: GPU demo incident
@@ -1057,7 +1078,7 @@ avg_nostack = statistics.mean(nostack_counts) if nostack_counts else 0
 avg_stack = statistics.mean(stack_counts) if stack_counts else 0
 
 print("=" * 70)
-print("  Ingero v0.7 Stack Tracing Benchmark Summary")
+print("  Ingero v0.8 Stack Tracing Benchmark Summary")
 print("=" * 70)
 print()
 print("Throughput (events in 20s window):")
@@ -1135,10 +1156,10 @@ if [[ "${#BENCH_NOSTACK_COUNTS[@]}" -eq 2 && "${#BENCH_STACK_COUNTS[@]}" -eq 2 ]
     else
         OVERHEAD=0
     fi
-    if [[ "$OVERHEAD" -lt 20 ]]; then
+    if [[ "$OVERHEAD" -lt 5 ]]; then
         record "PASS" "T18: benchmark complete" "2+2 iterations, overhead=${OVERHEAD}%, see logs/benchmark-summary.txt"
     else
-        record "FAIL" "T18: benchmark regression" "stack overhead=${OVERHEAD}% (expected <20%), stack_avg=$STACK_AVG, nostack_avg=$NOSTACK_AVG"
+        record "FAIL" "T18: benchmark regression" "stack overhead=${OVERHEAD}% (expected <5%), stack_avg=$STACK_AVG, nostack_avg=$NOSTACK_AVG"
     fi
 else
     record "FAIL" "T18: benchmark incomplete" "nostack=${#BENCH_NOSTACK_COUNTS[@]}, stack=${#BENCH_STACK_COUNTS[@]}"
@@ -1150,14 +1171,14 @@ fi
 # test-report.json is normally written at script end, but the MCP session needs
 # it NOW for get_test_report to return real data instead of "not found".
 # The final report will overwrite this with complete results.
-TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT + WARN_COUNT))
 : > $TEST_TMP/test_results_snapshot.txt
 for entry in "${TEST_RESULTS[@]}"; do
     echo "$entry" >> $TEST_TMP/test_results_snapshot.txt
 done
 GPU_NAME="$_GPU_NAME" DRIVER_VER="$_DRIVER_VER" KERNEL_VER="$_KERNEL_VER" \
   ARCH="$(uname -m)" PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
-  PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" TOTAL="$TOTAL" \
+  PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" WARN_COUNT="$WARN_COUNT" TOTAL="$TOTAL" \
   python3 -c "
 import json, os
 from datetime import datetime, timezone
@@ -1169,7 +1190,7 @@ with open('$TEST_TMP/test_results_snapshot.txt') as f:
             tests.append({'id': parts[0].strip(), 'name': parts[1].strip(), 'status': parts[2].strip(), 'detail': parts[3].strip(), 'duration_s': int(parts[4].strip())})
 report = {'version': '0.8', 'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'note': 'snapshot (test suite still running)',
   'system': {'gpu': os.environ.get('GPU_NAME','N/A'), 'driver': os.environ.get('DRIVER_VER','N/A'), 'kernel': os.environ.get('KERNEL_VER','N/A'), 'arch': os.environ.get('ARCH','N/A'), 'pytorch': os.environ.get('PYTORCH_VER','N/A'), 'go': os.environ.get('GO_VER','N/A')},
-  'summary': {'pass': int(os.environ.get('PASS_COUNT','0')), 'fail': int(os.environ.get('FAIL_COUNT','0')), 'skip': int(os.environ.get('SKIP_COUNT','0')), 'total': int(os.environ.get('TOTAL','0'))},
+  'summary': {'pass': int(os.environ.get('PASS_COUNT','0')), 'fail': int(os.environ.get('FAIL_COUNT','0')), 'skip': int(os.environ.get('SKIP_COUNT','0')), 'warn': int(os.environ.get('WARN_COUNT','0')), 'total': int(os.environ.get('TOTAL','0'))},
   'tests': tests}
 with open('logs/test-report.json', 'w') as f:
     json.dump(report, f, indent=2)
@@ -1254,14 +1275,17 @@ else
         record "FAIL" "T19c: MCP run_sql" "no events returned: ${RESP:0:200}"
     fi
 
-    # T19d: get_causal_chains
+    # T19d: get_causal_chains — must return a structured response with chain data or explicit "no chains"
     _test_start=$SECONDS
     log "Test 19d: MCP get_causal_chains"
     RESP=$(mcp_call "get_causal_chains" '{"since":"30m"}')
-    if echo "$RESP" | grep -q '"result"' && echo "$RESP" | grep -qi 'chain\|severity\|No causal\|HEALTHY\|\\\"rc\\\"\|sched_switch\|contention'; then
-        record "PASS" "T19d: MCP get_causal_chains" "chains or healthy response"
+    echo "T19d RESP: ${RESP:0:500}" >> logs/mcp-debug.log
+    if echo "$RESP" | grep -q '"result"' && echo "$RESP" | grep -qi 'HIGH\|MEDIUM\|severity.*chain\|No causal chains'; then
+        record "PASS" "T19d: MCP get_causal_chains" "chains or explicit no-chains response"
+    elif echo "$RESP" | grep -q '"result"'; then
+        record "FAIL" "T19d: MCP get_causal_chains" "response has no chain data or severity markers: ${RESP:0:200}"
     else
-        record "FAIL" "T19d: MCP get_causal_chains" "unexpected response: ${RESP:0:200}"
+        record "FAIL" "T19d: MCP get_causal_chains" "no result in response: ${RESP:0:200}"
     fi
 
     # T19e: get_test_report — snapshot report was generated before this phase.
@@ -1271,9 +1295,31 @@ else
     if echo "$RESP" | grep -q "version\|summary\|tests"; then
         record "PASS" "T19e: MCP get_test_report" "report returned (snapshot)"
     elif echo "$RESP" | grep -q "No test report\|test-report.json\|Run.*gpu-test"; then
-        record "PASS" "T19e: MCP get_test_report" "not found (snapshot may not have written)"
+        record "WARN" "T19e: MCP get_test_report" "not found (snapshot may not have written)"
     else
         record "FAIL" "T19e: MCP get_test_report" "unexpected response"
+    fi
+
+    # T19f: get_stacks — verify stack aggregation returns data
+    _test_start=$SECONDS
+    log "Test 19f: MCP get_stacks"
+    RESP=$(mcp_call "get_stacks" '{"since":"30m"}')
+    if echo "$RESP" | grep -q '"result"' && echo "$RESP" | grep -qi 'stack\|frames\|symbol\|count\|op'; then
+        record "PASS" "T19f: MCP get_stacks" "stack data returned"
+    elif echo "$RESP" | grep -q '"result"'; then
+        record "WARN" "T19f: MCP get_stacks" "result returned but no stack data (stacks may not be captured)"
+    else
+        record "FAIL" "T19f: MCP get_stacks" "unexpected response: ${RESP:0:200}"
+    fi
+
+    # T19g: run_sql write rejection — verify INSERT/UPDATE/DELETE are blocked
+    _test_start=$SECONDS
+    log "Test 19g: MCP run_sql write rejection"
+    RESP=$(mcp_call "run_sql" '{"query":"INSERT INTO events (source, op, pid, tid, timestamp, duration) VALUES (1, 1, 1, 1, 0, 0)"}')
+    if echo "$RESP" | grep -qi 'error\|denied\|read.only\|not allowed\|unauthorized\|isError'; then
+        record "PASS" "T19g: MCP run_sql write rejection" "INSERT correctly rejected"
+    else
+        record "FAIL" "T19g: MCP run_sql write rejection" "INSERT was not rejected: ${RESP:0:200}"
     fi
 
     # ── T20: MCP Session Transcript ──
@@ -1432,14 +1478,22 @@ else
 
     if [ -s "$SESSION_FILE" ]; then
         LINES=$(wc -l < "$SESSION_FILE")
-        record "PASS" "T20: MCP session transcript" "${LINES} lines → logs/mcp-session.txt"
+        # Validate that the session contains actual MCP responses (not just echo'd headers)
+        MCP_RESPONSES=$(grep -c '"result"\|"jsonrpc"' "$SESSION_FILE" 2>/dev/null || echo "0")
+        MCP_RESPONSES=$(echo "$MCP_RESPONSES" | head -1)
+        if [[ "$MCP_RESPONSES" -gt 0 ]]; then
+            record "PASS" "T20: MCP session transcript" "${LINES} lines, ${MCP_RESPONSES} MCP responses → logs/mcp-session.txt"
+        else
+            record "WARN" "T20: MCP session transcript" "${LINES} lines but no MCP responses found"
+        fi
     else
         record "FAIL" "T20: MCP session transcript" "empty file"
     fi
 
-    # Kill MCP server (started with sudo, so needs sudo to kill)
-    # Don't use wait — sudo-spawned processes aren't shell children, so wait hangs.
+    # Kill MCP server (started with sudo, so needs sudo to kill).
+    # Kill both the sudo wrapper and the ingero mcp child process.
     sudo kill "$MCP_PID" 2>/dev/null || true
+    sudo pkill -f 'ingero mcp' 2>/dev/null || true
     sleep 1
 fi
 
@@ -1453,13 +1507,13 @@ T22_DB="/tmp/ingero-t22a-test.db"
 rm -f "$T22_DB" "${T22_DB}-wal" "${T22_DB}-shm"
 WL_PID=$(start_workload 8)
 sleep 1
-sudo ./bin/ingero trace --record=false --pid "$WL_PID" --duration 5s > logs/trace-norecord.json 2> logs/trace-norecord.log
+sudo ./bin/ingero trace --record=false --json --pid "$WL_PID" --duration 5s > logs/trace-norecord.json 2> logs/trace-norecord.log
 wait "$WL_PID" 2>/dev/null || true
 NORECORD_COUNT=$(count_events logs/trace-norecord.json)
-if [[ "$NORECORD_COUNT" -gt 100 ]]; then
+if [[ "$NORECORD_COUNT" -gt 5000 ]]; then
     record "PASS" "T22a: --record=false" "$NORECORD_COUNT events streamed (no DB write)"
 else
-    record "FAIL" "T22a: --record=false" "$NORECORD_COUNT events (expected >100)"
+    record "FAIL" "T22a: --record=false" "$NORECORD_COUNT events (expected >5000)"
 fi
 
 # T22b: --log <path> (file output)
@@ -1467,7 +1521,7 @@ _test_start=$SECONDS
 log "Test 22b: trace --log (file output)"
 WL_PID=$(start_workload 8)
 sleep 1
-sudo ./bin/ingero trace --pid "$WL_PID" --duration 5s --log logs/trace-logflag.log > /dev/null 2>&1
+sudo ./bin/ingero trace --debug --pid "$WL_PID" --duration 5s --log logs/trace-logflag.log > /dev/null 2>&1
 wait "$WL_PID" 2>/dev/null || true
 if [ -s logs/trace-logflag.log ]; then
     LOGLINES=$(wc -l < logs/trace-logflag.log)
@@ -1526,47 +1580,300 @@ fi
 # Non-fatal (WARN not FAIL) — tracepoints may not be available on all kernels.
 
 # T22e: Block I/O events — generate I/O with dd, check for block_read/block_write
+# No --pid filter: block I/O is system-wide (kernel tracepoints, not per-process uprobes).
+# IMPORTANT: Write to $HOME (real block device), NOT /tmp (often tmpfs/RAM — no block layer).
 _test_start=$SECONDS
 log "Test 22e: Block I/O events"
 WL_PID=$(start_workload 12)
 sleep 1
-# Generate block I/O: write 10MB to a temp file during trace
-dd if=/dev/zero of=/tmp/ingero-io-test.bin bs=1M count=10 conv=fdatasync 2>/dev/null &
-DD_PID=$!
-sudo ./bin/ingero trace --json --pid "$WL_PID" --duration 8s > logs/trace-io-test.json 2> logs/trace-io-test.log
-wait "$DD_PID" 2>/dev/null || true
+# Generate block I/O: write 50MB with oflag=direct to bypass page cache and hit block layer.
+# Start trace first, then dd, to ensure the trace window captures the I/O.
+sudo ./bin/ingero trace --json --duration 8s > logs/trace-io-test.json 2> logs/trace-io-test.log &
+TRACE_PID=$!
+sleep 1  # let trace attach probes before generating I/O
+IO_TEST_FILE="$HOME/ingero-io-test.bin"
+dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 oflag=direct 2>/dev/null || \
+    dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 oflag=dsync 2>/dev/null || \
+    dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 conv=fdatasync 2>/dev/null
+sync  # force any cached writes to hit the block layer
+wait "$TRACE_PID" 2>/dev/null || true
 wait "$WL_PID" 2>/dev/null || true
-rm -f /tmp/ingero-io-test.bin
-IO_COUNT=$(grep -c '"block_read"\|"block_write"' logs/trace-io-test.json 2>/dev/null || echo "0")
+rm -f "$IO_TEST_FILE"
+IO_COUNT=$(grep -c '"block_read"\|"block_write"\|"block_discard"' logs/trace-io-test.json 2>/dev/null || echo "0")
 IO_COUNT=$(echo "$IO_COUNT" | head -1)
 if [[ "$IO_COUNT" -gt 0 ]]; then
     record "PASS" "T22e: Block I/O events" "$IO_COUNT block I/O events captured"
+elif grep -qi "I/O.*attached\|io.*trace\|block.*loaded" logs/trace-io-test.log 2>/dev/null; then
+    record "WARN" "T22e: Block I/O events" "tracer attached but 0 events (kernel may not emit tp/block on this hardware)"
 else
     record "WARN" "T22e: Block I/O events" "0 events (tracepoints may not be available)"
 fi
 
-# T22f: TCP retransmit events — verify tracer loads (retransmits may not occur)
+# T22f: TCP retransmit events — verify tracer loads successfully.
+# TCP retransmits require packet loss which can't be reliably induced without tc netem.
+# We verify attachment from the trace stderr; absence of retransmit events is expected.
 _test_start=$SECONDS
-log "Test 22f: TCP tracer loads"
-# We can't reliably induce retransmits without tc netem (may not be installed).
-# Just verify the tracer loads without error by checking the trace log.
-if grep -qi "TCP.*attached\|tcp.*trace\|tcp.*loaded" logs/trace-io-test.log 2>/dev/null; then
-    record "PASS" "T22f: TCP tracer" "tracer loaded successfully"
-elif grep -qi "tcp.*failed\|tcp.*error" logs/trace-io-test.log 2>/dev/null; then
+log "Test 22f: TCP tracer"
+if grep -qi "tcp.*failed\|tcp.*error" logs/trace-io-test.log 2>/dev/null; then
     record "WARN" "T22f: TCP tracer" "tracer failed to load (tracepoint unavailable)"
 else
-    record "PASS" "T22f: TCP tracer" "no TCP errors in trace log"
+    TCP_SRC_COUNT=$(grep -c '"source":"tcp"\|"tcp_retransmit"' logs/trace-io-test.json 2>/dev/null || echo "0")
+    TCP_SRC_COUNT=$(echo "$TCP_SRC_COUNT" | head -1)
+    if [[ "$TCP_SRC_COUNT" -gt 0 ]]; then
+        record "PASS" "T22f: TCP tracer" "$TCP_SRC_COUNT TCP retransmit events"
+    elif grep -qi "TCP.*attached\|tcp.*trace\|tcp.*loaded" logs/trace-io-test.log 2>/dev/null; then
+        record "PASS" "T22f: TCP tracer" "tracer attached (0 retransmits is normal — no packet loss)"
+    else
+        record "WARN" "T22f: TCP tracer" "no attachment log (tracepoint may not be available)"
+    fi
 fi
 
-# T22g: Network socket events — verify tracer loads
+# T22g: Network socket events — generate sendto/recvfrom with UDP loopback.
+# The net tracer hooks tp/syscalls/sys_enter_sendto and sys_enter_recvfrom.
+# No --pid and NO CUDA workload: testing net tracing in isolation because the
+# single merged event channel has head-of-line blocking — CUDA events at high
+# rates crowd out net events. This test validates the tracer captures events.
+# UDP loopback guarantees sendto/recvfrom syscalls (HTTP/TCP may use write/read).
 _test_start=$SECONDS
-log "Test 22g: Net socket tracer loads"
-if grep -qi "net.*attached\|net.*trace\|net.*loaded" logs/trace-io-test.log 2>/dev/null; then
-    record "PASS" "T22g: Net socket tracer" "tracer loaded successfully"
-elif grep -qi "net.*failed\|net.*error" logs/trace-io-test.log 2>/dev/null; then
+log "Test 22g: Net socket tracer"
+# Continuous UDP blaster: runs throughout the trace window.
+python3 -c "
+import socket, os, time, signal
+signal.signal(signal.SIGTERM, lambda *a: exit(0))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('127.0.0.1', 0))
+addr = s.getsockname()
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+data = os.urandom(1024)
+while True:
+    for _ in range(50):
+        c.sendto(data, addr)
+        s.recvfrom(1024)
+    time.sleep(0.05)
+" &
+NET_BLAST_PID=$!
+sleep 1
+# System-wide trace (no --pid) so net BPF PID filter is empty → captures all sendto/recvfrom.
+# No CUDA workload: avoids event pipeline congestion that starves net events.
+sudo ./bin/ingero trace --json --duration 8s > logs/trace-net-test.json 2> logs/trace-net-test.log
+kill "$NET_BLAST_PID" 2>/dev/null || true
+wait "$NET_BLAST_PID" 2>/dev/null || true
+
+if grep -qi "net.*failed\|net.*error" logs/trace-net-test.log 2>/dev/null; then
     record "WARN" "T22g: Net socket tracer" "tracer failed to load (tracepoint unavailable)"
 else
-    record "PASS" "T22g: Net socket tracer" "no net errors in trace log"
+    NET_SRC_COUNT=$(grep -c '"source":"net"\|"net_send"\|"net_recv"' logs/trace-net-test.json 2>/dev/null || echo "0")
+    NET_SRC_COUNT=$(echo "$NET_SRC_COUNT" | head -1)
+    if [[ "$NET_SRC_COUNT" -gt 0 ]]; then
+        record "PASS" "T22g: Net socket tracer" "$NET_SRC_COUNT net events captured"
+    elif grep -qi "net.*attached\|Net.*attached" logs/trace-net-test.log 2>/dev/null; then
+        record "WARN" "T22g: Net socket tracer" "tracer attached but 0 events (sendto/recvfrom may not fire on this kernel)"
+    else
+        record "WARN" "T22g: Net socket tracer" "no net events and no attachment log"
+    fi
+fi
+
+# T22h: cgroup_schedstat — verify per-cgroup scheduling stats are populated
+_test_start=$SECONDS
+log "Test 22h: cgroup_schedstat table"
+if [ -n "${DB_PATH:-}" ] 2>/dev/null || DB_PATH="$HOME/.ingero/ingero.db"; then
+    SCHEDSTAT_COUNT=0
+    if command -v sqlite3 &>/dev/null; then
+        SCHEDSTAT_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM cgroup_schedstat;" 2>/dev/null || \
+            sudo sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM cgroup_schedstat;" 2>/dev/null || echo "0")
+    else
+        SCHEDSTAT_COUNT=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('$DB_PATH')
+print(conn.execute('SELECT COUNT(*) FROM cgroup_schedstat').fetchone()[0])
+conn.close()
+" 2>/dev/null || sudo python3 -c "
+import sqlite3
+conn = sqlite3.connect('$DB_PATH')
+print(conn.execute('SELECT COUNT(*) FROM cgroup_schedstat').fetchone()[0])
+conn.close()
+" 2>/dev/null || echo "0")
+    fi
+    SCHEDSTAT_COUNT=$(echo "$SCHEDSTAT_COUNT" | head -1 | tr -d '[:space:]')
+    if [[ "$SCHEDSTAT_COUNT" -gt 0 ]]; then
+        record "PASS" "T22h: cgroup_schedstat" "$SCHEDSTAT_COUNT per-cgroup scheduling stat rows"
+    else
+        record "WARN" "T22h: cgroup_schedstat" "0 rows (may need longer trace with sched_switch events)"
+    fi
+else
+    record "SKIP" "T22h: cgroup_schedstat" "no DB found"
+fi
+
+# T22i: IO→GPU cross-source chain — dd writes + GPU contention + CPU stress → explain with IO layer.
+# IO chain requires CUDA tail anomaly (p99/p50 ≥ 3.0) as anchor. On fast GPUs (A100),
+# 5 GPU workers + stress-ng are needed to create enough contention.
+_test_start=$SECONDS
+log "Test 22i: IO→GPU cross-source chain"
+IO_CHAIN_DB="/tmp/ingero-io-chain-test.db"
+rm -f "$IO_CHAIN_DB"* 2>/dev/null || true
+IO_CHAIN_PIDS=""
+
+if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
+    # GPU contention: 5 workers + small matrix → frequent kernel launches, high GPU queue.
+    python3 tests/workloads/pathological/gpu_contention_driver.py \
+        --workers 5 --duration 45 --matrix-size 1024 > /dev/null 2>&1 &
+    IO_CHAIN_PIDS="$!"
+    sleep 3
+
+    # IO stress: continuous dd writes to real block device (NOT /tmp which is often tmpfs).
+    # oflag=direct bypasses page cache → forces block layer (block_rq_issue/block_rq_complete).
+    IO_FILL_FILE="$HOME/ingero-io-fill.bin"
+    (while true; do
+        dd if=/dev/zero of="$IO_FILL_FILE" bs=1M count=100 oflag=direct 2>/dev/null || \
+            dd if=/dev/zero of="$IO_FILL_FILE" bs=1M count=100 oflag=dsync 2>/dev/null || \
+            dd if=/dev/zero of="$IO_FILL_FILE" bs=1M count=100 conv=fdatasync 2>/dev/null
+        sync; rm -f "$IO_FILL_FILE"
+    done) &
+    IO_CHAIN_PIDS="$IO_CHAIN_PIDS $!"
+
+    # CPU stress: saturate all CPUs to create host scheduling contention.
+    # This pushes CUDA tail latency above the 3.0x threshold on fast GPUs.
+    if command -v stress-ng &>/dev/null; then
+        stress-ng --cpu "$(nproc)" --timeout 30s > /dev/null 2>&1 &
+        IO_CHAIN_PIDS="$IO_CHAIN_PIDS $!"
+    fi
+
+    # Trace 25s (no --pid: captures system-wide IO + CUDA from contention).
+    sudo ./bin/ingero trace --db "$IO_CHAIN_DB" --duration 25s > /dev/null 2> logs/trace-io-chain.log || true
+
+    # Cleanup background processes (wait only for known PIDs, not all bg jobs).
+    for pid in $IO_CHAIN_PIDS; do kill "$pid" 2>/dev/null || true; done
+    for pid in $IO_CHAIN_PIDS; do wait "$pid" 2>/dev/null || true; done
+    rm -f "$IO_FILL_FILE"
+
+    # Explain --chains reads pre-stored chains (computed during live trace with all IO
+    # events). explain --since replays from DB but fast IO ops (<10ms) aren't stored.
+    EXPLAIN_IO=$(sudo ./bin/ingero explain --chains --db "$IO_CHAIN_DB" --since 60s 2>&1 || true)
+    echo "$EXPLAIN_IO" > logs/explain-io-chain.log 2>&1
+
+    # Check for IO layer in chains. Use specific chain-content patterns to avoid false
+    # matching on error messages like "No stored causal chains found" (contains "chain").
+    if echo "$EXPLAIN_IO" | grep -qiE "I/O ops|block I/O|Write-heavy|DataLoader|checkpoint|IO layer|\[IO"; then
+        record "PASS" "T22i: IO→GPU chain" "IO layer found in causal chain"
+    elif echo "$EXPLAIN_IO" | grep -qiE "\[HIGH\]|\[MEDIUM\]|Timeline:|Root cause:"; then
+        record "WARN" "T22i: IO→GPU chain" "chains found but no IO layer (fast disk?)"
+    else
+        record "WARN" "T22i: IO→GPU chain" "no chains (GPU too fast for contention)"
+    fi
+else
+    record "SKIP" "T22i: IO→GPU chain" "gpu_contention_driver.py not found"
+fi
+
+# T22j: Net→GPU cross-source chain — UDP loopback + GPU contention → explain with NET layer.
+_test_start=$SECONDS
+log "Test 22j: Net→GPU cross-source chain"
+NET_CHAIN_DB="/tmp/ingero-net-chain-test.db"
+rm -f "$NET_CHAIN_DB"* 2>/dev/null || true
+NET_CHAIN_PIDS=""
+
+if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
+    # GPU contention: 3 workers.
+    python3 tests/workloads/pathological/gpu_contention_driver.py \
+        --workers 3 --duration 40 --matrix-size 2048 > /dev/null 2>&1 &
+    NET_CHAIN_PIDS="$!"
+    sleep 3
+
+    # UDP blaster: continuous sendto/recvfrom throughout the trace window.
+    # Must be continuous (not one-shot) because the correlator's 10s rolling window
+    # prunes old events — a burst that finishes in 1s would be gone before chains fire.
+    # Threshold: >100 ops AND >1MB in the window when CUDA anomaly triggers.
+    python3 -c "
+import socket, os, time, signal
+signal.signal(signal.SIGTERM, lambda *a: exit(0))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('127.0.0.1', 0))
+addr = s.getsockname()
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+data = os.urandom(10240)  # 10KB per packet
+time.sleep(2)
+# Loop continuously until killed (~25s trace window).
+while True:
+    for _ in range(200):
+        c.sendto(data, addr)
+        s.recvfrom(10240)
+    time.sleep(0.1)  # brief pause to avoid CPU saturation
+" &
+    NET_CHAIN_PIDS="$NET_CHAIN_PIDS $!"
+
+    # Trace 25s (no --pid).
+    sudo ./bin/ingero trace --db "$NET_CHAIN_DB" --duration 25s > /dev/null 2> logs/trace-net-chain.log || true
+
+    # Cleanup background processes (wait only for known PIDs, not all bg jobs).
+    for pid in $NET_CHAIN_PIDS; do kill "$pid" 2>/dev/null || true; done
+    for pid in $NET_CHAIN_PIDS; do wait "$pid" 2>/dev/null || true; done
+
+    # Explain --chains reads pre-stored chains (computed during live trace with all
+    # events including net). explain --since would replay from DB but net events aren't
+    # stored (fast, not anomalous) so the replay misses them.
+    EXPLAIN_NET=$(sudo ./bin/ingero explain --chains --db "$NET_CHAIN_DB" --since 60s 2>&1 || true)
+    echo "$EXPLAIN_NET" > logs/explain-net-chain.log 2>&1
+
+    # Check for NET layer in chains. Use specific chain-content patterns to avoid false
+    # matching on error messages like "No stored causal chains found" (contains "chain").
+    # NOTE: Net→GPU chains are rare on fast GPUs — the event pipeline's single merged
+    # channel starves net events under heavy GPU/host load. WARN is the expected outcome.
+    if echo "$EXPLAIN_NET" | grep -qiE "socket ops|socket I/O|network socket|NET layer|\[NET"; then
+        record "PASS" "T22j: Net→GPU chain" "NET layer found in causal chain"
+    elif echo "$EXPLAIN_NET" | grep -qiE "\[HIGH\]|\[MEDIUM\]|Timeline:|Root cause:"; then
+        record "WARN" "T22j: Net→GPU chain" "chains found but no NET layer (pipeline bottleneck)"
+    else
+        record "WARN" "T22j: Net→GPU chain" "no chains (GPU too fast or pipeline bottleneck)"
+    fi
+else
+    record "SKIP" "T22j: Net→GPU chain" "gpu_contention_driver.py not found"
+fi
+
+# T22k: Noisy neighbor detection — GPU workload + stress-ng CPU steal → explain --chains.
+_test_start=$SECONDS
+log "Test 22k: Noisy neighbor detection"
+NN_CHAIN_DB="/tmp/ingero-nn-test.db"
+rm -f "$NN_CHAIN_DB"* 2>/dev/null || true
+
+if [ -f tests/workloads/pathological/gpu_contention_driver.py ] && command -v stress-ng &>/dev/null; then
+    # GPU workload → get PID.
+    python3 tests/workloads/pathological/gpu_contention_driver.py \
+        --workers 1 --duration 40 --matrix-size 2048 > /dev/null 2>&1 &
+    WL_PID=$!
+    sleep 3
+
+    # Trace WITH --pid (table mode: correlator runs, target cgroup registered).
+    sudo ./bin/ingero trace --pid "$WL_PID" --db "$NN_CHAIN_DB" --duration 25s \
+        > /dev/null 2> logs/trace-noisy.log &
+    TRACE_PID=$!
+    sleep 2
+
+    # CPU stress: ALL cores → steals CPU from GPU workload (different cgroup).
+    stress-ng --cpu "$(nproc)" --timeout 20s > /dev/null 2>&1 &
+    STRESS_PID=$!
+
+    # Wait for trace to finish (wait only for known PIDs, not all bg jobs).
+    wait "$TRACE_PID" 2>/dev/null || true
+    kill "$WL_PID" 2>/dev/null || true
+    kill "$STRESS_PID" 2>/dev/null || true
+    wait "$WL_PID" "$STRESS_PID" 2>/dev/null || true
+
+    # Explain --chains reads stored chains from DB.
+    EXPLAIN_NN=$(sudo ./bin/ingero explain --chains --db "$NN_CHAIN_DB" --since 60s 2>&1 || true)
+    echo "$EXPLAIN_NN" > logs/explain-noisy.log 2>&1
+
+    # Check for noisy neighbor chain. Use specific chain-content patterns to avoid false
+    # matching on error messages like "No stored causal chains found" (contains "chain").
+    if echo "$EXPLAIN_NN" | grep -qiE "noisy neighbor"; then
+        record "PASS" "T22k: Noisy neighbor" "noisy neighbor chain detected"
+    elif echo "$EXPLAIN_NN" | grep -qiE "\[HIGH\]|\[MEDIUM\]|Timeline:|Root cause:"; then
+        record "WARN" "T22k: Noisy neighbor" "chains found but no noisy neighbor (single cgroup?)"
+    else
+        record "WARN" "T22k: Noisy neighbor" "no chains (may need cgroup isolation)"
+    fi
+elif ! command -v stress-ng &>/dev/null; then
+    record "SKIP" "T22k: Noisy neighbor" "stress-ng not installed"
+else
+    record "SKIP" "T22k: Noisy neighbor" "gpu_contention_driver.py not found"
 fi
 
 # ── T21: DB Schema Validation ──
@@ -1657,16 +1964,16 @@ log "GPU investigation: ingested $ML_INGESTED test results"
 ################################################################################
 # Final Report
 ################################################################################
-header "v0.7 Integration Test Report"
+header "v0.8 Integration Test Report"
 
-TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT + WARN_COUNT))
 SCRIPT_DURATION=$((SECONDS - SCRIPT_START))
 echo ""
-echo -e "$(ts)   ${GREEN}PASS: $PASS_COUNT${NC}  ${RED}FAIL: $FAIL_COUNT${NC}  ${YELLOW}SKIP: $SKIP_COUNT${NC}  Total: $TOTAL"
+echo -e "$(ts)   ${GREEN}PASS: $PASS_COUNT${NC}  ${RED}FAIL: $FAIL_COUNT${NC}  ${YELLOW}SKIP: $SKIP_COUNT${NC}  ${YELLOW}WARN: $WARN_COUNT${NC}  Total: $TOTAL"
 echo ""
 
 {
-    echo "Ingero v0.7 Integration Test Report"
+    echo "Ingero v0.8 Integration Test Report"
     echo "===================================="
     echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "Host: $(hostname)"
@@ -1675,18 +1982,12 @@ echo ""
     echo "Go: $(go version 2>/dev/null | awk '{print $3}')"
     echo "PyTorch: $(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo 'N/A')"
     echo ""
-    echo "Results: PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  SKIP=$SKIP_COUNT  Total=$TOTAL"
+    echo "Results: PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  SKIP=$SKIP_COUNT  WARN=$WARN_COUNT  Total=$TOTAL"
     echo ""
     echo -e "$REPORT"
 } > logs/test-report.txt
 
-# Generate JSON test report
-_GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo "N/A")
-_GPU_NAME=$(echo "$_GPU_INFO" | cut -d',' -f1 | xargs)
-_DRIVER_VER=$(echo "$_GPU_INFO" | cut -d',' -f2 | xargs)
-_KERNEL_VER=$(uname -r)
-_PYTORCH_VER=$(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo "N/A")
-_GO_VER=$(go version 2>/dev/null | awk '{print $3}')
+# Generate JSON test report (variables set in Phase 0)
 
 # Write test results to temp file, one line per result
 : > $TEST_TMP/test_results.txt
@@ -1697,7 +1998,7 @@ done
 SCRIPT_DURATION="$SCRIPT_DURATION" \
   GPU_NAME="$_GPU_NAME" DRIVER_VER="$_DRIVER_VER" KERNEL_VER="$_KERNEL_VER" \
   ARCH="$(uname -m)" PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
-  PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" TOTAL="$TOTAL" \
+  PASS_COUNT="$PASS_COUNT" FAIL_COUNT="$FAIL_COUNT" SKIP_COUNT="$SKIP_COUNT" WARN_COUNT="$WARN_COUNT" TOTAL="$TOTAL" \
   python3 -c "
 import json, sys, os
 from datetime import datetime, timezone
@@ -1736,6 +2037,7 @@ report = {
         'pass': int(os.environ.get('PASS_COUNT', '0')),
         'fail': int(os.environ.get('FAIL_COUNT', '0')),
         'skip': int(os.environ.get('SKIP_COUNT', '0')),
+        'warn': int(os.environ.get('WARN_COUNT', '0')),
         'total': int(os.environ.get('TOTAL', '0')),
     },
     'tests': tests,

@@ -2,8 +2,7 @@
 package cli
 
 import (
-	"fmt"
-	"os"
+	"log"
 
 	"github.com/ingero-io/ingero/internal/update"
 	"github.com/ingero-io/ingero/internal/version"
@@ -17,14 +16,18 @@ var updateCh <-chan update.Result
 // debugMode enables diagnostic output on stderr. Set via --debug flag.
 var debugMode bool
 
-// debugf prints a debug message to stderr if --debug is enabled.
+// debugf prints a debug message if --debug is enabled.
 // Zero cost when off: just a bool check (~1ns).
+//
+// Output goes to Go's log package — normally stderr, but redirected to a file
+// when --log is set (via log.SetOutput). This is why we use log.Printf here
+// instead of fmt.Fprintf(os.Stderr): --log must capture debug output.
 //
 // Use in initialization/setup paths (probe attachment, auto-detect, store open).
 // For hot paths, use periodic counters — never call debugf per-event.
 func debugf(format string, args ...any) {
 	if debugMode {
-		fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+		log.Printf("[DEBUG] "+format, args...)
 	}
 }
 

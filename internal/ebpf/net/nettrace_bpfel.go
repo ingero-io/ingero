@@ -26,10 +26,11 @@ type netTraceIngeroNetEvent struct {
 		Pad2        uint32
 		CgroupId    uint64
 	}
-	Fd        uint32
-	Bytes     uint32
-	Direction uint8
-	PadNet    [7]uint8
+	DurationNs uint64
+	Fd         uint32
+	Bytes      uint32
+	Direction  uint8
+	PadNet     [7]uint8
 }
 
 type netTraceNetEntry struct {

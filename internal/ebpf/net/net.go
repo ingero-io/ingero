@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/ingero-io/ingero/pkg/events"
@@ -15,6 +18,7 @@ import (
 // Tracer attaches to network socket syscall tracepoints and emits events.
 type Tracer struct {
 	objs        netTraceObjects
+	links       []link.Link
 	reader      *ringbuf.Reader
 	eventCh     chan events.Event
 	dropped     atomic.Uint64
@@ -30,9 +34,15 @@ func New() *Tracer {
 	}
 }
 
-// Attach loads the eBPF program and attaches tracepoints.
+// Attach loads the eBPF programs, attaches syscall tracepoints, and creates the
+// ring buffer reader. bpf2go's LoadAndAssign loads programs into the kernel but
+// does NOT attach them — explicit link.Tracepoint calls are required.
 func (t *Tracer) Attach() error {
 	closeFn := func() {
+		for _, l := range t.links {
+			l.Close()
+		}
+		t.links = nil
 		t.objs.Close()
 	}
 	defer func() {
@@ -43,6 +53,26 @@ func (t *Tracer) Attach() error {
 
 	if err := loadNetTraceObjects(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading net trace objects: %w", err)
+	}
+
+	// Attach syscall tracepoints — programs are loaded but dormant until linked.
+	type tpSpec struct {
+		group string
+		name  string
+		prog  *ebpf.Program
+	}
+	specs := []tpSpec{
+		{"syscalls", "sys_enter_sendto", t.objs.HandleSysEnterSendto},
+		{"syscalls", "sys_exit_sendto", t.objs.HandleSysExitSendto},
+		{"syscalls", "sys_enter_recvfrom", t.objs.HandleSysEnterRecvfrom},
+		{"syscalls", "sys_exit_recvfrom", t.objs.HandleSysExitRecvfrom},
+	}
+	for _, s := range specs {
+		tp, err := link.Tracepoint(s.group, s.name, s.prog, nil)
+		if err != nil {
+			return fmt.Errorf("attaching tracepoint %s/%s: %w", s.group, s.name, err)
+		}
+		t.links = append(t.links, tp)
 	}
 
 	var err error
@@ -56,8 +86,14 @@ func (t *Tracer) Attach() error {
 }
 
 // SetTargetPID adds a PID to the filter map.
+// Also inserts a sentinel entry at key=0 so the eBPF-side net_pid_map_empty()
+// check (which probes key=0) detects a non-empty map.
 func (t *Tracer) SetTargetPID(pid uint32) error {
 	val := uint8(1)
+	// Sentinel: key=0 signals "map is populated" to net_pid_map_empty().
+	if err := t.objs.NetTargetPids.Put(uint32(0), val); err != nil {
+		return err
+	}
 	return t.objs.NetTargetPids.Put(pid, val)
 }
 
@@ -115,6 +151,7 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 		TID:       e.Hdr.Tid,
 		Source:    events.SourceNet,
 		Op:        e.Hdr.Op,
+		Duration:  time.Duration(e.DurationNs),
 		Args:      [2]uint64{uint64(e.Fd), uint64(e.Bytes)},
 		CGroupID:  e.Hdr.CgroupId,
 	}, true
@@ -122,12 +159,15 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 
 // Close releases all resources.
 func (t *Tracer) Close() error {
-	if !t.closed.Swap(true) {
+	if t.closed.Swap(true) {
 		return nil
 	}
 	var errs []error
 	if t.reader != nil {
 		errs = append(errs, t.reader.Close())
+	}
+	for _, l := range t.links {
+		errs = append(errs, l.Close())
 	}
 	errs = append(errs, t.objs.Close())
 	return errors.Join(errs...)

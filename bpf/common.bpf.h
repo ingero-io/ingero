@@ -123,7 +123,7 @@ struct host_event {
 	__u32 target_pid;    /* for sched events: who was affected */
 };
 
-/* Block I/O event (56 bytes) — block_rq_issue / block_rq_complete.
+/* Block I/O event (64 bytes) — block_rq_issue / block_rq_complete.
  * Prefixed with ingero_ to avoid colliding with kernel's struct io_event in vmlinux.h.
  */
 struct ingero_io_event {
@@ -136,7 +136,7 @@ struct ingero_io_event {
 	__u8  _pad_io[7];
 };
 
-/* TCP event (56 bytes) — tcp_retransmit_skb */
+/* TCP event (48 bytes) — tcp_retransmit_skb */
 struct ingero_tcp_event {
 	struct ingero_event_hdr hdr;
 	__u32 saddr;            /* source IPv4 address */
@@ -147,9 +147,10 @@ struct ingero_tcp_event {
 	__u8  _pad_tcp[3];
 };
 
-/* Network socket event (48 bytes) — sendto/recvfrom syscalls */
+/* Network socket event (56 bytes) — sendto/recvfrom syscalls */
 struct ingero_net_event {
 	struct ingero_event_hdr hdr;
+	__u64 duration_ns;      /* syscall duration (entry → exit) */
 	__u32 fd;               /* socket file descriptor */
 	__u32 bytes;            /* bytes sent or received */
 	__u8  direction;        /* NET_OP_SEND or NET_OP_RECV */

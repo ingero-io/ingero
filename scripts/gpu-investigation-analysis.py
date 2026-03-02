@@ -211,17 +211,24 @@ class Investigation:
         """Set verdict: DETECTED, HEALTHY, or INCONCLUSIVE.
 
         Enforcement rules:
-        - MCP errors + non-DETECTED → INCONCLUSIVE (SKIP) — data was missing.
+        - MCP errors + non-DETECTED + provoked → FAIL — broken MCP shouldn't hide test failures.
+        - MCP errors + non-DETECTED + non-provoked → SKIP — data was missing, not actionable.
         - Provoked + HEALTHY → FAIL — we provoked the condition but didn't detect it.
+        - Provoked + INCONCLUSIVE → FAIL — insufficient data on a provoked test is a failure.
         """
         self.verdict = verdict
         self.finding = finding
 
         # MCP errors make non-DETECTED verdicts unreliable.
         if self.mcp_errors and verdict != "DETECTED":
-            self.status = "SKIP"
             self.verdict = "INCONCLUSIVE"
             self.finding = f"MCP errors ({len(self.mcp_errors)}): {self.finding}"
+            if self.provoked:
+                # Provoked test with MCP errors = FAIL (broken infra shouldn't hide failures)
+                self.status = "FAIL"
+                self.finding = f"PROVOKED INCONCLUSIVE (MCP errors): {finding}"
+            else:
+                self.status = "SKIP"
             return
 
         if verdict == "DETECTED":
@@ -232,6 +239,10 @@ class Investigation:
                 self.finding = f"PROVOKED NOT DETECTED: {finding}"
             else:
                 self.status = "PASS"
+        elif self.provoked:
+            # INCONCLUSIVE on a provoked test = FAIL
+            self.status = "FAIL"
+            self.finding = f"PROVOKED INCONCLUSIVE: {finding}"
         else:
             self.status = "SKIP"
 
@@ -258,14 +269,20 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
         (1, 1): "cudaMalloc",      (1, 2): "cudaFree",
         (1, 3): "cudaLaunchKernel",(1, 4): "cudaMemcpy",
         (1, 5): "cudaStreamSync",  (1, 6): "cudaDeviceSync",
-        (1, 7): "cudaMemcpyAsync",
+        (1, 7): "cudaMemcpyAsync", (1, 8): "cudaMallocManaged",
         (3, 1): "sched_switch",    (3, 2): "sched_wakeup",
         (3, 3): "mm_page_alloc",   (3, 4): "oom_kill",
         (3, 5): "process_exec",    (3, 6): "process_exit",
         (3, 7): "process_fork",
+        (3, 10): "pod_restart",    (3, 11): "pod_eviction",
+        (3, 12): "pod_oom_kill",
         (4, 1): "cuLaunchKernel",  (4, 2): "cuMemcpy",
         (4, 3): "cuMemcpyAsync",   (4, 4): "cuCtxSynchronize",
-        (4, 5): "cuMemAlloc",
+        (4, 5): "cuMemAlloc",      (4, 6): "cuMemAllocManaged",
+        (5, 1): "block_read",      (5, 2): "block_write",
+        (5, 3): "block_discard",
+        (6, 1): "tcp_retransmit",
+        (7, 1): "net_send",        (7, 2): "net_recv",
     }
     r_ops = mcp.run_sql(
         "SELECT source_id, op_id, name FROM ops ORDER BY source_id, op_id")
@@ -280,7 +297,7 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
             expected = EXPECTED_OPS.get((src, op))
             if expected and expected != name:
                 mismatches.append(f"({src},{op}): expected={expected}, got={name}")
-            elif not expected and src in (1, 3, 4):
+            elif not expected and src in (1, 3, 4, 5, 6, 7):
                 unknown_ops.append(f"({src},{op}): {name} (not in EXPECTED_OPS)")
         if mismatches:
             print(f"[FATAL] Op ID mapping mismatch — "
@@ -349,9 +366,9 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
         sync_pids = len([r for r in rows2 if (r.get("sync_events", 0) or 0) > 5])
 
         if sync_pids >= 2 and sched_count > 100 and amp > 3:
-            # Multi-PID: real straggler pattern (NCCL-relevant)
+            # Multi-PID: straggler pattern (scheduling contention across CUDA processes)
             inv.set_verdict("DETECTED",
-                            f"{sched_count} sched_switch, sync amp {amp:.1f}x across {sync_pids} PIDs")
+                            f"scheduling contention across {sync_pids} CUDA PIDs: {sched_count} sched_switch, sync amp {amp:.1f}x")
         elif sched_count > 100 and amp > 3:
             # Single-PID: CPU scheduling contention, not NCCL
             inv.set_verdict("DETECTED",
@@ -435,15 +452,17 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
                         question="My training crashes with CUDA OOM at 65% memory. Why?")
 
     # Action 1: cudaMalloc event counts + size distribution
+    # Use only runtime allocs (source=1, op=1) to avoid double-counting with driver cuMemAlloc.
+    # cuMemAlloc (source=4, op=5) is the underlying driver call for cudaMalloc.
     r1 = mcp.run_sql("""
         SELECT COUNT(*) as cnt,
                AVG(arg0) as avg_bytes,
                MAX(arg0) as max_bytes,
                SUM(arg0) as total_bytes
-        FROM events WHERE (source=1 AND op=1) OR (source=4 AND op=5)
+        FROM events WHERE source=1 AND op=1
     """)
     r1_rows = sql_to_dicts(r1)
-    inv.add_action("run_sql", "cudaMalloc/cuMemAlloc counts + sizes",
+    inv.add_action("run_sql", "cudaMalloc counts + sizes (runtime only, avoids driver double-count)",
                    f"{r1_rows[0].get('cnt', 0) if r1_rows else 0} alloc events")
 
     # Action 2: alloc duration trending per 10s bucket
@@ -452,22 +471,22 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
                COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us
-        FROM events WHERE (source=1 AND op=1) OR (source=4 AND op=5)
+        FROM events WHERE source=1 AND op=1
         GROUP BY bucket_s ORDER BY bucket_s
     """)
     rows2 = sql_to_dicts(r2)
     inv.add_action("run_sql", "alloc duration trending (10s buckets)",
                    f"{len(rows2)} buckets")
 
-    # Action 3: malloc-free balance
+    # Action 3: malloc-free balance (runtime only to avoid double-counting)
     r3 = mcp.run_sql("""
         SELECT
-            COUNT(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN 1 END) as allocs,
+            COUNT(CASE WHEN source=1 AND op=1 THEN 1 END) as allocs,
             COUNT(CASE WHEN source=1 AND op=2 THEN 1 END) as frees
         FROM events
     """)
     r3_rows = sql_to_dicts(r3)
-    inv.add_action("run_sql", "malloc-free balance",
+    inv.add_action("run_sql", "malloc-free balance (runtime only)",
                    f"allocs vs frees")
 
     # Action 4: allocation call stacks — shows which code paths allocate memory
@@ -636,22 +655,23 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
                         question="Are there cudaMalloc spikes indicating memory pressure?")
 
     # Action 1: large allocs (>10MB — 1MB triggers on routine cuDNN workspace allocs)
+    # Use runtime only (source=1) to avoid double-counting with driver cuMemAlloc.
     r1 = mcp.run_sql("""
         SELECT COUNT(*) as cnt,
                AVG(duration)/1000 as avg_us,
                MAX(duration)/1000 as max_us,
                SUM(arg0)/1e6 as total_mb
-        FROM events WHERE ((source=1 AND op=1) OR (source=4 AND op=5)) AND arg0 > 10485760
+        FROM events WHERE source=1 AND op=1 AND arg0 > 10485760
     """)
     r1_rows = sql_to_dicts(r1)
-    inv.add_action("run_sql", "cudaMalloc events with arg0 > 10MB",
+    inv.add_action("run_sql", "cudaMalloc events with arg0 > 10MB (runtime only)",
                    f"{r1_rows[0].get('cnt', 0) if r1_rows else 0} large allocs")
 
     # Action 2: alloc spikes correlated with sync spikes (5s buckets)
     r2 = mcp.run_sql("""
         SELECT CAST(timestamp / 5000000000 AS INT) * 5 as bucket,
-               COUNT(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN 1 END) as allocs,
-               MAX(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN duration END)/1000 as alloc_max_us,
+               COUNT(CASE WHEN source=1 AND op=1 THEN 1 END) as allocs,
+               MAX(CASE WHEN source=1 AND op=1 THEN duration END)/1000 as alloc_max_us,
                COUNT(CASE WHEN (source=1 AND op IN (5,6)) OR (source=4 AND op=4) THEN 1 END) as syncs,
                MAX(CASE WHEN (source=1 AND op IN (5,6)) OR (source=4 AND op=4) THEN duration END)/1000 as sync_max_us
         FROM events GROUP BY bucket ORDER BY bucket
@@ -833,32 +853,42 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
     inv.add_action("run_sql", "trace time range",
                    "total vs active seconds")
 
-    # Verdict: detect idle seconds (< 10 CUDA events) and gaps in the timeline
-    idle_secs = sum(1 for r in rows1 if (r.get("events", 0) or 0) < 10)
-    active_secs = len(rows1)
+    # Verdict: detect idle seconds and throughput drops.
+    # "Active seconds / total seconds" is too coarse — a single event per second counts as
+    # "active". Instead, check for seconds with very few events relative to the median, and
+    # for complete gaps (missing seconds with 0 CUDA events).
     min_s = r2_rows[0].get("min_s", 0) or 0 if r2_rows else 0
     max_s = r2_rows[0].get("max_s", 0) or 0 if r2_rows else 0
     total_secs = max_s - min_s if max_s > min_s else 0
 
-    # Check for gaps in seconds (missing seconds = no CUDA events at all)
-    if rows1 and total_secs > 0:
+    if rows1 and total_secs > 5:
+        event_counts = sorted([r.get("events", 0) or 0 for r in rows1])
+        median_events = event_counts[len(event_counts) // 2] if event_counts else 0
+        # "Low-activity" = less than 10% of median (not just <10 absolute)
+        low_threshold = max(10, int(median_events * 0.1))
+        idle_secs = sum(1 for r in rows1 if (r.get("events", 0) or 0) < low_threshold)
+        # Missing seconds = no CUDA events at all
         sec_set = set(r.get("sec", 0) for r in rows1)
         all_secs = set(range(int(min(sec_set)), int(max(sec_set)) + 1))
         missing_secs = len(all_secs - sec_set)
         total_idle = missing_secs + idle_secs
-    else:
-        missing_secs = 0
-        total_idle = idle_secs
+        idle_pct = total_idle / total_secs * 100
 
-    if total_idle > 5:
-        inv.set_verdict("DETECTED",
-                        f"{total_idle} idle seconds ({missing_secs} empty + {idle_secs} low-activity)")
-    elif total_idle > 2:
-        inv.set_verdict("DETECTED", f"{total_idle} idle seconds out of {total_secs:.0f}s")
-    elif total_secs > 0:
-        inv.set_verdict("HEALTHY", f"active {active_secs}/{total_secs:.0f}s")
+        if idle_pct > 20:
+            inv.set_verdict("DETECTED",
+                            f"{total_idle} idle seconds ({missing_secs} empty + {idle_secs} below {low_threshold} events/s), "
+                            f"{idle_pct:.0f}% idle, median={median_events}/s")
+        elif total_idle > 5:
+            inv.set_verdict("DETECTED",
+                            f"{total_idle} idle seconds out of {total_secs:.0f}s ({idle_pct:.0f}% idle, median={median_events}/s)")
+        else:
+            inv.set_verdict("HEALTHY",
+                            f"{len(rows1)} active seconds out of {total_secs:.0f}s, median={median_events} events/s, "
+                            f"{total_idle} idle (below {low_threshold}/s)")
+    elif rows1:
+        inv.set_verdict("HEALTHY", f"short trace ({total_secs:.0f}s), insufficient for idle analysis")
     else:
-        inv.set_verdict("INCONCLUSIVE", "no events")
+        inv.set_verdict("INCONCLUSIVE", "no CUDA events")
 
     investigations.append(inv)
 
@@ -870,21 +900,21 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
                         provoked=False,
                         question="Are there memory leaks? cudaMalloc/cudaFree imbalance?")
 
-    # Action 1: malloc vs free counts
+    # Action 1: malloc vs free counts (runtime only to avoid double-counting with driver cuMemAlloc)
     r1 = mcp.run_sql("""
         SELECT
-            COUNT(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN 1 END) as mallocs,
+            COUNT(CASE WHEN source=1 AND op=1 THEN 1 END) as mallocs,
             COUNT(CASE WHEN source=1 AND op=2 THEN 1 END) as frees
         FROM events
     """)
     r1_rows = sql_to_dicts(r1)
-    inv.add_action("run_sql", "malloc count vs free count",
+    inv.add_action("run_sql", "malloc count vs free count (runtime only)",
                    f"mallocs={r1_rows[0].get('mallocs', 0) if r1_rows else 0}, frees={r1_rows[0].get('frees', 0) if r1_rows else 0}")
 
-    # Action 2: cumulative imbalance over time
+    # Action 2: cumulative imbalance over time (runtime only)
     r2 = mcp.run_sql("""
         SELECT CAST(timestamp / 10000000000 AS INT) * 10 as bucket,
-               SUM(CASE WHEN (source=1 AND op=1) OR (source=4 AND op=5) THEN 1 ELSE 0 END) as mallocs,
+               SUM(CASE WHEN source=1 AND op=1 THEN 1 ELSE 0 END) as mallocs,
                SUM(CASE WHEN source=1 AND op=2 THEN 1 ELSE 0 END) as frees
         FROM events GROUP BY bucket ORDER BY bucket
     """)
@@ -976,11 +1006,11 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
     investigations.append(inv)
 
     # =========================================================================
-    # T23l: #12 Goodput Loss — NOT provoked (launch rate drop depends on CPU contention
-    # impact, which varies by core count and GPU speed — GH200 72-core barely affected)
+    # T23l: #12 Goodput Loss — provoked via Phase 3 (stress-ng CPU contention
+    # should cause detectable launch rate drop during contention window)
     # =========================================================================
     inv = Investigation("T23l", 12, "Goodput loss", "HIGH",
-                        provoked=False,
+                        provoked=True,
                         question="What fraction of GPU time is actual training vs. overhead?")
 
     # Action 1: trace stats wall% breakdown (cached)
@@ -1804,11 +1834,11 @@ def run_investigations(mcp: MCPClient, args) -> tuple[list[Investigation], dict]
     investigations.append(inv)
 
     # =========================================================================
-    # T23ab: #28 Phase-Aware Analysis — NOT provoked (contention/baseline ratio
-    # depends on GPU speed and detection sensitivity — varies across architectures)
+    # T23ab: #28 Phase-Aware Analysis — provoked via Phase 3 (stress-ng should
+    # cause detectable CUDA latency degradation during contention window)
     # =========================================================================
     inv = Investigation("T23ab", 28, "Phase-aware analysis", "LOW-MED",
-                        provoked=False,
+                        provoked=True,
                         question="How do CUDA metrics change across workload phases?")
 
     # Use CUDA+Driver events only for avg_us (host sched_switch events have

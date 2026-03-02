@@ -32,6 +32,7 @@ struct io_req_key {
 
 struct io_req_val {
 	__u64 timestamp_ns;
+	__u64 cgroup_id;     // captured at issue time for propagation to complete
 	__u32 pid;
 	__u32 tid;
 	__u32 nr_sector;
@@ -73,6 +74,7 @@ int handle_block_rq_issue(struct trace_event_raw_block_rq *ctx)
 
 	struct io_req_val val = {
 		.timestamp_ns = bpf_ktime_get_ns(),
+		.cgroup_id = bpf_get_current_cgroup_id(),
 		.pid = pid,
 		.tid = tid,
 		.nr_sector = ctx->nr_sector,
@@ -114,7 +116,7 @@ int handle_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx)
 	evt->hdr.op = val->rwbs;
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
-	evt->hdr.cgroup_id = 0; // completed in IRQ context
+	evt->hdr.cgroup_id = val->cgroup_id; // captured at issue time (complete runs in IRQ context)
 	evt->duration_ns = duration_ns;
 	evt->dev = ctx->dev;
 	evt->nr_sector = val->nr_sector;

@@ -158,6 +158,75 @@ func TestParseEventSchedWakeup(t *testing.T) {
 	}
 }
 
+func TestParseEventPodRestart(t *testing.T) {
+	// Pod lifecycle events are synthetic host events injected by the K8s PodCache.
+	// They use the same host_event struct but with pod-specific op codes.
+	raw := buildHostEventBytes(7000000000, 0, 0, uint8(events.SourceHost), uint8(events.HostPodRestart),
+		0,    // no duration (point-in-time event)
+		0,    // cpu
+		8888, // target_pid = the pod's main container PID
+		500,  // cgroup_id
+	)
+
+	evt, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent() error: %v", err)
+	}
+
+	if evt.Op != uint8(events.HostPodRestart) {
+		t.Errorf("Op = %d, want %d (HostPodRestart)", evt.Op, events.HostPodRestart)
+	}
+	if evt.Args[1] != 8888 {
+		t.Errorf("Args[1] (target_pid) = %d, want 8888", evt.Args[1])
+	}
+	if evt.CGroupID != 500 {
+		t.Errorf("CGroupID = %d, want 500", evt.CGroupID)
+	}
+}
+
+func TestParseEventPodEviction(t *testing.T) {
+	raw := buildHostEventBytes(8000000000, 0, 0, uint8(events.SourceHost), uint8(events.HostPodEviction),
+		0, 0,
+		7777, // evicted pod's PID
+		600,
+	)
+
+	evt, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent() error: %v", err)
+	}
+
+	if evt.Op != uint8(events.HostPodEviction) {
+		t.Errorf("Op = %d, want %d (HostPodEviction)", evt.Op, events.HostPodEviction)
+	}
+	if evt.Args[1] != 7777 {
+		t.Errorf("Args[1] (target_pid) = %d, want 7777", evt.Args[1])
+	}
+}
+
+func TestParseEventPodOOMKill(t *testing.T) {
+	raw := buildHostEventBytes(9000000000, 0, 0, uint8(events.SourceHost), uint8(events.HostPodOOMKill),
+		0, 0,
+		6666, // OOM-killed pod's PID
+		700,
+	)
+
+	evt, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent() error: %v", err)
+	}
+
+	if evt.Op != uint8(events.HostPodOOMKill) {
+		t.Errorf("Op = %d, want %d (HostPodOOMKill)", evt.Op, events.HostPodOOMKill)
+	}
+	if evt.Args[1] != 6666 {
+		t.Errorf("Args[1] (target_pid) = %d, want 6666", evt.Args[1])
+	}
+	if evt.CGroupID != 700 {
+		t.Errorf("CGroupID = %d, want 700", evt.CGroupID)
+	}
+}
+
 func TestParseEventTooShort(t *testing.T) {
 	_, err := parseEvent([]byte{1, 2, 3})
 	if err == nil {

@@ -23,6 +23,7 @@ package correlate
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -187,28 +188,39 @@ func New(opts ...Option) *Engine {
 
 // RecordHost adds a host event to the sliding window.
 // Old events beyond maxAge are pruned lazily.
-// Also tracks per-cgroup off-CPU stats for noisy neighbor detection.
+//
+// Per-cgroup off-CPU stats for noisy neighbor detection are tracked
+// separately via RecordCGroupSchedSwitch(), which must be called for
+// ALL sched_switch events (before PID filtering) so peer cgroup data
+// is available.
 func (e *Engine) RecordHost(evt events.Event) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.hostWindow = append(e.hostWindow, evt)
-
-	// Per-cgroup off-CPU tracking for noisy neighbor detection.
-	if events.HostOp(evt.Op) == events.HostSchedSwitch && evt.CGroupID > 1 && evt.Duration > 0 {
-		cs, ok := e.cgroupOffCPU[evt.CGroupID]
-		if !ok {
-			cs = &cgroupStats{}
-			e.cgroupOffCPU[evt.CGroupID] = cs
-		}
-		cs.offCPUDurations = append(cs.offCPUDurations, evt.Duration)
-		cs.totalOffCPU += evt.Duration
-		cs.eventCount++
-		// Auto-register cgroup as target if it matches a target PID's cgroup.
-		// (Target cgroups are also set explicitly via SetTargetCGroup.)
-	}
-
 	e.prune()
+}
+
+// RecordCGroupSchedSwitch tracks per-cgroup off-CPU stats for noisy neighbor
+// detection. Must be called for ALL sched_switch events regardless of PID
+// filter, because peer cgroup data is needed to detect scheduling contention.
+//
+// Call this BEFORE the PID filter in the event loop. RecordHost (called after
+// the PID filter) only updates the host sliding window used for correlations.
+func (e *Engine) RecordCGroupSchedSwitch(cgroupID uint64, duration time.Duration) {
+	if cgroupID <= 1 || duration <= 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs, ok := e.cgroupOffCPU[cgroupID]
+	if !ok {
+		cs = &cgroupStats{}
+		e.cgroupOffCPU[cgroupID] = cs
+	}
+	cs.offCPUDurations = append(cs.offCPUDurations, duration)
+	cs.totalOffCPU += duration
+	cs.eventCount++
 }
 
 // SetTargetCGroup registers a cgroup ID as belonging to the target workload.
@@ -440,11 +452,23 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 		}
 	}
 
-	// Count I/O events and total duration.
+	// Count I/O events with read/write breakdown, max latency, and throughput.
 	ioCount := len(ioWindow)
-	var ioTotalDur time.Duration
+	var ioTotalDur, ioMaxLatency time.Duration
+	var ioReadCount, ioWriteCount int
+	var ioTotalBytes uint64
 	for _, evt := range ioWindow {
 		ioTotalDur += evt.Duration
+		if evt.Duration > ioMaxLatency {
+			ioMaxLatency = evt.Duration
+		}
+		ioTotalBytes += evt.Args[0] * 512 // Args[0] = nr_sector, 512 bytes/sector
+		switch events.IOOp(evt.Op) {
+		case events.IORead:
+			ioReadCount++
+		case events.IOWrite:
+			ioWriteCount++
+		}
 	}
 
 	// Count TCP retransmit events.
@@ -460,6 +484,10 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	infraCtx := &infraContext{
 		ioCount:            ioCount,
 		ioTotalDur:         ioTotalDur,
+		ioReadCount:        ioReadCount,
+		ioWriteCount:       ioWriteCount,
+		ioMaxLatency:       ioMaxLatency,
+		ioTotalBytes:       ioTotalBytes,
 		tcpRetransmitCount: tcpRetransmitCount,
 		netCount:           netCount,
 		netTotalBytes:      netTotalBytes,
@@ -571,6 +599,10 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 type infraContext struct {
 	ioCount            int
 	ioTotalDur         time.Duration
+	ioReadCount        int
+	ioWriteCount       int
+	ioMaxLatency       time.Duration
+	ioTotalBytes       uint64 // nr_sector * 512
 	tcpRetransmitCount int
 	netCount           int
 	netTotalBytes      uint64
@@ -658,14 +690,42 @@ func (e *Engine) buildChain(
 	if infra != nil {
 		// Heavy block I/O concurrent with slow CUDA op.
 		if infra.ioCount > 50 || infra.ioTotalDur > 500*time.Millisecond {
+			// Build detailed breakdown: reads vs writes, throughput, peak latency.
+			detail := fmt.Sprintf("%d I/O ops", infra.ioCount)
+			if infra.ioReadCount > 0 || infra.ioWriteCount > 0 {
+				detail += fmt.Sprintf(" (%d reads, %d writes)", infra.ioReadCount, infra.ioWriteCount)
+			}
+			detail += fmt.Sprintf(", %v total", infra.ioTotalDur.Round(time.Millisecond))
+			if infra.ioTotalBytes > 0 {
+				detail += fmt.Sprintf(", %.1f MB", float64(infra.ioTotalBytes)/(1<<20))
+			}
+			if infra.ioMaxLatency > 0 {
+				detail += fmt.Sprintf(", peak %v", infra.ioMaxLatency.Round(time.Microsecond))
+			}
 			timeline = append(timeline, ChainEvent{
 				Layer:    "IO",
 				Op:       "block_io",
-				Detail:   fmt.Sprintf("%d I/O ops (%v total)", infra.ioCount, infra.ioTotalDur.Round(time.Millisecond)),
+				Detail:   detail,
 				Duration: infra.ioTotalDur,
 			})
 			causes = append(causes, "heavy block I/O")
-			recommendations = append(recommendations, "Check for checkpoint writes, model loads, or DataLoader disk reads during GPU work")
+			if infra.ioMaxLatency > 50*time.Millisecond || infra.ioTotalDur > 2*time.Second {
+				severity = "HIGH"
+			}
+
+			// Latency-based disk technology recommendations.
+			if infra.ioMaxLatency > 20*time.Millisecond {
+				recommendations = append(recommendations,
+					fmt.Sprintf("Block I/O peak latency %v suggests spinning disk or network storage — NVMe SSD reduces this to <1ms",
+						infra.ioMaxLatency.Round(time.Millisecond)))
+			}
+			if infra.ioWriteCount > infra.ioReadCount {
+				recommendations = append(recommendations, "Write-heavy I/O during GPU work: check checkpoint saves, use async checkpointing or a separate fast volume")
+			} else if infra.ioReadCount > infra.ioWriteCount {
+				recommendations = append(recommendations, "Read-heavy I/O during GPU work: DataLoader bottleneck — pre-load data to /dev/shm, increase RAM for page cache, or use NVMe")
+			} else {
+				recommendations = append(recommendations, "Check for checkpoint writes, model loads, or DataLoader disk reads during GPU work")
+			}
 		}
 
 		// TCP retransmit burst during GPU stall.
@@ -724,7 +784,7 @@ func (e *Engine) buildChain(
 			op.Op, op.P99, tailRatio, causeStr),
 		RootCause:       causeStr,
 		Timeline:        timeline,
-		Explanation:     buildExplanation(op, tailRatio, causes, sysCtx),
+		Explanation:     buildExplanation(op, tailRatio, causes, sysCtx, infra),
 		Recommendations: dedup(recommendations),
 	}
 }
@@ -850,7 +910,7 @@ func (e *Engine) SnapshotCGroupSchedStats() []CGroupSchedStat {
 }
 
 // buildExplanation generates a human-readable paragraph explaining the chain.
-func buildExplanation(op stats.OpStats, tailRatio float64, causes []string, sysCtx *SystemContext) string {
+func buildExplanation(op stats.OpStats, tailRatio float64, causes []string, sysCtx *SystemContext, infra *infraContext) string {
 	explanation := fmt.Sprintf("%s tail latency is %.1fx higher than typical (p99=%v vs p50=%v). ", op.Op, tailRatio, op.P99, op.P50)
 
 	if sysCtx != nil && sysCtx.CPUPercent > 90 {
@@ -860,8 +920,42 @@ func buildExplanation(op stats.OpStats, tailRatio float64, causes []string, sysC
 		explanation += fmt.Sprintf("The system is using %d MB of swap, causing memory access latency spikes. ", sysCtx.SwapUsedMB)
 	}
 
+	// I/O-specific explanation with disk technology inference.
+	if infra != nil && (infra.ioCount > 50 || infra.ioTotalDur > 500*time.Millisecond) {
+		explanation += fmt.Sprintf("Block I/O activity (%d ops, %v total, %.1f MB) is concurrent with GPU stalls. ",
+			infra.ioCount, infra.ioTotalDur.Round(time.Millisecond), float64(infra.ioTotalBytes)/(1<<20))
+		if infra.ioMaxLatency > 20*time.Millisecond {
+			explanation += fmt.Sprintf("Peak I/O latency of %v indicates spinning disk or network-attached storage; NVMe SSD typically achieves <1ms. ",
+				infra.ioMaxLatency.Round(time.Millisecond))
+		} else if infra.ioMaxLatency > 2*time.Millisecond {
+			explanation += fmt.Sprintf("Peak I/O latency of %v suggests SATA SSD; NVMe would halve this. ",
+				infra.ioMaxLatency.Round(time.Microsecond))
+		}
+		if infra.ioReadCount > infra.ioWriteCount*2 {
+			explanation += "Read-dominant I/O pattern suggests DataLoader or model loading from disk. "
+		} else if infra.ioWriteCount > infra.ioReadCount*2 {
+			explanation += "Write-dominant I/O pattern suggests checkpoint saves or logging during GPU work. "
+		}
+	}
+
+	// TCP-specific explanation.
+	if infra != nil && infra.tcpRetransmitCount > 5 {
+		explanation += fmt.Sprintf("%d TCP retransmissions indicate network congestion or packet loss. ", infra.tcpRetransmitCount)
+		if infra.tcpRetransmitCount > 50 {
+			explanation += "This volume of retransmits can add seconds of latency to distributed training (NCCL AllReduce) or inference serving. "
+		}
+	}
+
+	// Network I/O explanation.
+	if infra != nil && infra.netCount > 100 && infra.netTotalBytes > 1<<20 {
+		explanation += fmt.Sprintf("Heavy network socket I/O (%d ops, %.1f MB) concurrent with GPU stalls — GPU may be idle waiting for HTTP/gRPC responses or NCCL data transfers. ",
+			infra.netCount, float64(infra.netTotalBytes)/(1<<20))
+	}
+
 	for _, cause := range causes {
-		if cause != "high CPU utilization" && cause != "swap activity" {
+		if cause != "high CPU utilization" && cause != "swap activity" &&
+			cause != "heavy block I/O" && cause != "heavy network socket I/O" &&
+			!strings.Contains(cause, "TCP retransmit") {
 			explanation += fmt.Sprintf("Contributing factor: %s. ", cause)
 		}
 	}

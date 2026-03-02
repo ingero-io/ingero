@@ -44,6 +44,7 @@ type ioTraceIoReqKey struct {
 type ioTraceIoReqVal struct {
 	_           structs.HostLayout
 	TimestampNs uint64
+	CgroupId    uint64
 	Pid         uint32
 	Tid         uint32
 	NrSector    uint32
