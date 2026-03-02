@@ -45,6 +45,7 @@ spec:
         app.kubernetes.io/version: "0.7.0"
     spec:
       hostPID: true
+      terminationGracePeriodSeconds: 30
       serviceAccountName: ingero
       # Tolerate GPU node taints. Without these, the DaemonSet silently fails
       # to schedule on GPU nodes that use nvidia.com/gpu taints (common in

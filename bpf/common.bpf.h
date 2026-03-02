@@ -145,14 +145,15 @@ struct cuda_event_stack {
 /* Total: 32 + 8+8+8+4+4 + 2+6+512 = 584 bytes (was 576 in v0.6) */
 
 /*
- * target_cgroups — in-kernel cgroup filter map.
+ * target_cgroups — in-kernel cgroup filter map (defined in host_trace.bpf.c).
  *
- * Parallel to target_pids in host_trace.bpf.c. When populated by Go userspace,
- * allows filtering events by cgroup v2 ID — essential for K8s container scoping
- * without fragile PID enumeration.
+ * When populated by Go userspace, allows filtering host events by cgroup v2 ID
+ * — essential for K8s container scoping without fragile PID enumeration.
+ * Currently only used by host tracepoints; CUDA/driver uprobes filter by PID.
  *
  * 128 entries covers typical K8s nodes (one entry per container on node).
- * Defined here in the header so all 3 BPF programs can reference it.
+ * Note: SetTargetCGroup() is wired but not yet called from CLI — reserved for
+ * v0.8 noisy-neighbor detection (per-cgroup scheduler latency).
  */
 
 #endif /* __INGERO_COMMON_BPF_H */
