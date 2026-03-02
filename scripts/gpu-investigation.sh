@@ -228,6 +228,12 @@ sleep 20
 # Phase 2: Allocation stress (20-50s) — alloc_stress delay expires, stress begins
 ################################################################################
 
+# Verify alloc_stress survived Phase 1 delay and will fire during Phase 2
+if ! kill -0 "$ALLOC_PID" 2>/dev/null; then
+    echo -e "$(ts) ${YELLOW}[WARN]${NC} alloc_stress.py died during Phase 1. Phase 2 provocation will be absent."
+    echo -e "$(ts)   Last 5 lines of alloc_stress log:"
+    tail -5 logs/gpu-inv-alloc-stress.log 2>/dev/null || true
+fi
 echo -e "$(ts) ${CYAN}[PHASE 2]${NC} alloc_stress.py delay expired, stress active (30s)..."
 PHASE2_START=$(date +%s.%N)
 
@@ -285,7 +291,18 @@ if [[ "$DB_EVENTS" -lt 100 ]]; then
     for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
     exit 1
 fi
-echo -e "$(ts)   Trace complete. DB: $ML_DB ($DB_EVENTS events)"
+# Check CUDA+Driver events specifically — catches partial probe failures
+# where only HOST tracepoints fire but no CUDA uprobes attached
+CUDA_EVENTS=$(sudo sqlite3 "$ML_DB" "SELECT COUNT(*) FROM events WHERE source IN (1, 4)" 2>/dev/null || echo "0")
+if [[ "$CUDA_EVENTS" -lt 100 ]]; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Only $CUDA_EVENTS CUDA/Driver events (expected >100). Uprobes may not have attached."
+    echo -e "$(ts)   Total events: $DB_EVENTS (host tracepoints working, CUDA probes failed)"
+    tail -20 logs/gpu-inv-trace.log
+    record "FAIL" "T23a: CUDA probe validation" "only $CUDA_EVENTS CUDA+Driver events in DB"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
+echo -e "$(ts)   Trace complete. DB: $ML_DB ($DB_EVENTS events, $CUDA_EVENTS CUDA+Driver)"
 
 # Copy DB to logs/ for transfer
 sudo cp "$ML_DB" logs/gpu-investigation.db && sudo chmod 644 logs/gpu-investigation.db

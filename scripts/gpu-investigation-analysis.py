@@ -265,6 +265,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     ops_rows = sql_to_dicts(r_ops)
     if ops_rows:
         mismatches = []
+        unknown_ops = []
         for row in ops_rows:
             src = row.get("source_id", 0) or 0
             op = row.get("op_id", 0) or 0
@@ -272,11 +273,16 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             expected = EXPECTED_OPS.get((src, op))
             if expected and expected != name:
                 mismatches.append(f"({src},{op}): expected={expected}, got={name}")
+            elif not expected and src in (1, 3, 4):
+                unknown_ops.append(f"({src},{op}): {name} (not in EXPECTED_OPS)")
         if mismatches:
             print(f"[FATAL] Op ID mapping mismatch — "
                   f"DB ops table diverges from hardcoded IDs:\n  "
                   + "\n  ".join(mismatches), file=sys.stderr)
             sys.exit(2)
+        if unknown_ops:
+            print(f"[WARN] Unknown ops in DB (update EXPECTED_OPS): "
+                  + ", ".join(unknown_ops), file=sys.stderr)
 
     # Pre-fetch expensive MCP calls once (120s timeout each). These are reused
     # across multiple investigations to avoid redundant queries on large DBs.
@@ -482,17 +488,19 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
         total_bytes = r1_rows[0].get("total_bytes", 0) or 0
         imbalance = allocs - frees
 
-        # Check for duration trending
+        # Check for duration trending — require 3x increase across buckets
+        # and first_avg > 100us to filter normal PyTorch warmup patterns
+        # (small first allocs followed by larger steady-state allocs).
         trending = False
-        if len(rows2) >= 3:
+        if len(rows2) >= 4:
             first_avg = rows2[0].get("avg_us", 0) or 0
             last_avg = rows2[-1].get("avg_us", 0) or 0
-            if first_avg > 0 and last_avg > first_avg * 2:
+            if first_avg > 100 and last_avg > first_avg * 3:
                 trending = True
 
         if trending:
             inv.set_verdict("DETECTED",
-                            f"alloc duration trending up, allocs={allocs}, total={total_bytes/1e6:.0f}MB")
+                            f"alloc duration trending up ({last_avg:.0f}/{first_avg:.0f}us), allocs={allocs}, total={total_bytes/1e6:.0f}MB")
         elif frees > 0 and imbalance > 10:
             inv.set_verdict("DETECTED",
                             f"allocs={allocs}, frees={frees}, imbalance={imbalance}, total={total_bytes/1e6:.0f}MB")
@@ -1030,8 +1038,13 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # =========================================================================
     # T23m: #13 Model Swap Latency — provoked via Phase 1
     # =========================================================================
+    # provoked=False: the investigation traces a pre-initialized CUDA context
+    # (workload starts before trace), so the first alloc is NOT a cold-start.
+    # Cold-start provocation would require launching a fresh CUDA process within
+    # the trace window. On unified-memory GPUs (GH200), cold-start is also a
+    # non-issue (zero-copy memory). Either way, HEALTHY is a valid outcome.
     inv = Investigation("T23m", 13, "Model swap latency", "HIGH",
-                        provoked=not _unified_memory,
+                        provoked=False,
                         question="Is model loading causing latency?")
 
     # Action 1: first 15s events: alloc + memcpy
@@ -1208,8 +1221,10 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     # =========================================================================
     # T23q: #17 Cold Start — provoked via Phase 1
     # =========================================================================
+    # provoked=False: same as T23m — trace starts after CUDA context is warm.
+    # The first event in the trace is NOT the cold first-ever CUDA call.
     inv = Investigation("T23q", 17, "Cold start", "MEDIUM",
-                        provoked=not _unified_memory,
+                        provoked=False,
                         question="How long is the cold start? What's the init penalty?")
 
     # Action 1: first 10 events
@@ -1770,35 +1785,44 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
                         provoked=False,
                         question="How do CUDA metrics change across workload phases?")
 
+    # Use CUDA+Driver events only for avg_us (host sched_switch events have
+    # short durations that dominate the average and make contention look FASTER).
+    # Sched_switch counts come from a separate subquery on all events.
     r1 = mcp.run_sql("""
-        WITH boundaries AS (SELECT MIN(timestamp) as t0 FROM events)
-        SELECT
-            CASE
-                WHEN timestamp < (SELECT t0 FROM boundaries) + 20000000000 THEN '1_baseline'
-                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 20000000000
-                     AND (SELECT t0 FROM boundaries) + 50000000000 THEN '2_alloc_stress'
-                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 50000000000
-                     AND (SELECT t0 FROM boundaries) + 90000000000 THEN '3_contention'
-                WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 90000000000
-                     AND (SELECT t0 FROM boundaries) + 110000000000 THEN '4_recovery'
-                ELSE '5_clean'
-            END as phase,
-            COUNT(*) as events,
-            AVG(duration)/1000 as avg_us,
-            MAX(duration)/1000 as max_us,
-            COUNT(CASE WHEN source=3 AND op=1 THEN 1 END) as sched_switches
-        FROM events GROUP BY phase ORDER BY phase
+        WITH boundaries AS (SELECT MIN(timestamp) as t0 FROM events),
+        phases AS (
+            SELECT
+                CASE
+                    WHEN timestamp < (SELECT t0 FROM boundaries) + 20000000000 THEN '1_baseline'
+                    WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 20000000000
+                         AND (SELECT t0 FROM boundaries) + 50000000000 THEN '2_alloc_stress'
+                    WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 50000000000
+                         AND (SELECT t0 FROM boundaries) + 90000000000 THEN '3_contention'
+                    WHEN timestamp BETWEEN (SELECT t0 FROM boundaries) + 90000000000
+                         AND (SELECT t0 FROM boundaries) + 110000000000 THEN '4_recovery'
+                    ELSE '5_clean'
+                END as phase,
+                source, op, duration
+            FROM events
+        )
+        SELECT phase,
+            COUNT(CASE WHEN source IN (1, 4) THEN 1 END) as cuda_events,
+            AVG(CASE WHEN source IN (1, 4) THEN duration / 1000.0 END) as avg_us,
+            MAX(CASE WHEN source IN (1, 4) THEN duration / 1000.0 END) as max_us,
+            COUNT(CASE WHEN source=3 AND op=1 THEN 1 END) as sched_switches,
+            COUNT(*) as events
+        FROM phases GROUP BY phase ORDER BY phase
     """)
     rows1 = sql_to_dicts(r1)
-    inv.add_action("run_sql", "per-phase event metrics",
+    inv.add_action("run_sql", "per-phase CUDA metrics (host excluded from avg)",
                    f"{len(rows1)} phases analyzed")
 
     if len(rows1) >= 3:
         phase_summary = "; ".join(
-            f"{r.get('phase', '?')}: {r.get('events', 0)} events, avg={r.get('avg_us', 0) or 0:.0f}us, sched={r.get('sched_switches', 0)}"
+            f"{r.get('phase', '?')}: {r.get('cuda_events', 0)} CUDA events, avg={r.get('avg_us', 0) or 0:.0f}us, sched={r.get('sched_switches', 0)}"
             for r in rows1
         )
-        # Check for contention phase degradation
+        # Check for contention phase degradation (CUDA ops only)
         contention = next((r for r in rows1 if "contention" in str(r.get("phase", ""))), None)
         baseline = next((r for r in rows1 if "baseline" in str(r.get("phase", ""))), None)
         if contention and baseline:
@@ -1807,7 +1831,7 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
             degradation = safe_div(ct_avg, bl_avg) if bl_avg > 0 else 0
             if degradation > 2:
                 inv.set_verdict("DETECTED",
-                                f"contention phase {degradation:.1f}x slower than baseline. {phase_summary}")
+                                f"CUDA ops {degradation:.1f}x slower under contention. {phase_summary}")
             else:
                 inv.set_verdict("HEALTHY",
                                 f"contention/baseline ratio={degradation:.1f}x. {phase_summary}")
