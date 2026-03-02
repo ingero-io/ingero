@@ -17,6 +17,7 @@ spec:
         {{- include "ingero.labels" . | nindent 8 }}
     spec:
       hostPID: true
+      terminationGracePeriodSeconds: 30
       serviceAccountName: {{ .Values.serviceAccount.name }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
@@ -33,9 +34,7 @@ spec:
                   fieldPath: spec.nodeName
           args:
             - "trace"
-            {{- if .Values.trace.record }}
-            - "--record"
-            {{- end }}
+            - "--record={{ .Values.trace.record }}"
             - "--db"
             - {{ .Values.trace.dbPath | quote }}
             - "--max-db"

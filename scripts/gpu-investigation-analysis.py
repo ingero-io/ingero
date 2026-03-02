@@ -290,24 +290,6 @@ def run_investigations(mcp: MCPClient, args) -> list[Investigation]:
     _cached_stats = mcp.get_trace_stats("10m")
     _cached_sessions = mcp.get_sessions("0")
 
-    # Detect unified-memory GPUs (GH200, GH100) where cold-start latency is
-    # negligible due to NVLink-C2C coherent memory. On these architectures,
-    # Phase 1 cold-start provocation doesn't produce a measurable effect, so
-    # T23m/T23q should not be marked as provoked (HEALTHY is correct behavior).
-    _gpu_name = ""
-    try:
-        sess_data = _cached_sessions.get("data", {})
-        if isinstance(sess_data, dict):
-            cols = sess_data.get("columns", [])
-            rows_data = sess_data.get("data", [])
-            if rows_data and cols:
-                col_map = {c: i for i, c in enumerate(cols)}
-                if "gpu_model" in col_map:
-                    _gpu_name = str(rows_data[0][col_map["gpu_model"]]).upper()
-    except Exception:
-        pass
-    _unified_memory = any(tag in _gpu_name for tag in ("GH200", "GH100", "GB200", "GB300"))
-
     # =========================================================================
     # T23a: #1 NCCL Hangs — NOT provoked (requires multi-GPU / NCCL)
     # Single-GPU systems detect scheduling contention as a proxy signal.
