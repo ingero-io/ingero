@@ -8,6 +8,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/ingero-io/ingero/pkg/events"
@@ -16,6 +18,7 @@ import (
 // Tracer attaches to block I/O tracepoints and emits events.
 type Tracer struct {
 	objs        ioTraceObjects
+	links       []link.Link
 	reader      *ringbuf.Reader
 	eventCh     chan events.Event
 	dropped     atomic.Uint64
@@ -31,11 +34,15 @@ func New() *Tracer {
 	}
 }
 
-// Attach loads the eBPF program and attaches tracepoints.
-// tp_btf tracepoints auto-attach via the bpf2go loader.
+// Attach loads the eBPF programs, attaches tracepoints, and creates the ring
+// buffer reader. bpf2go's LoadAndAssign loads programs into the kernel but does
+// NOT attach them — explicit link.Tracepoint calls are required.
 func (t *Tracer) Attach() error {
-	// closeFn cleans up on partial failure. Set to nil on success.
 	closeFn := func() {
+		for _, l := range t.links {
+			l.Close()
+		}
+		t.links = nil
 		t.objs.Close()
 	}
 	defer func() {
@@ -44,13 +51,28 @@ func (t *Tracer) Attach() error {
 		}
 	}()
 
-	// Load and auto-attach all programs.
-	// tp_btf programs are attached during loading by the kernel.
 	if err := loadIoTraceObjects(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading I/O trace objects: %w", err)
 	}
 
-	// Create ring buffer reader.
+	// Attach tracepoints — programs are loaded but dormant until linked.
+	type tpSpec struct {
+		group string
+		name  string
+		prog  *ebpf.Program
+	}
+	specs := []tpSpec{
+		{"block", "block_rq_issue", t.objs.HandleBlockRqIssue},
+		{"block", "block_rq_complete", t.objs.HandleBlockRqComplete},
+	}
+	for _, s := range specs {
+		tp, err := link.Tracepoint(s.group, s.name, s.prog, nil)
+		if err != nil {
+			return fmt.Errorf("attaching tracepoint %s/%s: %w", s.group, s.name, err)
+		}
+		t.links = append(t.links, tp)
+	}
+
 	var err error
 	t.reader, err = ringbuf.NewReader(t.objs.IoEvents)
 	if err != nil {
@@ -125,12 +147,15 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 
 // Close releases all resources.
 func (t *Tracer) Close() error {
-	if !t.closed.Swap(true) {
+	if t.closed.Swap(true) {
 		return nil
 	}
 	var errs []error
 	if t.reader != nil {
 		errs = append(errs, t.reader.Close())
+	}
+	for _, l := range t.links {
+		errs = append(errs, l.Close())
 	}
 	errs = append(errs, t.objs.Close())
 	return errors.Join(errs...)

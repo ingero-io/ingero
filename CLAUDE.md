@@ -64,6 +64,7 @@ A bad test is worse than no test. Every test must justify its existence.
 * **Real implementations over mocks.** No mock frameworks (`gomock`, `testify/mock`, `mockgen`, etc.). Use real implementations with controlled inputs: binary builders for eBPF structs, in-memory SQLite for storage, `httptest.NewServer` for external HTTP boundaries. Mock only at the process boundary (network, filesystem), never internal interfaces.
 * **Table-driven tests with `t.Run()`.** This is the established pattern — use `[]struct{...}` with named subtests for all non-trivial test functions.
 * **Delete tests that test nothing.** If a test only checks that a function "doesn't panic" or returns `nil` error on the happy path with no other assertions, remove it. That's false confidence.
+* **Maintain the test matrix.** `docs/test_matrix.md` is the canonical registry of all unit tests. When adding or removing tests, update this file with the test number, description, and file path. Keep it in sync with the codebase.
 
 ## Progressive Context
 

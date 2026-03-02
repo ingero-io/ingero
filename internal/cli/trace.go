@@ -111,6 +111,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 		defer f.Close()
 		log.SetOutput(f)
+		log.Printf("ingero trace: log output started (debug=%v)", debugMode)
 		fmt.Fprintf(os.Stderr, "  Logging to %s\n", traceLogPath)
 	}
 
@@ -1013,6 +1014,9 @@ func newPIDNameCache(pids []int, processNames []string) *pidNameCache {
 // Lookup returns the process name for a PID.
 // If not cached, reads /proc/[pid]/comm and caches the result.
 func (c *pidNameCache) Lookup(pid uint32) string {
+	if c == nil {
+		return ""
+	}
 	c.mu.RLock()
 	name, ok := c.names[pid]
 	c.mu.RUnlock()
@@ -1110,6 +1114,11 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 				chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 			}
+			// Store final chains before rendering (ticker stores intermediate
+			// chains, but the last snapshot may detect new/upgraded chains).
+			if eventStore != nil && len(chains) > 0 {
+				eventStore.RecordChains(chainsToStored(chains))
+			}
 			renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
 			return nil
 
@@ -1125,12 +1134,27 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}
+				// Store final chains (same as ctx.Done path).
+				if eventStore != nil && len(chains) > 0 {
+					eventStore.RecordChains(chainsToStored(chains))
+				}
 				renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
 				return nil
 			}
 
+			// Track ALL sched_switch events for noisy neighbor detection
+			// (pre-PID-filter). Needs peer cgroup data that the PID filter
+			// would otherwise drop.
+			if corr != nil && evt.Source == events.SourceHost &&
+				events.HostOp(evt.Op) == events.HostSchedSwitch {
+				corr.RecordCGroupSchedSwitch(evt.CGroupID, evt.Duration)
+			}
+
 			// PID filter: nil = accept all, non-nil = only listed PIDs.
-			if pidFilter != nil && !pidFilter[evt.PID] {
+			// IO and TCP events are system-wide (kernel tracepoints, not per-process
+			// uprobes), so exempt them from PID filtering.
+			if pidFilter != nil && !pidFilter[evt.PID] &&
+				evt.Source != events.SourceIO && evt.Source != events.SourceTCP {
 				continue
 			}
 
@@ -1630,7 +1654,10 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			}
 
 			// PID filter: nil = accept all, non-nil = only listed PIDs.
-			if pidFilter != nil && !pidFilter[evt.PID] {
+			// IO and TCP events are system-wide (kernel tracepoints, not per-process
+			// uprobes), so exempt them from PID filtering.
+			if pidFilter != nil && !pidFilter[evt.PID] &&
+				evt.Source != events.SourceIO && evt.Source != events.SourceTCP {
 				continue
 			}
 

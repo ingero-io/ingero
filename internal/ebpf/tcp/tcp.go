@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/ingero-io/ingero/pkg/events"
@@ -15,6 +16,7 @@ import (
 // Tracer attaches to TCP tracepoints and emits retransmit events.
 type Tracer struct {
 	objs        tcpTraceObjects
+	links       []link.Link
 	reader      *ringbuf.Reader
 	eventCh     chan events.Event
 	dropped     atomic.Uint64
@@ -30,9 +32,16 @@ func New() *Tracer {
 	}
 }
 
-// Attach loads the eBPF program and attaches tracepoints.
+// Attach loads the eBPF program, attaches the BTF tracepoint, and creates the
+// ring buffer reader. The tcp_retransmit_skb program uses tp_btf (BTF-enabled
+// tracing) which attaches via link.AttachTracing — the kernel resolves the
+// tracepoint from BTF info embedded in the program.
 func (t *Tracer) Attach() error {
 	closeFn := func() {
+		for _, l := range t.links {
+			l.Close()
+		}
+		t.links = nil
 		t.objs.Close()
 	}
 	defer func() {
@@ -45,7 +54,15 @@ func (t *Tracer) Attach() error {
 		return fmt.Errorf("loading TCP trace objects: %w", err)
 	}
 
-	var err error
+	// tp_btf programs attach via AttachTracing (kernel resolves tracepoint from BTF).
+	tp, err := link.AttachTracing(link.TracingOptions{
+		Program: t.objs.HandleTcpRetransmit,
+	})
+	if err != nil {
+		return fmt.Errorf("attaching tp_btf/tcp_retransmit_skb: %w", err)
+	}
+	t.links = append(t.links, tp)
+
 	t.reader, err = ringbuf.NewReader(t.objs.TcpEvents)
 	if err != nil {
 		return fmt.Errorf("creating TCP ring buffer reader: %w", err)
@@ -122,12 +139,15 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 
 // Close releases all resources.
 func (t *Tracer) Close() error {
-	if !t.closed.Swap(true) {
+	if t.closed.Swap(true) {
 		return nil
 	}
 	var errs []error
 	if t.reader != nil {
 		errs = append(errs, t.reader.Close())
+	}
+	for _, l := range t.links {
+		errs = append(errs, l.Close())
 	}
 	errs = append(errs, t.objs.Close())
 	return errors.Join(errs...)

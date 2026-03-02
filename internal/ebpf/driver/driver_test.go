@@ -101,6 +101,46 @@ func TestParseEventDriverWithStack(t *testing.T) {
 	}
 }
 
+func TestParseEventDriverMemAllocManaged(t *testing.T) {
+	tsNs := uint64(5000000000) // 5s
+	allocSize := uint64(1 << 20) // 1 MiB unified memory
+	raw := buildDriverEventBytes(tsNs, 4000, 4001,
+		uint8(events.SourceDriver), uint8(events.DriverMemAllocManaged),
+		120000,    // 120µs duration
+		allocSize, // arg0 = allocation size in bytes
+		0,
+		0, 1, // gpuID = 1
+		99, // cgroup_id
+	)
+
+	evt, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent() error: %v", err)
+	}
+
+	if evt.Source != events.SourceDriver {
+		t.Errorf("Source = %v, want SourceDriver", evt.Source)
+	}
+	if evt.Op != uint8(events.DriverMemAllocManaged) {
+		t.Errorf("Op = %d, want %d (DriverMemAllocManaged)", evt.Op, events.DriverMemAllocManaged)
+	}
+	if evt.PID != 4000 {
+		t.Errorf("PID = %d, want 4000", evt.PID)
+	}
+	if evt.Duration != 120*time.Microsecond {
+		t.Errorf("Duration = %v, want 120µs", evt.Duration)
+	}
+	if evt.Args[0] != allocSize {
+		t.Errorf("Args[0] (alloc size) = %d, want %d", evt.Args[0], allocSize)
+	}
+	if evt.GPUID != 1 {
+		t.Errorf("GPUID = %d, want 1", evt.GPUID)
+	}
+	if evt.CGroupID != 99 {
+		t.Errorf("CGroupID = %d, want 99", evt.CGroupID)
+	}
+}
+
 func TestParseEventDriverTruncatedStack(t *testing.T) {
 	buf := buildDriverEventBytes(3000000000, 100, 101,
 		uint8(events.SourceDriver), uint8(events.DriverMemcpyAsync),
