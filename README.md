@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.6.101**
+**Version: 0.7.0**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -310,7 +310,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.6 (commit: adc2943, built: 2026-02-23)
+ingero v0.7.0 (commit: a9dd11d, built: 2026-03-02)
 ```
 
 ## Stack Tracing
@@ -454,14 +454,14 @@ Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azu
 
 | GPU | VRAM | Tests | Pass | Fail | Skip | Stack OH | Stack Cov |
 |-----|------|-------|------|------|------|----------|-----------|
-| H100 (PCIe / SXM5) | 80 GB | 34 | 34 | 0 | 0 | +1.7% | 99.5% |
-| GH200 | 480 GB | 34 | 34 | 0 | 0 | +1.7% | 99.8% |
-| A100 SXM4 | 40 GB | 34 | 34 | 0 | 0 | +0.4% | 99.7% |
-| A10 | 24 GB | 34 | 34 | 0 | 0 | +0.5% | 99.6% |
+| H100 (PCIe / SXM5) | 80 GB | 62 | 62 | 0 | 0 | +1.7% | 99.5% |
+| GH200 | 480 GB | 62 | 62 | 0 | 0 | +1.6% | 99.8% |
+| A100 SXM4 | 40 GB | 62 | 62 | 0 | 0 | +0.9% | 99.4% |
+| A10 | 24 GB | 62 | 62 | 0 | 0 | -0.1% | 99.2% |
 | RTX 4090 | 24 GB | 34 | 34 | 0 | 0 | +0.6% | 99.9% |
 | RTX 3090 | 24 GB | 34 | 34 | 0 | 0 | — | — |
 
-34/34 integration tests PASS across all GPUs. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper).
+62/62 integration tests PASS on GPUs tested with v0.7. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper). RTX 4090/3090 last tested with v0.6 (34 tests).
 
 ## What Ingero Addresses Today (v0.7)
 
@@ -501,12 +501,14 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 
 ## Roadmap
 
-**v0.7 — K8s Ready** (shipped):
+**v0.7 — K8s Ready** (shipped 2026-03-02):
 - Container/K8s metadata enrichment (`/proc/[pid]/cgroup` → pod/namespace via K8s API)
 - Auto-discover GPU pods on node (`nvidia.com/gpu` resource detection)
-- DaemonSet + RBAC + Helm chart deployment (`deploy/k8s/`, `deploy/helm/`)
+- DaemonSet + RBAC + Helm chart deployment (`deploy/k8s/`, `deploy/helm/ingero/`)
 - Systemd unit file (`make install` / `make uninstall`)
 - `--log <path>` flag for file output
+- Deadband snapshot filter (`--deadband`, `--heartbeat`)
+- 62 integration tests + 28 GPU investigations validated across A10, A100, GH200
 
 **v0.8 — K8s Insights + I/O Tracing:**
 - HTTP/gRPC inference serving tracing (vLLM, Triton)
@@ -514,7 +516,9 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 - `cudaMallocManaged` / `cuMemAllocManaged` tracing (Unified Memory page migration latency diagnosis)
 - Block I/O tracing (`block_rq_issue`/`block_rq_complete`) — completes I/O+CPU+CUDA causal chains
 - TCP retransmit + connection tracing — NCCL hang diagnosis, tool call attribution
-- RAG pipeline GPU contention diagnosis (per-process CUDA API breakdown)
+- Noisy neighbor detection (per-cgroup scheduler latency)
+- `process_name` field in JSON output
+- Test hardening (schema validation, investigation coverage, coverage gaps)
 
 ## FAQ
 
