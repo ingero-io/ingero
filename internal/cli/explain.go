@@ -23,14 +23,15 @@ import (
 )
 
 var (
-	explainDBPath string
-	explainPIDs   []int
-	explainSince  time.Duration
-	explainFrom   string
-	explainTo     string
-	explainJSON   bool
-	explainLast   int
-	explainChains bool
+	explainDBPath     string
+	explainPIDs       []int
+	explainSince      time.Duration
+	explainFrom       string
+	explainTo         string
+	explainJSON       bool
+	explainLast       int
+	explainChains     bool
+	explainPerProcess bool
 )
 
 var explainCmd = &cobra.Command{
@@ -46,6 +47,7 @@ Reads from the SQLite database populated by 'ingero trace'. No root needed.
   ingero explain --last 100        # last 100 events
   ingero explain --pid 4821        # filter by process
   ingero explain --chains          # show stored causal chains (no re-analysis)
+  ingero explain --per-process     # per-process CUDA API breakdown (RAG/multi-process)
   ingero explain --from "15:40" --to "15:45"  # absolute time range`,
 
 	RunE: explainRunE,
@@ -60,6 +62,7 @@ func init() {
 	explainCmd.Flags().BoolVar(&explainJSON, "json", false, "output as JSON")
 	explainCmd.Flags().IntVar(&explainLast, "last", 0, "analyze the N most recent events (0 = use --since)")
 	explainCmd.Flags().BoolVar(&explainChains, "chains", false, "show stored causal chains from DB (skip re-analysis)")
+	explainCmd.Flags().BoolVar(&explainPerProcess, "per-process", false, "per-process CUDA API breakdown (RAG/multi-process contention)")
 
 	rootCmd.AddCommand(explainCmd)
 }
@@ -75,6 +78,11 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	// --chains mode: show pre-computed causal chains from DB.
 	if explainChains {
 		return explainStoredChains()
+	}
+
+	// --per-process mode: per-process CUDA API breakdown.
+	if explainPerProcess {
+		return explainPerProcessBreakdown()
 	}
 
 	// Open DB.
@@ -234,6 +242,147 @@ func explainStoredChains() error {
 	}
 
 	fmt.Print(b.String())
+	return nil
+}
+
+// explainPerProcessBreakdown shows per-process CUDA API usage from aggregates.
+// Useful for RAG pipelines and multi-process GPU sharing diagnosis.
+func explainPerProcessBreakdown() error {
+	s, err := store.New(resolveExplainDB())
+	if err != nil {
+		return fmt.Errorf("opening database: %w\n\nHint: run 'ingero trace' first to collect events", err)
+	}
+	defer s.Close()
+
+	params := store.QueryParams{}
+	if explainLast > 0 {
+		params.Limit = explainLast
+	} else if explainFrom != "" || explainTo != "" {
+		if explainFrom != "" {
+			t, err := parseTime(explainFrom)
+			if err != nil {
+				return fmt.Errorf("parsing --from: %w", err)
+			}
+			params.From = t
+		}
+		if explainTo != "" {
+			t, err := parseTime(explainTo)
+			if err != nil {
+				return fmt.Errorf("parsing --to: %w", err)
+			}
+			params.To = t
+		}
+	} else {
+		params.Since = explainSince
+	}
+	params.PIDs = toUint32Slice(explainPIDs)
+
+	perProc, err := s.QueryAggregatePerProcess(params)
+	if err != nil {
+		return fmt.Errorf("querying per-process stats: %w", err)
+	}
+
+	if len(perProc) == 0 {
+		fmt.Println("  No per-process aggregate data found.")
+		fmt.Println("  Run 'ingero trace' first to collect events.")
+		return nil
+	}
+
+	if explainJSON {
+		return renderPerProcessJSON(perProc)
+	}
+	renderPerProcessReport(perProc, s)
+	return nil
+}
+
+func renderPerProcessReport(stats []store.ProcessOpStats, s *store.Store) {
+	var b strings.Builder
+	b.WriteString("PER-PROCESS GPU API BREAKDOWN\n\n")
+
+	// Group by PID.
+	type pidGroup struct {
+		pid      uint32
+		name     string
+		ops      []store.ProcessOpStats
+		totalOps int64
+	}
+	groups := make(map[uint32]*pidGroup)
+	var order []uint32
+	for _, st := range stats {
+		g, ok := groups[st.PID]
+		if !ok {
+			g = &pidGroup{pid: st.PID}
+			groups[st.PID] = g
+			order = append(order, st.PID)
+		}
+		g.ops = append(g.ops, st)
+		g.totalOps += st.Count
+	}
+
+	// Resolve process names from DB.
+	for _, pid := range order {
+		g := groups[pid]
+		var name string
+		s.DB().QueryRow("SELECT name FROM process_names WHERE pid = ?", pid).Scan(&name)
+		g.name = name
+	}
+
+	// Render each process.
+	for _, pid := range order {
+		g := groups[pid]
+		if g.name != "" {
+			b.WriteString(fmt.Sprintf("  PID %d (%s) — %d total ops\n", pid, g.name, g.totalOps))
+		} else {
+			b.WriteString(fmt.Sprintf("  PID %d — %d total ops\n", pid, g.totalOps))
+		}
+		for _, op := range g.ops {
+			avgNs := int64(0)
+			if op.Count > 0 {
+				avgNs = op.SumDur / op.Count
+			}
+			b.WriteString(fmt.Sprintf("    %-24s %8d calls   avg=%-10s max=%s\n",
+				op.OpName, op.Count,
+				formatDuration(time.Duration(avgNs)),
+				formatDuration(time.Duration(op.MaxDur))))
+		}
+		b.WriteString("\n")
+	}
+
+	// Multi-process contention summary.
+	cudaProcs := 0
+	for _, pid := range order {
+		g := groups[pid]
+		for _, op := range g.ops {
+			if op.Source == 1 || op.Source == 4 { // CUDA or Driver
+				cudaProcs++
+				break
+			}
+		}
+	}
+	if cudaProcs > 1 {
+		b.WriteString(fmt.Sprintf("  GPU CONTENTION: %d processes sharing GPU with concurrent CUDA calls\n", cudaProcs))
+		b.WriteString("  Recommendation: check for serialization on default stream, consider CUDA MPS\n")
+	}
+
+	fmt.Print(b.String())
+}
+
+func renderPerProcessJSON(stats []store.ProcessOpStats) error {
+	fmt.Println("[")
+	for i, st := range stats {
+		avgNs := int64(0)
+		if st.Count > 0 {
+			avgNs = st.SumDur / st.Count
+		}
+		fmt.Printf("  {\"pid\":%d,\"op\":%q,\"count\":%d,\"avg_ns\":%d,\"max_ns\":%d}",
+			st.PID, st.OpName, st.Count, avgNs, st.MaxDur)
+		if i < len(stats)-1 {
+			fmt.Println(",")
+		} else {
+			fmt.Println()
+		}
+	}
+	fmt.Println("]")
 	return nil
 }
 

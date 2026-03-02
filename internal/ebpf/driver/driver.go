@@ -95,6 +95,7 @@ func (t *Tracer) Attach() error {
 		{[]string{"cuMemcpyAsync", "cuMemcpyAsync_v2", "cuMemcpyAsync_ptsz"}, t.objs.UprobeCuMemcpyAsync, t.objs.UretprobeCuMemcpyAsync},
 		{[]string{"cuCtxSynchronize", "cuCtxSynchronize_v2", "cuCtxSynchronize_ptsz"}, t.objs.UprobeCuCtxSync, t.objs.UretprobeCuCtxSync},
 		{[]string{"cuMemAlloc_v2", "cuMemAlloc_v3", "cuMemAlloc"}, t.objs.UprobeCuMemAlloc, t.objs.UretprobeCuMemAlloc},
+		{[]string{"cuMemAllocManaged", "cuMemAllocManaged_v2"}, t.objs.UprobeCuMemAllocManaged, t.objs.UretprobeCuMemAllocManaged},
 	}
 
 	for _, spec := range specs {

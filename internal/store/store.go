@@ -207,6 +207,22 @@ CREATE TABLE IF NOT EXISTS event_aggregates (
 CREATE INDEX IF NOT EXISTS idx_aggregates_bucket ON event_aggregates(bucket);
 `
 
+// cgroupSchedstatSchema stores per-cgroup off-CPU scheduling statistics for
+// noisy neighbor detection. Aggregated from sched_switch events by cgroup_id.
+// Written periodically during tracing — not per-event.
+const cgroupSchedstatSchema = `
+CREATE TABLE IF NOT EXISTS cgroup_schedstat (
+	cgroup_id     INTEGER NOT NULL,
+	p99_off_cpu   INTEGER NOT NULL,  -- p99 off-CPU duration (nanos)
+	total_off_cpu INTEGER NOT NULL,  -- total off-CPU duration (nanos)
+	event_count   INTEGER NOT NULL,
+	window_start  INTEGER NOT NULL DEFAULT 0,  -- unix nanos
+	window_end    INTEGER NOT NULL DEFAULT 0,  -- unix nanos
+	PRIMARY KEY (cgroup_id, window_end)
+);
+CREATE INDEX IF NOT EXISTS idx_cgroup_schedstat_cgroup ON cgroup_schedstat(cgroup_id);
+`
+
 // lookupSchema creates static reference tables that make the DB self-describing.
 // Any SQL client can JOIN against these to get human-readable names.
 //
@@ -261,6 +277,9 @@ func populateLookupTables(db *sql.DB) {
 		{2, "NVIDIA", "NVIDIA kernel driver (nvidia.ko) — reserved, not currently traced"},
 		{3, "HOST", "Host kernel events — tracepoints (scheduler, memory, process lifecycle)"},
 		{4, "DRIVER", "CUDA Driver API (libcuda.so) — uprobes"},
+		{5, "IO", "Block I/O events — tracepoints (block_rq_issue/block_rq_complete)"},
+		{6, "TCP", "TCP events — tracepoints (tcp_retransmit_skb)"},
+		{7, "NET", "Network socket events — syscall tracepoints (sendto/recvfrom)"},
 	}
 	for _, s := range sources {
 		tx.Exec("INSERT INTO sources (id, name, description) VALUES (?, ?, ?)", s.id, s.name, s.desc)
@@ -295,6 +314,22 @@ func populateLookupTables(db *sql.DB) {
 		{4, 3, "cuMemcpyAsync", "Asynchronous memory copy via driver API"},
 		{4, 4, "cuCtxSynchronize", "Wait for all GPU work in context to complete"},
 		{4, 5, "cuMemAlloc", "GPU memory allocation via driver API"},
+		{4, 6, "cuMemAllocManaged", "Unified Memory allocation via driver API"},
+		// CUDA Runtime managed alloc (source=1)
+		{1, 8, "cudaMallocManaged", "Unified Memory allocation via runtime API"},
+		// Block I/O (source=5)
+		{5, 1, "block_read", "Block device read request"},
+		{5, 2, "block_write", "Block device write request"},
+		{5, 3, "block_discard", "Block device discard/trim request"},
+		// TCP (source=6)
+		{6, 1, "tcp_retransmit", "TCP segment retransmission"},
+		// Network socket (source=7)
+		{7, 1, "net_send", "Socket send/sendto syscall"},
+		{7, 2, "net_recv", "Socket recv/recvfrom syscall"},
+		// K8s lifecycle events (source=3, synthetic host ops)
+		{3, 10, "pod_restart", "K8s pod container restart detected"},
+		{3, 11, "pod_eviction", "K8s pod eviction detected"},
+		{3, 12, "pod_oom_kill", "K8s pod OOM kill detected"},
 	}
 	for _, o := range ops {
 		tx.Exec("INSERT INTO ops (source_id, op_id, name, description) VALUES (?, ?, ?, ?)", o.src, o.op, o.name, o.desc)
@@ -302,7 +337,7 @@ func populateLookupTables(db *sql.DB) {
 
 	// Schema info — units, version, helpful context
 	info := []struct{ k, v string }{
-		{"version", "0.7"},
+		{"version", "0.8"},
 		{"timestamp_unit", "nanoseconds (Unix epoch)"},
 		{"duration_unit", "nanoseconds"},
 		{"arg0_note", "Operation-specific: byte size for alloc/memcpy, kernel function pointer for launch"},
@@ -583,7 +618,23 @@ func New(dbPath string) (*Store, error) {
 	// Ensure schema_info reflects the running binary, even for databases
 	// created by an older version (populateLookupTables skips inserts when
 	// tables are already populated).
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.7')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
+
+	// v0.8 migration: add new sources and ops for existing databases.
+	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (5, 'IO', 'Block I/O events')")
+	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (6, 'TCP', 'TCP events')")
+	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (7, 'NET', 'Network socket events')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (1, 8, 'cudaMallocManaged', 'Unified Memory allocation')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (4, 6, 'cuMemAllocManaged', 'Unified Memory allocation via driver API')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 1, 'block_read', 'Block device read request')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 2, 'block_write', 'Block device write request')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 3, 'block_discard', 'Block device discard/trim request')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (6, 1, 'tcp_retransmit', 'TCP segment retransmission')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 1, 'net_send', 'Socket send/sendto syscall')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 2, 'net_recv', 'Socket recv/recvfrom syscall')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 10, 'pod_restart', 'K8s pod container restart detected')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 11, 'pod_eviction', 'K8s pod eviction detected')")
+	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 12, 'pod_oom_kill', 'K8s pod OOM kill detected')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
 	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates. sum_arg0 tracks mm_page_alloc total bytes (chain engine threshold: >1GB). count-stored = discarded count.')")
@@ -646,8 +697,14 @@ func New(dbPath string) (*Store, error) {
 	db.Exec(migrateAddPodName)
 	db.Exec(migrateAddNamespace)
 
-	// Update schema version to 0.7.
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.7')")
+	// v0.8: Create cgroup_schedstat table for noisy neighbor detection.
+	if _, err := db.Exec(cgroupSchedstatSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating cgroup_schedstat table: %w", err)
+	}
+
+	// Update schema version to 0.8.
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id → container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -1631,6 +1688,40 @@ func (s *Store) writeSnapshot(snap SystemSnapshot) {
 	)
 }
 
+// CGroupSchedStat holds per-cgroup off-CPU scheduling statistics.
+type CGroupSchedStat struct {
+	CGroupID    uint64
+	P99OffCPU   int64 // nanos
+	TotalOffCPU int64 // nanos
+	EventCount  int64
+	WindowStart int64 // unix nanos
+	WindowEnd   int64 // unix nanos
+}
+
+// RecordCGroupSchedStats writes per-cgroup scheduling statistics to SQLite.
+// Called periodically (e.g., every tick) for noisy neighbor detection.
+func (s *Store) RecordCGroupSchedStats(stats []CGroupSchedStat) {
+	if len(stats) == 0 {
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO cgroup_schedstat
+		(cgroup_id, p99_off_cpu, total_off_cpu, event_count, window_start, window_end)
+		VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	for _, st := range stats {
+		stmt.Exec(st.CGroupID, st.P99OffCPU, st.TotalOffCPU, st.EventCount, st.WindowStart, st.WindowEnd)
+	}
+	stmt.Close()
+	tx.Commit()
+}
+
 // QuerySnapshots retrieves system snapshots, optionally filtered by time range.
 // Use q.Since for "last N duration" or q.From/q.To for absolute ranges.
 // Results are chronological (oldest first) for replay into the correlator.
@@ -1847,6 +1938,60 @@ func (s *Store) QueryAggregatePerOp(q QueryParams) ([]AggregateOpStats, error) {
 			return nil, fmt.Errorf("scanning aggregate per-op row: %w", err)
 		}
 		// Resolve human-readable op name.
+		evt := events.Event{Source: events.Source(a.Source), Op: a.Op}
+		a.OpName = evt.OpName()
+		result = append(result, a)
+	}
+	return result, rows.Err()
+}
+
+// ProcessOpStats holds per-process, per-operation aggregate statistics.
+// Used by explain --per-process for RAG pipeline contention diagnosis.
+type ProcessOpStats struct {
+	PID    uint32
+	Source uint8
+	Op     uint8
+	OpName string
+	Count  int64
+	SumDur int64 // nanos
+	MinDur int64
+	MaxDur int64
+}
+
+// QueryAggregatePerProcess returns per-process, per-operation aggregate statistics.
+// Groups by (pid, source, op) to show which processes use which CUDA/host ops.
+func (s *Store) QueryAggregatePerProcess(q QueryParams) ([]ProcessOpStats, error) {
+	query := `SELECT pid, source, op, SUM(count), SUM(sum_dur), MIN(min_dur), MAX(max_dur)
+		FROM event_aggregates WHERE 1=1`
+	var args []interface{}
+
+	if !q.From.IsZero() {
+		query += " AND bucket >= ?"
+		args = append(args, q.From.UnixNano())
+	} else if q.Since > 0 {
+		query += " AND bucket >= ?"
+		args = append(args, time.Now().Add(-q.Since).UnixNano())
+	}
+	if !q.To.IsZero() {
+		query += " AND bucket <= ?"
+		args = append(args, q.To.UnixNano())
+	}
+	query, args = appendPIDFilter(query, args, q, "")
+
+	query += " GROUP BY pid, source, op ORDER BY pid, SUM(count) DESC"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying aggregate per-process: %w", err)
+	}
+	defer rows.Close()
+
+	var result []ProcessOpStats
+	for rows.Next() {
+		var a ProcessOpStats
+		if err := rows.Scan(&a.PID, &a.Source, &a.Op, &a.Count, &a.SumDur, &a.MinDur, &a.MaxDur); err != nil {
+			return nil, fmt.Errorf("scanning aggregate per-process row: %w", err)
+		}
 		evt := events.Event{Source: events.Source(a.Source), Op: a.Op}
 		a.OpName = evt.OpName()
 		result = append(result, a)

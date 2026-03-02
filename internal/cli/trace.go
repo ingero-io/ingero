@@ -17,12 +17,15 @@ import (
 	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
-	"github.com/ingero-io/ingero/internal/k8s"
+	"github.com/ingero-io/ingero/internal/ebpf/blockio"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
+	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
+	"github.com/ingero-io/ingero/internal/ebpf/tcp"
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
+	"github.com/ingero-io/ingero/internal/k8s"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/symtab"
@@ -49,6 +52,9 @@ var (
 	traceLogPath      string        // Log output file path (debug, no rotation).
 	traceDeadbandPct  float64       // Deadband threshold % (0 = disabled).
 	traceHeartbeat    time.Duration // Heartbeat interval (0 = no heartbeat).
+	traceNoIO         bool          // Disable block I/O tracing.
+	traceNoTCP        bool          // Disable TCP retransmit tracing.
+	traceNoNet        bool          // Disable network socket tracing.
 )
 
 var traceCmd = &cobra.Command{
@@ -83,6 +89,9 @@ func init() {
 	traceCmd.Flags().StringVar(&traceLogPath, "log", "", "write log output to file (append, no rotation)")
 	traceCmd.Flags().Float64Var(&traceDeadbandPct, "deadband", 0, "suppress snapshot writes when all metrics change < this % (0 = disabled)")
 	traceCmd.Flags().DurationVar(&traceHeartbeat, "heartbeat", 0, "force a snapshot write at least this often even if within deadband (0 = no heartbeat)")
+	traceCmd.Flags().BoolVar(&traceNoIO, "no-io", false, "disable block I/O tracing")
+	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
+	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -266,6 +275,66 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		defer driverTracer.Close()
 	}
 
+	// Step 3c: Create block I/O tracer (non-fatal).
+	var ioTracer *blockio.Tracer
+	ioProbeCount := 0
+	if !traceNoIO {
+		iot := blockio.New()
+		if err := iot.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: block I/O tracing unavailable: %v\n", err)
+			debugf("I/O tracer: attach failed: %v", err)
+		} else {
+			ioTracer = iot
+			ioProbeCount = 2
+			debugf("I/O tracer: %d tracepoints attached", ioProbeCount)
+		}
+	}
+	if ioTracer != nil {
+		defer ioTracer.Close()
+	}
+
+	// Step 3d: Create TCP retransmit tracer (non-fatal).
+	var tcpTracer *tcp.Tracer
+	tcpProbeCount := 0
+	if !traceNoTCP {
+		tt := tcp.New()
+		if err := tt.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: TCP tracing unavailable: %v\n", err)
+			debugf("TCP tracer: attach failed: %v", err)
+		} else {
+			tcpTracer = tt
+			tcpProbeCount = 1
+			debugf("TCP tracer: %d tracepoint attached", tcpProbeCount)
+		}
+	}
+	if tcpTracer != nil {
+		defer tcpTracer.Close()
+	}
+
+	// Step 3e: Create network socket tracer (non-fatal).
+	var netTracer *nettracer.Tracer
+	netProbeCount := 0
+	if !traceNoNet {
+		nt := nettracer.New()
+		if err := nt.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: network tracing unavailable: %v\n", err)
+			debugf("net tracer: attach failed: %v", err)
+		} else {
+			netTracer = nt
+			netProbeCount = 4
+			debugf("net tracer: %d tracepoints attached", netProbeCount)
+			// Seed target PIDs into net PID filter.
+			for _, pid := range targetPIDs {
+				if pid > 0 {
+					nt.SetTargetPID(uint32(pid))
+				}
+			}
+		}
+	}
+	if netTracer != nil {
+		defer netTracer.Close()
+	}
+
 	// Step 4: Create stats collector and correlation engine.
 	collector := stats.New()
 	corr := correlate.New()
@@ -387,7 +456,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}.NewSnapshotFilter()
 
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount, snapFilter)
+	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
 
 	// Step 7: Launch tracers and merge event channels.
 	go cudaTracer.Run(ctx)
@@ -398,13 +467,28 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go driverTracer.Run(ctx)
 	}
 
+	// Launch new tracers (I/O, TCP, net) — each feeds into the merged channel.
+	var extraChs [](<-chan events.Event)
+	if ioTracer != nil {
+		go ioTracer.Run(ctx)
+		extraChs = append(extraChs, ioTracer.Events())
+	}
+	if tcpTracer != nil {
+		go tcpTracer.Run(ctx)
+		extraChs = append(extraChs, tcpTracer.Events())
+	}
+	if netTracer != nil {
+		go netTracer.Run(ctx)
+		extraChs = append(extraChs, netTracer.Events())
+	}
+
 	// Start SQLite writer if recording.
 	if eventStore != nil {
 		go eventStore.Run(ctx)
 	}
 
 	// Fan-in: merge all event channels into one.
-	merged := mergeAllEventChannels(ctx, cudaTracer.Events(), hostTracer, driverTracer)
+	merged := mergeAllEventChannels(ctx, cudaTracer.Events(), hostTracer, driverTracer, extraChs...)
 
 	// Start Prometheus server if configured.
 	if promSrv != nil {
@@ -448,6 +532,15 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		if driverTracer != nil {
 			d += driverTracer.Dropped()
 		}
+		if ioTracer != nil {
+			d += ioTracer.Dropped()
+		}
+		if tcpTracer != nil {
+			d += tcpTracer.Dropped()
+		}
+		if netTracer != nil {
+			d += netTracer.Dropped()
+		}
 		return d
 	}
 
@@ -474,11 +567,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 8: Run the event loop.
+	// Step 8: Build PID→name cache for JSON output enrichment.
+	procNames := newPIDNameCache(targetPIDs, processNames)
+
+	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, trackPID)
 	}
 	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, trackPID)
 }
@@ -571,6 +667,9 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 		case events.HostSchedSwitch:
 			// sched_switch is causal chain critical — always store.
 			return true
+		case events.HostPodRestart, events.HostPodEviction, events.HostPodOOMKill:
+			// K8s lifecycle events are always stored (rare, high value).
+			return true
 		}
 	}
 
@@ -584,6 +683,19 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 	if evt.Source == events.SourceDriver && events.DriverOp(evt.Op) == events.DriverCtxSync {
 		return true
 	}
+
+	// TCP retransmits: always store (rare, high investigation value).
+	if evt.Source == events.SourceTCP {
+		return true
+	}
+
+	// Block I/O: store slow operations (>10ms latency, indicates contention).
+	if evt.Source == events.SourceIO && evt.Duration > 10*time.Millisecond {
+		return true
+	}
+
+	// Network: store only anomalous events (high throughput = lots of events).
+	// Falls through to the anomaly check below.
 
 	// Anomalous events (duration > 3x p50) are always stored.
 	if collector.IsAnomaly(evt) {
@@ -673,6 +785,33 @@ func flushAllAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store) {
 	eventStore.RecordAggregates(batch)
 }
 
+// isArgBytes returns true if arg0 for this (source, op) represents a byte count
+// that is meaningful to sum (e.g., allocation size, copy count). Returns false
+// for pointer-valued ops where summing would overflow int64 (e.g., cudaFree
+// receives a device pointer, cuLaunchKernel receives a function pointer).
+func isArgBytes(source events.Source, op uint8) bool {
+	switch source {
+	case events.SourceCUDA:
+		switch events.CUDAOp(op) {
+		case events.CUDAMalloc, events.CUDAMallocManaged, events.CUDAMemcpy, events.CUDAMemcpyAsync:
+			return true // arg0 = size or count
+		}
+	case events.SourceDriver:
+		switch events.DriverOp(op) {
+		case events.DriverMemAlloc, events.DriverMemAllocManaged, events.DriverMemcpy, events.DriverMemcpyAsync:
+			return true // arg0 = size
+		}
+	case events.SourceHost:
+		switch events.HostOp(op) {
+		case events.HostPageAlloc:
+			return true // arg0 = alloc bytes (4096 << order)
+		}
+	case events.SourceIO:
+		return true // arg0 = sector count (block I/O size)
+	}
+	return false
+}
+
 // recordAggregate updates the in-memory aggregate for an event.
 // Called for every event regardless of whether it's individually stored.
 // The 'stored' flag indicates whether the event was also written to the events table.
@@ -703,15 +842,19 @@ func recordAggregate(aggs map[aggKey]*aggValue, evt events.Event, stored bool) {
 	if durNanos > v.MaxDur {
 		v.MaxDur = durNanos
 	}
-	v.SumArg0 += int64(evt.Args[0])
+	// Only accumulate arg0 for byte-count ops (malloc size, memcpy count,
+	// page alloc bytes). Skip pointer-valued ops to avoid int64 overflow.
+	if isArgBytes(evt.Source, evt.Op) {
+		v.SumArg0 += int64(evt.Args[0])
+	}
 	if stored {
 		v.Stored++
 	}
 }
 
 // mergeAllEventChannels creates a single channel that receives events from
-// all active tracers (CUDA runtime, host, and optionally driver).
-func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, hostTracer *host.Tracer, driverTracer *driver.Tracer) <-chan events.Event {
+// all active tracers (CUDA runtime, host, driver, I/O, TCP, net).
+func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, hostTracer *host.Tracer, driverTracer *driver.Tracer, extraChs ...(<-chan events.Event)) <-chan events.Event {
 	// Collect all active channels.
 	channels := []<-chan events.Event{cudaCh}
 	if hostTracer != nil {
@@ -720,6 +863,7 @@ func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, host
 	if driverTracer != nil {
 		channels = append(channels, driverTracer.Events())
 	}
+	channels = append(channels, extraChs...)
 
 	if len(channels) == 1 {
 		return cudaCh
@@ -843,6 +987,50 @@ func resolveProcessNames(pids []int) []string {
 		names[i] = procMap[pid]
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------------
+// PID → process name cache
+// ---------------------------------------------------------------------------
+
+// pidNameCache is a thread-safe in-memory cache of PID → process name.
+// Populated from initial discovery and lazily from /proc/[pid]/comm.
+type pidNameCache struct {
+	mu    sync.RWMutex
+	names map[uint32]string
+}
+
+func newPIDNameCache(pids []int, processNames []string) *pidNameCache {
+	c := &pidNameCache{names: make(map[uint32]string)}
+	for i, pid := range pids {
+		if i < len(processNames) && processNames[i] != "" {
+			c.names[uint32(pid)] = processNames[i]
+		}
+	}
+	return c
+}
+
+// Lookup returns the process name for a PID.
+// If not cached, reads /proc/[pid]/comm and caches the result.
+func (c *pidNameCache) Lookup(pid uint32) string {
+	c.mu.RLock()
+	name, ok := c.names[pid]
+	c.mu.RUnlock()
+	if ok {
+		return name
+	}
+
+	// Lazy resolve from /proc.
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return ""
+	}
+	name = strings.TrimSpace(string(data))
+
+	c.mu.Lock()
+	c.names[pid] = name
+	c.mu.Unlock()
+	return name
 }
 
 // ---------------------------------------------------------------------------
@@ -984,8 +1172,18 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				onFork[0](evt.PID)
 			}
 
-			if corr != nil && evt.Source == events.SourceHost {
-				corr.RecordHost(evt)
+			// Feed events into correlation engine for causal chain analysis.
+			if corr != nil {
+				switch evt.Source {
+				case events.SourceHost:
+					corr.RecordHost(evt)
+				case events.SourceIO, events.SourceTCP, events.SourceNet:
+					corr.RecordEvent(evt)
+				}
+				// Auto-register target cgroups for noisy neighbor detection.
+				if evt.CGroupID > 1 && pidFilter != nil && pidFilter[evt.PID] {
+					corr.SetTargetCGroup(evt.CGroupID)
+				}
 			}
 
 			// Dynamic PID tracking: when a target process forks, auto-add child.
@@ -1012,8 +1210,57 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					})
 				}
 			}
+			// Drain K8s pod lifecycle events and inject as synthetic host events.
+			if podCache != nil {
+				for _, lce := range podCache.DrainLifecycleEvents() {
+					var op events.HostOp
+					switch lce.EventType {
+					case "restart":
+						op = events.HostPodRestart
+					case "eviction":
+						op = events.HostPodEviction
+					case "oom_kill":
+						op = events.HostPodOOMKill
+					default:
+						continue
+					}
+					syntheticEvt := events.Event{
+						Timestamp: lce.DetectedAt,
+						Source:    events.SourceHost,
+						Op:        uint8(op),
+					}
+					collector.Record(syntheticEvt)
+					if corr != nil {
+						corr.RecordHost(syntheticEvt)
+					}
+					if eventStore != nil {
+						eventStore.Record(syntheticEvt)
+					}
+					debugf("K8s lifecycle: %s/%s %s: %s", lce.Namespace, lce.PodName, lce.EventType, lce.Detail)
+				}
+			}
+
 			// Flush completed minute-buckets to SQLite.
 			flushAggregates(aggs, eventStore, time.Now())
+
+			// Flush per-cgroup scheduling stats for noisy neighbor detection.
+			if eventStore != nil && corr != nil {
+				cgStats := corr.SnapshotCGroupSchedStats()
+				if len(cgStats) > 0 {
+					storeStats := make([]store.CGroupSchedStat, len(cgStats))
+					now := time.Now()
+					for i, cs := range cgStats {
+						storeStats[i] = store.CGroupSchedStat{
+							CGroupID:    cs.CGroupID,
+							P99OffCPU:   int64(cs.P99OffCPU),
+							TotalOffCPU: int64(cs.TotalOffCPU),
+							EventCount:  cs.EventCount,
+							WindowEnd:   now.UnixNano(),
+						}
+					}
+					eventStore.RecordCGroupSchedStats(storeStats)
+				}
+			}
 
 			snap := collector.Snapshot()
 			attachSysSnapshot(snap, sysColl)
@@ -1156,14 +1403,20 @@ func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bo
 	// Section 1: System Context (one line with ASCII bars).
 	renderSystemLine(&b, &lines, snap.System)
 
-	// Split ops by Source for three-section display.
-	var cudaOps, driverOps, hostOps []stats.OpStats
+	// Split ops by Source for multi-section display.
+	var cudaOps, driverOps, hostOps, ioOps, tcpOps, netOps []stats.OpStats
 	for _, op := range snap.Ops {
 		switch op.Source {
 		case events.SourceHost:
 			hostOps = append(hostOps, op)
 		case events.SourceDriver:
 			driverOps = append(driverOps, op)
+		case events.SourceIO:
+			ioOps = append(ioOps, op)
+		case events.SourceTCP:
+			tcpOps = append(tcpOps, op)
+		case events.SourceNet:
+			netOps = append(netOps, op)
 		default:
 			cudaOps = append(cudaOps, op)
 		}
@@ -1184,6 +1437,27 @@ func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bo
 		fmt.Fprintf(&b, "\033[K\n")
 		lines++
 		renderOpsSection(&b, &lines, "Host Context", hostOps)
+	}
+
+	// Section 5: Block I/O table (if any I/O events present).
+	if len(ioOps) > 0 {
+		fmt.Fprintf(&b, "\033[K\n")
+		lines++
+		renderOpsSection(&b, &lines, "Block I/O", ioOps)
+	}
+
+	// Section 6: TCP table (if any TCP events present).
+	if len(tcpOps) > 0 {
+		fmt.Fprintf(&b, "\033[K\n")
+		lines++
+		renderOpsSection(&b, &lines, "TCP", tcpOps)
+	}
+
+	// Section 7: Network socket table (if any net events present).
+	if len(netOps) > 0 {
+		fmt.Fprintf(&b, "\033[K\n")
+		lines++
+		renderOpsSection(&b, &lines, "Network Socket", netOps)
 	}
 
 	// Empty line.
@@ -1250,24 +1524,25 @@ type jsonStackFrame struct {
 }
 
 type jsonEvent struct {
-	Timestamp  string           `json:"timestamp"`
-	PID        uint32           `json:"pid"`
-	TID        uint32           `json:"tid"`
-	Source     string           `json:"source"`
-	Op         string           `json:"op"`
-	DurationNs int64            `json:"duration_ns"`
-	Duration   string           `json:"duration"`
-	GPUID      uint32           `json:"gpu_id"`
-	Args       [2]uint64        `json:"args"`
-	ReturnCode int32            `json:"return_code"`
-	CGroupID   uint64           `json:"cgroup_id,omitempty"`
-	Anomaly    bool             `json:"anomaly"`
-	Stack      []jsonStackFrame `json:"stack,omitempty"`
+	Timestamp   string           `json:"timestamp"`
+	PID         uint32           `json:"pid"`
+	TID         uint32           `json:"tid"`
+	ProcessName string           `json:"process_name,omitempty"`
+	Source      string           `json:"source"`
+	Op          string           `json:"op"`
+	DurationNs  int64            `json:"duration_ns"`
+	Duration    string           `json:"duration"`
+	GPUID       uint32           `json:"gpu_id"`
+	Args        [2]uint64        `json:"args"`
+	ReturnCode  int32            `json:"return_code"`
+	CGroupID    uint64           `json:"cgroup_id,omitempty"`
+	Anomaly     bool             `json:"anomaly"`
+	Stack       []jsonStackFrame `json:"stack,omitempty"`
 }
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1406,18 +1681,19 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			}
 
 			je := jsonEvent{
-				Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
-				PID:        evt.PID,
-				TID:        evt.TID,
-				Source:     evt.Source.String(),
-				Op:         evt.OpName(),
-				DurationNs: evt.Duration.Nanoseconds(),
-				Duration:   formatDuration(evt.Duration),
-				GPUID:      evt.GPUID,
-				Args:       evt.Args,
-				ReturnCode: evt.RetCode,
-				CGroupID:   evt.CGroupID,
-				Anomaly:    collector.IsAnomaly(evt),
+				Timestamp:   evt.Timestamp.Format(time.RFC3339Nano),
+				PID:         evt.PID,
+				TID:         evt.TID,
+				ProcessName: procNames.Lookup(evt.PID),
+				Source:      evt.Source.String(),
+				Op:          evt.OpName(),
+				DurationNs:  evt.Duration.Nanoseconds(),
+				Duration:    formatDuration(evt.Duration),
+				GPUID:       evt.GPUID,
+				Args:        evt.Args,
+				ReturnCode:  evt.RetCode,
+				CGroupID:    evt.CGroupID,
+				Anomaly:     collector.IsAnomaly(evt),
 			}
 
 			// Include stack trace if present.
@@ -1462,7 +1738,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 // contaminating the JSON stream on stdout. This was a known bug through v0.4
 // where the ASCII header mixed with JSONL output, breaking jq, MCP consumers,
 // and any tool expecting valid JSONL on stdout.
-func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int, snapFilter *filter.SnapshotFilter) {
+func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int, ioProbeCount int, tcpProbeCount int, netProbeCount int, snapFilter *filter.SnapshotFilter) {
 	// In JSON mode, redirect header to stderr so stdout is clean JSONL.
 	w := os.Stdout
 	if traceJSON {
@@ -1505,6 +1781,15 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 	}
 	if hostProbeCount > 0 {
 		fmt.Fprintf(w, "  Host probes: %d attached\n", hostProbeCount)
+	}
+	if ioProbeCount > 0 {
+		fmt.Fprintf(w, "  I/O probes: %d attached\n", ioProbeCount)
+	}
+	if tcpProbeCount > 0 {
+		fmt.Fprintf(w, "  TCP probes: %d attached\n", tcpProbeCount)
+	}
+	if netProbeCount > 0 {
+		fmt.Fprintf(w, "  Net probes: %d attached\n", netProbeCount)
 	}
 
 	if !traceRecord {

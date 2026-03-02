@@ -42,6 +42,9 @@ const (
 	SourceNvidia Source = 2
 	SourceHost   Source = 3
 	SourceDriver Source = 4
+	SourceIO     Source = 5
+	SourceTCP    Source = 6
+	SourceNet    Source = 7
 )
 
 // String implements fmt.Stringer.
@@ -55,6 +58,12 @@ func (s Source) String() string {
 		return "host"
 	case SourceDriver:
 		return "driver"
+	case SourceIO:
+		return "io"
+	case SourceTCP:
+		return "tcp"
+	case SourceNet:
+		return "net"
 	default:
 		return fmt.Sprintf("unknown(%d)", s)
 	}
@@ -66,13 +75,14 @@ func (s Source) String() string {
 type CUDAOp uint8
 
 const (
-	CUDAMalloc       CUDAOp = 1
-	CUDAFree         CUDAOp = 2
-	CUDALaunchKernel CUDAOp = 3
-	CUDAMemcpy       CUDAOp = 4
-	CUDAStreamSync   CUDAOp = 5
-	CUDADeviceSync   CUDAOp = 6
-	CUDAMemcpyAsync  CUDAOp = 7
+	CUDAMalloc        CUDAOp = 1
+	CUDAFree          CUDAOp = 2
+	CUDALaunchKernel  CUDAOp = 3
+	CUDAMemcpy        CUDAOp = 4
+	CUDAStreamSync    CUDAOp = 5
+	CUDADeviceSync    CUDAOp = 6
+	CUDAMemcpyAsync   CUDAOp = 7
+	CUDAMallocManaged CUDAOp = 8
 )
 
 // String returns a human-readable name for the CUDA operation.
@@ -92,6 +102,8 @@ func (op CUDAOp) String() string {
 		return "cudaDeviceSync"
 	case CUDAMemcpyAsync:
 		return "cudaMemcpyAsync"
+	case CUDAMallocManaged:
+		return "cudaMallocManaged"
 	default:
 		return fmt.Sprintf("unknown(%d)", op)
 	}
@@ -110,6 +122,12 @@ const (
 	HostProcessExec HostOp = 5
 	HostProcessExit HostOp = 6
 	HostProcessFork HostOp = 7
+
+	// K8s lifecycle events (synthetic, not from eBPF).
+	// Op codes 10+ to avoid collisions with eBPF-defined host ops.
+	HostPodRestart  HostOp = 10
+	HostPodEviction HostOp = 11
+	HostPodOOMKill  HostOp = 12
 )
 
 // String returns a human-readable name for the host operation.
@@ -129,6 +147,12 @@ func (op HostOp) String() string {
 		return "process_exit"
 	case HostProcessFork:
 		return "process_fork"
+	case HostPodRestart:
+		return "pod_restart"
+	case HostPodEviction:
+		return "pod_eviction"
+	case HostPodOOMKill:
+		return "pod_oom_kill"
 	default:
 		return fmt.Sprintf("host_op(%d)", op)
 	}
@@ -140,11 +164,12 @@ func (op HostOp) String() string {
 type DriverOp uint8
 
 const (
-	DriverLaunchKernel DriverOp = 1
-	DriverMemcpy       DriverOp = 2
-	DriverMemcpyAsync  DriverOp = 3
-	DriverCtxSync      DriverOp = 4
-	DriverMemAlloc     DriverOp = 5
+	DriverLaunchKernel   DriverOp = 1
+	DriverMemcpy         DriverOp = 2
+	DriverMemcpyAsync    DriverOp = 3
+	DriverCtxSync        DriverOp = 4
+	DriverMemAlloc       DriverOp = 5
+	DriverMemAllocManaged DriverOp = 6
 )
 
 // String returns a human-readable name for the driver operation.
@@ -160,8 +185,76 @@ func (op DriverOp) String() string {
 		return "cuCtxSynchronize"
 	case DriverMemAlloc:
 		return "cuMemAlloc"
+	case DriverMemAllocManaged:
+		return "cuMemAllocManaged"
 	default:
 		return fmt.Sprintf("driver_op(%d)", op)
+	}
+}
+
+// IOOp identifies a block I/O operation.
+//
+// These values MUST match the IO_OP_* defines in bpf/common.bpf.h.
+type IOOp uint8
+
+const (
+	IORead    IOOp = 1
+	IOWrite   IOOp = 2
+	IODiscard IOOp = 3
+)
+
+// String returns a human-readable name for the I/O operation.
+func (op IOOp) String() string {
+	switch op {
+	case IORead:
+		return "block_read"
+	case IOWrite:
+		return "block_write"
+	case IODiscard:
+		return "block_discard"
+	default:
+		return fmt.Sprintf("io_op(%d)", op)
+	}
+}
+
+// TCPOp identifies a TCP operation.
+//
+// These values MUST match the TCP_OP_* defines in bpf/common.bpf.h.
+type TCPOp uint8
+
+const (
+	TCPRetransmit TCPOp = 1
+)
+
+// String returns a human-readable name for the TCP operation.
+func (op TCPOp) String() string {
+	switch op {
+	case TCPRetransmit:
+		return "tcp_retransmit"
+	default:
+		return fmt.Sprintf("tcp_op(%d)", op)
+	}
+}
+
+// NetOp identifies a network socket operation.
+//
+// These values MUST match the NET_OP_* defines in bpf/common.bpf.h.
+type NetOp uint8
+
+const (
+	NetSend NetOp = 1
+	NetRecv NetOp = 2
+)
+
+// String returns a human-readable name for the network operation.
+func (op NetOp) String() string {
+	switch op {
+	case NetSend:
+		return "net_send"
+	case NetRecv:
+		return "net_recv"
+	default:
+		return fmt.Sprintf("net_op(%d)", op)
 	}
 }
 
@@ -175,6 +268,12 @@ func (e Event) OpName() string {
 		return HostOp(e.Op).String()
 	case SourceDriver:
 		return DriverOp(e.Op).String()
+	case SourceIO:
+		return IOOp(e.Op).String()
+	case SourceTCP:
+		return TCPOp(e.Op).String()
+	case SourceNet:
+		return NetOp(e.Op).String()
 	default:
 		return fmt.Sprintf("op(%d)", e.Op)
 	}
@@ -188,13 +287,14 @@ func ResolveOp(name string) (Source, uint8, bool) {
 
 	// CUDA Runtime ops.
 	cudaOps := map[string]CUDAOp{
-		"cudamalloc":       CUDAMalloc,
-		"cudafree":         CUDAFree,
-		"cudalaunchkernel": CUDALaunchKernel,
-		"cudamemcpy":       CUDAMemcpy,
-		"cudastreamsync":   CUDAStreamSync,
-		"cudadevicesync":   CUDADeviceSync,
-		"cudamemcpyasync":  CUDAMemcpyAsync,
+		"cudamalloc":        CUDAMalloc,
+		"cudafree":          CUDAFree,
+		"cudalaunchkernel":  CUDALaunchKernel,
+		"cudamemcpy":        CUDAMemcpy,
+		"cudastreamsync":    CUDAStreamSync,
+		"cudadevicesync":    CUDADeviceSync,
+		"cudamemcpyasync":   CUDAMemcpyAsync,
+		"cudamallocmanaged": CUDAMallocManaged,
 	}
 	for k, v := range cudaOps {
 		if lower == k {
@@ -204,12 +304,14 @@ func ResolveOp(name string) (Source, uint8, bool) {
 
 	// CUDA Driver ops.
 	driverOps := map[string]DriverOp{
-		"culaunchkernel":   DriverLaunchKernel,
-		"cumemcpy":         DriverMemcpy,
-		"cumemcpyasync":    DriverMemcpyAsync,
-		"cuctxsynchronize": DriverCtxSync,
-		"cumemallocv2":     DriverMemAlloc,
-		"cumemalloc":       DriverMemAlloc,
+		"culaunchkernel":      DriverLaunchKernel,
+		"cumemcpy":            DriverMemcpy,
+		"cumemcpyasync":       DriverMemcpyAsync,
+		"cuctxsynchronize":    DriverCtxSync,
+		"cumemallocv2":        DriverMemAlloc,
+		"cumemalloc":          DriverMemAlloc,
+		"cumemallocmanaged":   DriverMemAllocManaged,
+		"cumemallocmanagedv2": DriverMemAllocManaged,
 	}
 	for k, v := range driverOps {
 		if lower == k {
@@ -226,10 +328,46 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		"process_exec":  HostProcessExec,
 		"process_exit":  HostProcessExit,
 		"process_fork":  HostProcessFork,
+		"pod_restart":   HostPodRestart,
+		"pod_eviction":  HostPodEviction,
+		"pod_oom_kill":  HostPodOOMKill,
 	}
 	for k, v := range hostOps {
 		if lower == k {
 			return SourceHost, uint8(v), true
+		}
+	}
+
+	// Block I/O ops.
+	ioOps := map[string]IOOp{
+		"block_read":    IORead,
+		"block_write":   IOWrite,
+		"block_discard": IODiscard,
+	}
+	for k, v := range ioOps {
+		if lower == k {
+			return SourceIO, uint8(v), true
+		}
+	}
+
+	// TCP ops.
+	tcpOps := map[string]TCPOp{
+		"tcp_retransmit": TCPRetransmit,
+	}
+	for k, v := range tcpOps {
+		if lower == k {
+			return SourceTCP, uint8(v), true
+		}
+	}
+
+	// Network socket ops.
+	netOps := map[string]NetOp{
+		"net_send": NetSend,
+		"net_recv": NetRecv,
+	}
+	for k, v := range netOps {
+		if lower == k {
+			return SourceNet, uint8(v), true
 		}
 	}
 

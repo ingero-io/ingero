@@ -273,6 +273,37 @@ int uretprobe_cu_mem_alloc(struct pt_regs *ctx)
 	return 0;
 }
 
+// ---- cuMemAllocManaged ----
+// CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags)
+// Unified Memory allocation in driver API. arg0 = bytesize (param 2).
+// Symbol may appear as cuMemAllocManaged or cuMemAllocManaged_v2.
+
+SEC("uprobe/cuMemAllocManaged")
+int uprobe_cu_mem_alloc_managed(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 bytesize = (__u64)PT_REGS_PARM2(ctx);
+
+	driver_save_entry(tid, DRIVER_OP_MEM_ALLOC_MANAGED, bytesize, 0);
+	return 0;
+}
+
+SEC("uretprobe/cuMemAllocManaged")
+int uretprobe_cu_mem_alloc_managed(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+
+	struct entry_state *entry = bpf_map_lookup_elem(&driver_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	driver_emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&driver_entry_map, &tid);
+	return 0;
+}
+
 // Force BTF emission for struct cuda_event (reused for driver events).
 const struct cuda_event *_unused_driver_event_force_btf __attribute__((unused));
 const struct cuda_event_stack *_unused_driver_event_stack_force_btf __attribute__((unused));

@@ -114,8 +114,8 @@ func TestLookupTablesCreated(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM sources").Scan(&srcCount); err != nil {
 		t.Fatalf("sources query: %v", err)
 	}
-	if srcCount != 4 {
-		t.Errorf("sources: got %d rows, want 4", srcCount)
+	if srcCount != 7 {
+		t.Errorf("sources: got %d rows, want 7", srcCount)
 	}
 
 	// Check ops table.
@@ -123,8 +123,8 @@ func TestLookupTablesCreated(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM ops").Scan(&opsCount); err != nil {
 		t.Fatalf("ops query: %v", err)
 	}
-	if opsCount != 19 {
-		t.Errorf("ops: got %d rows, want 19", opsCount)
+	if opsCount != 30 {
+		t.Errorf("ops: got %d rows, want 30", opsCount)
 	}
 
 	// Check schema_info.
@@ -231,8 +231,8 @@ func TestOpDescriptions(t *testing.T) {
 	defer s.Close()
 
 	descs := s.OpDescriptions()
-	if len(descs) != 19 {
-		t.Errorf("OpDescriptions: got %d, want 19", len(descs))
+	if len(descs) != 30 {
+		t.Errorf("OpDescriptions: got %d, want 30", len(descs))
 	}
 	if descs["cudaMalloc"] != "GPU memory allocation" {
 		t.Errorf("cudaMalloc desc = %q", descs["cudaMalloc"])
@@ -250,8 +250,8 @@ func TestSchemaInfo(t *testing.T) {
 	defer s.Close()
 
 	info := s.SchemaInfo()
-	if info["version"] != "0.7" {
-		t.Errorf("version = %q, want 0.7", info["version"])
+	if info["version"] != "0.8" {
+		t.Errorf("version = %q, want 0.8", info["version"])
 	}
 	if info["timestamp_unit"] == "" {
 		t.Error("timestamp_unit missing")

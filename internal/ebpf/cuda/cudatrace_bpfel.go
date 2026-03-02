@@ -90,20 +90,22 @@ type cudaTraceSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaTraceProgramSpecs struct {
-	UprobeCudaDeviceSync      *ebpf.ProgramSpec `ebpf:"uprobe_cuda_device_sync"`
-	UprobeCudaFree            *ebpf.ProgramSpec `ebpf:"uprobe_cuda_free"`
-	UprobeCudaLaunchKernel    *ebpf.ProgramSpec `ebpf:"uprobe_cuda_launch_kernel"`
-	UprobeCudaMalloc          *ebpf.ProgramSpec `ebpf:"uprobe_cuda_malloc"`
-	UprobeCudaMemcpy          *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy"`
-	UprobeCudaMemcpyAsync     *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy_async"`
-	UprobeCudaStreamSync      *ebpf.ProgramSpec `ebpf:"uprobe_cuda_stream_sync"`
-	UretprobeCudaDeviceSync   *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_device_sync"`
-	UretprobeCudaFree         *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_free"`
-	UretprobeCudaLaunchKernel *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_launch_kernel"`
-	UretprobeCudaMalloc       *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_malloc"`
-	UretprobeCudaMemcpy       *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_memcpy"`
-	UretprobeCudaMemcpyAsync  *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_memcpy_async"`
-	UretprobeCudaStreamSync   *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_stream_sync"`
+	UprobeCudaDeviceSync       *ebpf.ProgramSpec `ebpf:"uprobe_cuda_device_sync"`
+	UprobeCudaFree             *ebpf.ProgramSpec `ebpf:"uprobe_cuda_free"`
+	UprobeCudaLaunchKernel     *ebpf.ProgramSpec `ebpf:"uprobe_cuda_launch_kernel"`
+	UprobeCudaMalloc           *ebpf.ProgramSpec `ebpf:"uprobe_cuda_malloc"`
+	UprobeCudaMallocManaged    *ebpf.ProgramSpec `ebpf:"uprobe_cuda_malloc_managed"`
+	UprobeCudaMemcpy           *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy"`
+	UprobeCudaMemcpyAsync      *ebpf.ProgramSpec `ebpf:"uprobe_cuda_memcpy_async"`
+	UprobeCudaStreamSync       *ebpf.ProgramSpec `ebpf:"uprobe_cuda_stream_sync"`
+	UretprobeCudaDeviceSync    *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_device_sync"`
+	UretprobeCudaFree          *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_free"`
+	UretprobeCudaLaunchKernel  *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_launch_kernel"`
+	UretprobeCudaMalloc        *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_malloc"`
+	UretprobeCudaMallocManaged *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_malloc_managed"`
+	UretprobeCudaMemcpy        *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_memcpy"`
+	UretprobeCudaMemcpyAsync   *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_memcpy_async"`
+	UretprobeCudaStreamSync    *ebpf.ProgramSpec `ebpf:"uretprobe_cuda_stream_sync"`
 }
 
 // cudaTraceMapSpecs contains maps before they are loaded into the kernel.
@@ -170,20 +172,22 @@ type cudaTraceVariables struct {
 //
 // It can be passed to loadCudaTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaTracePrograms struct {
-	UprobeCudaDeviceSync      *ebpf.Program `ebpf:"uprobe_cuda_device_sync"`
-	UprobeCudaFree            *ebpf.Program `ebpf:"uprobe_cuda_free"`
-	UprobeCudaLaunchKernel    *ebpf.Program `ebpf:"uprobe_cuda_launch_kernel"`
-	UprobeCudaMalloc          *ebpf.Program `ebpf:"uprobe_cuda_malloc"`
-	UprobeCudaMemcpy          *ebpf.Program `ebpf:"uprobe_cuda_memcpy"`
-	UprobeCudaMemcpyAsync     *ebpf.Program `ebpf:"uprobe_cuda_memcpy_async"`
-	UprobeCudaStreamSync      *ebpf.Program `ebpf:"uprobe_cuda_stream_sync"`
-	UretprobeCudaDeviceSync   *ebpf.Program `ebpf:"uretprobe_cuda_device_sync"`
-	UretprobeCudaFree         *ebpf.Program `ebpf:"uretprobe_cuda_free"`
-	UretprobeCudaLaunchKernel *ebpf.Program `ebpf:"uretprobe_cuda_launch_kernel"`
-	UretprobeCudaMalloc       *ebpf.Program `ebpf:"uretprobe_cuda_malloc"`
-	UretprobeCudaMemcpy       *ebpf.Program `ebpf:"uretprobe_cuda_memcpy"`
-	UretprobeCudaMemcpyAsync  *ebpf.Program `ebpf:"uretprobe_cuda_memcpy_async"`
-	UretprobeCudaStreamSync   *ebpf.Program `ebpf:"uretprobe_cuda_stream_sync"`
+	UprobeCudaDeviceSync       *ebpf.Program `ebpf:"uprobe_cuda_device_sync"`
+	UprobeCudaFree             *ebpf.Program `ebpf:"uprobe_cuda_free"`
+	UprobeCudaLaunchKernel     *ebpf.Program `ebpf:"uprobe_cuda_launch_kernel"`
+	UprobeCudaMalloc           *ebpf.Program `ebpf:"uprobe_cuda_malloc"`
+	UprobeCudaMallocManaged    *ebpf.Program `ebpf:"uprobe_cuda_malloc_managed"`
+	UprobeCudaMemcpy           *ebpf.Program `ebpf:"uprobe_cuda_memcpy"`
+	UprobeCudaMemcpyAsync      *ebpf.Program `ebpf:"uprobe_cuda_memcpy_async"`
+	UprobeCudaStreamSync       *ebpf.Program `ebpf:"uprobe_cuda_stream_sync"`
+	UretprobeCudaDeviceSync    *ebpf.Program `ebpf:"uretprobe_cuda_device_sync"`
+	UretprobeCudaFree          *ebpf.Program `ebpf:"uretprobe_cuda_free"`
+	UretprobeCudaLaunchKernel  *ebpf.Program `ebpf:"uretprobe_cuda_launch_kernel"`
+	UretprobeCudaMalloc        *ebpf.Program `ebpf:"uretprobe_cuda_malloc"`
+	UretprobeCudaMallocManaged *ebpf.Program `ebpf:"uretprobe_cuda_malloc_managed"`
+	UretprobeCudaMemcpy        *ebpf.Program `ebpf:"uretprobe_cuda_memcpy"`
+	UretprobeCudaMemcpyAsync   *ebpf.Program `ebpf:"uretprobe_cuda_memcpy_async"`
+	UretprobeCudaStreamSync    *ebpf.Program `ebpf:"uretprobe_cuda_stream_sync"`
 }
 
 func (p *cudaTracePrograms) Close() error {
@@ -192,6 +196,7 @@ func (p *cudaTracePrograms) Close() error {
 		p.UprobeCudaFree,
 		p.UprobeCudaLaunchKernel,
 		p.UprobeCudaMalloc,
+		p.UprobeCudaMallocManaged,
 		p.UprobeCudaMemcpy,
 		p.UprobeCudaMemcpyAsync,
 		p.UprobeCudaStreamSync,
@@ -199,6 +204,7 @@ func (p *cudaTracePrograms) Close() error {
 		p.UretprobeCudaFree,
 		p.UretprobeCudaLaunchKernel,
 		p.UretprobeCudaMalloc,
+		p.UretprobeCudaMallocManaged,
 		p.UretprobeCudaMemcpy,
 		p.UretprobeCudaMemcpyAsync,
 		p.UretprobeCudaStreamSync,
