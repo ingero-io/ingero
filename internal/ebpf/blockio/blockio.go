@@ -140,7 +140,7 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 		Op:        e.Hdr.Op,
 		Duration:  time.Duration(e.DurationNs),
 		Args:      [2]uint64{uint64(e.NrSector), e.Sector},
-		GPUID:     e.Dev,
+		GPUID:     0, // dev number not stored; gpu_id is reserved for GPU device index
 		CGroupID:  e.Hdr.CgroupId,
 	}, true
 }

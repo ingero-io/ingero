@@ -69,6 +69,7 @@ record() {
     # Extract test ID (e.g. "T01") from name like "T01: check: GPU detected".
     local tid="${name%%:*}"
     local elapsed=$((SECONDS - _test_start))
+    detail="${detail//|//}"
     TEST_RESULTS+=("${tid}|${name}|${status}|${detail}|${elapsed}")
     if [[ "$status" == "PASS" ]]; then
         echo -e "$(ts)   ${GREEN}[PASS]${NC} $name"
@@ -1590,13 +1591,18 @@ sleep 1
 # Start trace first, then dd, to ensure the trace window captures the I/O.
 sudo ./bin/ingero trace --json --duration 8s > logs/trace-io-test.json 2> logs/trace-io-test.log &
 TRACE_PID=$!
+cleanup_sudo_pids+=("$TRACE_PID")
 sleep 1  # let trace attach probes before generating I/O
 IO_TEST_FILE="$HOME/ingero-io-test.bin"
 dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 oflag=direct 2>/dev/null || \
     dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 oflag=dsync 2>/dev/null || \
     dd if=/dev/zero of="$IO_TEST_FILE" bs=1M count=50 conv=fdatasync 2>/dev/null
 sync  # force any cached writes to hit the block layer
-wait "$TRACE_PID" 2>/dev/null || true
+# Poll instead of wait — TRACE_PID is sudo-spawned, bash wait hangs.
+for _i in $(seq 1 20); do
+    if ! sudo kill -0 "$TRACE_PID" 2>/dev/null; then break; fi
+    sleep 1
+done
 wait "$WL_PID" 2>/dev/null || true
 rm -f "$IO_TEST_FILE"
 IO_COUNT=$(grep -c '"block_read"\|"block_write"\|"block_discard"' logs/trace-io-test.json 2>/dev/null || echo "0")
@@ -1630,16 +1636,17 @@ fi
 
 # T22g: Network socket events — generate sendto/recvfrom with UDP loopback.
 # The net tracer hooks tp/syscalls/sys_enter_sendto and sys_enter_recvfrom.
-# No --pid and NO CUDA workload: testing net tracing in isolation because the
-# single merged event channel has head-of-line blocking — CUDA events at high
-# rates crowd out net events. This test validates the tracer captures events.
+# System-wide trace (no --pid): net BPF PID filter is empty → captures all
+# sendto/recvfrom. NO CUDA workload: avoids event pipeline congestion.
+# Note: --pid rejects non-CUDA PIDs, so we cannot filter to the UDP blaster.
 # UDP loopback guarantees sendto/recvfrom syscalls (HTTP/TCP may use write/read).
 _test_start=$SECONDS
 log "Test 22g: Net socket tracer"
 # Continuous UDP blaster: runs throughout the trace window.
 python3 -c "
-import socket, os, time, signal
-signal.signal(signal.SIGTERM, lambda *a: exit(0))
+import socket, os, time, signal, sys
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+print(f'UDP blaster PID: {os.getpid()}', flush=True)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('127.0.0.1', 0))
 addr = s.getsockname()
@@ -1652,9 +1659,9 @@ while True:
     time.sleep(0.05)
 " &
 NET_BLAST_PID=$!
+cleanup_pids+=("$NET_BLAST_PID")
 sleep 1
-# System-wide trace (no --pid) so net BPF PID filter is empty → captures all sendto/recvfrom.
-# No CUDA workload: avoids event pipeline congestion that starves net events.
+# System-wide trace: net BPF PID filter empty → traces all sendto/recvfrom.
 sudo ./bin/ingero trace --json --duration 8s > logs/trace-net-test.json 2> logs/trace-net-test.log
 kill "$NET_BLAST_PID" 2>/dev/null || true
 wait "$NET_BLAST_PID" 2>/dev/null || true
@@ -1676,7 +1683,15 @@ fi
 # T22h: cgroup_schedstat — verify per-cgroup scheduling stats are populated
 _test_start=$SECONDS
 log "Test 22h: cgroup_schedstat table"
-if [ -n "${DB_PATH:-}" ] 2>/dev/null || DB_PATH="$HOME/.ingero/ingero.db"; then
+# Check both $HOME and /root for the ingero DB (sudo creates at /root/).
+if [ -z "${DB_PATH:-}" ]; then
+    if [ -f "$HOME/.ingero/ingero.db" ]; then
+        DB_PATH="$HOME/.ingero/ingero.db"
+    elif sudo test -f /root/.ingero/ingero.db 2>/dev/null; then
+        DB_PATH="/root/.ingero/ingero.db"
+    fi
+fi
+if [ -n "${DB_PATH:-}" ]; then
     SCHEDSTAT_COUNT=0
     if command -v sqlite3 &>/dev/null; then
         SCHEDSTAT_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM cgroup_schedstat;" 2>/dev/null || \
@@ -1704,6 +1719,48 @@ else
     record "SKIP" "T22h: cgroup_schedstat" "no DB found"
 fi
 
+# T22l: Managed alloc (cudaMallocManaged) — compile and run managed_alloc.cu,
+# verify cudaMallocManaged events appear in trace output.
+_test_start=$SECONDS
+log "Test 22l: Managed alloc (cudaMallocManaged)"
+MANAGED_ALLOC_SRC="tests/workloads/synthetic/managed_alloc.cu"
+MANAGED_ALLOC_BIN="$TEST_TMP/managed_alloc"
+if [[ -f "$MANAGED_ALLOC_SRC" ]] && command -v nvcc &>/dev/null; then
+    if nvcc "$MANAGED_ALLOC_SRC" -o "$MANAGED_ALLOC_BIN" 2>/dev/null; then
+        # Start trace FIRST (background), let probes attach, then run the program.
+        # managed_alloc.cu exits in <1s — launching it before the trace means
+        # the process is already dead by the time probes attach.
+        sudo ./bin/ingero trace --json --duration 8s \
+            > "$TEST_TMP/trace-managed.json" 2> "$TEST_TMP/trace-managed.log" &
+        TRACE_MANAGED_PID=$!
+        cleanup_sudo_pids+=("$TRACE_MANAGED_PID")
+        sleep 2  # let probes attach
+        "$MANAGED_ALLOC_BIN" 2>/dev/null || true
+        sleep 1  # let ring buffer drain
+        sudo kill "$TRACE_MANAGED_PID" 2>/dev/null || true
+        # Poll instead of wait — TRACE_MANAGED_PID is sudo-spawned, bash wait hangs.
+        for _i in $(seq 1 10); do
+            if ! sudo kill -0 "$TRACE_MANAGED_PID" 2>/dev/null; then break; fi
+            sleep 1
+        done
+        MANAGED_COUNT=$(grep -c '"cudaMallocManaged"\|"cuMemAllocManaged"' "$TEST_TMP/trace-managed.json" 2>/dev/null || echo "0")
+        MANAGED_COUNT=$(echo "$MANAGED_COUNT" | head -1)
+        if [[ "$MANAGED_COUNT" -gt 0 ]]; then
+            record "PASS" "T22l: Managed alloc" "$MANAGED_COUNT cudaMallocManaged/cuMemAllocManaged events"
+        else
+            record "WARN" "T22l: Managed alloc" "0 managed alloc events (probes may not match library version)"
+        fi
+    else
+        record "WARN" "T22l: Managed alloc" "nvcc compile failed (CUDA toolkit version mismatch?)"
+    fi
+else
+    if [[ ! -f "$MANAGED_ALLOC_SRC" ]]; then
+        record "SKIP" "T22l: Managed alloc" "managed_alloc.cu not found"
+    else
+        record "SKIP" "T22l: Managed alloc" "nvcc not available"
+    fi
+fi
+
 # T22i: IO→GPU cross-source chain — dd writes + GPU contention + CPU stress → explain with IO layer.
 # IO chain requires CUDA tail anomaly (p99/p50 ≥ 3.0) as anchor. On fast GPUs (A100),
 # 5 GPU workers + stress-ng are needed to create enough contention.
@@ -1718,6 +1775,7 @@ if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
     python3 tests/workloads/pathological/gpu_contention_driver.py \
         --workers 5 --duration 45 --matrix-size 1024 > /dev/null 2>&1 &
     IO_CHAIN_PIDS="$!"
+    cleanup_pids+=("$!")
     sleep 3
 
     # IO stress: continuous dd writes to real block device (NOT /tmp which is often tmpfs).
@@ -1730,6 +1788,7 @@ if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
         sync; rm -f "$IO_FILL_FILE"
     done) &
     IO_CHAIN_PIDS="$IO_CHAIN_PIDS $!"
+    cleanup_pids+=("$!")
 
     # CPU stress: saturate all CPUs to create host scheduling contention.
     # This pushes CUDA tail latency above the 3.0x threshold on fast GPUs.
@@ -1776,6 +1835,7 @@ if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
     python3 tests/workloads/pathological/gpu_contention_driver.py \
         --workers 3 --duration 40 --matrix-size 2048 > /dev/null 2>&1 &
     NET_CHAIN_PIDS="$!"
+    cleanup_pids+=("$!")
     sleep 3
 
     # UDP blaster: continuous sendto/recvfrom throughout the trace window.
@@ -1799,6 +1859,7 @@ while True:
     time.sleep(0.1)  # brief pause to avoid CPU saturation
 " &
     NET_CHAIN_PIDS="$NET_CHAIN_PIDS $!"
+    cleanup_pids+=("$!")
 
     # Trace 25s (no --pid).
     sudo ./bin/ingero trace --db "$NET_CHAIN_DB" --duration 25s > /dev/null 2> logs/trace-net-chain.log || true
@@ -1845,14 +1906,19 @@ if [ -f tests/workloads/pathological/gpu_contention_driver.py ] && command -v st
     sudo ./bin/ingero trace --pid "$WL_PID" --db "$NN_CHAIN_DB" --duration 25s \
         > /dev/null 2> logs/trace-noisy.log &
     TRACE_PID=$!
+    cleanup_sudo_pids+=("$TRACE_PID")
     sleep 2
 
     # CPU stress: ALL cores → steals CPU from GPU workload (different cgroup).
     stress-ng --cpu "$(nproc)" --timeout 20s > /dev/null 2>&1 &
     STRESS_PID=$!
+    cleanup_pids+=("$STRESS_PID")
 
-    # Wait for trace to finish (wait only for known PIDs, not all bg jobs).
-    wait "$TRACE_PID" 2>/dev/null || true
+    # Poll instead of wait — TRACE_PID is sudo-spawned, bash wait hangs.
+    for _i in $(seq 1 30); do
+        if ! sudo kill -0 "$TRACE_PID" 2>/dev/null; then break; fi
+        sleep 1
+    done
     kill "$WL_PID" 2>/dev/null || true
     kill "$STRESS_PID" 2>/dev/null || true
     wait "$WL_PID" "$STRESS_PID" 2>/dev/null || true
@@ -1987,14 +2053,8 @@ echo ""
     echo -e "$REPORT"
 } > logs/test-report.txt
 
-# Generate JSON test report (variables set in Phase 0)
-
-# Write test results to temp file, one line per result
-: > $TEST_TMP/test_results.txt
-for entry in "${TEST_RESULTS[@]}"; do
-    echo "$entry" >> $TEST_TMP/test_results.txt
-done
-
+# Generate final JSON test report (overwrites the pre-MCP snapshot).
+# Build the test list inline to avoid temp file issues.
 SCRIPT_DURATION="$SCRIPT_DURATION" \
   GPU_NAME="$_GPU_NAME" DRIVER_VER="$_DRIVER_VER" KERNEL_VER="$_KERNEL_VER" \
   ARCH="$(uname -m)" PYTORCH_VER="$_PYTORCH_VER" GO_VER="$_GO_VER" \
@@ -2003,23 +2063,22 @@ SCRIPT_DURATION="$SCRIPT_DURATION" \
 import json, sys, os
 from datetime import datetime, timezone
 
-results_file = '$TEST_TMP/test_results.txt'
+# Read test results from stdin (piped from bash array)
 tests = []
-with open(results_file) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split('|', 4)
-        if len(parts) == 5:
-            tid, name, status, detail, dur = parts
-            tests.append({
-                'id': tid.strip(),
-                'name': name.strip(),
-                'status': status.strip(),
-                'detail': detail.strip(),
-                'duration_s': int(dur.strip()),
-            })
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    parts = line.split('|', 4)
+    if len(parts) == 5:
+        tid, name, status, detail, dur = parts
+        tests.append({
+            'id': tid.strip(),
+            'name': name.strip(),
+            'status': status.strip(),
+            'detail': detail.strip(),
+            'duration_s': int(dur.strip()),
+        })
 
 report = {
     'version': '0.8',
@@ -2046,7 +2105,7 @@ report = {
 with open('logs/test-report.json', 'w') as f:
     json.dump(report, f, indent=2)
 print(f'JSON report: logs/test-report.json ({len(tests)} tests)')
-"
+" < <(printf '%s\n' "${TEST_RESULTS[@]}")
 
 echo "$(ts) Report: logs/test-report.txt"
 echo "$(ts) JSON:   logs/test-report.json"

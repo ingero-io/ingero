@@ -80,8 +80,8 @@ func TestParseEventBlockRead(t *testing.T) {
 	if evt.Args[1] != 1024 { // sector
 		t.Errorf("Args[1] (sector) = %d, want 1024", evt.Args[1])
 	}
-	if evt.GPUID != 0x0800 { // dev
-		t.Errorf("GPUID (dev) = %d, want 0x0800", evt.GPUID)
+	if evt.GPUID != 0 { // dev not stored in GPUID — kept zero for semantic clarity
+		t.Errorf("GPUID = %d, want 0", evt.GPUID)
 	}
 	if evt.CGroupID != 99 {
 		t.Errorf("CGroupID = %d, want 99", evt.CGroupID)

@@ -55,7 +55,7 @@ type Server struct {
 func New(s *store.Store) *Server {
 	srv := gomcp.NewServer(&gomcp.Implementation{
 		Name:    "ingero",
-		Version: "0.7.0",
+		Version: "0.8.0",
 		Title:   "Ingero GPU Causal Observability — AI-first analysis",
 	}, nil)
 
@@ -320,7 +320,10 @@ func (s *Server) registerTools() {
 		snap := collector.Snapshot()
 
 		// Query aggregate totals for accurate counts (selective storage).
-		aggTotals, _ := s.store.QueryAggregateTotals(qparams)
+		aggTotals, aggErr := s.store.QueryAggregateTotals(qparams)
+		if aggErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: querying aggregate totals: %v\n", aggErr)
+		}
 		text := formatStatsSnapshot(snap, since, len(evts), tsc, opDescs, &aggTotals)
 
 		return &gomcp.CallToolResult{
@@ -369,9 +372,11 @@ func (s *Server) registerTools() {
 
 		// Fast path: check stored chains first (pre-computed during live trace).
 		// Skip when PID filter is active — stored chains don't have PID info.
+		var chainQueryWarning string
 		if !hasPIDFilter {
 			stored, err := s.store.QueryChains(since)
 			if err != nil {
+				chainQueryWarning = fmt.Sprintf("Warning: stored chain query failed (%v), falling back to replay.", err)
 				fmt.Fprintf(os.Stderr, "warning: querying stored chains: %v\n", err)
 			}
 			if len(stored) > 0 {
@@ -388,9 +393,13 @@ func (s *Server) registerTools() {
 		// On Count() error, refuse replay (fail-safe: avoid loading unknown amount of data).
 		count, countErr := s.store.Count()
 		if countErr != nil || count > 500_000 {
+			msg := fmt.Sprintf("No stored causal chains found. DB has %d events — too large for replay. Use run_sql to query the causal_chains table directly, or use get_trace_stats for aggregate statistics.", count)
+			if chainQueryWarning != "" {
+				msg = chainQueryWarning + " " + msg
+			}
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: fmt.Sprintf("No stored causal chains found. DB has %d events — too large for replay. Use run_sql to query the causal_chains table directly, or use get_trace_stats for aggregate statistics.", count)},
+					&gomcp.TextContent{Text: msg},
 				},
 			}, struct{}{}, nil
 		}
@@ -431,7 +440,10 @@ func (s *Server) registerTools() {
 		corr := correlate.New(correlate.WithMaxAge(0)) // unlimited — replayed events have past timestamps
 
 		// Replay system snapshots for post-hoc causal chain analysis.
-		snapshots, _ := s.store.QuerySnapshots(store.QueryParams{Since: since})
+		snapshots, snapErr := s.store.QuerySnapshots(store.QueryParams{Since: since})
+		if snapErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: querying snapshots: %v\n", snapErr)
+		}
 		if len(snapshots) > 0 {
 			sysCtxs := make([]correlate.SystemContext, len(snapshots))
 			for i, snap := range snapshots {

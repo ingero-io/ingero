@@ -143,6 +143,7 @@ type cgroupStats struct {
 	offCPUDurations []time.Duration // individual sched_switch durations
 	totalOffCPU     time.Duration
 	eventCount      int64
+	firstSeen       time.Time // timestamp of first sched_switch for this cgroup
 }
 
 // CGroupSchedStat is the exported per-cgroup scheduling stats for storage.
@@ -211,11 +212,19 @@ func (e *Engine) RecordCGroupSchedSwitch(cgroupID uint64, duration time.Duration
 	if cgroupID <= 1 || duration <= 0 {
 		return
 	}
+	// Cap at 1s: voluntary sleeps (process blocked on I/O, futex, etc.) produce
+	// multi-second durations that are not CPU contention. Real involuntary
+	// preemption (noisy neighbor stealing CPU) never exceeds ~1s because the
+	// Linux CFS scheduler's default timeslice is much shorter.
+	const maxContention = time.Second
+	if duration > maxContention {
+		duration = maxContention
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cs, ok := e.cgroupOffCPU[cgroupID]
 	if !ok {
-		cs = &cgroupStats{}
+		cs = &cgroupStats{firstSeen: time.Now()}
 		e.cgroupOffCPU[cgroupID] = cs
 	}
 	cs.offCPUDurations = append(cs.offCPUDurations, duration)
@@ -687,9 +696,16 @@ func (e *Engine) buildChain(
 	}
 
 	// Layer 2b: Infrastructure events (I/O, TCP, network).
+	// Only include I/O when it's relevant to the CUDA stall — background
+	// journald/flush noise (50+ ops with sub-ms latency) should not appear
+	// in every chain. Require either significant volume (≥200 ops), total
+	// duration ≥1s, or peak I/O latency ≥1% of the CUDA p99.
+	cudaP99 := time.Duration(op.P99)
 	if infra != nil {
-		// Heavy block I/O concurrent with slow CUDA op.
-		if infra.ioCount > 50 || infra.ioTotalDur > 500*time.Millisecond {
+		ioRelevant := infra.ioCount >= 200 ||
+			infra.ioTotalDur >= time.Second ||
+			(infra.ioMaxLatency > 0 && cudaP99 > 0 && infra.ioMaxLatency >= cudaP99/100)
+		if ioRelevant {
 			// Build detailed breakdown: reads vs writes, throughput, peak latency.
 			detail := fmt.Sprintf("%d I/O ops", infra.ioCount)
 			if infra.ioReadCount > 0 || infra.ioWriteCount > 0 {
@@ -903,6 +919,7 @@ func (e *Engine) SnapshotCGroupSchedStats() []CGroupSchedStat {
 			P99OffCPU:   durationPercentile(cs.offCPUDurations, 0.99),
 			TotalOffCPU: cs.totalOffCPU,
 			EventCount:  cs.eventCount,
+			WindowStart: cs.firstSeen,
 			WindowEnd:   now,
 		})
 	}

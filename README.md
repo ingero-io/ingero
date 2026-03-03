@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.7.0.3**
+**Version: 0.8.0**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -110,16 +110,16 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.7.0`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.8.0`):
 
 ```bash
 # Linux amd64
-VERSION=0.7.0
+VERSION=0.8.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
-VERSION=0.7.0
+VERSION=0.8.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -333,7 +333,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.7.0 (commit: a9dd11d, built: 2026-03-02)
+ingero v0.8.0 (commit: 9adbb11, built: 2026-03-03)
 ```
 
 ## Stack Tracing
@@ -475,52 +475,52 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 
 Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azure). Stack tracing is on by default. GPU-measured overhead: **0.4-1.7%** (within noise).
 
-| GPU | VRAM | Tests | Pass | Fail | Skip | Stack OH | Stack Cov |
+| GPU | VRAM | Tests | Pass | Fail | Warn | Stack OH | Stack Cov |
 |-----|------|-------|------|------|------|----------|-----------|
+| GH200 | 480 GB | 80 | 76 | 0 | 4 | +1.6% | 99.8% |
+| A100 SXM4 | 40 GB | 80 | 76 | 0 | 4 | +0.9% | 99.4% |
+| A10 | 24 GB | 80 | 76 | 0 | 4 | -0.1% | 99.2% |
 | H100 (PCIe / SXM5) | 80 GB | 62 | 62 | 0 | 0 | +1.7% | 99.5% |
-| GH200 | 480 GB | 62 | 62 | 0 | 0 | +1.6% | 99.8% |
-| A100 SXM4 | 40 GB | 62 | 62 | 0 | 0 | +0.9% | 99.4% |
-| A10 | 24 GB | 62 | 62 | 0 | 0 | -0.1% | 99.2% |
 | RTX 4090 | 24 GB | 34 | 34 | 0 | 0 | +0.6% | 99.9% |
 | RTX 3090 | 24 GB | 34 | 34 | 0 | 0 | — | — |
 
-62/62 integration tests PASS on GPUs tested with v0.7. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper). RTX 4090/3090 last tested with v0.6 (34 tests).
+76/80 integration tests PASS (0 FAIL, 4 WARN) on GPUs tested with v0.8. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper).
 
-## What Ingero Addresses Today (v0.7)
+## What Ingero Addresses Today (v0.8)
 
 Ingero addresses 25 of 32 documented GPU problems across training, inference, and AI agent workloads. See the [full problem statement](https://github.com/ingero-io/ingero/blob/main/docs/gpu-problems-statement.md) for sources and competitor analysis.
 
 | # | GPU Problem | Severity | How Ingero Detects It |
 |---|-------------|----------|----------------------|
-| 1 | NCCL hangs & distributed training deadlocks | CRITICAL | `sched_switch` shows blocked rank + CUDA sync timing (single-node). v0.8: TCP retransmit tracing identifies network-caused hangs |
-| 2 | GPU underutilization / data pipeline starvation | CRITICAL | Host scheduler + `cudaStreamSync` + `cudaMemcpy` pipeline bubble diagnosis. v0.8: Block I/O shows DataLoader disk bottleneck |
-| 3 | CUDA OOM & memory fragmentation | CRITICAL | `cudaMalloc`/`cuMemAlloc` allocation pattern tracing. v0.8: `cudaMallocManaged` adds managed-memory over-subscription detection |
+| 1 | NCCL hangs & distributed training deadlocks | CRITICAL | `sched_switch` shows blocked rank + CUDA sync timing. TCP retransmit tracing identifies network-caused hangs **(v0.8)** |
+| 2 | GPU underutilization / data pipeline starvation | CRITICAL | Host scheduler + `cudaStreamSync` + `cudaMemcpy` pipeline bubble diagnosis. Block I/O shows DataLoader disk bottleneck **(v0.8)** |
+| 3 | CUDA OOM & memory fragmentation | CRITICAL | `cudaMalloc`/`cuMemAlloc` allocation pattern tracing. `cudaMallocManaged` adds managed-memory over-subscription detection **(v0.8)** |
 | 4 | Silent data corruption (SDC) | CRITICAL | Anomalous kernel timing as indirect signal (limited) |
 | 5 | Inference cost explosion (multi-step agents) | CRITICAL | CUDA API burst/idle patterns per agent session |
-| 6 | KV cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption. v0.8: managed-memory page fault detection |
+| 6 | KV cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption. Managed-memory page fault detection **(v0.8)** |
 | 7 | GPU hardware failures at scale | HIGH | `cudaMemcpy` baseline drift, `sched_switch` frequency anomalies |
 | 8 | CPU bottleneck in GPU serving | HIGH | `sched_switch` on inference process + `cudaStreamSync` idle gaps |
-| 9 | GPU idle waste during agent tool execution | HIGH | CUDA API silence periods correlated with host process activity. v0.8: TCP tracing shows "GPU idle during 2s HTTP tool call" |
+| 9 | GPU idle waste during agent tool execution | HIGH | CUDA API silence periods correlated with host process activity. TCP tracing shows "GPU idle during 2s HTTP tool call" **(v0.8)** |
 | 10 | GPU memory leaks in long-running services | HIGH | `cudaMalloc`/`cudaFree` imbalance tracking over time, per-container via cgroup |
 | 11 | Mixed precision (AMP) instability | HIGH | Anomalous kernel timing (skipped updates = fast sync) |
-| 12 | Goodput loss (training efficiency gap) | HIGH | Scheduler preemption, memcpy latency, pipeline bubbles. v0.8: Block I/O shows checkpoint write + data read overhead |
+| 12 | Goodput loss (training efficiency gap) | HIGH | Scheduler preemption, memcpy latency, pipeline bubbles. Block I/O shows checkpoint write + data read overhead **(v0.8)** |
 | 13 | GPU scheduling & orchestration failures (K8s) | HIGH | Per-cgroup `sched_switch` latency + pod/namespace metadata. Auto-discovers `nvidia.com/gpu` pods **(v0.7)** |
-| 14 | Model swapping latency (multi-model agents) | HIGH | `cudaMalloc` + `cudaMemcpy` patterns during model load. v0.8: Block I/O shows disk→CPU transfer time |
+| 14 | Model swapping latency (multi-model agents) | HIGH | `cudaMalloc` + `cudaMemcpy` patterns during model load. Block I/O shows disk→CPU transfer time **(v0.8)** |
 | 15 | CUDA device-side asserts & illegal memory access | MEDIUM | CUDA API call sequence + stack traces before crash |
 | 16 | NVIDIA driver / CUDA version incompatibility | MEDIUM | Uprobe attachment failure = library/driver mismatch signal |
 | 17 | Thermal throttling & power limit throttling | MEDIUM | Kernel duration trending over time |
-| 18 | Noisy neighbor / multi-tenant GPU interference | MEDIUM | Per-cgroup `sched_switch` latency + CUDA API latency correlation identifies which co-located workload causes degradation **(v0.7)** |
-| 19 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing. v0.8: Block I/O completes disk→CPU→GPU pipeline |
-| 20 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync. v0.8: TCP retransmit tracing on NCCL ports |
-| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown (`explain --per-process`) — shows which process is hogging GPU time |
-| 22 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync`. v0.8: Block I/O shows actual write latency + NFS timeouts |
-| 23 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration. v0.8: `cudaMallocManaged` page migration + Block I/O shows NVMe-PCIe contention |
+| 18 | Noisy neighbor / multi-tenant GPU interference | MEDIUM | Per-cgroup `sched_switch` latency + CUDA API latency correlation. Noisy neighbor detection via cgroup_schedstat **(v0.7+v0.8)** |
+| 19 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing. Block I/O completes disk→CPU→GPU pipeline **(v0.8)** |
+| 20 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync. TCP retransmit tracing on NCCL ports **(v0.8)** |
+| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown (`explain --per-process`) — shows which process is hogging GPU time **(v0.8)** |
+| 22 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync`. Block I/O shows actual write latency + NFS timeouts **(v0.8)** |
+| 23 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration. `cudaMallocManaged` page migration + Block I/O shows NVMe-PCIe contention **(v0.8)** |
 | 24 | Loss spikes (non-AMP) | LOW-MED | System event correlation with loss timing |
 | 25 | Triton Inference Server multi-GPU bugs | LOW-MED | CUDA API tracing on Triton processes |
 
-**v0.7 adds:** K8s-native detection — per-cgroup tracing with container ID resolution and pod metadata enrichment enables #13 and #18 above.
+**v0.7 added:** K8s-native detection — per-cgroup tracing with container ID resolution and pod metadata enrichment (#13, #18).
 
-**v0.8 will add three observability pillars:** (1) `cudaMallocManaged`/`cuMemAllocManaged` for Unified Memory page fault causal chains (#3, #6, #23). (2) Block I/O tracing (`block_rq_issue`/`block_rq_complete`) completes the I/O+CPU+CUDA chain — "DataLoader slow because 200ms NFS read" (#2, #12, #14, #19, #22, #23). (3) TCP retransmit + connection tracing for NCCL hang diagnosis and agent tool call attribution (#1, #9, #20). Note: RDMA/InfiniBand (used by large GPU clusters for NCCL) bypasses TCP — eBPF visibility into RDMA is a v0.9 investigation.
+**v0.8 added three observability pillars:** (1) `cudaMallocManaged`/`cuMemAllocManaged` for Unified Memory page fault causal chains (#3, #6, #23). (2) Block I/O tracing (`block_rq_issue`/`block_rq_complete`) completes the I/O+CPU+CUDA chain — "DataLoader slow because 200ms NFS read" (#2, #12, #14, #19, #22, #23). (3) TCP retransmit + network socket tracing for NCCL hang diagnosis and agent tool call attribution (#1, #9, #20). Note: RDMA/InfiniBand (used by large GPU clusters for NCCL) bypasses TCP — eBPF visibility into RDMA is a future investigation.
 
 ## Roadmap
 
@@ -533,16 +533,17 @@ Ingero addresses 25 of 32 documented GPU problems across training, inference, an
 - Deadband snapshot filter (`--deadband`, `--heartbeat`)
 - 62 integration tests + 28 GPU investigations validated across A10, A100, GH200
 
-**v0.8 — K8s Insights + I/O Tracing:**
-- HTTP/gRPC inference serving tracing (vLLM, Triton)
-- Pod lifecycle correlation (eviction, OOM-kill, restart)
-- `cudaMallocManaged` / `cuMemAllocManaged` tracing (Unified Memory page migration latency diagnosis)
+**v0.8 — K8s Insights + Deep Infrastructure Tracing** (shipped 2026-03-03):
 - Block I/O tracing (`block_rq_issue`/`block_rq_complete`) — completes I/O+CPU+CUDA causal chains
-- TCP retransmit + connection tracing — NCCL hang diagnosis, tool call attribution
-- Noisy neighbor detection (per-cgroup scheduler latency)
-- Per-process CUDA API breakdown (`explain --per-process`) for RAG pipeline contention diagnosis
-- `process_name` field in JSON output
-- Test hardening (schema validation, investigation coverage, coverage gaps)
+- TCP retransmit tracing (`tcp_retransmit_skb`) — NCCL hang diagnosis
+- Network socket I/O tracing (`sendto`/`recvfrom`) — tool call attribution
+- `cudaMallocManaged` / `cuMemAllocManaged` tracing (Unified Memory)
+- Cross-source causal chains (IO→GPU, TCP→GPU, Net→GPU, compound) — 4-layer chain model
+- Pod lifecycle correlation (eviction, OOM-kill, restart → GPU timeline)
+- Noisy neighbor detection (per-cgroup scheduler latency via `cgroup_schedstat`)
+- Per-process CUDA API breakdown (`explain --per-process`) for RAG pipeline contention
+- `process_name` field in streaming JSON output
+- 80 integration tests (76 PASS, 4 WARN) + 28 ML Eng investigations validated across A10, A100, GH200
 
 ## FAQ
 

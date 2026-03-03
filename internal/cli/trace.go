@@ -324,10 +324,15 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			netTracer = nt
 			netProbeCount = 4
 			debugf("net tracer: %d tracepoints attached", netProbeCount)
-			// Seed target PIDs into net PID filter.
-			for _, pid := range targetPIDs {
-				if pid > 0 {
-					nt.SetTargetPID(uint32(pid))
+			// Seed net PID filter ONLY when --pid is explicit. Auto-discovered
+			// PIDs are CUDA processes — seeding them blocks all non-CUDA network
+			// traffic, producing zero net events in practice. With an empty map
+			// the BPF filter traces all PIDs (net_pid_map_empty() → true).
+			if len(tracePIDs) > 0 {
+				for _, pid := range targetPIDs {
+					if pid > 0 {
+						nt.SetTargetPID(uint32(pid))
+					}
 				}
 			}
 		}
@@ -558,13 +563,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Correlator PID: single PID for single-process, 0 for multi/all (aggregate).
 	corrPID := singlePIDOrZero(targetPIDs)
 	trackPID := func(pid uint32) {
-		if hostTracer == nil || pid == 0 {
+		if pid == 0 {
 			return
 		}
 		if !trackedPIDs[pid] {
 			trackedPIDs[pid] = true
-			hostTracer.SetTargetPID(pid)
-			debugf("host tracer: dynamically added PID %d", pid)
+			if hostTracer != nil {
+				hostTracer.SetTargetPID(pid)
+				debugf("host tracer: dynamically added PID %d", pid)
+			}
+			if netTracer != nil && len(tracePIDs) > 0 {
+				netTracer.SetTargetPID(pid)
+				debugf("net tracer: dynamically added PID %d", pid)
+			}
 		}
 	}
 
@@ -1279,6 +1290,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 							P99OffCPU:   int64(cs.P99OffCPU),
 							TotalOffCPU: int64(cs.TotalOffCPU),
 							EventCount:  cs.EventCount,
+							WindowStart: cs.WindowStart.UnixNano(),
 							WindowEnd:   now.UnixNano(),
 						}
 					}
