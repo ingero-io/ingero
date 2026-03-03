@@ -79,8 +79,8 @@ fi
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Navigate to mono-repo root (3 levels up from agent/scripts/azure/).
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Navigate to repo root (2 levels up from scripts/azure/).
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STATE_FILE="$PROJECT_DIR/.azure-vm.json"
 ENV_FILE="$PROJECT_DIR/.env"
 

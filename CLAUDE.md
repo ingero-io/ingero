@@ -66,6 +66,16 @@ A bad test is worse than no test. Every test must justify its existence.
 * **Delete tests that test nothing.** If a test only checks that a function "doesn't panic" or returns `nil` error on the happy path with no other assertions, remove it. That's false confidence.
 * **Maintain the test matrix.** `docs/test_matrix.md` is the canonical registry of all unit tests. When adding or removing tests, update this file with the test number, description, and file path. Keep it in sync with the codebase.
 
+## Internal Contributors
+
+Ingero team members: full project context (architecture, dev environment, GPU workflow, teaching mode) is in the `ingero-io/internal` repo. Symlink it for Claude Code:
+
+```bash
+mkdir -p .claude && ln -s ../../internal/CLAUDE.md .claude/CLAUDE.md
+```
+
+Related private repos: `ingero-io/ingero-ee` (enterprise extensions), `ingero-io/internal` (strategy, docs, full CLAUDE.md).
+
 ## Progressive Context
 
 Do not guess how the system works. Read the relevant source files when needed. All commits require DCO sign-off (`git commit -s`) — see `CONTRIBUTING.md`.

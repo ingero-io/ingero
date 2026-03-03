@@ -4,8 +4,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 3 levels up from scripts/lambdalabs/ to reach mono-repo root.
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# 2 levels up from scripts/lambdalabs/ to reach repo root.
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STATE_FILE="$PROJECT_DIR/.lambdalabs-vm.json"
 
 if [[ ! -f "$STATE_FILE" ]]; then

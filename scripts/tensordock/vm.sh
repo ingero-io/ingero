@@ -84,8 +84,8 @@ IMAGES_FALLBACK=("ubuntu2404_ml_pytorch" "ubuntu2404_ml_everything" "ubuntu2404"
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Navigate to mono-repo root (3 levels up from agent/scripts/tensordock/).
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Navigate to repo root (2 levels up from scripts/tensordock/).
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STATE_FILE="$PROJECT_DIR/.tensordock-vm.json"
 ENV_FILE="$PROJECT_DIR/.env"
 

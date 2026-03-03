@@ -30,12 +30,16 @@ Thumbs.db
 *.pem
 *.key
 
-# VM state (created at repo root, but exclude here too for standalone clones)
+# VM state
 .tensordock-vm.json
 .lambdalabs-vm.json
+.azure-vm.json
 
 # Logs (session logs, test output)
 /logs/
+
+# Claude Code (local-only project context)
+.claude/
 
 # Test artifacts
 coverage.out

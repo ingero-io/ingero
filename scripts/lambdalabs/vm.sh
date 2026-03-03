@@ -81,8 +81,8 @@ PREFERRED_REGIONS=("us-east-1" "us-west-1" "us-east-2" "us-south-1" "us-midwest-
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Navigate to mono-repo root (3 levels up from agent/scripts/lambdalabs/).
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Navigate to repo root (2 levels up from scripts/lambdalabs/).
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STATE_FILE="$PROJECT_DIR/.lambdalabs-vm.json"
 ENV_FILE="$PROJECT_DIR/.env"
 

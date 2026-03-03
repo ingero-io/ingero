@@ -1,8 +1,7 @@
 .PHONY: all build generate clean test test-ci lint install uninstall wsl-setup gpu-deploy gpu-start gpu-stop gpu-destroy gpu-status gpu-ssh gpu-info gpu-validate gpu-logs lambda-deploy lambda-destroy lambda-status lambda-ssh lambda-info lambda-sync lambda-test lambda-validate lambda-logs azure-deploy azure-start azure-stop azure-destroy azure-status azure-ssh azure-info azure-sync azure-test azure-validate azure-logs fmt dev gpu-k3s-setup gpu-k3s-test lambda-k3s-setup lambda-k3s-test
 
 # Variables
-# Mono-repo root is one level above agent/.
-REPO_ROOT := $(shell cd .. && pwd)
+REPO_ROOT := $(shell pwd)
 BINARY := bin/ingero
 GOFLAGS := -tags linux
 BPF_CLANG := clang
