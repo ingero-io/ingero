@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-Last updated: 2026-03-02 (v0.8-dev, 215 total tests)
+Last updated: 2026-03-03 (v0.8.0, 215 total tests)
 
 ## Summary
 

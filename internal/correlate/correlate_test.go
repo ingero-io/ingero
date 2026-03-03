@@ -643,14 +643,15 @@ func TestCausalChainBlockIOWithoutGPUAnomaly(t *testing.T) {
 func TestCausalChainBlockIOBelowThreshold(t *testing.T) {
 	eng := New()
 
-	// Only 10 I/O events (below threshold of 50), short duration (below 500ms total).
+	// 10 I/O events with sub-ms latency: not relevant to a 100ms CUDA p99.
+	// Filters: count < 200, total 1ms < 1s, peak 100us < 1% of CUDA p99 (1ms).
 	for i := 0; i < 10; i++ {
-		eng.RecordEvent(makeIOEvt(events.IORead, 1*time.Millisecond, 8))
+		eng.RecordEvent(makeIOEvt(events.IORead, 100*time.Microsecond, 8))
 	}
 
 	chains := eng.SnapshotCausalChains(anomalousCUDAOps(), 0)
 	if chainHasLayer(chains, "IO") {
-		t.Error("should not produce IO chain below threshold (10 events, 10ms total)")
+		t.Error("should not produce IO chain when I/O is irrelevant to CUDA tail latency")
 	}
 }
 
