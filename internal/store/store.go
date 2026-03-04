@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -1441,6 +1442,47 @@ func (s *Store) Close() error {
 		chownForSudoUser(s.dbPath + "-shm")
 	}
 
+	return err
+}
+
+// Compact reclaims wasted space at shutdown. Runs WAL checkpoint to merge
+// the write-ahead log, then VACUUM if >20% of pages are free. The final
+// checkpoint merges the VACUUM result into the main file. Safe to call
+// after all writes are done (WaitDone + StopSession completed).
+func (s *Store) Compact() error {
+	if s.dbPath == "" || s.dbPath == ":memory:" {
+		return nil
+	}
+
+	// Merge WAL into main DB file — always fast.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	// Check free page ratio.
+	var pageCount, freeCount int64
+	s.db.QueryRow("PRAGMA page_count").Scan(&pageCount)
+	s.db.QueryRow("PRAGMA freelist_count").Scan(&freeCount)
+
+	if pageCount == 0 || freeCount == 0 {
+		return nil
+	}
+
+	freeRatio := float64(freeCount) / float64(pageCount)
+	if freeRatio < 0.20 {
+		return nil // less than 20% free — not worth it
+	}
+
+	log.Printf("compacting database: %d pages (%d free, %.0f%%)", pageCount, freeCount, freeRatio*100)
+
+	// VACUUM rebuilds the entire file, reclaiming all free pages. This works
+	// even when incremental_vacuum only partially reclaims (scattered pages).
+	// Runs through a single pooled connection — fine for shutdown.
+	if _, err := s.db.Exec("VACUUM"); err != nil {
+		return err
+	}
+
+	// Merge any WAL entries created by VACUUM into the main file so the
+	// on-disk size reflects the compaction.
+	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
 }
 

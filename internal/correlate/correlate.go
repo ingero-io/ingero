@@ -42,6 +42,18 @@ const DefaultSchedSwitchThreshold = 5
 // A ratio > 3 means the tail latency is anomalously high.
 const DefaultTailRatio = 3.0
 
+// DefaultThroughputDropRatio is the current/peak rate below which a
+// throughput-drop chain is emitted. 0.6 means >40% drop from peak.
+const DefaultThroughputDropRatio = 0.6
+
+// minThroughputPeak is the minimum peak ops/s before rate-based detection
+// kicks in. Below this, event rates are too noisy for meaningful analysis.
+const minThroughputPeak = 10.0
+
+// minBaselineSnapshots is the number of snapshots needed before throughput-
+// drop detection activates. This ensures the peak rate is a real baseline.
+const minBaselineSnapshots = 5
+
 // Correlation describes a detected relationship between host events and
 // CUDA latency anomalies.
 type Correlation struct {
@@ -156,6 +168,12 @@ type CGroupSchedStat struct {
 	WindowEnd    time.Time
 }
 
+// opKey identifies a unique operation by source and op code.
+type opKey struct {
+	source events.Source
+	op     uint8
+}
+
 // Engine performs cross-layer correlation between host events and CUDA stats.
 type Engine struct {
 	mu         sync.RWMutex
@@ -166,6 +184,13 @@ type Engine struct {
 	maxAge     time.Duration
 	sysCtx     *SystemContext // latest system context, nil if not available
 	chainSeq   int           // sequence counter for chain IDs
+
+	// Throughput-drop detection: track event rates across snapshots.
+	latestTime   time.Time       // latest event timestamp (from AdvanceClock)
+	prevOpCounts map[opKey]int64 // op counts at previous snapshot
+	prevSnapTime time.Time       // event-time of previous snapshot
+	peakRates    map[opKey]float64 // peak ops/sec observed per op
+	snapCount    int             // total snapshots taken
 
 	// Per-cgroup off-CPU tracking for noisy neighbor detection.
 	// Keyed by cgroup_id, tracks sched_switch durations per cgroup.
@@ -178,6 +203,8 @@ type Engine struct {
 func New(opts ...Option) *Engine {
 	e := &Engine{
 		maxAge:        DefaultMaxAge,
+		prevOpCounts:  make(map[opKey]int64),
+		peakRates:     make(map[opKey]float64),
 		cgroupOffCPU:  make(map[uint64]*cgroupStats),
 		targetCGroups: make(map[uint64]bool),
 	}
@@ -200,6 +227,18 @@ func (e *Engine) RecordHost(evt events.Event) {
 
 	e.hostWindow = append(e.hostWindow, evt)
 	e.prune()
+}
+
+// AdvanceClock updates the engine's notion of "current time" from the event
+// stream. In live mode, call with time.Now(). In replay mode, call with
+// evt.Timestamp. Used for throughput-drop rate calculations where wall-clock
+// is meaningless during replay.
+func (e *Engine) AdvanceClock(t time.Time) {
+	e.mu.Lock()
+	if t.After(e.latestTime) {
+		e.latestTime = t
+	}
+	e.mu.Unlock()
 }
 
 // RecordCGroupSchedSwitch tracks per-cgroup off-CPU stats for noisy neighbor
@@ -522,6 +561,113 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 			chains = append(chains, *chain)
 		}
 	}
+
+	// --- Throughput-drop detection ---
+	// For CUDA/Driver ops that didn't trigger the tail-ratio gate, check if
+	// their event rate dropped significantly from the observed peak. This
+	// catches contention on fast GPUs where per-call latency stays low but
+	// throughput tanks.
+	now := e.latestTime
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	// Compute current rates and update peak rates (always, even during baseline).
+	// opRates maps each op to its current rate this window.
+	opRates := make(map[opKey]float64)
+	if !e.prevSnapTime.IsZero() {
+		elapsed := now.Sub(e.prevSnapTime).Seconds()
+		if elapsed >= 0.5 {
+			for _, op := range cudaOps {
+				if op.Source != events.SourceCUDA && op.Source != events.SourceDriver {
+					continue
+				}
+				key := opKey{op.Source, op.OpCode}
+				prevCount, ok := e.prevOpCounts[key]
+				if !ok {
+					continue
+				}
+				delta := op.Count - prevCount
+				if delta < 10 {
+					continue
+				}
+				rate := float64(delta) / elapsed
+				opRates[key] = rate
+				if rate > e.peakRates[key] {
+					e.peakRates[key] = rate
+				}
+			}
+		}
+	}
+
+	// Only detect drops after enough baseline snapshots to establish a real peak.
+	if e.snapCount >= minBaselineSnapshots && len(opRates) > 0 {
+		// Collect ops that already have tail-ratio chains (skip them).
+		tailChainOps := make(map[opKey]bool)
+		for _, ch := range chains {
+			if len(ch.Timeline) > 0 {
+				last := ch.Timeline[len(ch.Timeline)-1]
+				if last.Layer == "CUDA" || last.Layer == "DRIVER" {
+					for _, op := range cudaOps {
+						if op.Op == last.Op {
+							tailChainOps[opKey{op.Source, op.OpCode}] = true
+						}
+					}
+				}
+			}
+		}
+
+		for _, op := range cudaOps {
+			if op.Source != events.SourceCUDA && op.Source != events.SourceDriver {
+				continue
+			}
+			key := opKey{op.Source, op.OpCode}
+			if tailChainOps[key] {
+				continue // already has a tail-ratio chain
+			}
+			currentRate, ok := opRates[key]
+			if !ok {
+				continue
+			}
+
+			peak := e.peakRates[key]
+			if peak < minThroughputPeak {
+				continue // rate too low to be meaningful
+			}
+			if currentRate < 1.0 {
+				continue // workload stopped — not a real drop
+			}
+
+			ratio := currentRate / peak
+			if ratio >= DefaultThroughputDropRatio {
+				continue // drop < 40% — not significant
+			}
+
+			// Require corroborating host/infra evidence.
+			hasEvidence := schedSwitchCount >= DefaultSchedSwitchThreshold ||
+				infraCtx.ioCount >= 50 ||
+				infraCtx.tcpRetransmitCount > 5
+
+			if !hasEvidence {
+				continue
+			}
+
+			chain := e.buildThroughputDropChain(op, peak, currentRate,
+				sysCtx, schedSwitchCount, totalOffCPU, infraCtx)
+			if chain != nil {
+				chains = append(chains, *chain)
+			}
+		}
+	}
+
+	// Update throughput tracking state for next snapshot.
+	e.prevOpCounts = make(map[opKey]int64)
+	for _, op := range cudaOps {
+		key := opKey{op.Source, op.OpCode}
+		e.prevOpCounts[key] = op.Count
+	}
+	e.prevSnapTime = now
+	e.snapCount++
 
 	// OOM always produces a HIGH chain.
 	if oomCount > 0 {
@@ -980,6 +1126,116 @@ func buildExplanation(op stats.OpStats, tailRatio float64, causes []string, sysC
 	return explanation
 }
 
+// buildThroughputDropChain creates a chain for a CUDA op whose event rate
+// dropped significantly from its peak while host evidence confirms resource
+// contention. This complements the tail-ratio gate for fast GPUs where
+// per-call latency stays low but aggregate throughput drops.
+func (e *Engine) buildThroughputDropChain(
+	op stats.OpStats,
+	peakRate, currentRate float64,
+	sysCtx *SystemContext,
+	schedSwitchCount int,
+	totalOffCPU time.Duration,
+	infra *infraContext,
+) *CausalChain {
+	dropPct := (1.0 - currentRate/peakRate) * 100
+	var timeline []ChainEvent
+	var causes []string
+	var recommendations []string
+	severity := "MEDIUM"
+	if dropPct > 60 {
+		severity = "HIGH"
+	}
+
+	// Layer 1: System context (same pattern as buildChain).
+	if sysCtx != nil {
+		if sysCtx.CPUPercent > 90 {
+			timeline = append(timeline, ChainEvent{
+				Layer: "SYSTEM", Op: "cpu",
+				Detail: fmt.Sprintf("CPU %.0f%%", sysCtx.CPUPercent),
+			})
+			causes = append(causes, "high CPU utilization")
+			severity = "HIGH"
+		}
+		if sysCtx.MemUsedPct > 95 {
+			timeline = append(timeline, ChainEvent{
+				Layer: "SYSTEM", Op: "memory",
+				Detail: fmt.Sprintf("Memory %.0f%% used (%d MB available)", sysCtx.MemUsedPct, sysCtx.MemAvailMB),
+			})
+			causes = append(causes, "memory pressure")
+		}
+	}
+
+	// Layer 2: Host evidence.
+	if schedSwitchCount >= DefaultSchedSwitchThreshold {
+		timeline = append(timeline, ChainEvent{
+			Layer: "HOST", Op: "sched_switch",
+			Detail:   fmt.Sprintf("%d context switches (%s off-CPU)", schedSwitchCount, totalOffCPU.Round(time.Millisecond)),
+			Duration: totalOffCPU,
+		})
+		causes = append(causes, fmt.Sprintf("%d sched_switch events", schedSwitchCount))
+		recommendations = append(recommendations,
+			"Pin training process to dedicated cores with taskset",
+			"Add nice -n 19 to background jobs (logrotate, cron)",
+		)
+	}
+	if infra != nil && infra.ioCount >= 50 {
+		timeline = append(timeline, ChainEvent{
+			Layer: "INFRA", Op: "block_io",
+			Detail: fmt.Sprintf("%d I/O ops (%s total)", infra.ioCount, infra.ioTotalDur.Round(time.Millisecond)),
+		})
+		causes = append(causes, fmt.Sprintf("%d block I/O operations", infra.ioCount))
+	}
+	if infra != nil && infra.tcpRetransmitCount > 5 {
+		timeline = append(timeline, ChainEvent{
+			Layer: "NET", Op: "tcp_retransmit",
+			Detail: fmt.Sprintf("%d retransmits", infra.tcpRetransmitCount),
+		})
+		causes = append(causes, fmt.Sprintf("%d TCP retransmits", infra.tcpRetransmitCount))
+		recommendations = append(recommendations, "Check network health: switch errors, NIC stats (ethtool -S), MTU mismatches")
+	}
+
+	if len(causes) == 0 {
+		return nil
+	}
+
+	// Layer 3: The affected CUDA/Driver op (throughput drop).
+	layer := "CUDA"
+	if op.Source == events.SourceDriver {
+		layer = "DRIVER"
+	}
+	timeline = append(timeline, ChainEvent{
+		Layer:  layer,
+		Op:     op.Op,
+		Detail: fmt.Sprintf("throughput dropped %.0f%% (%.0f → %.0f ops/s)", dropPct, peakRate, currentRate),
+	})
+
+	e.chainSeq++
+	summary := fmt.Sprintf("%s throughput dropped %.0f%% — %s", op.Op, dropPct, strings.Join(causes, " + "))
+
+	return &CausalChain{
+		ID:              fmt.Sprintf("chain-%03d", e.chainSeq),
+		Severity:        severity,
+		Summary:         summary,
+		RootCause:       strings.Join(causes, " + "),
+		Timeline:        timeline,
+		Explanation:     e.buildThroughputExplanation(op, peakRate, currentRate, dropPct, causes, sysCtx),
+		Recommendations: dedup(recommendations),
+	}
+}
+
+func (e *Engine) buildThroughputExplanation(op stats.OpStats, peak, current, dropPct float64, causes []string, sysCtx *SystemContext) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s throughput dropped %.0f%% from %.0f to %.0f ops/s. ", op.Op, dropPct, peak, current)
+	fmt.Fprintf(&b, "Per-call latency (p50=%v, p99=%v) remained low, but aggregate throughput declined due to %s. ",
+		op.P50, op.P99, strings.Join(causes, " and "))
+	if sysCtx != nil && sysCtx.CPUPercent > 90 {
+		fmt.Fprintf(&b, "The system CPU is at %.0f%%, causing the host-side CUDA dispatch path to be delayed between calls. ", sysCtx.CPUPercent)
+	}
+	fmt.Fprintf(&b, "This pattern is typical on fast GPUs where individual calls complete quickly but the CPU cannot dispatch them fast enough under contention.")
+	return b.String()
+}
+
 // severityRank maps severity strings to numeric rank for comparison.
 // Higher rank = more severe.
 func severityRank(s string) int {
@@ -1039,6 +1295,7 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 	for _, evt := range evts {
 		collector.Record(evt)
 		globalCollector.Record(evt)
+		corr.AdvanceClock(evt.Timestamp)
 		switch evt.Source {
 		case events.SourceHost:
 			corr.RecordHost(evt)

@@ -1584,3 +1584,313 @@ func TestNoisyNeighborWithoutPreFilter(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Throughput-Drop Chain Tests
+//
+// The tail-ratio gate (p99/p50 > 3x) misses contention on fast GPUs where
+// individual CUDA calls complete in microseconds regardless of load. The
+// throughput-drop detector instead tracks ops/sec across snapshots and fires
+// when the rate drops >40% from peak with corroborating host evidence.
+// ---------------------------------------------------------------------------
+
+// testSnapshot describes one time-window for throughput-drop testing.
+type testSnapshot struct {
+	t        time.Time
+	cudaOps  []stats.OpStats
+	hostEvts []events.Event
+}
+
+// runSnapshots feeds a sequence of snapshots through the engine, returning
+// all chains from the final snapshot.
+func runSnapshots(t *testing.T, snapshots []testSnapshot) []CausalChain {
+	t.Helper()
+	eng := New(WithMaxAge(0))
+	var chains []CausalChain
+	for _, snap := range snapshots {
+		for _, evt := range snap.hostEvts {
+			eng.RecordHost(evt)
+		}
+		eng.AdvanceClock(snap.t)
+		chains = eng.SnapshotCausalChains(snap.cudaOps, 0)
+	}
+	return chains
+}
+
+// makeSchedSwitchEvts creates n sched_switch events with the given timestamp.
+func makeSchedSwitchEvts(n int, ts time.Time) []events.Event {
+	evts := make([]events.Event, n)
+	for i := range evts {
+		evts[i] = events.Event{
+			Timestamp: ts,
+			PID:       1234,
+			TID:       1234,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostSchedSwitch),
+			Duration:  2 * time.Millisecond,
+			Args:      [2]uint64{0, 1234},
+		}
+	}
+	return evts
+}
+
+// cuLaunchOps returns a CUDA op stat with healthy tail (p99≈p50) at the given count.
+// This simulates a fast GPU where per-call latency is always low.
+func cuLaunchOps(count int64) []stats.OpStats {
+	return []stats.OpStats{
+		{
+			Op:     "cuLaunchKernel",
+			OpCode: uint8(events.CUDALaunchKernel),
+			Source: events.SourceCUDA,
+			Count:  count,
+			P50:    15 * time.Microsecond,
+			P99:    25 * time.Microsecond, // ratio = 1.7x, below 3x threshold
+		},
+	}
+}
+
+func TestThroughputDropWithSchedSwitch(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// 7 snapshots at 1-second intervals: first 5 build baseline (~100 ops/s),
+	// then 2 with half the rate (~50 ops/s) + sched_switch evidence.
+	snapshots := make([]testSnapshot, 7)
+	for i := 0; i < 5; i++ {
+		snapshots[i] = testSnapshot{
+			t:       base.Add(time.Duration(i) * time.Second),
+			cudaOps: cuLaunchOps(int64((i + 1) * 100)), // cumulative: 100, 200, 300, 400, 500
+		}
+	}
+	// Snapshots 5-6: rate drops to ~50/s (was ~100/s) with host contention.
+	snapshots[5] = testSnapshot{
+		t:        base.Add(5 * time.Second),
+		cudaOps:  cuLaunchOps(550), // delta=50 in 1s → 50/s (peak was 100/s)
+		hostEvts: makeSchedSwitchEvts(10, base.Add(5*time.Second)),
+	}
+	snapshots[6] = testSnapshot{
+		t:        base.Add(6 * time.Second),
+		cudaOps:  cuLaunchOps(600), // delta=50 in 1s → 50/s
+		hostEvts: makeSchedSwitchEvts(10, base.Add(6*time.Second)),
+	}
+
+	chains := runSnapshots(t, snapshots)
+
+	found := false
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") {
+			found = true
+			if !strings.Contains(ch.Summary, "cuLaunchKernel") {
+				t.Errorf("expected cuLaunchKernel in summary, got %q", ch.Summary)
+			}
+			// Verify HOST layer present.
+			hasHost := false
+			hasCUDA := false
+			for _, evt := range ch.Timeline {
+				if evt.Layer == "HOST" {
+					hasHost = true
+				}
+				if evt.Layer == "CUDA" && strings.Contains(evt.Detail, "throughput") {
+					hasCUDA = true
+				}
+			}
+			if !hasHost {
+				t.Error("expected HOST layer in throughput-drop chain")
+			}
+			if !hasCUDA {
+				t.Error("expected CUDA layer with throughput detail")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected throughput-drop chain, got none")
+	}
+}
+
+func TestThroughputDropNoHostEvidence(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// Same rate pattern but no sched_switch events — should NOT produce chain.
+	snapshots := make([]testSnapshot, 7)
+	for i := 0; i < 5; i++ {
+		snapshots[i] = testSnapshot{
+			t:       base.Add(time.Duration(i) * time.Second),
+			cudaOps: cuLaunchOps(int64((i + 1) * 100)),
+		}
+	}
+	snapshots[5] = testSnapshot{
+		t:       base.Add(5 * time.Second),
+		cudaOps: cuLaunchOps(550),
+		// No host events.
+	}
+	snapshots[6] = testSnapshot{
+		t:       base.Add(6 * time.Second),
+		cudaOps: cuLaunchOps(600),
+	}
+
+	chains := runSnapshots(t, snapshots)
+
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") {
+			t.Error("should not produce throughput-drop chain without host evidence")
+		}
+	}
+}
+
+func TestThroughputDropStableThroughput(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// Stable ~100/s with sched_switch — should NOT produce throughput chain.
+	snapshots := make([]testSnapshot, 7)
+	for i := 0; i < 7; i++ {
+		snapshots[i] = testSnapshot{
+			t:        base.Add(time.Duration(i) * time.Second),
+			cudaOps:  cuLaunchOps(int64((i + 1) * 100)),
+			hostEvts: makeSchedSwitchEvts(10, base.Add(time.Duration(i)*time.Second)),
+		}
+	}
+
+	chains := runSnapshots(t, snapshots)
+
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") {
+			t.Error("should not produce throughput-drop chain when rate is stable")
+		}
+	}
+}
+
+func TestThroughputDropBelowMinPeak(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// Peak rate = 5 ops/s — below minThroughputPeak (10).
+	snapshots := make([]testSnapshot, 7)
+	for i := 0; i < 5; i++ {
+		snapshots[i] = testSnapshot{
+			t:       base.Add(time.Duration(i) * time.Second),
+			cudaOps: cuLaunchOps(int64((i + 1) * 5)), // 5/s peak
+		}
+	}
+	snapshots[5] = testSnapshot{
+		t:        base.Add(5 * time.Second),
+		cudaOps:  cuLaunchOps(27), // ~2/s
+		hostEvts: makeSchedSwitchEvts(10, base.Add(5*time.Second)),
+	}
+	snapshots[6] = testSnapshot{
+		t:        base.Add(6 * time.Second),
+		cudaOps:  cuLaunchOps(29), // ~2/s
+		hostEvts: makeSchedSwitchEvts(10, base.Add(6*time.Second)),
+	}
+
+	chains := runSnapshots(t, snapshots)
+
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") {
+			t.Error("should not produce throughput-drop chain when peak < minThroughputPeak")
+		}
+	}
+}
+
+func TestThroughputDropSkipsTailRatioOps(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// An op with p99/p50 > 3x gets a tail-ratio chain, not a throughput-drop chain.
+	eng := New(WithMaxAge(0))
+
+	// Build baseline with two ops: cudaStreamSync (anomalous tail) + cuLaunchKernel (healthy tail).
+	for i := 0; i < 5; i++ {
+		ts := base.Add(time.Duration(i) * time.Second)
+		eng.AdvanceClock(ts)
+		eng.SnapshotCausalChains([]stats.OpStats{
+			{
+				Op: "cudaStreamSync", OpCode: uint8(events.CUDAStreamSync),
+				Source: events.SourceCUDA, Count: int64((i + 1) * 100),
+				P50: 1 * time.Millisecond, P99: 100 * time.Millisecond, // 100x ratio
+			},
+			{
+				Op: "cuLaunchKernel", OpCode: uint8(events.CUDALaunchKernel),
+				Source: events.SourceCUDA, Count: int64((i + 1) * 100),
+				P50: 15 * time.Microsecond, P99: 25 * time.Microsecond, // 1.7x ratio
+			},
+		}, 0)
+	}
+
+	// Drop phase: add sched_switch evidence, drop both ops to 50/s.
+	for i := 0; i < 10; i++ {
+		eng.RecordHost(events.Event{
+			Timestamp: base.Add(5 * time.Second),
+			PID:       1234, TID: 1234,
+			Source:   events.SourceHost,
+			Op:       uint8(events.HostSchedSwitch),
+			Duration: 2 * time.Millisecond,
+			Args:     [2]uint64{0, 1234},
+		})
+	}
+	eng.AdvanceClock(base.Add(5 * time.Second))
+	chains := eng.SnapshotCausalChains([]stats.OpStats{
+		{
+			Op: "cudaStreamSync", OpCode: uint8(events.CUDAStreamSync),
+			Source: events.SourceCUDA, Count: 550,
+			P50: 1 * time.Millisecond, P99: 100 * time.Millisecond,
+		},
+		{
+			Op: "cuLaunchKernel", OpCode: uint8(events.CUDALaunchKernel),
+			Source: events.SourceCUDA, Count: 550,
+			P50: 15 * time.Microsecond, P99: 25 * time.Microsecond,
+		},
+	}, 0)
+
+	// cudaStreamSync should have a tail-ratio chain, NOT a throughput-drop chain.
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") &&
+			strings.Contains(ch.Summary, "cudaStreamSync") {
+			t.Error("cudaStreamSync should have a tail-ratio chain, not throughput-drop")
+		}
+	}
+
+	// cuLaunchKernel should have a throughput-drop chain.
+	found := false
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") &&
+			strings.Contains(ch.Summary, "cuLaunchKernel") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected cuLaunchKernel throughput-drop chain (tail ratio below 3x)")
+	}
+}
+
+func TestThroughputDropHighSeverity(t *testing.T) {
+	base := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+
+	// >60% drop → severity = HIGH.
+	snapshots := make([]testSnapshot, 7)
+	for i := 0; i < 5; i++ {
+		snapshots[i] = testSnapshot{
+			t:       base.Add(time.Duration(i) * time.Second),
+			cudaOps: cuLaunchOps(int64((i + 1) * 100)), // 100/s peak
+		}
+	}
+	// Drop to 30/s (70% drop > 60% threshold).
+	snapshots[5] = testSnapshot{
+		t:        base.Add(5 * time.Second),
+		cudaOps:  cuLaunchOps(530),
+		hostEvts: makeSchedSwitchEvts(10, base.Add(5*time.Second)),
+	}
+	snapshots[6] = testSnapshot{
+		t:        base.Add(6 * time.Second),
+		cudaOps:  cuLaunchOps(560),
+		hostEvts: makeSchedSwitchEvts(10, base.Add(6*time.Second)),
+	}
+
+	chains := runSnapshots(t, snapshots)
+
+	for _, ch := range chains {
+		if strings.Contains(ch.Summary, "throughput dropped") {
+			if ch.Severity != "HIGH" {
+				t.Errorf("severity = %q, want HIGH for >60%% throughput drop", ch.Severity)
+			}
+			return
+		}
+	}
+	t.Error("expected throughput-drop chain with HIGH severity")
+}

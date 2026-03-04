@@ -439,6 +439,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 					debugf("failed to stop session: %v", err)
 				}
 			}
+			eventStore.Compact()
 			eventStore.Close()
 			fmt.Fprintf(os.Stderr, "  Recorded events to %s\n", dbPath)
 		}()
@@ -1161,6 +1162,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			var corrs []correlate.Correlation
 			var chains []correlate.CausalChain
 			if corr != nil {
+				corr.AdvanceClock(time.Now())
 				corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 				chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 			}
@@ -1181,6 +1183,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				var corrs []correlate.Correlation
 				var chains []correlate.CausalChain
 				if corr != nil {
+					corr.AdvanceClock(time.Now())
 					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}
@@ -1368,6 +1371,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				var corrs []correlate.Correlation
 				var chains []correlate.CausalChain
 				if corr != nil {
+					corr.AdvanceClock(time.Now())
 					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}

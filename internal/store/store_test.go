@@ -2098,3 +2098,79 @@ func TestDBMethodReturnsNonNil(t *testing.T) {
 		t.Error("DB() returned nil")
 	}
 }
+
+func TestCompact(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "compact-test.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s) failed: %v", dbPath, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	// Insert 5000 events with distinct timestamps so event pages dominate schema.
+	baseTime := time.Now().Add(-10 * time.Minute)
+	for i := 0; i < 5000; i++ {
+		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
+		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
+		s.Record(evt)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Stop Run() so we can safely operate on the DB.
+	cancel()
+	<-done
+
+	// Delete 4900 of 5000 rows to create heavy fragmentation.
+	s.db.Exec("DELETE FROM events WHERE id > 100")
+
+	// Checkpoint WAL so disk reflects current state.
+	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	sizeBefore := info.Size()
+	if sizeBefore == 0 {
+		t.Fatal("expected positive file size before compact")
+	}
+
+	countBefore, _ := s.Count()
+	if countBefore == 0 {
+		t.Fatal("expected some rows to remain before compact")
+	}
+
+	// Compact should reclaim the 90% free space.
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact() failed: %v", err)
+	}
+
+	info, err = os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat after compact failed: %v", err)
+	}
+	sizeAfter := info.Size()
+
+	// Verify file size shrunk by more than 50%.
+	if sizeAfter >= sizeBefore/2 {
+		t.Errorf("expected >50%% reduction: before=%d, after=%d (%.0f%% reduction)",
+			sizeBefore, sizeAfter, 100*(1-float64(sizeAfter)/float64(sizeBefore)))
+	}
+
+	// Verify remaining rows are intact.
+	countAfter, _ := s.Count()
+	if countAfter != countBefore {
+		t.Errorf("compact changed row count: before=%d, after=%d", countBefore, countAfter)
+	}
+
+	t.Logf("compact: %d → %d bytes (%.0f%% reduction), %d rows intact",
+		sizeBefore, sizeAfter, 100*(1-float64(sizeAfter)/float64(sizeBefore)), countAfter)
+
+	s.Close()
+}

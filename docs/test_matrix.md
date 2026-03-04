@@ -2,20 +2,20 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-217 total tests.
+224 total tests.
 
 ## Summary
 
 | Package | Tests | Coverage Focus |
 |---------|-------|----------------|
-| correlate | 48 | Causal chain engine, cross-source correlation |
+| correlate | 54 | Causal chain engine, cross-source correlation, throughput-drop |
 | ebpf/blockio | 3 | Block I/O event parsing |
 | ebpf/tcp | 4 | TCP retransmit event parsing, edge cases |
 | ebpf/net | 5 | Network socket event parsing, edge cases |
 | ebpf/cuda | 5 | CUDA runtime event + stack parsing |
 | ebpf/driver | 5 | CUDA driver event + stack parsing, managed alloc |
 | ebpf/host | 8 | Host kernel event + pod lifecycle parsing |
-| store | 5 | SQLite storage, chain round-trip, batch process names |
+| store | 6 | SQLite storage, chain round-trip, batch process names, compact |
 | stats | 22 | Percentiles, anomaly detection, spike patterns |
 | mcp | 9 | TSC compression, aggregate/chain formatting |
 | cli | 10 | Duration format, storage hierarchy, time parsing, PID name cache |
@@ -100,6 +100,17 @@
 | 47 | TestPodOOMKillChain | pod_oom_kill → HIGH chain (treated same as kernel OOM) | correlate_test.go |
 | 48a | TestNoisyNeighborWithPreFilterTracking | Pre-filter RecordCGroupSchedSwitch populates peer data → noisy neighbor fires | correlate_test.go |
 | 48b | TestNoisyNeighborWithoutPreFilter | Without pre-filter, peer cgroup missing → noisy neighbor does NOT fire | correlate_test.go |
+
+### Throughput-Drop Chain Tests
+
+| # | Test | Description | File |
+|---|------|-------------|------|
+| 49 | TestThroughputDropWithSchedSwitch | Peak ~100/s → drop to 50/s + sched_switch → throughput-drop chain | correlate_test.go |
+| 50 | TestThroughputDropNoHostEvidence | Same drop but 0 sched_switch → no chain | correlate_test.go |
+| 51 | TestThroughputDropStableThroughput | Stable ~100/s + sched_switch → no throughput chain | correlate_test.go |
+| 52 | TestThroughputDropBelowMinPeak | Peak 5 ops/s → below minThroughputPeak → no chain | correlate_test.go |
+| 53 | TestThroughputDropSkipsTailRatioOps | Op with p99/p50 > 3x gets tail-ratio chain, not throughput-drop | correlate_test.go |
+| 54 | TestThroughputDropHighSeverity | >60% drop → severity = HIGH | correlate_test.go |
 
 ## eBPF Event Parsing
 
@@ -199,6 +210,7 @@
 | 102 | TestCausalChainsRoundTrip | Stores and retrieves causal chains with timeline | lookup_test.go |
 | 103 | TestLookupTablesCreated | Lookup tables created on DB init | lookup_test.go |
 | 103a | TestRecordProcessNames | Batch PID→name persistence, skip empty, overwrite | store_test.go |
+| 103b | TestCompact | Insert 1000, delete 900, Compact() → >50% size reduction, rows intact | store_test.go |
 
 ## CLI (cli/trace_test.go, pidutil_test.go)
 
