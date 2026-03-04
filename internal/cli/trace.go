@@ -560,6 +560,13 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// cudaPIDs tracks PIDs with CUDA Runtime or Driver API activity only.
+	// Used by shouldStore() to filter sched_switch storage — IO/TCP/Net PIDs
+	// are system-wide tracepoints that would widen the set to include system
+	// daemons, defeating the storage filter. trackedPIDs (above) is broader
+	// and includes IO/TCP/Net PIDs for eBPF target_pids enrollment.
+	cudaPIDs := make(map[uint32]bool)
+
 	// Correlator PID: single PID for single-process, 0 for multi/all (aggregate).
 	corrPID := singlePIDOrZero(targetPIDs)
 	trackPID := func(pid uint32) {
@@ -586,9 +593,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, trackedPIDs, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, trackedPIDs, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, cudaPIDs, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1066,7 @@ func (c *pidNameCache) Lookup(pid uint32) string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, trackedPIDs map[uint32]bool, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1192,7 +1199,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
 				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
-					traceStackSamples, stackSamples, trackedPIDs)
+					traceStackSamples, stackSamples, cudaPIDs)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
@@ -1205,10 +1212,14 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				recordAggregate(aggs, evt, stored)
 			}
 
-			// Dynamic PID tracking: register CUDA/driver event PIDs with
+			// Dynamic PID tracking: register non-host event PIDs with
 			// the host tracer so it collects host events for those processes.
+			// Also track CUDA/Driver PIDs separately for shouldStore() filter.
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
+			}
+			if evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver {
+				cudaPIDs[evt.PID] = true
 			}
 
 			// Feed events into correlation engine for causal chain analysis.
@@ -1225,7 +1236,11 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				}
 			}
 
-			// Dynamic PID tracking: when a target process forks, auto-add child.
+			// Dynamic PID tracking: when a target process forks, auto-add child
+			// to eBPF target_pids (for host event collection). Do NOT inherit
+			// cudaPIDs — only actual CUDA/Driver events add PIDs there.
+			// This prevents stress-ng workers (forked from Python subprocess)
+			// from getting stored sched_switch despite having no CUDA activity.
 			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
 				childPID := uint32(evt.Args[1])
 				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {
@@ -1582,7 +1597,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, trackedPIDs map[uint32]bool, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1696,7 +1711,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
 				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
-					traceStackSamples, stackSamples, trackedPIDs)
+					traceStackSamples, stackSamples, cudaPIDs)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
@@ -1709,13 +1724,18 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				recordAggregate(aggs, evt, stored)
 			}
 
-			// Dynamic PID tracking: register CUDA/driver event PIDs with
+			// Dynamic PID tracking: register non-host event PIDs with
 			// the host tracer so it collects host events for those processes.
+			// Also track CUDA/Driver PIDs separately for shouldStore() filter.
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
 			}
+			if evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver {
+				cudaPIDs[evt.PID] = true
+			}
 
-			// Dynamic PID tracking: when a target process forks, auto-add child.
+			// Dynamic PID tracking: fork child → eBPF target_pids only.
+			// Do NOT inherit cudaPIDs — only actual CUDA/Driver events add PIDs.
 			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
 				childPID := uint32(evt.Args[1])
 				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {

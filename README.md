@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.8.0.1**
+**Version: 0.8.0.2**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
