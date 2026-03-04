@@ -1570,10 +1570,13 @@ WL_PID=$(start_workload 8)
 sleep 1
 sudo ./bin/ingero trace --max-db 50m --pid "$WL_PID" --duration 5s > /dev/null 2> logs/trace-maxdb.log
 wait "$WL_PID" 2>/dev/null || true
-if ! grep -qi "unknown\|invalid\|error.*max-db" logs/trace-maxdb.log 2>/dev/null; then
+# Check for actual --max-db errors only (not unrelated warnings like block I/O CO-RE failures).
+if grep -qi "error.*max-db\|unknown flag.*max-db\|invalid.*max-db\|parsing --max-db" logs/trace-maxdb.log 2>/dev/null; then
+    record "FAIL" "T22d: --max-db flag" "flag rejected or error"
+elif grep -q "Recorded events\|Events:" logs/trace-maxdb.log 2>/dev/null; then
     record "PASS" "T22d: --max-db flag" "accepted without error"
 else
-    record "FAIL" "T22d: --max-db flag" "flag rejected or error"
+    record "FAIL" "T22d: --max-db flag" "trace produced no output"
 fi
 
 # ── T22e-g: New Event Source Integration (Block I/O, TCP, Net) ──

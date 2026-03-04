@@ -1,6 +1,6 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.8.0.2**
+**Version: 0.8.1**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -110,16 +110,16 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.8.0`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.8.1`):
 
 ```bash
 # Linux amd64
-VERSION=0.8.0
+VERSION=0.8.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
-VERSION=0.8.0
+VERSION=0.8.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -333,7 +333,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.8.0 (commit: 9adbb11, built: 2026-03-03)
+ingero v0.8.1 (commit: 2818c9e, built: 2026-03-04)
 ```
 
 ## Stack Tracing

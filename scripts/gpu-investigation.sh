@@ -277,6 +277,9 @@ kill "$TRAIN_PID" 2>/dev/null || true
 wait "$TRAIN_PID" 2>/dev/null || true
 
 # Validate trace produced events — catches ingero trace crashes or probe failures
+# Force WAL checkpoint first — ingero (modernc.org/sqlite) may leave data in WAL file
+# that the sqlite3 CLI won't see without an explicit checkpoint.
+sudo sqlite3 "$ML_DB" "PRAGMA wal_checkpoint(TRUNCATE)" 2>/dev/null || true
 DB_EVENTS=$(sudo sqlite3 "$ML_DB" "SELECT COUNT(*) FROM events" 2>/dev/null || echo "0")
 if [[ "$DB_EVENTS" -lt 100 ]]; then
     echo -e "$(ts) ${RED}[ERROR]${NC} Trace captured only $DB_EVENTS events (expected >100). See logs/gpu-inv-trace.log"
