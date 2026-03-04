@@ -311,6 +311,7 @@ def phase_io_pressure(device, steps=100, save_every=20):
             save_t0 = time.time()
             model.save_pretrained(ckpt_path)
             tokenizer.save_pretrained(ckpt_path)
+            os.sync()  # Force page cache → block device so Ingero block I/O tracepoints fire
             save_dt = time.time() - save_t0
             avg = running_loss / (step + 1)
             print(f"  step {step+1}/{steps}  loss={avg:.3f}  "

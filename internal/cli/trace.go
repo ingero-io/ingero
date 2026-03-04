@@ -367,6 +367,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 	var eventStore *store.Store
 	var sessionID int64
+	var procNames *pidNameCache
 	if traceRecord {
 		dbPath := traceDBPath
 		if dbPath == "" {
@@ -429,6 +430,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// Wait for the batch writer goroutine to finish flushing
 			// before writing session metadata or closing the DB.
 			eventStore.WaitDone()
+			// Flush discovered PID→name mappings to SQLite.
+			if procNames != nil {
+				eventStore.RecordProcessNames(procNames.Names())
+			}
 			if sessionID > 0 {
 				if err := eventStore.StopSession(sessionID, time.Now()); err != nil {
 					debugf("failed to stop session: %v", err)
@@ -587,7 +592,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 8: Build PID→name cache for JSON output enrichment.
-	procNames := newPIDNameCache(targetPIDs, processNames)
+	procNames = newPIDNameCache(targetPIDs, processNames)
 
 	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
@@ -595,12 +600,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	if traceJSON {
 		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, cudaPIDs, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, trackPID)
 }
 
 // ---------------------------------------------------------------------------
 // Selective storage — store only investigation-valuable events, aggregate rest
 // ---------------------------------------------------------------------------
+
+// flushEveryN triggers an inline aggregate flush every N events in the event
+// loop. This prevents Go select starvation during high-throughput periods
+// (400K+ events/min) where the 1-second ticker may be starved by the event
+// channel, causing missed minute-bucket flushes. flushAggregates() is cheap
+// (map scan, only writes completed minute-buckets), so inline calls are safe.
+const flushEveryN = 10_000
 
 // aggKey identifies a minute-bucket for aggregation.
 // Events that shouldStore() rejects are counted here instead of stored individually.
@@ -1059,6 +1071,21 @@ func (c *pidNameCache) Lookup(pid uint32) string {
 	return name
 }
 
+// Names returns a snapshot copy of all cached PID→name mappings.
+// Used at shutdown to flush discovered names to SQLite.
+func (c *pidNameCache) Names() map[uint32]string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[uint32]string, len(c.names))
+	for k, v := range c.names {
+		out[k] = v
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Table mode — live-updating stats display
 // ---------------------------------------------------------------------------
@@ -1066,7 +1093,7 @@ func (c *pidNameCache) Lookup(pid uint32) string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1086,6 +1113,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 	// Selective storage: aggregate map for events not individually stored.
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
+	var aggFlushCount int // inline flush counter (see flushEveryN)
 
 	// Stack sampling: per-stack event counter to limit DB redundancy.
 	stackSamples := make(map[uint64]int)
@@ -1210,6 +1238,10 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					}
 				}
 				recordAggregate(aggs, evt, stored)
+				aggFlushCount++
+				if aggFlushCount%flushEveryN == 0 {
+					flushAggregates(aggs, eventStore, time.Now())
+				}
 			}
 
 			// Dynamic PID tracking: register non-host event PIDs with
@@ -1218,8 +1250,15 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
 			}
-			if evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver {
+			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver) {
 				cudaPIDs[evt.PID] = true
+			}
+
+			// Resolve process name for non-host events (CUDA, Driver, IO, TCP, Net).
+			// Host events excluded — sched_switch fires for hundreds of irrelevant
+			// system PIDs that would pollute the cache.
+			if procNames != nil && evt.Source != events.SourceHost {
+				procNames.Lookup(evt.PID)
 			}
 
 			// Feed events into correlation engine for causal chain analysis.
@@ -1245,6 +1284,9 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				childPID := uint32(evt.Args[1])
 				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {
 					onFork[0](childPID)
+				}
+				if procNames != nil && childPID > 0 {
+					procNames.Lookup(childPID)
 				}
 			}
 
@@ -1613,6 +1655,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 	// Selective storage: aggregate map for events not individually stored.
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
+	var aggFlushCount int // inline flush counter (see flushEveryN)
 
 	// Stack sampling: per-stack event counter (same as table mode).
 	stackSamples := make(map[uint64]int)
@@ -1722,6 +1765,10 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 					}
 				}
 				recordAggregate(aggs, evt, stored)
+				aggFlushCount++
+				if aggFlushCount%flushEveryN == 0 {
+					flushAggregates(aggs, eventStore, time.Now())
+				}
 			}
 
 			// Dynamic PID tracking: register non-host event PIDs with
@@ -1730,7 +1777,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
 			}
-			if evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver {
+			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver) {
 				cudaPIDs[evt.PID] = true
 			}
 
@@ -1740,6 +1787,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				childPID := uint32(evt.Args[1])
 				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {
 					onFork[0](childPID)
+				}
+				if procNames != nil && childPID > 0 {
+					procNames.Lookup(childPID)
 				}
 			}
 

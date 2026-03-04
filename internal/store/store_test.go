@@ -2019,6 +2019,74 @@ func TestFramesMigrationOnOldDB(t *testing.T) {
 	_ = rows // empty is fine, we just need the column to exist
 }
 
+// TestRecordProcessNames verifies batch PID→name persistence.
+// Names discovered at runtime via /proc/[pid]/comm are flushed to SQLite
+// at shutdown. This test validates the batch INSERT OR REPLACE behavior.
+func TestRecordProcessNames(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	tests := []struct {
+		name      string
+		input     map[uint32]string
+		wantCount int
+	}{
+		{
+			name:      "multiple_names",
+			input:     map[uint32]string{100: "python3", 200: "worker", 300: "vllm"},
+			wantCount: 3,
+		},
+		{
+			name:      "empty_names_skipped",
+			input:     map[uint32]string{400: "valid", 500: ""},
+			wantCount: 4, // cumulative: 3 + 1 (500 skipped)
+		},
+		{
+			name:      "nil_map",
+			input:     nil,
+			wantCount: 4, // unchanged
+		},
+		{
+			name:      "empty_map",
+			input:     map[uint32]string{},
+			wantCount: 4, // unchanged
+		},
+		{
+			name:      "overwrite_existing",
+			input:     map[uint32]string{100: "python3.12"},
+			wantCount: 4, // same count, name updated
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s.RecordProcessNames(tt.input)
+
+			var count int
+			err := s.db.QueryRow("SELECT COUNT(*) FROM process_names").Scan(&count)
+			if err != nil {
+				t.Fatalf("count query failed: %v", err)
+			}
+			if count != tt.wantCount {
+				t.Errorf("process_names count = %d, want %d", count, tt.wantCount)
+			}
+		})
+	}
+
+	// Verify the overwritten name is correct.
+	var name string
+	err = s.db.QueryRow("SELECT name FROM process_names WHERE pid = 100").Scan(&name)
+	if err != nil {
+		t.Fatalf("query PID 100 failed: %v", err)
+	}
+	if name != "python3.12" {
+		t.Errorf("PID 100 name = %q, want %q", name, "python3.12")
+	}
+}
+
 func TestDBMethodReturnsNonNil(t *testing.T) {
 	s, err := New(":memory:")
 	if err != nil {

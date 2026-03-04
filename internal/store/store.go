@@ -1803,6 +1803,37 @@ func (s *Store) RecordProcessName(pid uint32, name string) {
 		pid, name, time.Now().UnixNano())
 }
 
+// RecordProcessNames batch-inserts PID→name mappings in a single transaction.
+// Called at shutdown to persist names discovered at runtime via /proc/[pid]/comm.
+// Skips empty names. Uses INSERT OR REPLACE so the most recent name wins.
+func (s *Store) RecordProcessNames(names map[uint32]string) {
+	if len(names) == 0 {
+		return
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	defer stmt.Close()
+
+	now := time.Now().UnixNano()
+	for pid, name := range names {
+		if name == "" {
+			continue
+		}
+		stmt.Exec(pid, name, now)
+	}
+
+	tx.Commit()
+}
+
 // RecordAggregates batch-inserts aggregate rows (one per minute-bucket per op).
 // Called from the trace event loop when flushing completed minute-buckets.
 //

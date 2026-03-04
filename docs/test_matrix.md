@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-Last updated: 2026-03-03 (v0.8.0, 215 total tests)
+Last updated: 2026-03-04 (v0.8.0, 217 total tests)
 
 ## Summary
 
@@ -15,10 +15,10 @@ Last updated: 2026-03-03 (v0.8.0, 215 total tests)
 | ebpf/cuda | 5 | CUDA runtime event + stack parsing |
 | ebpf/driver | 5 | CUDA driver event + stack parsing, managed alloc |
 | ebpf/host | 8 | Host kernel event + pod lifecycle parsing |
-| store | 4 | SQLite storage, chain round-trip |
+| store | 5 | SQLite storage, chain round-trip, batch process names |
 | stats | 22 | Percentiles, anomaly detection, spike patterns |
 | mcp | 9 | TSC compression, aggregate/chain formatting |
-| cli | 9 | Duration format, storage hierarchy, time parsing |
+| cli | 10 | Duration format, storage hierarchy, time parsing, PID name cache |
 | filter | 11 | Deadband suppression, heartbeat, concurrency |
 | cgroup | 6 | Container ID extraction, cgroup v1/v2 parsing |
 | k8s | 7 | Pod list parsing, GPU pod filtering, cache |
@@ -198,6 +198,7 @@ Last updated: 2026-03-03 (v0.8.0, 215 total tests)
 | 101 | TestRecordAndQuery | Records events and queries with correct counts | store_test.go |
 | 102 | TestCausalChainsRoundTrip | Stores and retrieves causal chains with timeline | lookup_test.go |
 | 103 | TestLookupTablesCreated | Lookup tables created on DB init | lookup_test.go |
+| 103a | TestRecordProcessNames | Batch PID→name persistence, skip empty, overwrite | store_test.go |
 
 ## CLI (cli/trace_test.go, pidutil_test.go)
 
@@ -211,6 +212,7 @@ Last updated: 2026-03-03 (v0.8.0, 215 total tests)
 | 109 | TestIsStackResolved | Stack resolution detection | trace_test.go |
 | 110 | TestShouldStoreStackSampling | Stack sampling limit with anomaly bypass | trace_test.go |
 | 111 | TestShouldStoreStackSamplingAnomalyBypass | Anomalies bypass stack sample limits | trace_test.go |
+| 111a | TestPIDNameCacheNames | Names() returns snapshot copy, nil-safe, mutation-safe | trace_test.go |
 | 112 | TestToUint32Slice | int slice → uint32 slice, filtering zeros | pidutil_test.go |
 | 113 | TestSinglePIDOrZero | Returns single PID or 0 if multiple/empty | pidutil_test.go |
 | 114 | TestPidSetFromInts | Creates PID filter set from int list | pidutil_test.go |

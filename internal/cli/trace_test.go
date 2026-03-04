@@ -795,3 +795,76 @@ func TestShouldStoreStackSamplingAnomalyBypass(t *testing.T) {
 		t.Error("anomaly should bypass stack sample limit")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// pidNameCache.Names() tests
+// ---------------------------------------------------------------------------
+
+// TestPIDNameCacheNames verifies that Names() returns a snapshot copy of
+// cached PID→name mappings, including lazily resolved names.
+func TestPIDNameCacheNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		pids     []int
+		names    []string
+		wantLen  int
+		wantPID  uint32
+		wantName string
+	}{
+		{
+			name:     "initial_mappings",
+			pids:     []int{100, 200},
+			names:    []string{"python3", "worker"},
+			wantLen:  2,
+			wantPID:  100,
+			wantName: "python3",
+		},
+		{
+			name:    "empty_cache",
+			pids:    nil,
+			names:   nil,
+			wantLen: 0,
+		},
+		{
+			name:     "skip_empty_names",
+			pids:     []int{100, 200},
+			names:    []string{"python3", ""},
+			wantLen:  1,
+			wantPID:  100,
+			wantName: "python3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newPIDNameCache(tt.pids, tt.names)
+			got := c.Names()
+			if len(got) != tt.wantLen {
+				t.Errorf("Names() len = %d, want %d", len(got), tt.wantLen)
+			}
+			if tt.wantPID > 0 {
+				if got[tt.wantPID] != tt.wantName {
+					t.Errorf("Names()[%d] = %q, want %q", tt.wantPID, got[tt.wantPID], tt.wantName)
+				}
+			}
+		})
+	}
+
+	// Verify Names() returns a copy (mutations don't affect cache).
+	t.Run("returns_copy", func(t *testing.T) {
+		c := newPIDNameCache([]int{100}, []string{"python3"})
+		snapshot := c.Names()
+		snapshot[100] = "mutated"
+		if c.Lookup(100) != "python3" {
+			t.Error("Names() should return a copy, not a reference to internal map")
+		}
+	})
+
+	// Nil cache returns nil.
+	t.Run("nil_cache", func(t *testing.T) {
+		var c *pidNameCache
+		if c.Names() != nil {
+			t.Error("nil pidNameCache.Names() should return nil")
+		}
+	})
+}
