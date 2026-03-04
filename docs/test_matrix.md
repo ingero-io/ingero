@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-Last updated: 2026-03-04 (v0.8.0, 217 total tests)
+217 total tests.
 
 ## Summary
 
@@ -32,7 +32,7 @@ Last updated: 2026-03-04 (v0.8.0, 217 total tests)
 
 ## Correlate Engine — Causal Chain Tests
 
-### v0.2 Correlation Tests (Legacy)
+### Core Correlation Tests
 
 | # | Test | Description | File |
 |---|------|-------------|------|
@@ -45,7 +45,7 @@ Last updated: 2026-03-04 (v0.8.0, 217 total tests)
 | 7 | TestCorrelationString | Correlation.String() formatting | correlate_test.go |
 | 8 | TestEmptyCorrelations | No events/ops → empty correlations | correlate_test.go |
 
-### v0.3 Causal Chain Tests (Host + System)
+### Causal Chain Tests (Host + System)
 
 | # | Test | Description | File |
 |---|------|-------------|------|
@@ -58,7 +58,7 @@ Last updated: 2026-03-04 (v0.8.0, 217 total tests)
 | 15 | TestWithMaxAgeZeroDisablesPruning | maxAge=0 retains all events (historical replay mode) | correlate_test.go |
 | 16 | TestHostOpsIgnoredInCUDAAnalysis | Host-only ops not correlated with themselves | correlate_test.go |
 
-### v0.8 Single-Source Chain Tests (IO, TCP, Net)
+### Single-Source Chain Tests (IO, TCP, Net)
 
 | # | Test | Description | File |
 |---|------|-------------|------|
@@ -82,7 +82,7 @@ Last updated: 2026-03-04 (v0.8.0, 217 total tests)
 | 34 | TestCausalChainExplanationBlockIODetail | IO explanation: "Block I/O activity", "spinning disk", "Read-dominant" | correlate_test.go |
 | 35 | TestCausalChainExplanationNetworkIO | Net explanation: "network socket I/O" | correlate_test.go |
 
-### v0.8 Compound Chain Tests (Old + New Sensors)
+### Compound Chain Tests (Multi-Sensor)
 
 | # | Test | Description | File |
 |---|------|-------------|------|
