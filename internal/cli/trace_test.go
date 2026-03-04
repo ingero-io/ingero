@@ -189,13 +189,20 @@ func TestShouldStoreHierarchy(t *testing.T) {
 			wantStore: true,
 		},
 
-		// Tier 4: sched_switch always stored (causal chain critical).
+		// Tier 4: sched_switch stored only for CUDA-active PIDs.
 		{
-			name:      "sched_switch",
+			name:      "sched_switch/cuda_pid",
 			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 1000},
 			start:     pastBootstrap,
 			recAll:    false,
 			wantStore: true,
+		},
+		{
+			name:      "sched_switch/non_cuda_pid",
+			evt:       events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 9999},
+			start:     pastBootstrap,
+			recAll:    false,
+			wantStore: false,
 		},
 
 		// mm_page_alloc → always aggregate, never store individually.
@@ -287,14 +294,52 @@ func TestShouldStoreHierarchy(t *testing.T) {
 		},
 	}
 
+	// PID 1000 is the active PID used by all test events above.
+	activePIDs := map[uint32]bool{1000: true}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldStore(tt.evt, tt.start, tt.recAll, collector, 0, nil)
+			got := shouldStore(tt.evt, tt.start, tt.recAll, collector, 0, nil, activePIDs)
 			if got != tt.wantStore {
 				t.Errorf("shouldStore() = %v, want %v", got, tt.wantStore)
 			}
 		})
 	}
+
+	// Edge case: nil activePIDs → safety fallback stores all sched_switch.
+	// This happens when no CUDA events have arrived yet (discovery mode).
+	t.Run("sched_switch/nil_activePIDs_fallback", func(t *testing.T) {
+		evt := events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 9999}
+		if !shouldStore(evt, pastBootstrap, false, collector, 0, nil, nil) {
+			t.Error("sched_switch with nil activePIDs should store (safety fallback)")
+		}
+	})
+
+	// Edge case: empty activePIDs → same fallback as nil.
+	t.Run("sched_switch/empty_activePIDs_fallback", func(t *testing.T) {
+		evt := events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 9999}
+		if !shouldStore(evt, pastBootstrap, false, collector, 0, nil, map[uint32]bool{}) {
+			t.Error("sched_switch with empty activePIDs should store (safety fallback)")
+		}
+	})
+
+	// Edge case: bootstrap stores non-tracked sched_switch (bootstrap gate
+	// fires before the sched_switch filter in the decision hierarchy).
+	t.Run("sched_switch/non_tracked_pid_during_bootstrap", func(t *testing.T) {
+		evt := events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 9999}
+		if !shouldStore(evt, time.Now(), false, collector, 0, nil, activePIDs) {
+			t.Error("non-tracked sched_switch during bootstrap should store (bootstrap gate)")
+		}
+	})
+
+	// Edge case: --record-all stores non-tracked sched_switch (record-all
+	// gate fires before the sched_switch filter in the decision hierarchy).
+	t.Run("sched_switch/non_tracked_pid_record_all", func(t *testing.T) {
+		evt := events.Event{Source: events.SourceHost, Op: uint8(events.HostSchedSwitch), Duration: 50 * time.Microsecond, PID: 9999}
+		if !shouldStore(evt, pastBootstrap, true, collector, 0, nil, activePIDs) {
+			t.Error("non-tracked sched_switch with --record-all should store")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +427,7 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 
 	// Simulate live mode: feed ALL events to collector + apply shouldStore.
 	sessionStart := now.Add(-1 * time.Minute) // past bootstrap window
+	activePIDs := map[uint32]bool{pid: true}
 	var storedEvents []events.Event
 
 	for i, evt := range allEvents {
@@ -390,7 +436,7 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 		if i%50 == 49 {
 			liveCollector.Snapshot()
 		}
-		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil) {
+		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil, activePIDs) {
 			storedEvents = append(storedEvents, evt)
 		}
 	}
@@ -530,7 +576,7 @@ func TestPageAllocAggregateOnly(t *testing.T) {
 		if i%30 == 29 {
 			liveCollector.Snapshot()
 		}
-		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil) {
+		if shouldStore(evt, sessionStart, false, liveCollector, 0, nil, map[uint32]bool{pid: true}) {
 			storedEvents = append(storedEvents, evt)
 		}
 	}
@@ -668,26 +714,26 @@ func TestShouldStoreStackSampling(t *testing.T) {
 	// With maxStackSamples=3, first 3 should store.
 	samples := make(map[uint64]int)
 	for i := 0; i < 3; i++ {
-		if !shouldStore(evt, sessionStart, true, collector, 3, samples) {
+		if !shouldStore(evt, sessionStart, true, collector, 3, samples, nil) {
 			t.Errorf("event %d should store (under limit)", i)
 		}
 		samples[stackHash]++
 	}
 
 	// 4th should be rejected (limit reached, not an anomaly).
-	if shouldStore(evt, sessionStart, true, collector, 3, samples) {
+	if shouldStore(evt, sessionStart, true, collector, 3, samples, nil) {
 		t.Error("event 4 should NOT store (over stack sample limit)")
 	}
 
 	// With maxStackSamples=0 (unlimited), always stores.
-	if !shouldStore(evt, sessionStart, true, collector, 0, samples) {
+	if !shouldStore(evt, sessionStart, true, collector, 0, samples, nil) {
 		t.Error("should store with unlimited stack samples")
 	}
 
 	// Events without stacks are unaffected by sampling.
 	noStackEvt := evt
 	noStackEvt.Stack = nil
-	if !shouldStore(noStackEvt, sessionStart, true, collector, 3, samples) {
+	if !shouldStore(noStackEvt, sessionStart, true, collector, 3, samples, nil) {
 		t.Error("no-stack events should be unaffected by sampling")
 	}
 
@@ -738,14 +784,14 @@ func TestShouldStoreStackSamplingAnomalyBypass(t *testing.T) {
 	samples[stackHash] = 5 // already at limit
 
 	// A normal event should be rejected (over limit, not anomaly).
-	if shouldStore(baseEvt, sessionStart, true, collector, 5, samples) {
+	if shouldStore(baseEvt, sessionStart, true, collector, 5, samples, nil) {
 		t.Error("normal event should be rejected when over stack sample limit")
 	}
 
 	// An anomaly (100x duration) should bypass the limit.
 	anomaly := baseEvt
 	anomaly.Duration = 100 * time.Millisecond // 1000x the p50 of 100µs
-	if !shouldStore(anomaly, sessionStart, true, collector, 5, samples) {
+	if !shouldStore(anomaly, sessionStart, true, collector, 5, samples, nil) {
 		t.Error("anomaly should bypass stack sample limit")
 	}
 }

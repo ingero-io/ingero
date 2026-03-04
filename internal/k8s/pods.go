@@ -16,8 +16,6 @@ const (
 	// v0.8 can switch to the watch API for real-time updates if needed.
 	pollInterval = 30 * time.Second
 
-	// waitReadyTimeout is the default max wait for the first pod list.
-	waitReadyTimeout = 5 * time.Second
 )
 
 // PodInfo holds metadata for a single pod, indexed by container ID.

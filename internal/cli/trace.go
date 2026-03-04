@@ -586,9 +586,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, trackedPIDs, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, trackedPIDs, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -627,12 +627,13 @@ type aggValue struct {
 //  2. --record-all mode → always store
 //  3. Bootstrap (first 10s of session) → store (builds baseline in DB)
 //  4. Process lifecycle (exec/exit/fork/OOM) → store (rare, high value)
-//  5. sched_switch → store (causal chain critical)
+//  5. sched_switch → store if CUDA-active PID (aggregate-only for others)
 //  6. Sync ops (StreamSync/DeviceSync/CtxSync) → store (latency symptoms)
 //  7. Anomalous (duration > 3x p50) → store (the interesting stuff)
 //  8. Everything else → aggregate only (cuLaunchKernel, sched_wakeup, etc.)
 func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
-	collector *stats.Collector, maxStackSamples int, stackSamples map[uint64]int) bool {
+	collector *stats.Collector, maxStackSamples int, stackSamples map[uint64]int,
+	activePIDs map[uint32]bool) bool {
 
 	// mm_page_alloc: always aggregate, never store individually.
 	// Must be checked BEFORE bootstrap and --record-all gates.
@@ -677,8 +678,11 @@ func shouldStore(evt events.Event, sessionStart time.Time, recordAll bool,
 		case events.HostProcessExec, events.HostProcessExit, events.HostProcessFork, events.HostOOMKill:
 			return true
 		case events.HostSchedSwitch:
-			// sched_switch is causal chain critical — always store.
-			return true
+			// Store only for tracked PIDs (CUDA/driver activity or fork
+			// children). Non-tracked sched_switch (stress-ng, system
+			// daemons) is aggregate-only — the chain engine uses
+			// counts/durations, not individual rows.
+			return len(activePIDs) == 0 || activePIDs[evt.PID]
 		case events.HostPodRestart, events.HostPodEviction, events.HostPodOOMKill:
 			// K8s lifecycle events are always stored (rare, high value).
 			return true
@@ -1055,7 +1059,7 @@ func (c *pidNameCache) Lookup(pid uint32) string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, trackedPIDs map[uint32]bool, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1188,7 +1192,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
 				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
-					traceStackSamples, stackSamples)
+					traceStackSamples, stackSamples, trackedPIDs)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
@@ -1578,7 +1582,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, trackedPIDs map[uint32]bool, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1692,7 +1696,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
 				stored := shouldStore(evt, sessionStart, traceRecordAll, collector,
-					traceStackSamples, stackSamples)
+					traceStackSamples, stackSamples, trackedPIDs)
 				if stored {
 					eventStore.Record(evt)
 					storedEventCount++
