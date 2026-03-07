@@ -1,0 +1,16 @@
+[Unit]
+Description=Ingero GPU Observability Agent
+After=network.target
+Documentation=https://github.com/ingero-io/ingero
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ingero trace --record --db /var/lib/ingero/ingero.db --max-db 100g
+Restart=on-failure
+RestartSec=5s
+LimitMEMLOCK=infinity
+# eBPF requires CAP_BPF + CAP_PERFMON (or root)
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target

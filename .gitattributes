@@ -1,0 +1,18 @@
+# Force LF line endings everywhere.
+# This project runs on Linux (eBPF agent) and is developed via WSL.
+# CRLF breaks bash scripts when scp'd to Linux VMs.
+* text=auto eol=lf
+
+# Ensure shell scripts are always LF
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Binary files — do not convert
+*.o binary
+*.so binary
+*.docx binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary

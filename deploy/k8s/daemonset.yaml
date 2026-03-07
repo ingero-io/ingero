@@ -1,0 +1,114 @@
+# Ingero DaemonSet — runs one agent pod per GPU node.
+#
+# Prerequisites:
+#   - NVIDIA GPU Operator installed (provides nvidia.com/gpu.present label)
+#   - Namespace: kubectl apply -f namespace.yaml
+#   - RBAC: kubectl apply -f rbac.yaml
+#
+# The agent runs 'ingero trace --record' which attaches eBPF probes to
+# libcudart.so and libcuda.so on the host, traces CUDA API calls, and
+# stores events in SQLite at /var/lib/ingero/ingero.db on the host.
+#
+# Why privileged + hostPID:
+#   - eBPF probe attachment requires CAP_BPF + CAP_PERFMON + CAP_SYS_ADMIN
+#   - hostPID allows tracing processes in other containers on the same node
+#   - /proc must be the host's /proc (not container /proc) for PID resolution
+#
+# Query the agent via kubectl exec:
+#   kubectl exec -n ingero-system ds/ingero -- ingero explain --since 5m
+#   kubectl exec -n ingero-system ds/ingero -- ingero query --since 1m --json
+#
+# MCP access via port-forward:
+#   kubectl port-forward -n ingero-system ds/ingero 8080:8080
+#   # Then: ingero mcp --http :8080 (from inside the pod)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingero
+  namespace: ingero-system
+  labels:
+    app.kubernetes.io/name: ingero
+    app.kubernetes.io/version: "0.8.0"
+spec:
+  # OnDelete: prevents event loss during rolling updates. eBPF probes detach
+  # when the old pod dies and reattach when the new pod starts — there's a gap
+  # where events are missed. OnDelete lets the operator control the upgrade pace.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingero
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingero
+        app.kubernetes.io/version: "0.8.0"
+    spec:
+      hostPID: true
+      terminationGracePeriodSeconds: 30
+      serviceAccountName: ingero
+      # Tolerate GPU node taints. Without these, the DaemonSet silently fails
+      # to schedule on GPU nodes that use nvidia.com/gpu taints (common in
+      # mixed CPU/GPU clusters).
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoExecute
+      # Only schedule on GPU nodes. Requires NVIDIA GPU Operator which sets
+      # this label. On clusters without GPU Operator, remove this selector
+      # and use a toleration-only approach.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: ingero
+          image: ghcr.io/ingero-io/ingero:v0.8
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          args:
+            - "trace"
+            - "--record"
+            - "--db"
+            - "/var/lib/ingero/ingero.db"
+            - "--max-db"
+            - "100g"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: proc
+              mountPath: /proc
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/ingero
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: "1"
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+        - name: data
+          hostPath:
+            path: /var/lib/ingero
+            type: DirectoryOrCreate

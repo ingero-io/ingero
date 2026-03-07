@@ -1,0 +1,409 @@
+#!/bin/bash
+################################################################################
+# GPU Problem Investigation — 28 Issues via MCP
+#
+# Comprehensive GPU causal observability validation. Runs a 5-phase 120s trace
+# with ResNet-50 training + alloc_stress + stress-ng, then investigates all 28
+# GPU problems Ingero can detect through MCP tool calls (primarily run_sql).
+#
+# Architecture: Bash handles trace/workload lifecycle, Python handles MCP
+# queries and analysis. This separation exists because:
+#   - Bash: sudo, signals, process cleanup, MCP server lifecycle
+#   - Python: JSON processing, statistical analysis, HTTP/MCP calls, reports
+#
+# Phases:
+#   1 (0-20s):    Cold start + steady baseline (ResNet-50 from scratch)
+#   2 (20-50s):   Allocation stress (alloc_stress.py in background)
+#   3 (50-90s):   CPU contention (stress-ng saturates all cores)
+#   4 (90-110s):  Recovery (stressors killed, training continues)
+#   5 (110-120s): Continued clean training
+#
+# Output: 28 test results (T23a-T23ab), investigation report, ML_RESULT lines
+#
+# Run standalone:   bash scripts/gpu-investigation.sh
+# Run via suite:    bash scripts/gpu-test.sh   (Phase 6)
+#
+# Requires: GPU, PyTorch, stress-ng, Ingero binary at bin/ingero
+################################################################################
+
+set -uo pipefail
+
+# Resolve paths — works from agent/ or agent/scripts/
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "$(basename "$SCRIPT_DIR")" == "scripts" ]]; then
+    cd "$SCRIPT_DIR/.." || exit 1
+else
+    cd "$SCRIPT_DIR" || exit 1
+fi
+INGERO_DIR="$(pwd)"
+
+# Colors
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; NC=''
+fi
+
+PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+_test_start=$SECONDS
+
+# Structured results for gpu-test.sh ingestion
+declare -a ML_RESULTS  # "ID|name|status|detail|duration_s"
+
+ts() { date -u '+%Y-%m-%d %H:%M:%S'; }
+
+record() {
+    local status="$1" name="$2" detail="$3"
+    local elapsed=$((SECONDS - _test_start))
+    local tid="${name%%:*}"
+    ML_RESULTS+=("${tid}|${name}|${status}|${detail}|${elapsed}")
+
+    if [[ "$status" == "PASS" ]]; then
+        echo -e "$(ts)   ${GREEN}[PASS]${NC} $name"
+        PASS_COUNT=$((PASS_COUNT + 1))
+    elif [[ "$status" == "FAIL" ]]; then
+        echo -e "$(ts)   ${RED}[FAIL]${NC} $name — $detail"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    elif [[ "$status" == "SKIP" ]]; then
+        echo -e "$(ts)   ${YELLOW}[SKIP]${NC} $name — $detail"
+        SKIP_COUNT=$((SKIP_COUNT + 1))
+    fi
+    _test_start=$SECONDS
+}
+
+# PIDs to clean up on exit
+cleanup_pids=()
+cleanup_sudo_pids=()
+ML_DB=""
+MCP_PORT=""
+cleanup() {
+    # Kill sudo-spawned processes FIRST (pkill -f) — kill+wait on the sudo
+    # wrapper PID can deadlock because sudo doesn't forward SIGTERM to children.
+    if [[ -n "$ML_DB" ]]; then
+        sudo pkill -f "ingero trace.*${ML_DB}" 2>/dev/null || true
+        sudo pkill -f "ingero mcp.*${ML_DB}" 2>/dev/null || true
+    fi
+    sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
+    pkill -f 'alloc_stress.py' 2>/dev/null || true
+
+    # Kill sudo-spawned PIDs (never wait — sudo creates separate process tree)
+    for pid in "${cleanup_sudo_pids[@]}"; do
+        sudo kill "$pid" 2>/dev/null || true
+    done
+
+    # Kill and reap direct children (safe to wait)
+    for pid in "${cleanup_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${cleanup_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if [[ -n "$ML_DB" ]]; then
+        sudo rm -f "${ML_DB}" "${ML_DB}-wal" "${ML_DB}-shm" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+################################################################################
+# Preflight
+################################################################################
+
+if [[ ! -x bin/ingero ]]; then
+    echo "ERROR: bin/ingero not found. Run 'make build' first."
+    exit 1
+fi
+
+if ! command -v stress-ng &>/dev/null; then
+    echo "ERROR: stress-ng not found. Install: sudo apt-get install -y stress-ng"
+    exit 1
+fi
+
+if ! python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "ERROR: PyTorch with CUDA not available."
+    exit 1
+fi
+
+if [[ ! -f scripts/gpu-investigation-analysis.py ]]; then
+    echo "ERROR: scripts/gpu-investigation-analysis.py not found."
+    exit 1
+fi
+
+mkdir -p logs
+
+################################################################################
+# Setup: 5-Phase Trace (120s)
+################################################################################
+
+echo ""
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}  GPU Problem Investigation — 28 Issues via MCP${NC}"
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+ML_DB="/tmp/ingero_inv_$(head -c 6 /dev/urandom | xxd -p).db"
+TRACE_DURATION=120
+REPORT_FILE="logs/gpu-investigation-report.log"
+
+echo -e "$(ts) ${CYAN}[SETUP]${NC} 5-phase trace: 120s total"
+echo -e "$(ts)   Phase 1: 0-20s   Cold start + baseline (ResNet-50)"
+echo -e "$(ts)   Phase 2: 20-50s  Allocation stress (alloc_stress.py)"
+echo -e "$(ts)   Phase 3: 50-90s  CPU contention (stress-ng $(nproc) workers)"
+echo -e "$(ts)   Phase 4: 90-110s Recovery (stressors killed)"
+echo -e "$(ts)   Phase 5: 110-120s Continued clean training"
+
+# Pre-download CIFAR-10 dataset so training starts GPU work immediately.
+echo -e "$(ts)   Pre-downloading CIFAR-10 dataset..."
+if ! python3 -c "
+import torchvision
+torchvision.datasets.CIFAR10(root='/tmp/cifar10', train=True, download=True)
+print('CIFAR-10 ready')
+" > logs/gpu-inv-dataset-download.log 2>&1; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} CIFAR-10 download failed. See logs/gpu-inv-dataset-download.log"
+    cat logs/gpu-inv-dataset-download.log
+    exit 1
+fi
+echo -e "$(ts)   $(tail -1 logs/gpu-inv-dataset-download.log)"
+
+################################################################################
+# Phase 1: Cold start + steady baseline (0-20s)
+################################################################################
+
+echo -e "$(ts) ${CYAN}[PHASE 1]${NC} Starting ResNet-50 training..."
+
+# Start training (10 epochs — enough to cover 120s on fast GPUs like H100/GH200)
+python3 tests/workloads/training/resnet50_cifar10.py \
+    --epochs 10 --batch-size 64 > logs/gpu-inv-training.log 2>&1 &
+TRAIN_PID=$!
+cleanup_pids+=("$TRAIN_PID")
+
+# Start alloc_stress BEFORE the trace so auto-discovery enrolls its PID.
+# --delay 30: initializes CUDA immediately (makes PID discoverable), then sleeps
+# 30s before actual stress work begins. Since alloc_stress launches ~10s before
+# the trace, the delay expires at trace-time t=20s (aligns with Phase 2).
+# --duration 30: stress runs for 30s (covers Phase 2's t=20-50s window).
+echo -e "$(ts)   Starting alloc_stress.py (delay=30s, duration=30s)..."
+python3 tests/workloads/synthetic/alloc_stress.py --delay 30 --duration 30 \
+    > logs/gpu-inv-alloc-stress.log 2>&1 &
+ALLOC_PID=$!
+cleanup_pids+=("$ALLOC_PID")
+
+# Wait for CUDA init (both training and alloc_stress)
+echo -e "$(ts)   Waiting for training + alloc_stress to reach GPU..."
+sleep 10
+
+if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Training process died. See logs/gpu-inv-training.log"
+    cat logs/gpu-inv-training.log
+    exit 1
+fi
+
+if ! kill -0 "$ALLOC_PID" 2>/dev/null; then
+    echo -e "$(ts) ${YELLOW}[WARN]${NC} alloc_stress.py died early. Phase 2 provocation may not fire."
+    echo -e "$(ts)   See logs/gpu-inv-alloc-stress.log"
+    tail -5 logs/gpu-inv-alloc-stress.log 2>/dev/null || true
+fi
+
+echo -e "$(ts)   Training PID: $TRAIN_PID, Alloc PID: $ALLOC_PID"
+echo -e "$(ts)   Starting trace (${TRACE_DURATION}s) with --record-all --stack..."
+
+# Start trace — --record-all stores every event, --stack captures call stacks
+# Redirect both stdout and stderr to log (stdout bleed corrupts ML_RESULT parsing).
+# Auto-discovery will find both training (TRAIN_PID) and alloc_stress (ALLOC_PID)
+# because both have already initialized CUDA (loaded libcudart.so).
+sudo ./bin/ingero trace --db "$ML_DB" --record-all --stack --duration "${TRACE_DURATION}s" \
+    > logs/gpu-inv-trace.log 2>&1 &
+TRACE_PID=$!
+cleanup_sudo_pids+=("$TRACE_PID")
+
+# Phase 1 runs for 20s (trace capturing, alloc_stress in delay/sleep)
+echo -e "$(ts)   Phase 1: baseline (20s)..."
+sleep 20
+
+################################################################################
+# Phase 2: Allocation stress (20-50s) — alloc_stress delay expires, stress begins
+################################################################################
+
+# Verify alloc_stress survived Phase 1 delay and will fire during Phase 2
+if ! kill -0 "$ALLOC_PID" 2>/dev/null; then
+    echo -e "$(ts) ${YELLOW}[WARN]${NC} alloc_stress.py died during Phase 1. Phase 2 provocation will be absent."
+    echo -e "$(ts)   Last 5 lines of alloc_stress log:"
+    tail -5 logs/gpu-inv-alloc-stress.log 2>/dev/null || true
+fi
+echo -e "$(ts) ${CYAN}[PHASE 2]${NC} alloc_stress.py delay expired, stress active (30s)..."
+
+# Phase 2 runs for 30s (alloc_stress does actual work during this window)
+sleep 30
+
+################################################################################
+# Phase 3: CPU contention (50-90s)
+################################################################################
+
+echo -e "$(ts) ${CYAN}[PHASE 3]${NC} Starting stress-ng (40s, $(nproc) workers)..."
+
+# Kill alloc_stress if still running (it should have finished its 30s duration by now)
+kill "$ALLOC_PID" 2>/dev/null || true
+
+NCPUS=$(nproc)
+sudo stress-ng --cpu "$NCPUS" --cpu-method matrixprod --timeout 40s > /dev/null 2>&1 &
+STRESS_PID=$!
+cleanup_sudo_pids+=("$STRESS_PID")
+
+# Phase 3 runs for 40s
+sleep 40
+
+################################################################################
+# Phase 4: Recovery (90-110s)
+################################################################################
+
+echo -e "$(ts) ${CYAN}[PHASE 4]${NC} Killing stressors, recovery phase (20s)..."
+
+# pkill -f the actual stress-ng workers — sudo kill on the wrapper PID
+# only kills the sudo process, not the stress-ng children it spawned.
+sudo pkill -f 'stress-ng.*matrixprod' 2>/dev/null || true
+
+# Phase 4 + 5 run for the remaining 30s of the trace
+# Poll instead of wait — TRACE_PID is sudo-spawned, bash wait would hang.
+echo -e "$(ts)   Waiting for trace to finish (~30s remaining)..."
+for _i in $(seq 1 60); do
+    if ! sudo kill -0 "$TRACE_PID" 2>/dev/null; then break; fi
+    sleep 1
+done
+# Cannot capture exit status of sudo-spawned process. Validate DB instead.
+
+# Kill training
+kill "$TRAIN_PID" 2>/dev/null || true
+wait "$TRAIN_PID" 2>/dev/null || true
+
+# Validate trace produced events — catches ingero trace crashes or probe failures
+# Force WAL checkpoint first — ingero (modernc.org/sqlite) may leave data in WAL file
+# that the sqlite3 CLI won't see without an explicit checkpoint.
+sudo sqlite3 "$ML_DB" "PRAGMA wal_checkpoint(TRUNCATE)" 2>/dev/null || true
+DB_EVENTS=$(sudo sqlite3 "$ML_DB" "SELECT COUNT(*) FROM events" 2>/dev/null || echo "0")
+if [[ "$DB_EVENTS" -lt 100 ]]; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Trace captured only $DB_EVENTS events (expected >100). See logs/gpu-inv-trace.log"
+    tail -20 logs/gpu-inv-trace.log
+    record "FAIL" "T23a: trace captured events" "only $DB_EVENTS events in DB (trace may have crashed)"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
+# Check CUDA+Driver events specifically — catches partial probe failures
+# where only HOST tracepoints fire but no CUDA uprobes attached
+CUDA_EVENTS=$(sudo sqlite3 "$ML_DB" "SELECT COUNT(*) FROM events WHERE source IN (1, 4)" 2>/dev/null || echo "0")
+if [[ "$CUDA_EVENTS" -lt 100 ]]; then
+    echo -e "$(ts) ${RED}[ERROR]${NC} Only $CUDA_EVENTS CUDA/Driver events (expected >100). Uprobes may not have attached."
+    echo -e "$(ts)   Total events: $DB_EVENTS (host tracepoints working, CUDA probes failed)"
+    tail -20 logs/gpu-inv-trace.log
+    record "FAIL" "T23a: CUDA probe validation" "only $CUDA_EVENTS CUDA+Driver events in DB"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
+echo -e "$(ts)   Trace complete. DB: $ML_DB ($DB_EVENTS events, $CUDA_EVENTS CUDA+Driver)"
+
+# Copy DB to logs/ for transfer
+sudo cp "$ML_DB" logs/gpu-investigation.db && sudo chmod 644 logs/gpu-investigation.db
+sudo cp "${ML_DB}-wal" logs/gpu-investigation.db-wal 2>/dev/null && sudo chmod 644 logs/gpu-investigation.db-wal || true
+sudo cp "${ML_DB}-shm" logs/gpu-investigation.db-shm 2>/dev/null && sudo chmod 644 logs/gpu-investigation.db-shm || true
+
+################################################################################
+# Start MCP Server
+################################################################################
+
+echo -e "$(ts) ${CYAN}[MCP]${NC} Starting MCP server..."
+
+MCP_PORT=$(( 8443 + RANDOM % 1000 ))
+# sudo required: trace creates root-owned DB, MCP server must be able to read it.
+sudo ./bin/ingero mcp --db "$ML_DB" --http ":${MCP_PORT}" > logs/gpu-inv-mcp.log 2>&1 &
+MCP_PID=$!
+cleanup_sudo_pids+=("$MCP_PID")
+
+# Wait for MCP server to be ready
+MCP_READY=0
+for i in $(seq 1 15); do
+    if curl -skf -o /dev/null "https://localhost:${MCP_PORT}/mcp" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json, text/event-stream' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"gpu-investigation","version":"1.0"}}}' 2>/dev/null; then
+        MCP_READY=1
+        break
+    fi
+    sleep 0.5
+done
+
+if [[ "$MCP_READY" -eq 0 ]]; then
+    echo -e "$(ts)   ${RED}MCP server not ready after 7.5s${NC}"
+    echo -e "$(ts)   MCP log: $(tail -3 logs/gpu-inv-mcp.log)"
+    record "FAIL" "T23a: MCP server" "MCP server failed to start"
+    for entry in "${ML_RESULTS[@]}"; do echo "ML_RESULT|${entry}"; done
+    exit 1
+fi
+
+echo -e "$(ts)   MCP server ready on :${MCP_PORT}"
+
+################################################################################
+# Run Python Analysis (28 Investigations)
+################################################################################
+
+echo ""
+echo -e "$(ts) ${CYAN}[ANALYSIS]${NC} Running 28 GPU problem investigations via MCP..."
+
+ANALYSIS_OUTPUT=$(python3 scripts/gpu-investigation-analysis.py \
+    --mcp-url "https://localhost:${MCP_PORT}/mcp" \
+    --db "$ML_DB" \
+    --report "$REPORT_FILE" \
+    2> logs/gpu-inv-analysis-stderr.log)
+ANALYSIS_EXIT=$?
+
+# Display investigation output (non-ML_RESULT lines)
+echo "$ANALYSIS_OUTPUT" | grep -v '^ML_RESULT|'
+
+# Kill MCP server
+sudo kill "$MCP_PID" 2>/dev/null || true
+
+################################################################################
+# Ingest Results
+################################################################################
+
+# Parse ML_RESULT lines from Python output
+INGESTED=0
+while IFS='|' read -r tid name status detail dur; do
+    record "$status" "$name" "$detail"
+    INGESTED=$((INGESTED + 1))
+done < <(echo "$ANALYSIS_OUTPUT" | grep '^ML_RESULT|' | sed 's/^ML_RESULT|//')
+
+if [[ "$INGESTED" -eq 0 ]]; then
+    if [[ "$ANALYSIS_EXIT" -ne 0 ]]; then
+        record "FAIL" "T23a: GPU investigation" "analysis script failed (exit $ANALYSIS_EXIT)"
+        echo "Analysis stderr:"
+        cat logs/gpu-inv-analysis-stderr.log
+    else
+        record "FAIL" "T23a: GPU investigation" "no structured results returned"
+    fi
+elif [[ "$ANALYSIS_EXIT" -ne 0 && "$INGESTED" -lt 28 ]]; then
+    record "FAIL" "T23a: GPU investigation" "partial results: ${INGESTED}/28 (exit $ANALYSIS_EXIT)"
+    echo "Analysis stderr:"
+    cat logs/gpu-inv-analysis-stderr.log
+fi
+
+################################################################################
+# Summary
+################################################################################
+
+echo ""
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+echo -e "  ${GREEN}PASS=${PASS_COUNT}${NC}  ${RED}FAIL=${FAIL_COUNT}${NC}  ${YELLOW}SKIP=${SKIP_COUNT}${NC}  Total=${TOTAL}"
+echo -e "  Report: ${REPORT_FILE}"
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Output structured results for gpu-test.sh ingestion
+for entry in "${ML_RESULTS[@]}"; do
+    echo "ML_RESULT|${entry}"
+done
+
+if [[ $FAIL_COUNT -gt 0 ]]; then
+    exit 1
+fi
+exit 0

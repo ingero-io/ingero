@@ -1,0 +1,24 @@
+// Grafana Alloy config — receives OTLP from Ingero, writes to Prometheus.
+// Ingero pushes metrics via: --otlp localhost:4317
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}

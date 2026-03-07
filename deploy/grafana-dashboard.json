@@ -1,0 +1,73 @@
+{
+  "dashboard": {
+    "title": "Ingero — GPU Causal Observability",
+    "uid": "ingero-v03",
+    "panels": [
+      {
+        "title": "CUDA Latency (p50/p95/p99)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "gpu_cuda_operation_duration_microseconds{source=\"cuda\"}",
+            "legendFormat": "{{operation}} {{percentile}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "title": "Time Fraction Breakdown",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "gpu_cuda_operation_count{source=\"cuda\"}",
+            "legendFormat": "{{operation}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "title": "System Context",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "system_cpu_utilization * 100",
+            "legendFormat": "CPU %"
+          },
+          {
+            "expr": "system_memory_utilization * 100",
+            "legendFormat": "Memory %"
+          },
+          {
+            "expr": "system_cpu_load_average_1m",
+            "legendFormat": "Load Avg"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+      },
+      {
+        "title": "Anomaly Count",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "ingero_anomaly_count",
+            "legendFormat": "Anomalies"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16}
+      },
+      {
+        "title": "Host Events",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "gpu_cuda_operation_count{source=\"host\"}",
+            "legendFormat": "{{operation}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20}
+      }
+    ],
+    "time": {"from": "now-15m", "to": "now"},
+    "refresh": "10s"
+  }
+}

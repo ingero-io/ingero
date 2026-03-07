@@ -1,0 +1,46 @@
+# Binaries
+/bin/
+/ingero
+*.a
+
+# eBPF generated (vmlinux.h is machine-specific, not committed)
+# Note: *_bpfel.go and *_bpfel.o ARE committed — CI needs them to build.
+bpf/headers/vmlinux.h
+
+# Go
+vendor/
+
+# Build output
+dist/
+.output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.pem
+*.key
+
+# VM state
+.tensordock-vm.json
+.lambdalabs-vm.json
+.azure-vm.json
+
+# Logs (session logs, test output)
+/logs/
+
+# Claude Code (local-only project context)
+.claude/
+
+# Test artifacts
+coverage.out
+*.test
