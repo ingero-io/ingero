@@ -143,35 +143,6 @@ sudo make install # copies binary to /usr/local/bin/ingero
 
 ## Commands
 
-### `ingero dashboard`
-
-Start a browser-based GPU monitoring dashboard backed by the SQLite event store. Shows live system metrics, CUDA operation latencies, causal chains, and a capability manifest (grayed-out panels for metrics Ingero doesn't yet collect, with tooltips naming the required external tool). Requires `ingero trace` to be running (or to have run recently).
-
-```bash
-ingero dashboard                           # HTTPS on :8080 (self-signed TLS 1.3)
-ingero dashboard --addr :9090              # custom port
-ingero dashboard --db /path/to/ingero.db   # custom database
-ingero dashboard --tls-cert cert.pem --tls-key key.pem  # custom TLS certificate
-
-# Remote access via SSH tunnel:
-ssh -L 8080:localhost:8080 user@gpu-vm
-# Then open https://localhost:8080 in browser
-```
-
-**No sudo needed** — the dashboard reads from the SQLite database populated by `ingero trace`.
-
-**Security:** TLS 1.3 only. Auto-generates an ephemeral self-signed ECDSA P-256 certificate (valid 24h) if no `--tls-cert`/`--tls-key` provided. DNS rebinding protection rejects requests from non-localhost Host headers.
-
-**API endpoints:**
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/v1/overview` | Event count, chain count, latest system snapshot, GPU info, top causal chain |
-| `GET /api/v1/ops?since=5m` | Per-operation latency stats (percentile or aggregate mode) |
-| `GET /api/v1/chains?since=1h` | Stored causal chains with severity, root cause, timeline |
-| `GET /api/v1/snapshots?since=60s` | System metric time series (CPU, memory, swap, load) |
-| `GET /api/v1/capabilities` | Metric availability manifest (available vs. grayed-out with required tool) |
-
 ### `ingero check`
 
 Check if your system is ready for eBPF-based GPU tracing.
@@ -348,6 +319,35 @@ curl -sk https://localhost:8080/mcp \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_trace_stats","arguments":{"tsc":false}}}' | jq
 ```
+
+### `ingero dashboard`
+
+Start a browser-based GPU monitoring dashboard backed by the SQLite event store. Shows live system metrics, CUDA operation latencies, causal chains, and a capability manifest (grayed-out panels for metrics Ingero doesn't yet collect, with tooltips naming the required external tool). Requires `ingero trace` to be running (or to have run recently).
+
+```bash
+ingero dashboard                           # HTTPS on :8080 (self-signed TLS 1.3)
+ingero dashboard --addr :9090              # custom port
+ingero dashboard --db /path/to/ingero.db   # custom database
+ingero dashboard --tls-cert cert.pem --tls-key key.pem  # custom TLS certificate
+
+# Remote access via SSH tunnel:
+ssh -L 8080:localhost:8080 user@gpu-vm
+# Then open https://localhost:8080 in browser
+```
+
+**No sudo needed** — the dashboard reads from the SQLite database populated by `ingero trace`.
+
+**Security:** TLS 1.3 only. Auto-generates an ephemeral self-signed ECDSA P-256 certificate (valid 24h) if no `--tls-cert`/`--tls-key` provided. DNS rebinding protection rejects requests from non-localhost Host headers.
+
+**API endpoints:**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/overview` | Event count, chain count, latest system snapshot, GPU info, top causal chain |
+| `GET /api/v1/ops?since=5m` | Per-operation latency stats (percentile or aggregate mode) |
+| `GET /api/v1/chains?since=1h` | Stored causal chains with severity, root cause, timeline |
+| `GET /api/v1/snapshots?since=60s` | System metric time series (CPU, memory, swap, load) |
+| `GET /api/v1/capabilities` | Metric availability manifest (available vs. grayed-out with required tool) |
 
 ### `ingero demo`
 
