@@ -359,3 +359,14 @@
 | 213 | TestCUDAOpString | CUDA op names | types_test.go |
 | 214 | TestHostOpString | Host op names (sched_switch, pod_restart, etc.) | types_test.go |
 | 215 | TestDriverOpString | Driver op names (cuLaunchKernel, etc.) | types_test.go |
+| 216 | TestServerStartsAndServesHTML | Dashboard HTTPS serves embedded HTML | dashboard_test.go |
+| 217 | TestServerGracefulShutdown | Context cancel → clean shutdown | dashboard_test.go |
+| 218 | TestHostGuardRejectsBadHost | DNS rebinding protection (7 host variants) | dashboard_test.go |
+| 219 | TestHandleOverview | Overview JSON with populated DB | api_test.go |
+| 220 | TestHandleOverviewNoStore | Nil store → graceful empty response | api_test.go |
+| 221 | TestHandleOps | Per-op stats with since parameter | api_test.go |
+| 222 | TestHandleChains | Causal chains from DB | api_test.go |
+| 223 | TestHandleSnapshots | System snapshot time series | api_test.go |
+| 224 | TestHandleCapabilities | Full capability manifest (available + grayed) | api_test.go |
+| 225 | TestCapabilitiesStructure | All IDs unique, tooltips on unavailable | api_test.go |
+| 226 | TestHandleOpsBadSince | Invalid since param → 400 error | api_test.go |

@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ingero GPU Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0a0c10; --bg-card: #12151c; --border: #1e2330; --bg-sub: #0d0f14;
+      --text: #e8eaf0; --text-sec: #8890a4; --text-muted: #555d74;
+      --green: #22c55e; --green-dim: #166534;
+      --amber: #f59e0b; --amber-dim: #92400e;
+      --red: #ef4444; --red-dim: #991b1b;
+      --cyan: #06b6d4; --cyan-dim: #155e75;
+      --blue: #3b82f6; --purple: #a855f7;
+      --font-mono: 'Menlo', 'Consolas', 'Monaco', 'Liberation Mono', monospace;
+      --font-sans: system-ui, -apple-system, sans-serif;
+    }
+    body { background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 13px; line-height: 1.5; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 16px 20px; }
+
+    /* Header */
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+    .header-left { display: flex; align-items: center; gap: 10px; }
+    .header-left h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+    .header-sub { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); margin-top: 4px; margin-left: 18px; letter-spacing: 0.08em; }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .dot.ok { background: var(--green); box-shadow: 0 0 12px var(--green); }
+    .dot.warn { background: var(--amber); box-shadow: 0 0 12px var(--amber); animation: pulse 1.5s infinite; }
+    .dot.err { background: var(--red); box-shadow: 0 0 12px var(--red); animation: pulse 1.5s infinite; }
+    .dot.off { background: var(--text-muted); }
+
+    .time-select { display: flex; gap: 4px; }
+    .time-select button { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-sec); padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); }
+    .time-select button.active { background: var(--border); color: var(--text); border-color: var(--text-muted); }
+
+    .level-toggle { display: flex; align-items: center; gap: 2px; background: var(--bg-card); border-radius: 6px; border: 1px solid var(--border); padding: 2px; }
+    .level-btn { font-size: 9px; font-family: var(--font-mono); font-weight: 700; padding: 4px 8px; border-radius: 4px; cursor: pointer; border: none; background: transparent; color: var(--text-muted); transition: all 0.15s; }
+    .level-btn.active { background: rgba(59,130,246,0.13); color: var(--blue); }
+
+    /* Cards & Sections */
+    .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    .section-hdr { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
+
+    /* Accordion */
+    .accordion { margin-bottom: 12px; }
+    .accordion-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer; user-select: none; }
+    .accordion-head:hover { background: rgba(30,35,48,0.3); }
+    .accordion-arrow { color: var(--text-muted); font-size: 11px; transition: transform 0.2s; }
+    .accordion-arrow.open { transform: rotate(90deg); }
+    .accordion-badge { font-size: 9px; font-weight: 700; color: var(--blue); font-family: var(--font-mono); background: rgba(59,130,246,0.09); padding: 2px 6px; border-radius: 3px; }
+    .accordion-label { font-size: 11px; font-weight: 600; color: var(--text-sec); letter-spacing: 0.06em; }
+    .accordion-info { margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; font-size: 9px; font-weight: 700; font-family: var(--font-mono); cursor: pointer; color: var(--text-muted); border: 1px solid var(--border); background: transparent; position: relative; }
+    .accordion-body { padding: 0 14px 14px; }
+
+    /* Scorecards */
+    .sc-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .scorecard { border-radius: 8px; padding: 10px 12px; display: flex; align-items: center; gap: 10px; }
+    .sc-label { font-size: 8px; color: var(--text-muted); font-family: var(--font-mono); letter-spacing: 0.05em; }
+    .sc-value { font-size: 14px; font-weight: 700; font-family: var(--font-mono); }
+
+    /* Banner */
+    .banner { border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; display: flex; align-items: flex-start; gap: 12px; }
+    .banner-icon { width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+    .banner-title { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+    .banner-desc { font-size: 11px; color: var(--text-sec); line-height: 1.5; }
+
+    /* Causal Chain horizontal */
+    .chain-horiz { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .chain-pill { display: inline-flex; align-items: center; gap: 5px; border-radius: 5px; padding: 5px 10px; font-size: 10px; font-family: var(--font-mono); }
+    .chain-pill .ch-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .chain-pill .ch-layer { font-weight: 700; }
+    .chain-pill .ch-metric { color: var(--text-sec); }
+    .chain-arrow { color: var(--text-muted); font-size: 12px; }
+    .chain-toggle { display: flex; gap: 4px; margin-left: auto; }
+    .chain-toggle-btn { font-size: 9px; font-family: var(--font-mono); padding: 3px 8px; border-radius: 4px; cursor: pointer; border: 1px solid var(--border); background: transparent; color: var(--text-muted); }
+    .chain-toggle-btn.active { background: rgba(59,130,246,0.12); color: var(--blue); border-color: var(--blue); }
+
+    /* Recommendations */
+    .rec-item { border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; }
+    .rec-item:last-child { margin-bottom: 0; }
+    .rec-pri { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; font-family: var(--font-mono); }
+    .rec-title { font-size: 11px; font-weight: 600; }
+    .rec-desc { font-size: 10px; color: var(--text-sec); margin-top: 3px; }
+
+    /* Pipeline metrics with bars */
+    .metric-bar { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+    .metric-bar .mb-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .metric-bar .mb-label { color: var(--text-sec); font-size: 10px; font-family: var(--font-mono); min-width: 90px; flex-shrink: 0; }
+    .metric-bar .mb-track { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .metric-bar .mb-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+    .metric-bar .mb-val { font-size: 10px; font-family: var(--font-mono); font-weight: 600; min-width: 32px; text-align: right; }
+
+    /* Stall bars */
+    .stall-bar { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+    .stall-bar .sb-label { color: var(--text-muted); font-size: 10px; font-family: var(--font-mono); width: 80px; flex-shrink: 0; }
+    .stall-bar .sb-track { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .stall-bar .sb-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+    .stall-bar .sb-val { color: var(--text-muted); font-size: 10px; font-family: var(--font-mono); width: 35px; text-align: right; }
+
+    /* Ops table */
+    .ops-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; }
+    .ops-table th { text-align: left; padding: 6px 10px; color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .ops-table td { padding: 6px 10px; border-bottom: 1px solid var(--bg-sub); }
+    .ops-table tr:hover { background: #161922; }
+    .ops-table .num { text-align: right; }
+    .ops-table .src { color: var(--text-muted); font-size: 10px; }
+
+    /* Sparklines */
+    .sparkline-row { display: flex; flex-direction: column; gap: 14px; }
+    .sparkline-item { }
+    .sparkline-label { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .sparkline-label span { font-size: 8px; color: var(--text-muted); font-family: var(--font-mono); }
+    .sparkline-label .val { font-size: 11px; color: var(--text); font-weight: 500; }
+    .sparkline-svg { width: 100%; height: 32px; display: block; }
+
+    /* Infra badges */
+    .infra-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+    .infra-badge { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--bg-sub); border-radius: 4px; font-size: 11px; }
+    .infra-badge .indicator { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .infra-badge .indicator.on { background: var(--green); box-shadow: 0 0 4px var(--green); }
+    .infra-badge .indicator.off { background: var(--text-muted); }
+    .infra-badge .lbl { color: var(--text-sec); }
+    .infra-badge .cnt { font-family: var(--font-mono); color: var(--text); margin-left: auto; }
+
+    /* Grayed */
+    .grayed { position: relative; pointer-events: none; }
+    .grayed > *:not(.grayed-overlay) { opacity: 0.25; }
+    .grayed-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 2; pointer-events: auto; }
+    .grayed-tooltip { background: rgba(18,21,28,0.92); border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; font-size: 11px; color: #d4d8e4; white-space: nowrap; max-width: 320px; text-align: center; }
+
+    /* Grids */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid-resp-2-3 { display: grid; grid-template-columns: 2fr 3fr; gap: 12px; }
+    .grid-resp-1-2 { display: grid; grid-template-columns: minmax(240px, 1fr) 2fr; gap: 12px; }
+    .sub-panel { background: rgba(30,35,48,0.09); border-radius: 8px; padding: 12px; }
+
+    /* No data */
+    .no-data { text-align: center; padding: 40px 20px; color: var(--text-muted); }
+    .no-data p { margin: 8px 0; }
+    .no-data code { font-family: var(--font-mono); background: var(--bg-card); padding: 2px 6px; border-radius: 3px; color: var(--text-sec); }
+
+    /* Footer */
+    .footer { margin-top: 16px; padding: 10px 0; border-top: 1px solid var(--border); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 9px; color: var(--text-muted); font-family: var(--font-mono); }
+
+    /* Cluster map mini */
+    .cluster-gpus { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+    .cluster-gpu { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 56px; cursor: default; }
+    .cluster-gpu-bar { width: 100%; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-family: var(--font-mono); font-weight: 600; transition: all 0.6s ease; }
+    .cluster-gpu-lbl { font-size: 7px; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); }
+
+    /* NVTX phase bar */
+    .nvtx-bar { display: flex; gap: 1px; border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
+    .nvtx-seg { padding: 4px 6px; text-align: center; font-size: 8px; font-family: var(--font-mono); }
+
+    @media (max-width: 768px) {
+      .sc-grid { grid-template-columns: repeat(2, 1fr); }
+      .grid-2, .grid-resp-2-3, .grid-resp-1-2 { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 500px) {
+      .sc-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container" id="app">
+    <div class="no-data" id="loading">
+      <div style="width:24px;height:24px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 12px;"></div>
+      <p>Connecting to Ingero...</p>
+    </div>
+  </div>
+  <script>
+(function() {
+  'use strict';
+
+  // --- State ---
+  let capabilities = [];
+  let overview = null;
+  let ops = null;
+  let chains = null;
+  let snapshots = null;
+  let snapshotHistory = { cpu: [], mem: [], load: [] };
+  let sinceParam = '5m';
+  let lastUpdate = null;
+  let unavailableSet = new Set();
+  let errorState = null;
+  let openSections = { l1: true, l2: true, l3: true };
+  let chainViewMode = 'chain'; // 'chain' or 'tree'
+  let chainExpanded = false; // show all chains or just top 5
+
+  const app = document.getElementById('app');
+
+  // --- API ---
+  const API = '/api/v1';
+
+  async function fetchJSON(path) {
+    const resp = await fetch(API + path);
+    if (!resp.ok) throw new Error(resp.status + ' ' + resp.statusText);
+    return resp.json();
+  }
+
+  async function loadCapabilities() {
+    try {
+      const caps = await fetchJSON('/capabilities');
+      capabilities = caps;
+      unavailableSet = new Set(caps.filter(function(c) { return !c.available; }).map(function(c) { return c.id; }));
+    } catch (e) {
+      console.error('capabilities:', e);
+    }
+  }
+
+  async function loadAll() {
+    try {
+      var results = await Promise.all([
+        fetchJSON('/overview'),
+        fetchJSON('/ops?since=' + sinceParam),
+        fetchJSON('/chains?since=' + sinceParam),
+        fetchJSON('/snapshots?since=60s'),
+      ]);
+      overview = results[0];
+      ops = results[1];
+      chains = results[2];
+      snapshots = results[3];
+      errorState = null;
+
+      if (snapshots && snapshots.snapshots && snapshots.snapshots.length > 0) {
+        snapshotHistory.cpu = snapshots.snapshots.map(function(s) { return s.cpu_percent; });
+        snapshotHistory.mem = snapshots.snapshots.map(function(s) { return s.mem_percent; });
+        snapshotHistory.load = snapshots.snapshots.map(function(s) { return s.load_avg; });
+      }
+
+      lastUpdate = new Date();
+      render();
+    } catch (e) {
+      console.error('poll error:', e);
+      errorState = e.message;
+      render();
+    }
+  }
+
+  // --- Helpers ---
+  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function fmt(n) { return n == null ? '-' : n.toLocaleString(); }
+  function fmtUS(us) {
+    if (us == null) return '-';
+    if (us < 1000) return us + 'us';
+    if (us < 1000000) return (us / 1000).toFixed(1) + 'ms';
+    return (us / 1000000).toFixed(2) + 's';
+  }
+  function statusColor(v, lo, hi) {
+    lo = lo || 70; hi = hi || 90;
+    if (v >= hi) return 'var(--red)';
+    if (v >= lo) return 'var(--amber)';
+    return 'var(--green)';
+  }
+  function sevColor(s) {
+    if (s === 'HIGH') return 'var(--red)';
+    if (s === 'MEDIUM') return 'var(--amber)';
+    return 'var(--green)';
+  }
+  function sevBg(s) {
+    if (s === 'HIGH') return 'rgba(239,68,68,0.06)';
+    if (s === 'MEDIUM') return 'rgba(245,158,11,0.06)';
+    return 'rgba(34,197,94,0.06)';
+  }
+  function sevBorder(s) {
+    if (s === 'HIGH') return 'rgba(239,68,68,0.25)';
+    if (s === 'MEDIUM') return 'rgba(245,158,11,0.25)';
+    return 'rgba(34,197,94,0.25)';
+  }
+  function layerColor(layer) {
+    if (layer === 'SYSTEM') return 'var(--cyan)';
+    if (layer === 'HOST' || layer === 'INFRA') return 'var(--amber)';
+    if (layer === 'CUDA') return 'var(--green)';
+    if (layer === 'ROOT') return 'var(--purple)';
+    return 'var(--text-muted)';
+  }
+  function isGrayed(id) { return unavailableSet.has(id); }
+  function grayTooltip(id) {
+    var cap = capabilities.find(function(c) { return c.id === id; });
+    return cap ? cap.tooltip : '';
+  }
+
+  function sparklineSVG(data, color, height) {
+    if (!data || data.length < 2) return '<svg class="sparkline-svg" viewBox="0 0 200 ' + height + '"></svg>';
+    height = height || 32;
+    var w = 200;
+    var max = Math.max.apply(null, data.concat([1]));
+    var step = w / (data.length - 1);
+    var pts = data.map(function(v, i) { return (i * step).toFixed(1) + ',' + (height - (v / max) * (height - 4) - 2).toFixed(1); });
+    var polyPts = '0,' + height + ' ' + pts.join(' ') + ' ' + w + ',' + height;
+    var last = pts[pts.length - 1];
+    return '<svg class="sparkline-svg" viewBox="0 0 ' + w + ' ' + height + '" preserveAspectRatio="none">' +
+      '<polygon points="' + polyPts + '" fill="' + color + '" opacity="0.15"/>' +
+      '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="1.5"/>' +
+      '<circle cx="' + last.split(',')[0] + '" cy="' + last.split(',')[1] + '" r="2.5" fill="' + color + '"/>' +
+      '</svg>';
+  }
+
+  function wrapGrayed(id, html) {
+    if (!isGrayed(id)) return html;
+    return '<div class="grayed">' + html + '<div class="grayed-overlay"><div class="grayed-tooltip">' + esc(grayTooltip(id)) + '</div></div></div>';
+  }
+
+  function accordion(level, label, contentFn) {
+    var isOpen = openSections[level.toLowerCase()];
+    var h = '';
+    h += '<div class="card accordion">';
+    h += '<div class="accordion-head" onclick="window.__toggleSection(\'' + level.toLowerCase() + '\')">';
+    h += '<span class="accordion-arrow ' + (isOpen ? 'open' : '') + '">&#9654;</span>';
+    h += '<span class="accordion-badge">' + level + '</span>';
+    h += '<span class="accordion-label">' + esc(label) + '</span>';
+    h += '</div>';
+    if (isOpen) {
+      h += '<div class="accordion-body">' + contentFn() + '</div>';
+    }
+    h += '</div>';
+    return h;
+  }
+
+  // Deduplicate chains by root_cause (normalize by stripping numbers for grouping)
+  function deduplicateChains(allChains) {
+    var groups = {};
+    var order = [];
+    allChains.forEach(function(ch) {
+      // Normalize: strip numbers so "3782 sched_switch" and "3735 sched_switch" group together
+      var key = (ch.root_cause || ch.summary).replace(/[0-9,]+/g, '#');
+      if (!groups[key]) {
+        groups[key] = { chain: ch, count: 1 };
+        order.push(key);
+      } else {
+        groups[key].count++;
+        // Keep highest severity
+        var sevRank = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+        if ((sevRank[ch.severity] || 0) > (sevRank[groups[key].chain.severity] || 0)) {
+          groups[key].chain = ch;
+        }
+      }
+    });
+    return order.map(function(k) { return groups[k]; });
+  }
+
+  // --- Render ---
+  function render() {
+    if (!overview && !errorState) {
+      app.innerHTML = '<div class="no-data"><div style="width:24px;height:24px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 12px;"></div><p>Connecting to Ingero...</p></div>';
+      return;
+    }
+
+    if (errorState && !overview) {
+      app.innerHTML = '<div class="no-data"><p style="color:var(--red);">Connection error: ' + esc(errorState) + '</p><p>Make sure <code>ingero trace</code> has been run to populate the database.</p></div>';
+      return;
+    }
+
+    var ov = overview || {};
+    var sys = ov.system || {};
+    var tc = ov.top_chain;
+    var hasChains = chains && chains.chains && chains.chains.length > 0;
+    var hasOps = ops && ops.ops && ops.ops.length > 0;
+    var hasSnapshots = snapshotHistory.cpu.length > 0;
+
+    // Overall status
+    var statusDot = 'ok', statusText = 'Healthy';
+    if (tc) {
+      if (tc.severity === 'HIGH') { statusDot = 'err'; statusText = 'Issue Detected'; }
+      else if (tc.severity === 'MEDIUM') { statusDot = 'warn'; statusText = 'Warning'; }
+    }
+    if (ov.event_count === 0) { statusDot = 'off'; statusText = 'No Data'; }
+
+    var html = '';
+
+    // ── HEADER ──
+    html += '<div class="header">';
+    html += '<div>';
+    html += '<div class="header-left">';
+    html += '<div class="dot ' + statusDot + '"></div>';
+    html += '<h1>INGERO</h1>';
+    html += '</div>';
+    var subParts = ['eBPF + CUDA PROBES', 'LIVE TELEMETRY'];
+    if (ov.gpu) {
+      if (ov.gpu.model) subParts.unshift(ov.gpu.model);
+      var verParts = [];
+      if (ov.gpu.driver_version) verParts.push('Driver ' + ov.gpu.driver_version);
+      if (ov.gpu.cuda_version) verParts.push('CUDA ' + ov.gpu.cuda_version);
+      if (verParts.length) subParts.push(verParts.join(' / '));
+    }
+    html += '<div class="header-sub">' + subParts.join(' &mdash; ') + '</div>';
+    html += '</div>';
+    html += '<div class="header-right">';
+    html += '<div class="time-select">';
+    ['1m','5m','15m','1h'].forEach(function(t) {
+      html += '<button class="' + (sinceParam === t ? 'active' : '') + '" onclick="window.__setSince(\'' + t + '\')">' + t + '</button>';
+    });
+    html += '</div>';
+    html += '<div class="level-toggle">';
+    ['L1','L2','L3'].forEach(function(lv) {
+      var k = lv.toLowerCase();
+      html += '<button class="level-btn ' + (openSections[k] ? 'active' : '') + '" onclick="window.__toggleSection(\'' + k + '\')">' + lv + '</button>';
+    });
+    html += '</div>';
+    if (lastUpdate) {
+      html += '<span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">' + lastUpdate.toLocaleTimeString() + '</span>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    // ── L1: EXECUTIVE OVERVIEW ──
+    html += accordion('L1', 'EXECUTIVE OVERVIEW', function() {
+      var s = '';
+      s += '<div class="sc-grid">';
+
+      // Cluster Health scorecard
+      var healthLabel, healthColor;
+      if (tc && tc.severity === 'HIGH') { healthLabel = 'ISSUE'; healthColor = 'var(--red)'; }
+      else if (tc && tc.severity === 'MEDIUM') { healthLabel = 'DEGRADED'; healthColor = 'var(--amber)'; }
+      else if (ov.event_count === 0) { healthLabel = 'NO DATA'; healthColor = 'var(--text-muted)'; }
+      else { healthLabel = 'HEALTHY'; healthColor = 'var(--green)'; }
+      s += '<div class="scorecard" style="background:' + healthColor + '08;border:1px solid ' + healthColor + '30">';
+      s += '<div class="dot" style="background:' + healthColor + ';box-shadow:0 0 8px ' + healthColor + '66"></div>';
+      s += '<div><div class="sc-label">SYSTEM HEALTH</div><div class="sc-value" style="color:' + healthColor + '">' + healthLabel + '</div></div></div>';
+
+      // CPU
+      var cpuPct = sys.cpu_percent != null ? sys.cpu_percent.toFixed(1) : '-';
+      var cpuColor = sys.cpu_percent != null ? statusColor(sys.cpu_percent) : 'var(--text-muted)';
+      s += '<div class="scorecard" style="background:' + cpuColor + '08;border:1px solid ' + cpuColor + '30">';
+      s += '<div class="dot" style="background:' + cpuColor + ';box-shadow:0 0 8px ' + cpuColor + '66"></div>';
+      s += '<div><div class="sc-label">CPU HEALTH</div><div class="sc-value" style="color:' + cpuColor + '">' + cpuPct + '%</div></div></div>';
+
+      // Memory
+      var memPct = sys.mem_percent != null ? sys.mem_percent.toFixed(1) : '-';
+      var memColor = sys.mem_percent != null ? statusColor(sys.mem_percent) : 'var(--text-muted)';
+      s += '<div class="scorecard" style="background:' + memColor + '08;border:1px solid ' + memColor + '30">';
+      s += '<div class="dot" style="background:' + memColor + ';box-shadow:0 0 8px ' + memColor + '66"></div>';
+      s += '<div><div class="sc-label">MEMORY</div><div class="sc-value" style="color:' + memColor + '">' + memPct + '%</div></div></div>';
+
+      // Events
+      var evtColor = ov.event_count > 0 ? 'var(--cyan)' : 'var(--text-muted)';
+      s += '<div class="scorecard" style="background:' + evtColor + '08;border:1px solid ' + evtColor + '30">';
+      s += '<div class="dot" style="background:' + evtColor + ';box-shadow:0 0 8px ' + evtColor + '66"></div>';
+      s += '<div><div class="sc-label">EVENTS TRACED</div><div class="sc-value" style="color:' + evtColor + '">' + fmt(ov.event_count) + '</div></div></div>';
+
+      s += '</div>'; // sc-grid
+
+      // Second row: GPU metrics (grayed) + Chain count (available)
+      s += '<div class="sc-grid" style="margin-top:8px;">';
+      s += wrapGrayed('gpu_util', '<div class="scorecard" style="background:var(--text-muted)08;border:1px solid var(--border)"><div class="dot off"></div><div><div class="sc-label">GPU UTILIZATION</div><div class="sc-value" style="color:var(--text-muted)">-</div></div></div>');
+      s += wrapGrayed('hbm_occupancy', '<div class="scorecard" style="background:var(--text-muted)08;border:1px solid var(--border)"><div class="dot off"></div><div><div class="sc-label">HBM OCCUPANCY</div><div class="sc-value" style="color:var(--text-muted)">-</div></div></div>');
+      s += wrapGrayed('power_draw', '<div class="scorecard" style="background:var(--text-muted)08;border:1px solid var(--border)"><div class="dot off"></div><div><div class="sc-label">POWER DRAW</div><div class="sc-value" style="color:var(--text-muted)">-</div></div></div>');
+
+      // Chain count (available)
+      var chainColor = ov.chain_count > 0 ? 'var(--amber)' : 'var(--green)';
+      s += '<div class="scorecard" style="background:' + chainColor + '08;border:1px solid ' + chainColor + '30">';
+      s += '<div class="dot" style="background:' + chainColor + ';box-shadow:0 0 8px ' + chainColor + '66"></div>';
+      s += '<div><div class="sc-label">CAUSAL CHAINS</div><div class="sc-value" style="color:' + chainColor + '">' + fmt(ov.chain_count) + '</div></div></div>';
+      s += '</div>'; // sc-grid
+      return s;
+    });
+
+    // ── BOTTLENECK BANNER ──
+    if (tc) {
+      var isHigh = tc.severity === 'HIGH';
+      var bannerColor = isHigh ? 'var(--red)' : 'var(--amber)';
+      html += '<div class="banner" style="background:' + (isHigh ? 'rgba(239,68,68,0.05)' : 'rgba(245,158,11,0.05)') + ';border:1px solid ' + bannerColor + '25">';
+      html += '<div class="banner-icon" style="background:' + bannerColor + '20">&#9888;</div>';
+      html += '<div>';
+      html += '<div class="banner-title" style="color:' + bannerColor + '">BOTTLENECK DETECTED: ' + esc(tc.severity) + '</div>';
+      html += '<div class="banner-desc">' + esc(tc.summary) + '</div>';
+      html += '</div></div>';
+    } else if (ov.event_count > 0) {
+      html += '<div class="banner" style="background:rgba(34,197,94,0.05);border:1px solid rgba(34,197,94,0.25)">';
+      html += '<div class="banner-icon" style="background:rgba(34,197,94,0.2)">&#10003;</div>';
+      html += '<div>';
+      html += '<div class="banner-title" style="color:var(--green)">SYSTEM NOMINAL</div>';
+      html += '<div class="banner-desc">No causal chains detected. All monitored subsystems operating normally.</div>';
+      html += '</div></div>';
+    }
+
+    // ── CAUSAL CHAIN ──
+    if (hasChains) {
+      var dedupedChains = deduplicateChains(chains.chains);
+      var showChains = chainExpanded ? dedupedChains : dedupedChains.slice(0, 5);
+
+      html += '<div class="card" style="margin-bottom:12px;padding:10px 14px;">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">';
+      html += '<span class="section-hdr">CAUSAL CHAINS &mdash; ROOT CAUSE ANALYSIS</span>';
+      html += '<span style="font-size:9px;font-family:var(--font-mono);color:var(--text-muted);background:var(--border);padding:1px 5px;border-radius:3px;">' + dedupedChains.length + ' unique</span>';
+      html += '<div class="chain-toggle">';
+      html += '<button class="chain-toggle-btn ' + (chainViewMode === 'chain' ? 'active' : '') + '" onclick="window.__setChainView(\'chain\')">CHAIN</button>';
+      html += '<button class="chain-toggle-btn ' + (chainViewMode === 'tree' ? 'active' : '') + '" onclick="window.__setChainView(\'tree\')">TREE</button>';
+      html += '</div>';
+      html += '</div>';
+
+      showChains.forEach(function(group) {
+        var ch = group.chain;
+        var count = group.count;
+
+        html += '<div style="margin-bottom:10px;padding:8px 10px;border-radius:6px;background:' + sevBg(ch.severity) + ';border:1px solid ' + sevBorder(ch.severity) + '">';
+
+        // Header with count badge
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">';
+        html += '<span class="rec-pri" style="background:' + sevColor(ch.severity) + ';color:' + (ch.severity === 'MEDIUM' ? '#000' : '#fff') + '">' + esc(ch.severity) + '</span>';
+        html += '<span style="font-size:11px;font-weight:600;">' + esc(ch.summary) + '</span>';
+        if (count > 1) {
+          html += '<span style="font-size:9px;font-family:var(--font-mono);color:var(--text-muted);background:var(--border);padding:1px 5px;border-radius:3px;">x' + count + '</span>';
+        }
+        html += '</div>';
+
+        // Chain visualization
+        if (ch.timeline && ch.timeline.length > 0) {
+          if (chainViewMode === 'chain') {
+            // Horizontal chain (mock style)
+            html += '<div class="chain-horiz" style="margin:6px 0;">';
+            ch.timeline.forEach(function(te, i) {
+              if (i > 0) html += '<span class="chain-arrow">&rarr;</span>';
+              var lc = layerColor(te.layer);
+              html += '<div class="chain-pill" style="background:' + lc + '10;border:1px solid ' + lc + '40">';
+              html += '<span class="ch-dot" style="background:' + lc + '"></span>';
+              html += '<span class="ch-layer" style="color:' + lc + '">' + esc(te.layer) + '</span>';
+              html += '<span class="ch-metric">' + esc(te.detail) + '</span>';
+              html += '</div>';
+            });
+            html += '</div>';
+          } else {
+            // Tree view (indented)
+            html += '<div style="margin:6px 0;font-size:10px;font-family:var(--font-mono);line-height:2;">';
+            ch.timeline.forEach(function(te, i) {
+              var lc = layerColor(te.layer);
+              html += '<div style="padding-left:' + (i * 20) + 'px;">';
+              html += '<span style="color:' + lc + '">' + (i < ch.timeline.length - 1 ? '&#9660;' : '&#9679;') + '</span>';
+              html += ' <span style="font-weight:700;color:' + lc + '">' + esc(te.layer) + '</span>';
+              html += ' <span style="color:var(--text-sec)">&mdash; ' + esc(te.detail) + '</span>';
+              html += '</div>';
+            });
+            html += '</div>';
+          }
+        }
+
+        // Root cause
+        html += '<div style="font-size:10px;color:var(--text-sec);margin-top:2px;">Root cause: ' + esc(ch.root_cause) + '</div>';
+
+        // Recommendations (first one only, keep concise)
+        if (ch.recommendations && ch.recommendations.length > 0) {
+          html += '<div style="margin-top:4px;font-size:10px;color:var(--cyan);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + ch.recommendations.map(function(r) { return esc(r); }).join('; ') + '">Fix: ' + esc(ch.recommendations[0]);
+          if (ch.recommendations.length > 1) html += ' <span style="color:var(--text-muted);">(+' + (ch.recommendations.length - 1) + ' more)</span>';
+          html += '</div>';
+        }
+
+        html += '</div>';
+      });
+
+      // Show more/less
+      if (dedupedChains.length > 5) {
+        html += '<div style="text-align:center;margin-top:6px;">';
+        html += '<button onclick="window.__toggleChainExpand()" style="font-size:9px;font-family:var(--font-mono);padding:4px 12px;border-radius:4px;cursor:pointer;background:var(--bg-card);border:1px solid var(--border);color:var(--text-sec);">';
+        html += chainExpanded ? 'SHOW LESS' : 'SHOW ALL ' + dedupedChains.length + ' CHAINS';
+        html += '</button></div>';
+      }
+
+      html += '</div>';
+    }
+
+    // ── RECOMMENDED ACTIONS (from top chain) ──
+    if (tc && tc.recommendations && tc.recommendations.length > 0) {
+      html += '<div class="card" style="margin-bottom:12px;padding:10px 14px;">';
+      html += '<div class="section-hdr" style="margin-bottom:8px;">RECOMMENDED ACTIONS</div>';
+      tc.recommendations.forEach(function(rec, i) {
+        var priColor = i === 0 ? 'var(--red)' : 'var(--amber)';
+        var pri = i === 0 ? 'P0' : 'P1';
+        html += '<div class="rec-item" style="background:' + priColor + '08;border:1px solid ' + priColor + '20">';
+        html += '<div style="display:flex;align-items:center;gap:6px;">';
+        html += '<span class="rec-pri" style="color:' + (i === 0 ? '#fff' : '#000') + ';background:' + priColor + '">' + pri + '</span>';
+        html += '<span class="rec-title">' + esc(rec) + '</span>';
+        html += '</div></div>';
+      });
+      html += '</div>';
+    }
+
+    // ── L2: NODE / JOB METRICS ──
+    html += accordion('L2', 'NODE / JOB METRICS', function() {
+      var s = '';
+      s += '<div class="grid-resp-2-3">';
+
+      // Left: Pipeline Stage Metrics
+      s += '<div class="sub-panel">';
+      s += '<div class="section-hdr" style="margin-bottom:6px;">PIPELINE STAGE METRICS</div>';
+
+      // Available metrics from ops data
+      var opsBySource = {};
+      if (hasOps) {
+        ops.ops.forEach(function(o) {
+          opsBySource[o.source] = (opsBySource[o.source] || 0) + o.count;
+        });
+      }
+
+      var pipelineMetrics = [
+        { label: 'CUDA Runtime', avail: true, count: opsBySource['CUDA'] || opsBySource['cuda'] || 0, max: ov.event_count || 1 },
+        { label: 'CUDA Driver', avail: true, count: opsBySource['Driver'] || opsBySource['driver'] || 0, max: ov.event_count || 1 },
+        { label: 'Host Kernel', avail: true, count: opsBySource['Host'] || opsBySource['host'] || 0, max: ov.event_count || 1 },
+        { label: 'Block I/O', avail: true, count: opsBySource['IO'] || opsBySource['io'] || 0, max: ov.event_count || 1 },
+        { label: 'TCP', avail: true, count: opsBySource['TCP'] || opsBySource['tcp'] || 0, max: ov.event_count || 1 },
+        { label: 'Network I/O', avail: true, count: opsBySource['Net'] || opsBySource['net'] || 0, max: ov.event_count || 1 },
+      ];
+
+      pipelineMetrics.forEach(function(m) {
+        var frac = m.max > 0 ? Math.min(1, m.count / m.max) : 0;
+        var color = frac > 0.5 ? 'var(--green)' : frac > 0 ? 'var(--amber)' : 'var(--text-muted)';
+        s += '<div class="metric-bar">';
+        s += '<div class="mb-dot" style="background:' + (m.count > 0 ? 'var(--green)' : 'var(--text-muted)') + ';box-shadow:0 0 4px ' + (m.count > 0 ? 'var(--green)' : 'transparent') + '"></div>';
+        s += '<span class="mb-label">' + esc(m.label) + '</span>';
+        s += '<div class="mb-track"><div class="mb-fill" style="width:' + (frac * 100) + '%;background:' + color + '"></div></div>';
+        s += '<span class="mb-val" style="color:' + color + '">' + fmt(m.count) + '</span>';
+        s += '</div>';
+      });
+
+      // Grayed: Storage, PCIe, NVLink, InfiniBand
+      var grayedPipeline = [
+        { label: 'Storage Read', id: 'storage_io', tip: 'Requires block I/O tracing with per-device breakdown' },
+        { label: 'PCIe BW', id: 'pcie_util', tip: 'Requires DCGM PCIE_TX/RX_BYTES counters' },
+        { label: 'NVLink', id: 'nvlink_util', tip: 'Requires DCGM NVLINK_TX/RX_BYTES' },
+        { label: 'InfiniBand', id: 'ib_util', tip: 'Requires RDMA/IB kernel tracepoints' },
+      ];
+      grayedPipeline.forEach(function(m) {
+        s += '<div class="metric-bar" style="opacity:0.3;" title="' + esc(m.tip) + '">';
+        s += '<div class="mb-dot" style="background:var(--text-muted)"></div>';
+        s += '<span class="mb-label">' + esc(m.label) + '</span>';
+        s += '<div class="mb-track"><div class="mb-fill" style="width:0%;background:var(--text-muted)"></div></div>';
+        s += '<span class="mb-val" style="color:var(--text-muted)">-</span>';
+        s += '</div>';
+      });
+
+      // System metrics
+      if (sys.cpu_percent != null) {
+        s += '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">';
+        var cpuFrac = sys.cpu_percent / 100;
+        s += '<div class="metric-bar"><div class="mb-dot" style="background:' + statusColor(sys.cpu_percent) + '"></div><span class="mb-label">CPU %</span><div class="mb-track"><div class="mb-fill" style="width:' + sys.cpu_percent + '%;background:' + statusColor(sys.cpu_percent) + '"></div></div><span class="mb-val" style="color:' + statusColor(sys.cpu_percent) + '">' + sys.cpu_percent.toFixed(1) + '%</span></div>';
+        s += '<div class="metric-bar"><div class="mb-dot" style="background:' + statusColor(sys.mem_percent) + '"></div><span class="mb-label">Memory %</span><div class="mb-track"><div class="mb-fill" style="width:' + sys.mem_percent + '%;background:' + statusColor(sys.mem_percent) + '"></div></div><span class="mb-val" style="color:' + statusColor(sys.mem_percent) + '">' + sys.mem_percent.toFixed(1) + '%</span></div>';
+        s += '<div class="metric-bar"><div class="mb-dot" style="background:var(--text-sec)"></div><span class="mb-label">Load Avg</span><div class="mb-track"><div class="mb-fill" style="width:' + Math.min(100, sys.load_avg * 10) + '%;background:var(--purple)"></div></div><span class="mb-val" style="color:var(--purple)">' + sys.load_avg.toFixed(2) + '</span></div>';
+        s += '</div>';
+      }
+      s += '</div>'; // sub-panel
+
+      // Right: Cluster Map (grayed)
+      s += '<div class="sub-panel">';
+      s += wrapGrayed('cluster_map', function() {
+        var cm = '';
+        cm += '<div class="section-hdr" style="margin-bottom:10px;">CLUSTER &mdash; MULTI-NODE GPU MAP</div>';
+        // Fake node tabs
+        cm += '<div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:8px;">';
+        for (var n = 0; n < 4; n++) {
+          cm += '<div style="flex:1;padding:6px 4px;text-align:center;font-family:var(--font-mono);">';
+          cm += '<div style="font-size:8px;color:var(--text-muted);">N' + n + '</div>';
+          cm += '<div style="font-size:12px;font-weight:700;color:var(--text-muted);">-</div>';
+          cm += '</div>';
+        }
+        cm += '</div>';
+        // Fake GPU grid
+        cm += '<div class="cluster-gpus">';
+        for (var g = 0; g < 8; g++) {
+          cm += '<div class="cluster-gpu">';
+          cm += '<div class="cluster-gpu-bar" style="height:20px;background:rgba(85,93,116,0.1);border:1px solid rgba(85,93,116,0.3);color:var(--text-muted);">-</div>';
+          cm += '<span class="cluster-gpu-lbl">GPU:' + g + '</span>';
+          cm += '</div>';
+        }
+        cm += '</div>';
+        return cm;
+      }());
+      s += '</div>'; // sub-panel
+
+      s += '</div>'; // grid-resp-2-3
+
+      // Infra sensors row
+      s += '<div class="card" style="margin-top:12px;">';
+      s += '<div class="section-hdr" style="margin-bottom:8px;">INFRASTRUCTURE SENSORS</div>';
+      s += '<div class="infra-grid">';
+
+      var infraItems = [
+        { id: 'cuda_ops', label: 'CUDA Runtime', source: 'uprobes' },
+        { id: 'driver_ops', label: 'CUDA Driver', source: 'uprobes' },
+        { id: 'host_events', label: 'Host Kernel', source: 'tracepoints' },
+        { id: 'block_io', label: 'Block I/O', source: 'tracepoints' },
+        { id: 'tcp_retransmit', label: 'TCP Retransmits', source: 'tracepoint' },
+        { id: 'net_io', label: 'Network I/O', source: 'tracepoints' },
+        { id: 'stack_traces', label: 'Stack Traces', source: 'DWARF' },
+        { id: 'causal_chains', label: 'Causal Engine', source: '4-layer' },
+      ];
+
+      infraItems.forEach(function(item) {
+        var available = !isGrayed(item.id);
+        var count = '';
+        if (item.id === 'cuda_ops') count = fmt(opsBySource['CUDA'] || opsBySource['cuda'] || 0);
+        else if (item.id === 'driver_ops') count = fmt(opsBySource['Driver'] || opsBySource['driver'] || 0);
+        else if (item.id === 'host_events') count = fmt(opsBySource['Host'] || opsBySource['host'] || 0);
+        else if (item.id === 'block_io') count = fmt(opsBySource['IO'] || opsBySource['io'] || 0);
+        else if (item.id === 'tcp_retransmit') count = fmt(opsBySource['TCP'] || opsBySource['tcp'] || 0);
+        else if (item.id === 'net_io') count = fmt(opsBySource['Net'] || opsBySource['net'] || 0);
+        else if (item.id === 'causal_chains') count = fmt(ov.chain_count || 0);
+
+        s += '<div class="infra-badge">';
+        s += '<div class="indicator ' + (available ? 'on' : 'off') + '"></div>';
+        s += '<span class="lbl">' + esc(item.label) + '</span>';
+        if (count) s += '<span class="cnt">' + count + '</span>';
+        s += '</div>';
+      });
+
+      // Grayed infra
+      var grayedInfra = [
+        { id: 'nvlink_util', label: 'NVLink' },
+        { id: 'ib_util', label: 'InfiniBand' },
+        { id: 'pcie_util', label: 'PCIe Counters' },
+      ];
+      grayedInfra.forEach(function(item) {
+        s += '<div class="infra-badge" style="opacity:0.3;" title="' + esc(grayTooltip(item.id)) + '">';
+        s += '<div class="indicator off"></div>';
+        s += '<span class="lbl">' + esc(item.label) + '</span>';
+        s += '</div>';
+      });
+
+      s += '</div></div>'; // infra-grid, card
+
+      return s;
+    });
+
+    // ── L3: KERNEL DETAIL ──
+    html += accordion('L3', 'KERNEL DETAIL', function() {
+      var s = '';
+
+      // Hydraulic Flow (grayed)
+      s += '<div class="sub-panel" style="margin-bottom:12px;">';
+      s += wrapGrayed('pipeline_flow', function() {
+        var hf = '';
+        hf += '<div class="section-hdr" style="margin-bottom:6px;">HYDRAULIC FLOW &mdash; DATA PIPELINE</div>';
+        hf += '<svg viewBox="0 0 760 180" style="width:100%;height:auto;">';
+        // Grid lines
+        for (var i = 0; i < 39; i++) hf += '<line x1="' + (i*20) + '" y1="0" x2="' + (i*20) + '" y2="180" stroke="#1e2330" stroke-width="0.3"/>';
+        for (var j = 0; j < 10; j++) hf += '<line x1="0" y1="' + (j*20) + '" x2="760" y2="' + (j*20) + '" stroke="#1e2330" stroke-width="0.3"/>';
+        // Stage boxes
+        var stages = [{label:'STORAGE',sub:'NAS/NVMe',x:30},{label:'CPU',sub:'Preprocessing',x:220},{label:'PCIe BUS',sub:'Host→Device',x:410},{label:'GPU SMs',sub:'Compute',x:600}];
+        stages.forEach(function(st) {
+          hf += '<rect x="' + st.x + '" y="52" width="70" height="56" rx="6" fill="#12151c" stroke="#1e2330" stroke-width="0.8"/>';
+          hf += '<text x="' + (st.x+35) + '" y="72" text-anchor="middle" font-size="9" fill="#555d74" font-family="Menlo,Consolas,monospace" font-weight="700">' + st.label + '</text>';
+          hf += '<text x="' + (st.x+35) + '" y="84" text-anchor="middle" font-size="7" fill="#555d74" font-family="Menlo,Consolas,monospace">' + st.sub + '</text>';
+          hf += '<text x="' + (st.x+35) + '" y="100" text-anchor="middle" font-size="14" fill="#555d74" font-family="Menlo,Consolas,monospace" font-weight="700">-%</text>';
+        });
+        // Pipes
+        [[100,220],[290,410],[480,600]].forEach(function(p) {
+          hf += '<rect x="' + p[0] + '" y="76" width="' + (p[1]-p[0]) + '" height="8" rx="2" fill="none" stroke="#1e2330" stroke-width="0.8"/>';
+        });
+        // Reservoirs
+        hf += '<rect x="170" y="130" width="40" height="40" rx="4" fill="none" stroke="#1e2330" stroke-width="0.8"/>';
+        hf += '<text x="190" y="150" text-anchor="middle" font-size="8" fill="#555d74" font-family="Menlo,Consolas,monospace">DRAM</text>';
+        hf += '<rect x="555" y="130" width="40" height="40" rx="4" fill="none" stroke="#1e2330" stroke-width="0.8"/>';
+        hf += '<text x="575" y="150" text-anchor="middle" font-size="8" fill="#555d74" font-family="Menlo,Consolas,monospace">HBM</text>';
+        hf += '<text x="10" y="175" font-size="7" fill="#555d74" font-family="Menlo,Consolas,monospace">HYDRAULIC FLOW — pipe width = bandwidth · fill = utilization · particles = throughput · gauges = queue depth</text>';
+        hf += '</svg>';
+        return hf;
+      }());
+      s += '</div>';
+
+      // Stall Classification + Flame Graph row
+      s += '<div class="grid-resp-1-2" style="margin-bottom:12px;">';
+
+      // SM Stall Classification (grayed)
+      s += '<div class="sub-panel">';
+      s += wrapGrayed('stall_breakdown', function() {
+        var sb = '';
+        sb += '<div class="section-hdr" style="margin-bottom:10px;">SM STALL CLASSIFICATION</div>';
+        var stalls = [
+          { label: 'Sync', color: 'var(--amber)' },
+          { label: 'Memory', color: 'var(--red)' },
+          { label: 'Compute', color: 'var(--blue)' },
+          { label: 'Instruct.', color: 'var(--purple)' },
+          { label: 'Structural', color: 'var(--cyan)' },
+        ];
+        stalls.forEach(function(st) {
+          sb += '<div class="stall-bar">';
+          sb += '<span class="sb-label">' + st.label + '</span>';
+          sb += '<div class="sb-track"><div class="sb-fill" style="width:0%;background:' + st.color + '"></div></div>';
+          sb += '<span class="sb-val">-%</span>';
+          sb += '</div>';
+        });
+        sb += '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px;">';
+        sb += '<div class="metric-bar"><div class="mb-dot" style="background:var(--text-muted)"></div><span class="mb-label">SM Efficiency</span><span class="mb-val" style="color:var(--text-muted)">-</span></div>';
+        sb += '<div class="metric-bar"><div class="mb-dot" style="background:var(--text-muted)"></div><span class="mb-label">Power Draw</span><span class="mb-val" style="color:var(--text-muted)">-</span></div>';
+        sb += '</div>';
+        return sb;
+      }());
+      s += '</div>';
+
+      // Flame Graph (grayed)
+      s += '<div class="sub-panel">';
+      s += wrapGrayed('nvtx_phases', function() {
+        var fg = '';
+        fg += '<div class="section-hdr" style="margin-bottom:10px;">AI FLAME GRAPH &mdash; KERNEL ATTRIBUTION</div>';
+        var rows = [
+          { label: 'Thread', spans: [{l:'train_step()',w:100,c:'#EAB308'}] },
+          { label: 'Python', spans: [{l:'forward()',w:35,c:'#EAB308'},{l:'loss.backward()',w:30,c:'#EAB308'},{l:'optimizer.step()',w:15,c:'#EAB308'},{l:'data_load',w:15,c:'#EAB308'}] },
+          { label: 'C/C++', spans: [{l:'aten::mm',w:28,c:'#F97316'},{l:'aten::conv2d',w:12,c:'#F97316'},{l:'autograd::backward',w:25,c:'#F97316'},{l:'sgd_step',w:12,c:'#F97316'},{l:'DataPipe::fill',w:12,c:'#F97316'}] },
+          { label: 'CUDA', spans: [{l:'gemm_kern',w:25,c:'#22c55e'},{l:'conv_kern',w:10,c:'#22c55e'},{l:'nccl_allreduce',w:18,c:'#06b6d4'},{l:'bwd_kern',w:22,c:'#22c55e'},{l:'',w:25,c:'#1e2330'}] },
+        ];
+        rows.forEach(function(row) {
+          var tot = row.spans.reduce(function(s, sp) { return s + sp.w; }, 0);
+          fg += '<div style="display:flex;align-items:stretch;margin-bottom:2px;">';
+          fg += '<div style="width:50px;color:var(--text-muted);font-size:9px;display:flex;align-items:center;flex-shrink:0;font-family:var(--font-mono);">' + row.label + '</div>';
+          fg += '<div style="flex:1;display:flex;height:24px;gap:1px;">';
+          row.spans.forEach(function(sp) {
+            fg += '<div style="flex:' + (sp.w/tot) + ';background:' + sp.c + '30;border-left:2px solid ' + sp.c + ';display:flex;align-items:center;padding-left:4px;color:' + sp.c + ';font-size:8px;overflow:hidden;white-space:nowrap;font-family:var(--font-mono);">' + (sp.w > 8 ? sp.l : '') + '</div>';
+          });
+          fg += '</div></div>';
+        });
+        // Legend
+        fg += '<div style="color:var(--text-muted);font-size:8px;margin-top:6px;padding-left:50px;font-family:var(--font-mono);">';
+        fg += '<span style="color:#EAB308">&#9632;</span> Python ';
+        fg += '<span style="margin-left:8px;color:#F97316">&#9632;</span> C/C++ ';
+        fg += '<span style="margin-left:8px;color:#22c55e">&#9632;</span> GPU Kernel ';
+        fg += '<span style="margin-left:8px;color:#06b6d4">&#9632;</span> NCCL ';
+        fg += '</div>';
+        return fg;
+      }());
+      s += '</div>';
+      s += '</div>'; // grid-resp-1-2
+
+      // Sparklines + NVTX Phases row
+      s += '<div class="grid-2">';
+
+      // Sparklines (real data if available)
+      s += '<div class="sub-panel">';
+      s += '<div class="section-hdr" style="margin-bottom:10px;">TEMPORAL TRACE &mdash; 60s WINDOW</div>';
+
+      // NVTX Phase Bar (grayed mini version)
+      s += '<div class="nvtx-bar" style="opacity:0.3;" title="Requires NVTX range probes on libnvToolsExt.so">';
+      var nvtxPhases = [{l:'Forward',c:'#22c55e',f:30},{l:'Backward',c:'#f97316',f:35},{l:'Optimizer',c:'#3b82f6',f:15},{l:'DataLoad',c:'#a855f7',f:20}];
+      nvtxPhases.forEach(function(ph) {
+        s += '<div class="nvtx-seg" style="flex:' + ph.f + ';background:' + ph.c + '20;color:' + ph.c + '">' + ph.l + ' ' + ph.f + '%</div>';
+      });
+      s += '</div>';
+
+      if (hasSnapshots) {
+        s += '<div class="sparkline-row">';
+        var latestCPU = snapshotHistory.cpu[snapshotHistory.cpu.length - 1];
+        var latestMem = snapshotHistory.mem[snapshotHistory.mem.length - 1];
+        var latestLoad = snapshotHistory.load[snapshotHistory.load.length - 1];
+
+        s += '<div class="sparkline-item"><div class="sparkline-label"><span>CPU %</span><span class="val">' + (latestCPU != null ? latestCPU.toFixed(1) + '%' : '-') + '</span></div>';
+        s += sparklineSVG(snapshotHistory.cpu, 'var(--amber)', 32) + '</div>';
+
+        s += '<div class="sparkline-item"><div class="sparkline-label"><span>Mem %</span><span class="val">' + (latestMem != null ? latestMem.toFixed(1) + '%' : '-') + '</span></div>';
+        s += sparklineSVG(snapshotHistory.mem, 'var(--cyan)', 32) + '</div>';
+
+        s += '<div class="sparkline-item"><div class="sparkline-label"><span>Load Avg</span><span class="val">' + (latestLoad != null ? latestLoad.toFixed(2) : '-') + '</span></div>';
+        s += sparklineSVG(snapshotHistory.load, 'var(--purple)', 32) + '</div>';
+
+        // GPU Util sparkline (grayed)
+        s += '<div class="sparkline-item" style="opacity:0.3;" title="Requires DCGM or NVML for GPU utilization time series">';
+        s += '<div class="sparkline-label"><span>GPU Util</span><span class="val">-</span></div>';
+        s += '<svg class="sparkline-svg" viewBox="0 0 200 32"></svg></div>';
+
+        s += '</div>'; // sparkline-row
+      } else {
+        s += '<div class="no-data" style="padding:20px;"><p>Waiting for system snapshots...</p><p>Run <code>sudo ingero trace</code> to start collecting.</p></div>';
+      }
+      s += '</div>'; // sub-panel
+
+      // Training Phases (grayed)
+      s += '<div class="sub-panel">';
+      s += wrapGrayed('nvtx_phases', function() {
+        var tp = '';
+        tp += '<div class="section-hdr" style="margin-bottom:8px;">TRAINING PHASES (NVTX)</div>';
+        nvtxPhases.forEach(function(ph) {
+          tp += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;">';
+          tp += '<div style="width:10px;height:10px;border-radius:2px;background:' + ph.c + ';flex-shrink:0;"></div>';
+          tp += '<span style="font-family:var(--font-mono);color:var(--text-sec);font-size:10px;">' + ph.l + '</span>';
+          tp += '<span style="margin-left:auto;font-family:var(--font-mono);color:' + ph.c + ';font-weight:600;font-size:10px;">' + ph.f + '%</span>';
+          tp += '</div>';
+        });
+        tp += '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:8px;">';
+        tp += '<div style="font-size:9px;color:var(--text-muted);font-family:var(--font-mono);margin-bottom:4px;">ITERATION BREAKDOWN</div>';
+        tp += '<div style="height:6px;display:flex;border-radius:3px;overflow:hidden;">';
+        nvtxPhases.forEach(function(ph) {
+          tp += '<div style="flex:' + ph.f + ';background:' + ph.c + '"></div>';
+        });
+        tp += '</div></div>';
+        return tp;
+      }());
+      s += '</div>';
+
+      s += '</div>'; // grid-2
+
+      // CUDA Operations Table (real data)
+      if (hasOps) {
+        s += '<div class="card" style="margin-top:12px;overflow-x:auto;">';
+        s += '<div class="section-hdr" style="margin-bottom:8px;">CUDA / HOST OPERATION LATENCY</div>';
+        s += '<table class="ops-table">';
+        s += '<thead><tr><th>Operation</th><th>Source</th><th class="num">Count</th>';
+        if (ops.mode === 'percentile') {
+          s += '<th class="num">P50</th><th class="num">P95</th><th class="num">P99</th>';
+        } else {
+          s += '<th class="num">Avg</th><th class="num">Min</th><th class="num">Max</th>';
+        }
+        s += '</tr></thead><tbody>';
+
+        ops.ops.forEach(function(op) {
+          s += '<tr>';
+          s += '<td>' + esc(op.operation) + '</td>';
+          s += '<td class="src">' + esc(op.source) + '</td>';
+          s += '<td class="num">' + fmt(op.count) + '</td>';
+          if (ops.mode === 'percentile') {
+            s += '<td class="num">' + fmtUS(op.p50_us) + '</td>';
+            s += '<td class="num">' + fmtUS(op.p95_us) + '</td>';
+            s += '<td class="num" style="color:' + (op.p99_us > 10000 ? 'var(--amber)' : 'var(--text)') + '">' + fmtUS(op.p99_us) + '</td>';
+          } else {
+            s += '<td class="num">' + fmtUS(op.avg_us) + '</td>';
+            s += '<td class="num">' + fmtUS(op.min_us) + '</td>';
+            s += '<td class="num">' + fmtUS(op.max_us) + '</td>';
+          }
+          s += '</tr>';
+        });
+
+        s += '</tbody></table></div>';
+      }
+
+      // What-If Modeling (grayed)
+      s += '<div class="card" style="margin-top:12px;">';
+      s += wrapGrayed('what_if', function() {
+        var wi = '';
+        wi += '<div class="section-hdr" style="margin-bottom:8px;">WHAT-IF SCENARIO MODELING</div>';
+        wi += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:4px 20px;">';
+        ['Storage Bandwidth','CPU Capacity','PCIe Generation','HBM Capacity'].forEach(function(label) {
+          wi += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;">';
+          wi += '<span style="font-size:10px;color:var(--text-sec);font-family:var(--font-mono);min-width:120px;">' + label + '</span>';
+          wi += '<div style="flex:1;height:4px;background:var(--border);border-radius:2px;"></div>';
+          wi += '<span style="font-size:11px;font-family:var(--font-mono);color:var(--text-muted);font-weight:600;min-width:35px;">1.0x</span>';
+          wi += '</div>';
+        });
+        wi += '</div>';
+        return wi;
+      }());
+      s += '</div>';
+
+      return s;
+    });
+
+    // No data message
+    if (ov.event_count === 0) {
+      html += '<div class="no-data"><p>No events in database.</p><p>Run <code>sudo ingero trace</code> to start collecting data,</p><p>or <code>ingero demo --no-gpu</code> to generate synthetic data.</p></div>';
+    }
+
+    // ── FOOTER ──
+    html += '<div class="footer">';
+    html += '<span>INGERO TELEMETRY &mdash; eBPF + CUDA PROBES &mdash; &lt;2% OVERHEAD</span>';
+    html += '<span>TLS 1.3 &mdash; Polling every 2s' + (lastUpdate ? ' &mdash; Last: ' + lastUpdate.toLocaleTimeString() : '') + '</span>';
+    html += '</div>';
+
+    app.innerHTML = html;
+  }
+
+  // --- Controls ---
+  window.__setSince = function(t) {
+    sinceParam = t;
+    loadAll();
+  };
+
+  window.__toggleSection = function(k) {
+    openSections[k] = !openSections[k];
+    render();
+  };
+
+  window.__setChainView = function(mode) {
+    chainViewMode = mode;
+    render();
+  };
+
+  window.__toggleChainExpand = function() {
+    chainExpanded = !chainExpanded;
+    render();
+  };
+
+  // --- Init ---
+  async function init() {
+    await loadCapabilities();
+    await loadAll();
+    setInterval(loadAll, 2000);
+  }
+
+  init();
+})();
+  </script>
+</body>
+</html>

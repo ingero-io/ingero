@@ -4,7 +4,7 @@
 
 Ingero is a production-grade, eBPF-based GPU causal observability agent. It traces CUDA Runtime and Driver APIs via uprobes, plus host OS events (CPU scheduling, memory, process lifecycle) via kernel tracepoints, to build causal chains explaining GPU latency. Designed for zero-config, <2% overhead, always-on production use.
 
-Single Go binary, 7 commands: `check`, `trace`, `demo`, `explain`, `query`, `mcp`, `version`.
+Single Go binary, 8 commands: `check`, `trace`, `demo`, `explain`, `query`, `mcp`, `dashboard`, `version`.
 
 ## Build & Verify Workflow
 
@@ -26,7 +26,7 @@ eBPF compilation requires Linux (or WSL). Real GPU tracing requires `sudo` and a
 cmd/ingero/         CLI entry point
 internal/           Go packages (cli, ebpf/cuda, ebpf/driver, ebpf/host,
                     correlate, store, mcp, export, stats, sysinfo, symtab,
-                    cgroup, k8s, discover, update, version, ...)
+                    cgroup, k8s, dashboard, discover, update, version, ...)
 bpf/                eBPF C programs (kernel-space, GPL-2.0 OR BSD-3-Clause)
 pkg/events/         Shared event types
 scripts/            GPU VM lifecycle, setup, integration tests

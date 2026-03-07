@@ -1616,6 +1616,14 @@ type TimelineEntry struct {
 	DurationUS int64 `json:"dur_us,omitempty"`
 }
 
+// ExpireChains deletes chains older than the given duration.
+// Called when the system is healthy (no new chains detected) so stale
+// chains don't persist indefinitely in the dashboard.
+func (s *Store) ExpireChains(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+	s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
+}
+
 // RecordChains upserts causal chains into the database.
 // Uses INSERT OR REPLACE so repeated detections of the same chain ID update in place.
 func (s *Store) RecordChains(chains []StoredChain) {

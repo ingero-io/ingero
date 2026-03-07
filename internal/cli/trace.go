@@ -1375,8 +1375,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 				}
-				if eventStore != nil && len(chains) > 0 {
-					eventStore.RecordChains(chainsToStored(chains))
+				if eventStore != nil {
+					if len(chains) > 0 {
+						eventStore.RecordChains(chainsToStored(chains))
+					} else {
+						eventStore.ExpireChains(2 * time.Minute)
+					}
 				}
 				renderTable(snap, droppedFn(), &linesDrawn, false, corrs, chains)
 			}
