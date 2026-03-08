@@ -147,7 +147,7 @@ sudo make install # copies binary to /usr/local/bin/ingero
 
 Check if your system is ready for eBPF-based GPU tracing.
 
-```bash
+```text
 $ ingero check
 
 Ingero — System Readiness Check
@@ -455,42 +455,42 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 ## How It Works
 
 ```
-┌───────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────────────────────────┐
 │  User Space                                                    │
 │                                                                │
-│  ┌─────────┐    ┌──────────────┐  ┌───────┐   ┌───────────┐ │
-│  │  CUDA   │    │   ingero     │  │SQLite │   │MCP Server  │ │
-│  │  App    │    │   agent      │─▶│  DB   │◀──│(stdio/HTTPS)│ │
-│  │(PyTorch)│    │              │  │       │   └───────────┘ │
-│  │         │    │              │  │       │   ┌───────────┐ │
-│  │         │    │              │  │       │◀──│ Dashboard  │ │
-│  │         │    │              │  └───────┘   │  (HTTPS)   │ │
-│  └──┬──┬───┘    │ ┌──────────┐│                              │
-│     │  │        │ │ causal   ││  ┌───────────┐               │
-│     │  │        │ │ engine   ││  │ OTLP /    │               │
-│     │  │        │ └──────────┘│─▶│ Prometheus│               │
-│     │  │        └──┬──┬──┬────┘  └───────────┘               │
-│     │  │           │  │  │ ▲                                  │
-│     │  │           │  │  │ │ ring buffers                     │
-│  ───┼──┼───────────┼──┼──┼─┼─────────────────────────────────│
-│     │  ▼           │  ▼  ▼ │                                  │
-│     │ ┌─────────┐  │ ┌────────────────────┐                   │
-│     │ │libcuda  │◄─┤ │  eBPF uprobes      │  (Driver API)    │
-│     │ │  .so    │  │ │  cuLaunchKernel     │                  │
-│     │ └─────────┘  │ │  cuMemcpy/Alloc     │                  │
-│     ▼              │ └────────────────────┘                   │
-│  ┌─────────┐       │ ┌────────────────────┐                   │
-│  │libcudart│◄──────┘ │  eBPF uprobes      │  (Runtime API)   │
-│  │  .so    │         │  cudaLaunchKernel   │                  │
-│  └─────────┘         │  cudaMalloc/Memcpy  │                  │
-│                      └────────────────────┘                   │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │  eBPF tracepoints (sched_switch, mm_page_alloc, oom,    │  │
-│  │  sched_process_exec/exit/fork)                          │  │
-│  └─────────────────────────────────────────────────────────┘  │
+│  ┌─────────┐    ┌─────────────┐  ┌───────┐    ┌─────────────┐  │
+│  │  CUDA   │    │   ingero    │  │SQLite │    │MCP Server   │  │
+│  │  App    │    │   agent     │─▶│  DB   │◀──│(stdio/HTTPS)│  │
+│  │(PyTorch)│    │             │  │       │    └─────────────┘  │
+│  │         │    │             │  │       │   ┌───────────┐     │
+│  │         │    │             │  │       │◀──│ Dashboard │     │
+│  │         │    │             │  └───────┘   │  (HTTPS)  │     │
+│  └──┬──┬───┘    │ ┌──────────┐│              └───────────┘     │
+│     │  │        │ │ causal   ││   ┌───────────┐                │
+│     │  │        │ │ engine   ││   │ OTLP /    │                │
+│     │  │        │ └──────────┘│─▶│ Prometheus│                 │
+│     │  │        └──┬──┬──┬────┘   └───────────┘                │
+│     │  │           │  │  │ ▲                                   │
+│     │  │           │  │  │ │ ring buffers                      │
+│─────┼──┼───────────┼──┼──┼─┼───────────────────────────────────│
+│     │  ▼           │  ▼  ▼ │                                   │
+│     │ ┌─────────┐  │ ┌────────────────────┐                    │
+│     │ │libcuda  │◄─┤ │  eBPF uprobes      │  (Driver API)      │
+│     │ │  .so    │  │ │  cuLaunchKernel     │                   │
+│     │ └─────────┘  │ │  cuMemcpy/Alloc     │                   │
+│     ▼              │ └────────────────────┘                    │
+│  ┌─────────┐       │ ┌────────────────────┐                    │
+│  │libcudart│◄──────┘ │  eBPF uprobes      │  (Runtime API)     │
+│  │  .so    │         │  cudaLaunchKernel   │                   │
+│  └─────────┘         │  cudaMalloc/Memcpy  │                   │
+│                      └────────────────────┘                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  eBPF tracepoints (sched_switch, mm_page_alloc, oom,    │   │
+│  │  sched_process_exec/exit/fork)                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
 │                                                                │
 │  Kernel Space        /proc → CPU%, Mem%, Load, Swap            │
-└───────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────┘
 ```
 
 1. **Discover** — scans `/proc` for processes linked to `libcudart.so`, finds `libcuda.so` automatically
