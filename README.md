@@ -526,7 +526,7 @@ Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azu
 
 ## What Ingero Addresses Today
 
-Ingero addresses 25 of 32 documented GPU problems across training, inference, and AI agent workloads. See the [full problem statement](https://github.com/ingero-io/ingero/blob/main/docs/gpu-problems-statement.md) for sources and competitor analysis.
+Ingero addresses 25 documented GPU problems across training, inference, and AI agent workloads:
 
 | # | GPU Problem | Severity | How Ingero Detects It |
 |---|-------------|----------|----------------------|
