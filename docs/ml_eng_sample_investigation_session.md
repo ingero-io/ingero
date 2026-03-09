@@ -4,11 +4,14 @@
 
 ---
 
-# Session 3: A10 (x86_64) — Deep Dive with Temporal Analysis
+# Session 1: A10 (x86_64) — Deep Dive with Temporal Analysis
 
 **Setup**: `ingero mcp --db gpu-investigation.db --http :8090`
+
 **DB size**: 14 MB (2.04M events traced, 98,854 stored via stack sampling)
+
 **GPU**: NVIDIA A10 23GB, Lambda Labs
+
 **Date**: 2026-03-01
 
 ---
@@ -260,7 +263,7 @@ DataLoader(
 
 ---
 
-## Session 3 Summary
+## Session 1 Summary
 
 | Metric | Value |
 |---|---|
@@ -290,10 +293,12 @@ DataLoader(
 
 ---
 
-# Session 1: A100 SXM4 (x86_64)
+# Session 2: A100 SXM4 (x86_64)
 
 **Setup**: `ingero mcp --db gpu-investigation.db --http :8090`
+
 **DB size**: 7.7 MB (2.64M events traced, 50K stored via stack sampling)
+
 **GPU**: NVIDIA A100 SXM4 40GB, Lambda Labs
 
 ---
@@ -502,7 +507,7 @@ Load average peaked at **16.9** — roughly 17 runnable threads competing for CP
 
 ---
 
-## Session Summary
+## Session 2 Summary
 
 | Metric | Value |
 |---|---|
@@ -531,10 +536,12 @@ Load average peaked at **16.9** — roughly 17 runnable threads competing for CP
 
 ---
 
-# Session 2: GH200 (ARM64/aarch64)
+# Session 3: GH200 (ARM64/aarch64)
 
 **Setup**: `ingero mcp --db gpu-investigation.db --http :8090`
+
 **DB size**: 22 MB (1.71M events traced, 265K stored via stack sampling)
+
 **GPU**: NVIDIA GH200 480GB (Grace Hopper, ARM64), Lambda Labs
 
 ---
@@ -683,7 +690,7 @@ Load average *decreased* (31→12.6) as the storm intensified (44K→111K switch
 
 ---
 
-## Session 2 Summary
+## Session 3 Summary
 
 | Metric | Value |
 |---|---|
