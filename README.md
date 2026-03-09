@@ -135,7 +135,8 @@ sudo mv ingero /usr/local/bin/
 git clone https://github.com/ingero-io/ingero.git
 cd ingero
 make              # generates eBPF bindings, builds, tests, and lints — single command
-sudo make install # copies binary to /usr/local/bin/ingero
+sudo make install # optional — copies binary to /usr/local/bin/ingero
+                  # or just use ./bin/ingero directly, or: alias ingero=$PWD/bin/ingero
 ```
 
 ## Requirements
