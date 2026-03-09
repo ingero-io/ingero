@@ -16,11 +16,13 @@
 
 ---
 
-## Q1: "How did my last training go?"
+### Engineer: "How did my last training go?"
 
-**MCP tools used**: `get_trace_stats`, `get_causal_chains`, `run_sql` (sessions)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_trace_stats`, `get_causal_chains`, `run_sql`*
 
 **Environment**: NVIDIA A10 (23 GB), Driver 570.148, Intel Xeon Platinum 8358 @ 2.60 GHz (30 cores), 227 GB RAM, Python 3.10.12. Session duration: ~120 seconds.
 
@@ -40,13 +42,17 @@ The dominant pattern: **CPU scheduling contention is causing CUDA calls to stall
 | cudaMalloc | 65µs | 2.1ms | 33x | Runtime alloc delays |
 | cuLaunchKernel | 116µs | 5.0ms | — | Kernel launch delays |
 
+</blockquote>
+
 ---
 
-## Q2: "Which process is stealing the CPU?"
+### Engineer: "Which process is stealing the CPU?"
 
-**MCP tools used**: `run_sql` (sched_switch by PID with process names, CUDA events by PID)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `run_sql` (sched_switch by PID with process names, CUDA events by PID)*
 
 It's not an external process — **it's the training job's own processes contending with each other**:
 
@@ -63,21 +69,25 @@ It's not an external process — **it's the training job's own processes contend
 
 The actual GPU process (PID 12006) is clean — only 359 context switches totaling 5ms. But the main Python process (12004) has **42,170 context switches**.
 
+</blockquote>
+
 ---
 
-## Q3: "What's the stack trace for those data workers?"
+### Engineer: "What's the stack trace for those data workers?"
 
-**MCP tools used**: `get_stacks` (sched_switch, cudaStreamSync, cudaMalloc, cuLaunchKernel)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_stacks` (sched_switch, cudaStreamSync, cudaMalloc, cuLaunchKernel)*
 
 Host kernel events (`sched_switch`) don't capture userspace stacks — kernel tracepoint limitation. But the CUDA stacks show exactly what code was impacted:
 
-### cudaStreamSync (biggest stall — p99 = 39.9ms)
+**cudaStreamSync (biggest stall — p99 = 39.9ms)**
 - **1,879 calls** from `libtorch_cuda.so` → `c10::TensorImpl::~TensorImpl` (tensor destructor)
 - avg 33ms, max 43ms — PyTorch garbage collection of GPU tensors
 
-### cudaMalloc (p99 = 2.1ms, 206GB total allocated)
+**cudaMalloc (p99 = 2.1ms, 206GB total allocated)**
 
 | Stack | Calls | Avg | Source |
 |-------|-------|-----|--------|
@@ -86,20 +96,25 @@ Host kernel events (`sched_switch`) don't capture userspace stacks — kernel tr
 | `empty_cache()` → `fragmentation_pattern()` | 156 | 0.7ms | **torch.cuda.memory:210** |
 | `direct_cuda_alloc_free()` → `main()` | 101 | 65µs | **alloc_stress.py:46** |
 
-### cuLaunchKernel (GPU kernel launches)
+**cuLaunchKernel (GPU kernel launches)**
+
 Two main paths:
 1. **cuDNN BatchNorm** — `cudnnBatchNormalizationForwardTrainingEx` (160 launches, avg 608µs)
 2. **cuDNN graph execution** — `cudnnBackendExecute` (156 launches, avg 449µs)
 
+</blockquote>
+
 ---
 
-## Q4: "Show me the full stack from alloc_stress.py:74 to GPU"
+### Engineer: "Show me the full stack from alloc_stress.py:74 to GPU"
 
-**MCP tools used**: `run_sql` (stack_traces JOIN events, filtering by frame content)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Stack 1 — Primary path (4,009 calls, 207 GB allocated, avg 1.0ms)
+*Tools used: `run_sql` (stack_traces JOIN events, filtering by frame content)*
+
+**Stack 1 — Primary path (4,009 calls, 207 GB allocated, avg 1.0ms)**
 ```
  Python    alloc_stress.py:1       <module>
  Python    alloc_stress.py:114     main()
@@ -112,7 +127,7 @@ Two main paths:
  CUDA RT   libcudart.so.12.8.90    cudaMalloc()               ← actual GPU alloc
 ```
 
-### Stack 2 — FFI path (1,718 calls, 181 GB allocated, avg 0.9ms)
+**Stack 2 — FFI path (1,718 calls, 181 GB allocated, avg 0.9ms)**
 ```
  Python    alloc_stress.py:1       <module>
  Python    alloc_stress.py:114     main()
@@ -121,7 +136,7 @@ Two main paths:
  C          libffi.so.8.1.0         ctypes/FFI call bridge     ← bypasses caching allocator
 ```
 
-### Stack 3 — Cache flush path (156 calls, 17 GB, avg 0.7ms, max 2.1ms)
+**Stack 3 — Cache flush path (156 calls, 17 GB, avg 0.7ms, max 2.1ms)**
 ```
  Python    alloc_stress.py:1       <module>
  Python    alloc_stress.py:114     main()
@@ -137,13 +152,17 @@ Two main paths:
 
 Total: **5,883 `cudaMalloc` calls allocating 406 GB** from one function. On a 23 GB A10, that's cycling through the entire GPU memory ~17 times.
 
+</blockquote>
+
 ---
 
-## Q5: "Show me when the stalls happen"
+### Engineer: "Show me when the stalls happen"
 
-**MCP tools used**: `run_sql` (temporal bucketing of cudaMalloc, sched_switch, cudaStreamSync in 10s windows)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `run_sql` (temporal bucketing of cudaMalloc, sched_switch, cudaStreamSync in 10s windows)*
 
 ```
 Time(s)  cudaMalloc           CPU Contention         cudaStreamSync
@@ -168,13 +187,17 @@ Time(s)  cudaMalloc           CPU Contention         cudaStreamSync
 2. **20-50s — Allocation storm**: `fragmentation_pattern()` fires. 6,200 cudaMallocs in 30s, 491 GB allocated. CPU contention peaks at 13,217 context switches. **Worst stall: 790ms.**
 3. **50-120s — Recovery → Steady state**: Allocations stop, off-CPU drops 6x, stream sync drops from 40ms to 16ms.
 
+</blockquote>
+
 ---
 
-## Q6: "Show me the smoking gun"
+### Engineer: "Show me the smoking gun"
 
-**MCP tools used**: `run_sql` (events > 500ms stalls, microsecond-level event timeline at t=42.12s)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `run_sql` (events > 500ms stalls, microsecond-level event timeline at t=42.12s)*
 
 All 4 DataLoader workers stalled simultaneously at **t = 42.12 seconds**:
 
@@ -214,17 +237,21 @@ Microsecond-level event reconstruction:
 
 **Full causal chain**: `alloc_stress.py:74` runs tight `cudaFree`/`cudaMalloc` loop → main process preempted 50ms → forks new DataLoader workers at t=42.119s → fork under memory pressure (GPU allocator mapped 400+ GB) forces kernel to copy page tables holding `mmap_sem` → **all 4 old workers frozen 609-790ms** → workers drained and killed → GPU resumes.
 
+</blockquote>
+
 ---
 
-## Q7: "How to fix it?"
+### Engineer: "How to fix it?"
 
-**MCP tools used**: `get_causal_chains` (PID-filtered), `run_sql` (recommendations from causal_chains)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_causal_chains` (PID-filtered), `run_sql` (recommendations from causal_chains)*
 
 Three fixes, in priority order:
 
-### 1. Fix the memory fragmentation (root cause)
+**1. Fix the memory fragmentation (root cause)**
 ```python
 # BEFORE: tight alloc/free loop fragments GPU memory
 for i in range(N):
@@ -238,12 +265,12 @@ for i in range(N):
     view = buf[:size]                       # zero-cost view, no malloc
 ```
 
-### 2. Pin training process to dedicated cores
+**2. Pin training process to dedicated cores**
 ```bash
 taskset -c 0-3 python3 train.py
 ```
 
-### 3. Use persistent_workers=True (eliminates the 790ms stall)
+**3. Use persistent_workers=True (eliminates the 790ms stall)**
 ```python
 DataLoader(
     dataset,
@@ -253,13 +280,15 @@ DataLoader(
 )
 ```
 
-### Expected impact
+**Expected impact**
 
 | Fix | Eliminates | Time saved per epoch |
 |-----|-----------|---------------------|
 | Pre-allocate buffers | 406 GB malloc churn, 5,883 driver calls | ~6s of GPU stalls |
 | `persistent_workers=True` | 790ms fork stall + worker respawn | ~1-2s |
 | `taskset` core pinning | 42,170 context switches on training PID | ~38s off-CPU time |
+
+</blockquote>
 
 ---
 
@@ -303,11 +332,13 @@ DataLoader(
 
 ---
 
-## Q1: "How did my last training go? Any findings by Ingero?"
+### Engineer: "How did my last training go? Any findings by Ingero?"
 
-**MCP tools used**: `get_trace_stats`, `get_causal_chains`
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_trace_stats`, `get_causal_chains`*
 
 Ingero traced **2.64 million** CUDA/system events over your training run on the A100 GPU.
 
@@ -330,17 +361,21 @@ Ingero traced **2.64 million** CUDA/system events over your training run on the 
 1. Pin your training process to dedicated CPU cores with `taskset`
 2. Lower priority of background jobs with `nice -n 19`
 
+</blockquote>
+
 ---
 
-## Q2: "What code paths cause the cudaStreamSync stalls?"
+### Engineer: "What code paths cause the cudaStreamSync stalls?"
 
-**MCP tools used**: `get_stacks` (source=1, op="cudaStreamSync")
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_stacks` (source=1, op="cudaStreamSync")*
 
 Two code paths, one dominant offender:
 
-### Path 1 — 99.1% of calls (2,899 of 2,924) — THE PROBLEM
+**Path 1 — 99.1% of calls (2,899 of 2,924) — THE PROBLEM**
 ```
 libtorch_cuda.so
   → c10::TensorImpl::~TensorImpl()   (tensor destructor)
@@ -350,7 +385,7 @@ libtorch_cuda.so
 
 This is PyTorch's **tensor cleanup path**. When a tensor goes out of scope, PyTorch destroys it, which calls `cudaStreamSync` to ensure all pending GPU work on that tensor's stream is complete before freeing memory. Under CPU contention (load avg 10.9), the process gets descheduled *while waiting for the sync*, inflating what should be a ~50µs call to 8.8ms.
 
-### Path 2 — 0.9% of calls (25) — healthy
+**Path 2 — 0.9% of calls (25) — healthy**
 ```
 libtorch_cuda.so
   → c10::TensorImpl::~TensorImpl()   (same destructor, different callsite)
@@ -361,19 +396,24 @@ Same destructor, but this path runs during low-contention windows and completes 
 
 **Bottom line**: The cudaStreamSync stalls are not caused by slow GPU work. They're caused by **tensor destruction happening while the CPU is overloaded** — the thread gets descheduled mid-sync.
 
+</blockquote>
+
 ---
 
-## Q3: "Show me the kernel launch paths and memory allocation patterns"
+### Engineer: "Show me the kernel launch paths and memory allocation patterns"
 
-**MCP tools used**: `get_stacks` (cudaLaunchKernel, cuLaunchKernel, cudaMalloc)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Kernel Launches (1.69M total)
+*Tools used: `get_stacks` (cudaLaunchKernel, cuLaunchKernel, cudaMalloc)*
+
+**Kernel Launches (1.69M total)**
 
 The model uses **two launch paths** — normal for PyTorch:
 
-#### Driver API path (cuLaunchKernel) — 1.69M launches, 97% of kernels
+**Driver API path (cuLaunchKernel) — 1.69M launches, 97% of kernels**
+
 cuBLAS/cuDNN calling the GPU directly, bypassing the runtime API:
 
 | Operation | Calls | Avg | Max | Library |
@@ -382,7 +422,8 @@ cuBLAS/cuDNN calling the GPU directly, bypassing the runtime API:
 | **BatchNorm backward** | 140 | 234µs | 7.0ms | `cudnnBatchNormalization` (backward) |
 | Tensor ops | 230 | 46µs | 4.0ms | `cudaLaunchKernel` → `libtorch_cuda.so` |
 
-#### Runtime API path (cudaLaunchKernel) — 607K launches
+**Runtime API path (cudaLaunchKernel) — 607K launches**
+
 PyTorch's element-wise CUDA kernels:
 
 | Operation | Calls | Avg | Max | Code Path |
@@ -397,7 +438,7 @@ PyTorch's element-wise CUDA kernels:
 
 **Pattern**: Kernels with avg > 1ms (`add`, `BatchNorm`) suffer from CPU contention. Kernels with avg < 100µs (`softmax`, `mean`, `div`) complete before the scheduler can preempt.
 
-### Memory Allocation (cudaMalloc) — full Python traces
+**Memory Allocation (cudaMalloc) — full Python traces**
 
 | Code Path | Calls | Avg | Total Allocated | Source |
 |---|---|---|---|---|
@@ -407,15 +448,19 @@ PyTorch's element-wise CUDA kernels:
 
 **Key insight**: Ingero traced all the way from the CUDA driver up through PyTorch C++ into the **exact Python source lines**.
 
+</blockquote>
+
 ---
 
-## Q4: "Show me the memory alloc/free balance and any leaks"
+### Engineer: "Show me the memory alloc/free balance and any leaks"
 
-**MCP tools used**: `get_stacks` (cudaFree), `run_sql` (aggregates for malloc/free counts and per-minute breakdown)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Overall Balance
+*Tools used: `get_stacks` (cudaFree), `run_sql` (aggregates for malloc/free counts and per-minute breakdown)*
+
+**Overall Balance**
 
 | Operation | Calls | Total Allocated |
 |---|---|---|
@@ -426,7 +471,7 @@ PyTorch's element-wise CUDA kernels:
 
 76 allocations were not freed during the session — but this is **not a real leak**. PyTorch's CUDA caching allocator intentionally holds onto GPU memory pools and releases them only at process exit. 76 out of 45,992 (0.17%) is perfectly normal for a training run.
 
-### Per-Minute Breakdown
+**Per-Minute Breakdown**
 
 | Minute | Mallocs | Frees | Delta |
 |---|---|---|---|
@@ -436,7 +481,7 @@ PyTorch's element-wise CUDA kernels:
 
 The pattern is healthy — allocs and frees track each other closely. Minute 2 actually freed 10 more than it allocated (cleaning up from minute 1).
 
-### Where Frees Happen (by code path)
+**Where Frees Happen (by code path)**
 
 | Code Path | Frees | Avg Time |
 |---|---|---|
@@ -446,15 +491,19 @@ The pattern is healthy — allocs and frees track each other closely. Minute 2 a
 
 **Bottom line**: No memory leak. Alloc/free pattern is balanced, PyTorch's caching allocator is working correctly, and the 76 unfreed allocations are expected cache retention.
 
+</blockquote>
+
 ---
 
-## Q5: "Let's look at the scheduling storms"
+### Engineer: "Let's look at the scheduling storms"
 
-**MCP tools used**: `get_causal_chains`, `run_sql` (scheduling events per minute, context switches per PID with process names and off-CPU time)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Scheduling Storm Timeline
+*Tools used: `get_causal_chains`, `run_sql` (scheduling events per minute, context switches per PID with process names and off-CPU time)*
+
+**Scheduling Storm Timeline**
 
 | Minute | Context Switches | Wakeups | Intensity |
 |---|---|---|---|
@@ -464,7 +513,7 @@ The pattern is healthy — allocs and frees track each other closely. Minute 2 a
 
 **Total**: 14,504 context switches in 120 seconds — the training process was descheduled ~121 times per second.
 
-### Who's Getting Hit
+**Who's Getting Hit**
 
 | Process | PID | Switches | Off-CPU Time | Role |
 |---|---|---|---|---|
@@ -477,7 +526,7 @@ The pattern is healthy — allocs and frees track each other closely. Minute 2 a
 
 **The main training process (PID 17054) was off-CPU for 62 seconds out of a 120-second trace — it lost 51% of its CPU time to scheduling.**
 
-### The Causal Chain
+**The Causal Chain**
 
 Ingero traced 18 distinct causal patterns (47 HIGH severity), all following the same chain:
 
@@ -494,16 +543,18 @@ Ingero traced 18 distinct causal patterns (47 HIGH severity), all following the 
 
 **The worst hit**: cudaStreamSync went from 7µs (p50) to **7.4ms** (p99) — a **1,028x inflation**. The GPU finished its work in microseconds but the CPU thread waiting for it was asleep.
 
-### What's Causing the Load
+**What's Causing the Load**
 
 Load average peaked at **16.9** — roughly 17 runnable threads competing for CPU cores. The training itself only has 6 processes (1 main + 1 child + 4 DataLoader workers). The remaining ~11 runnable threads are **other system processes** (monitoring agents, log shippers, cron jobs, or noisy neighbors on shared infrastructure).
 
-### Recommendations
+**Recommendations**
 
 1. **`taskset -c 0-7 python3 train.py`** — Pin training to 8 dedicated cores
 2. **`nice -n 19`** on all background processes — deprioritize them
 3. **Check for noisy neighbors** — load avg 16.9 with only 6 training processes means ~11 competing threads from elsewhere
 4. **Consider `num_workers=2`** instead of 4 — DataLoader workers spent 17s each off-CPU, competing with the main process
+
+</blockquote>
 
 ---
 
@@ -546,11 +597,13 @@ Load average peaked at **16.9** — roughly 17 runnable threads competing for CP
 
 ---
 
-## Q1: "How did my training go?"
+### Engineer: "How did my training go?"
 
-**MCP tools used**: `get_trace_stats`, `get_causal_chains`
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_trace_stats`, `get_causal_chains`*
 
 Ingero traced **1.71 million** events during the training run, storing 265K sampled events for investigation.
 
@@ -572,13 +625,17 @@ Ingero also spotted a memory pressure chain: **10,408 page allocations (1.2 GB)*
 
 **Memory balance**: 10,937 mallocs vs 10,937 frees — **perfectly balanced**, no leaks.
 
+</blockquote>
+
 ---
 
-## Q2: "Show me the call stacks for cudaLaunchKernel"
+### Engineer: "Show me the call stacks for cudaLaunchKernel"
 
-**MCP tools used**: `get_stacks` (source=1, op="cudaLaunchKernel")
+<blockquote>
 
-**Answer**:
+#### AI Assistant
+
+*Tools used: `get_stacks` (source=1, op="cudaLaunchKernel")*
 
 Top 10 `cudaLaunchKernel` code paths, ranked by call frequency:
 
@@ -597,15 +654,19 @@ Top 10 `cudaLaunchKernel` code paths, ranked by call frequency:
 
 The training loop is dominated by **tensor addition** (gradient accumulation) and **ReLU forward/backward** passes — the ResNet-50 signature. All paths go through `python3` → `_PyEval_EvalFrameDefault` → `libtorch_python.so` → `libtorch_cuda.so` — standard PyTorch eager-mode on ARM64.
 
+</blockquote>
+
 ---
 
-## Q3: "What lines of my code caused issues?"
+### Engineer: "What lines of my code caused issues?"
 
-**MCP tools used**: `get_stacks` (cudaMalloc, cudaLaunchKernel, cudaFree)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### `alloc_stress.py` — 3 functions, all rooted at `main()` line 114
+*Tools used: `get_stacks` (cudaMalloc, cudaLaunchKernel, cudaFree)*
+
+**`alloc_stress.py` — 3 functions, all rooted at `main()` line 114**
 
 | File | Line | Function | Impact | Avg Latency | Max Latency |
 |---|---|---|---|---|---|
@@ -617,15 +678,19 @@ The training loop is dominated by **tensor addition** (gradient accumulation) an
 
 **Python frames confirmed working on ARM64** — Ingero's DWARF-based CPython frame walker resolved exact source files, function names, and line numbers on aarch64.
 
+</blockquote>
+
 ---
 
-## Q4: "Show me the scheduling storms"
+### Engineer: "Show me the scheduling storms"
 
-**MCP tools used**: `get_causal_chains`, `run_sql` (scheduling events per minute, context switches per PID)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Storm Timeline
+*Tools used: `get_causal_chains`, `run_sql` (scheduling events per minute, context switches per PID)*
+
+**Storm Timeline**
 
 | Minute | Context Switches | Wakeups | Page Allocs | Memory |
 |---|---|---|---|---|
@@ -634,7 +699,7 @@ The training loop is dominated by **tensor addition** (gradient accumulation) an
 
 A **223x increase** in context switches in minute 2.
 
-### Who's Getting Hit
+**Who's Getting Hit**
 
 | Process | PID | Switches | Off-CPU Time | Role |
 |---|---|---|---|---|
@@ -647,7 +712,7 @@ A **223x increase** in context switches in minute 2.
 
 **The main training process was descheduled 237,394 times — 1,977/sec — and spent 62 seconds off-CPU.**
 
-### Storm Escalation (from causal chains)
+**Storm Escalation (from causal chains)**
 
 | Phase | Sched Switches/window | Load Avg | Memory Pressure | CUDA Effect |
 |---|---|---|---|---|
@@ -659,15 +724,19 @@ A **223x increase** in context switches in minute 2.
 
 Load average *decreased* (31→12.6) as the storm intensified (44K→111K switches) — processes were finishing, but survivors fought harder for CPU.
 
+</blockquote>
+
 ---
 
-## Q5: "Show me the memory alloc/free balance"
+### Engineer: "Show me the memory alloc/free balance"
 
-**MCP tools used**: `run_sql` (aggregate counts, per-minute breakdown), `get_stacks` (cudaMalloc with sum_arg0)
+<blockquote>
 
-**Answer**:
+#### AI Assistant
 
-### Overall Balance
+*Tools used: `run_sql` (aggregate counts, per-minute breakdown), `get_stacks` (cudaMalloc with sum_arg0)*
+
+**Overall Balance**
 
 | Operation | Total Calls | Total Allocated |
 |---|---|---|
@@ -677,7 +746,7 @@ Load average *decreased* (31→12.6) as the storm intensified (44K→111K switch
 
 **Perfectly balanced — 10,937 mallocs, 10,937 frees. Zero leak.**
 
-### Allocation by Code Path
+**Allocation by Code Path**
 
 | Function | Line | Calls | Avg Latency | Max Latency | Total Allocated |
 |---|---|---|---|---|---|
@@ -687,6 +756,8 @@ Load average *decreased* (31→12.6) as the storm intensified (44K→111K switch
 | `main()` | 114 | 4 | **39.8ms** | 40.3ms | 2.0 GB |
 
 `fragmentation_pattern()` defeats the CUDA caching allocator by calling `empty_cache()` then reallocating from scratch — forcing fresh driver allocations during CPU contention.
+
+</blockquote>
 
 ---
 
