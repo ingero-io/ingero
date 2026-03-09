@@ -12,8 +12,6 @@
 
 **GPU**: NVIDIA A10 23GB, Lambda Labs
 
-**Date**: 2026-03-01
-
 ---
 
 ### Engineer: "How did my last training go?"
