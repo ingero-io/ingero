@@ -176,7 +176,7 @@ All checks passed — ready to trace!
 
 ### `ingero trace`
 
-Live event stream with rolling stats, system context, and anomaly detection. Events are recorded to SQLite by default (use `--record=false` to disable).
+Live event stream with rolling stats, system context, and anomaly detection. Events are recorded to SQLite by default (use `--record=false` to disable). The database is capped at 10 GB rolling storage and auto-purges old events when the limit is reached (see `--max-db`).
 
 ```bash
 sudo ingero trace                           # auto-detect all CUDA processes for current user
