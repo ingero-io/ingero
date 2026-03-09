@@ -583,4 +583,4 @@ Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero check
 Dual-licensed following the standard eBPF split-licensing model (same as Cilium, Falco, and most eBPF projects):
 
 * **User-Space** (Go agent, CLI, causal engine, SQLite, MCP): [Apache License 2.0](LICENSE) — maximum enterprise compatibility, no copyleft.
-* **Kernel-Space** (eBPF C code in `bpf/`): `GPL-2.0 OR BSD-3-Clause` — GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
+* **Kernel-Space** (eBPF C code in `bpf/`): [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html) OR [BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause) — GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
