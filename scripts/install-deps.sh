@@ -16,6 +16,26 @@ NC='\033[0m'
 ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; exit 1; }
 
+GO_VERSION="1.26.1"
+GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
+GO_URL="https://go.dev/dl/${GO_TARBALL}"
+
+install_go() {
+    echo "  Downloading Go ${GO_VERSION}..."
+    rm -f "$GO_TARBALL"
+    wget -q --show-progress -O "$GO_TARBALL" "$GO_URL" \
+        || fail "Failed to download Go from $GO_URL"
+    # Verify we got a real gzip file, not an HTML error page
+    if ! file "$GO_TARBALL" | grep -q gzip; then
+        rm -f "$GO_TARBALL"
+        fail "Downloaded file is not a valid gzip archive. Check that Go ${GO_VERSION} exists at $GO_URL"
+    fi
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf "$GO_TARBALL"
+    rm -f "$GO_TARBALL"
+    ok "go ${GO_VERSION} installed"
+}
+
 echo "=== Ingero build dependency installer ==="
 echo ""
 
@@ -29,19 +49,11 @@ if command -v go &>/dev/null; then
         ok "go $(go version | grep -oP 'go[0-9.]+') already installed"
     else
         echo "  Go $GO_VER found but 1.26+ required. Installing..."
-        wget -q https://go.dev/dl/go1.26.1.linux-amd64.tar.gz
-        sudo rm -rf /usr/local/go
-        sudo tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz
-        rm go1.26.1.linux-amd64.tar.gz
-        ok "go 1.26.1 installed"
+        install_go
     fi
 else
     echo "  Go not found. Installing..."
-    wget -q https://go.dev/dl/go1.26.1.linux-amd64.tar.gz
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz
-    rm go1.26.1.linux-amd64.tar.gz
-    ok "go 1.26.1 installed"
+    install_go
 fi
 
 # Ensure Go is in PATH for the rest of this script

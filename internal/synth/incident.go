@@ -21,7 +21,7 @@ func init() {
 
 var incidentScenario = &Scenario{
 	Name:        "incident",
-	Title:       "The WOW Demo — Full Causal Chain Incident",
+	Title:       "Full Causal Chain Incident",
 	Description: "Normal CUDA baseline → CPU storm → cudaStreamSync 8x spike → auto root cause",
 	Insight: `This is the scenario every ML engineer hits but can't diagnose.
 nvidia-smi says "GPU utilization 98%", but the GPU is actually stalling
