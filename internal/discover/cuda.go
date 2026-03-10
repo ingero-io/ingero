@@ -109,14 +109,22 @@ var cudaSearchPaths = []string{
 }
 
 // FindLibCUDART searches standard paths for libcudart.so.
-// Falls back to Python's nvidia.cuda_runtime package, then to host filesystem
-// via /proc/1/root/ (for containerized agents with hostPID: true).
+// Falls back to Python venv site-packages, then Python import, then host
+// filesystem via /proc/1/root/ (for containerized agents with hostPID: true).
 func FindLibCUDART() (string, error) {
 	if path, err := findLibInPaths(cudaSearchPaths, "libcudart.so*"); err == nil {
 		return path, nil
 	}
 
-	// Fallback: ask Python's nvidia.cuda_runtime package for the library path.
+	// Fallback: scan Python venv site-packages for nvidia CUDA libraries.
+	// Deep Learning AMIs (AWS, GCP, Azure) install CUDA inside Python venvs
+	// at paths like /opt/pytorch/lib/python3.*/site-packages/nvidia/cu*/lib/.
+	// This works even under sudo where the venv isn't activated.
+	if path, err := findLibCUDARTInVenvs(); err == nil {
+		return path, nil
+	}
+
+	// Fallback: ask Python's nvidia CUDA package for the library path.
 	if path, err := findLibCUDARTViaPython(); err == nil {
 		return path, nil
 	}
@@ -129,6 +137,31 @@ func FindLibCUDART() (string, error) {
 	}
 
 	return "", fmt.Errorf("libcudart.so not found in standard paths or Python packages")
+}
+
+// findLibCUDARTInVenvs searches common Python venv site-packages directories
+// for libcudart.so. Handles Deep Learning AMIs where CUDA is bundled inside
+// pip-installed nvidia packages (nvidia.cu13, nvidia.cuda_runtime, etc.).
+func findLibCUDARTInVenvs() (string, error) {
+	// Glob patterns for common venv locations on Deep Learning AMIs.
+	venvGlobs := []string{
+		"/opt/*/lib/python*/site-packages/nvidia/cu*/lib",
+		"/opt/*/lib/python*/site-packages/nvidia/cuda_runtime/lib",
+		"/home/*/anaconda3/lib/python*/site-packages/nvidia/cu*/lib",
+		"/home/*/.conda/envs/*/lib/python*/site-packages/nvidia/cu*/lib",
+	}
+	for _, pattern := range venvGlobs {
+		dirs, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, dir := range dirs {
+			if path, err := findLibInDir(dir); err == nil {
+				return path, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no libcudart.so in Python venvs")
 }
 
 // findLibInPaths searches directories for a glob pattern and returns the
@@ -176,30 +209,48 @@ func findLibOnHost(dirs []string, pattern string) (string, error) {
 	return "", fmt.Errorf("not found on host")
 }
 
-// findLibCUDARTViaPython discovers libcudart.so from Python's nvidia.cuda_runtime package.
-// This handles the common case where PyTorch is pip-installed and bundles its own CUDA runtime.
-// When running as root (via sudo), also tries running Python as the original user (SUDO_USER).
+// findLibCUDARTViaPython discovers libcudart.so from Python's nvidia CUDA packages.
+// Handles both the legacy nvidia.cuda_runtime (CUDA ≤12) and nvidia.cu* (CUDA 13+)
+// package names. When running as root (via sudo), also tries running Python as
+// the original user (SUDO_USER).
 func findLibCUDARTViaPython() (string, error) {
-	pyCmd := `import nvidia.cuda_runtime, os; print(os.path.join(nvidia.cuda_runtime.__path__[0], 'lib'))`
-
-	// Try directly first.
-	if dir, err := runPythonCmd(pyCmd); err == nil {
-		if path, err := findLibInDir(dir); err == nil {
-			return path, nil
-		}
+	// Try multiple Python module paths — the package name changed in CUDA 13
+	// from nvidia.cuda_runtime to nvidia.cu13 (and nvidia.cu<N> for future versions).
+	pyCmds := []string{
+		// CUDA 13+: nvidia.cu13, nvidia.cu14, etc.
+		`import importlib, glob, os
+for pkg in sorted(glob.glob(os.path.join(os.path.dirname(__import__('nvidia').__path__[0]), 'nvidia', 'cu*')), reverse=True):
+    mod = os.path.basename(pkg)
+    try:
+        m = importlib.import_module(f'nvidia.{mod}')
+        libdir = os.path.join(m.__path__[0], 'lib')
+        if any(f.startswith('libcudart') for f in os.listdir(libdir)):
+            print(libdir); break
+    except Exception: pass`,
+		// CUDA ≤12: nvidia.cuda_runtime
+		`import nvidia.cuda_runtime, os; print(os.path.join(nvidia.cuda_runtime.__path__[0], 'lib'))`,
 	}
 
-	// When running as root via sudo, Python packages may be installed for the
-	// original user only. Try running as SUDO_USER.
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		if dir, err := runPythonCmdAsUser(pyCmd, sudoUser); err == nil {
+	for _, pyCmd := range pyCmds {
+		// Try directly first.
+		if dir, err := runPythonCmd(pyCmd); err == nil && dir != "" {
 			if path, err := findLibInDir(dir); err == nil {
 				return path, nil
 			}
 		}
+
+		// When running as root via sudo, Python packages may be installed for the
+		// original user only. Try running as SUDO_USER.
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if dir, err := runPythonCmdAsUser(pyCmd, sudoUser); err == nil && dir != "" {
+				if path, err := findLibInDir(dir); err == nil {
+					return path, nil
+				}
+			}
+		}
 	}
 
-	return "", fmt.Errorf("python nvidia.cuda_runtime not available")
+	return "", fmt.Errorf("python nvidia CUDA packages not available")
 }
 
 func runPythonCmd(code string) (string, error) {
