@@ -150,19 +150,25 @@ GOTOOLCHAIN=local go install honnef.co/go/tools/cmd/staticcheck@latest 2>/dev/nu
 # ---- 6. Symlink libcudart.so (GPU runtime) ----
 echo ""
 echo "[6/7] Checking libcudart.so..."
-if ldconfig -p 2>/dev/null | grep -q libcudart.so; then
-    ok "libcudart.so already discoverable"
+if ldconfig -p 2>/dev/null | grep -q 'libcudart\.so'; then
+    ok "libcudart.so already discoverable via ldconfig"
 elif [ -L /usr/lib/x86_64-linux-gnu/libcudart.so ]; then
     ok "libcudart.so symlink already exists"
 else
-    # Search common locations one at a time. Using a single find with
-    # multiple paths fails silently when some paths don't exist.
-    # The Deep Learning AMI buries libcudart.so deep inside the PyTorch
-    # venv's site-packages/nvidia/ tree.
+    # Search common locations for libcudart. Deep Learning AMIs (AWS, GCP)
+    # often bundle CUDA inside Python venvs with only the versioned name
+    # (e.g. libcudart.so.13) and no unversioned libcudart.so.
+    # Search for both unversioned and versioned names.
     CUDART_PATH=""
     for search_dir in /opt /usr/local/cuda /usr/lib; do
         if [ -d "$search_dir" ]; then
+            # Prefer unversioned libcudart.so, fall back to versioned (libcudart.so.*)
             CUDART_PATH=$(find "$search_dir" -name 'libcudart.so' -type f 2>/dev/null | head -1)
+            if [ -z "$CUDART_PATH" ]; then
+                CUDART_PATH=$(find "$search_dir" -name 'libcudart.so.*' -type f 2>/dev/null \
+                    | grep -v '\.a$' \
+                    | head -1)
+            fi
             [ -n "$CUDART_PATH" ] && break
         fi
     done
@@ -171,7 +177,8 @@ else
         ok "symlinked $CUDART_PATH → /usr/lib/x86_64-linux-gnu/libcudart.so"
     else
         echo "  SKIP: libcudart.so not found (not needed for build, needed for 'ingero check/trace')"
-        echo "  If using a PyTorch venv, run: sudo ln -sf \$(find / -name libcudart.so -type f | head -1) /usr/lib/x86_64-linux-gnu/libcudart.so"
+        echo "  If using a PyTorch venv, run:"
+        echo "    sudo ln -sf \$(find /opt -name 'libcudart.so*' -type f | grep -v '\\.a\$' | head -1) /usr/lib/x86_64-linux-gnu/libcudart.so"
     fi
 fi
 
