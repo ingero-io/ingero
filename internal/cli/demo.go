@@ -39,7 +39,8 @@ var (
 var demoCmd = &cobra.Command{
 	Use:   "demo [scenario]",
 	Short: "Run demo scenarios — auto-detects GPU, defaults to all 6 scenarios",
-	Long: `Run demo scenarios that showcase Ingero's CUDA profiling insights.
+	Long: func() string {
+		return `Run demo scenarios that showcase Ingero's CUDA profiling insights.
 
 Auto-detect mode (default):
   Automatically detects GPU availability and runs all scenarios.
@@ -50,7 +51,8 @@ Examples:
   ingero demo cold-start                # auto-detect GPU, one scenario
   sudo ingero demo --gpu                # force GPU mode
   ingero demo --no-gpu                  # force synthetic mode
-  ingero demo --no-gpu --speed 5        # fast synthetic mode`,
+  ingero demo --no-gpu --speed 5        # fast synthetic mode` + printScenarioHelpString()
+	}(),
 
 	Args: cobra.MaximumNArgs(1),
 	RunE: demoRunE,
@@ -168,6 +170,32 @@ func listScenarios() {
 	fmt.Println("Synthetic mode (no GPU needed):")
 	fmt.Println("  ingero demo --no-gpu <name>")
 	fmt.Println("  ingero demo --no-gpu all")
+}
+
+// printScenarioHelp prints scenario descriptions for --help output.
+func printScenarioHelp() {
+	fmt.Println()
+	fmt.Println("Scenarios:")
+	fmt.Println()
+	for _, s := range synth.Registry {
+		fmt.Printf("  %-18s %s\n", s.Name, s.Title)
+		fmt.Printf("  %-18s %s\n", "", s.Description)
+		fmt.Println()
+	}
+}
+
+// printScenarioHelpString returns scenario descriptions as a string.
+func printScenarioHelpString() string {
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString("Scenarios:\n")
+	sb.WriteString("\n")
+	for _, s := range synth.Registry {
+		sb.WriteString(fmt.Sprintf("  %-18s %s\n", s.Name, s.Title))
+		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "", s.Description))
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // ---------------------------------------------------------------------------
