@@ -104,4 +104,41 @@ func TestParseTime(t *testing.T) {
 	}
 }
 
+func TestParseSince(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "minutes", input: "5m", want: 5 * time.Minute},
+		{name: "hours", input: "1h", want: time.Hour},
+		{name: "seconds", input: "30s", want: 30 * time.Second},
+		{name: "hours and minutes", input: "1h30m", want: 90 * time.Minute},
+		{name: "days", input: "2d", want: 48 * time.Hour},
+		{name: "weeks", input: "1w", want: 168 * time.Hour},
+		{name: "weeks and days", input: "1w2d", want: 216 * time.Hour},
+		{name: "invalid string", input: "not-a-duration", wantErr: true},
+		{name: "empty string", input: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseSince(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseSince(%q) should return error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSince(%q) unexpected error: %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Errorf("parseSince(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSinglePIDOrZero and TestToUint32Slice are in pidutil_test.go.

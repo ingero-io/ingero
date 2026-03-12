@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-224 total tests.
+225 total tests.
 
 ## Summary
 
@@ -18,7 +18,7 @@
 | store | 6 | SQLite storage, chain round-trip, batch process names, compact |
 | stats | 22 | Percentiles, anomaly detection, spike patterns |
 | mcp | 9 | TSC compression, aggregate/chain formatting |
-| cli | 10 | Duration format, storage hierarchy, time parsing, PID name cache |
+| cli | 11 | Duration format, storage hierarchy, time parsing, since parsing, PID name cache |
 | filter | 11 | Deadband suppression, heartbeat, concurrency |
 | cgroup | 6 | Container ID extraction, cgroup v1/v2 parsing |
 | k8s | 7 | Pod list parsing, GPU pod filtering, cache |
@@ -229,6 +229,7 @@
 | 113 | TestSinglePIDOrZero | Returns single PID or 0 if multiple/empty | pidutil_test.go |
 | 114 | TestPidSetFromInts | Creates PID filter set from int list | pidutil_test.go |
 | 115 | TestParseTime | Time string parsing: full datetime, ISO, time-only, errors | explain_test.go |
+| 115a | TestParseSince | Duration string parsing: Go units, extended units (2d, 1w, 1w2d), invalid input | explain_test.go |
 
 ## MCP (mcp/server_test.go, tsc_test.go)
 

@@ -5,7 +5,8 @@
 // No eBPF probes, no root required.
 //
 // Call chain: explainRunE → open DB → query events →
-//   replay through stats + correlator → renderIncidentReport
+//
+//	replay through stats + correlator → renderIncidentReport
 package cli
 
 import (
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	str2duration "github.com/xhit/go-str2duration/v2"
 
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
@@ -25,7 +27,7 @@ import (
 var (
 	explainDBPath     string
 	explainPIDs       []int
-	explainSince      time.Duration
+	explainSince      string
 	explainFrom       string
 	explainTo         string
 	explainJSON       bool
@@ -56,7 +58,7 @@ Reads from the SQLite database populated by 'ingero trace'. No root needed.
 func init() {
 	explainCmd.Flags().StringVar(&explainDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	explainCmd.Flags().IntSliceVarP(&explainPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
-	explainCmd.Flags().DurationVar(&explainSince, "since", 5*time.Minute, "analyze events from the last duration")
+	explainCmd.Flags().StringVar(&explainSince, "since", "5m", "analyze events from the last duration")
 	explainCmd.Flags().StringVar(&explainFrom, "from", "", "start time (e.g., '2026-02-20 15:40' or '15:40')")
 	explainCmd.Flags().StringVar(&explainTo, "to", "", "end time (e.g., '2026-02-20 15:45' or '15:45')")
 	explainCmd.Flags().BoolVar(&explainJSON, "json", false, "output as JSON")
@@ -119,7 +121,11 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// Default: --since duration.
-		params.Since = explainSince
+		since, err := parseSince(explainSince)
+		if err != nil {
+			return err
+		}
+		params.Since = since
 	}
 
 	params.PIDs = toUint32Slice(explainPIDs)
@@ -200,7 +206,11 @@ func explainStoredChains() error {
 	}
 	defer s.Close()
 
-	stored, err := s.QueryChains(explainSince)
+	since, err := parseSince(explainSince)
+	if err != nil {
+		return err
+	}
+	stored, err := s.QueryChains(since)
 	if err != nil {
 		return fmt.Errorf("querying chains: %w", err)
 	}
@@ -273,7 +283,11 @@ func explainPerProcessBreakdown() error {
 			params.To = t
 		}
 	} else {
-		params.Since = explainSince
+		since, err := parseSince(explainSince)
+		if err != nil {
+			return err
+		}
+		params.Since = since
 	}
 	params.PIDs = toUint32Slice(explainPIDs)
 
@@ -515,6 +529,16 @@ func renderChainsJSON(chains []correlate.CausalChain) error {
 	}
 	fmt.Println("]")
 	return nil
+}
+
+// parseSince parses the --since flag value into a time.Duration.
+// Uses go-str2duration which supports human-friendly formats like "1h30m", "2d", "1w".
+func parseSince(s string) (time.Duration, error) {
+	d, err := str2duration.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --since value %q: expected a duration like 5m, 1h, 2d, 1w", s)
+	}
+	return d, nil
 }
 
 // parseTime parses a time string in common formats.
