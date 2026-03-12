@@ -6,6 +6,7 @@ require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/modelcontextprotocol/go-sdk v1.3.1
 	github.com/spf13/cobra v1.10.2
+	github.com/xhit/go-str2duration/v2 v2.1.0
 	golang.org/x/sys v0.37.0
 	modernc.org/sqlite v1.46.1
 )

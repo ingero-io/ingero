@@ -17,7 +17,7 @@ import (
 
 var (
 	queryDBPath string
-	querySince  time.Duration
+	querySince  string
 	queryPIDs   []int
 	queryOp     string
 	queryJSON   bool
@@ -40,7 +40,7 @@ Examples:
 
 func init() {
 	queryCmd.Flags().StringVar(&queryDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
-	queryCmd.Flags().DurationVar(&querySince, "since", 1*time.Hour, "query events from the last duration (e.g., 30m, 1h, 24h)")
+	queryCmd.Flags().StringVar(&querySince, "since", "1h", "query events from the last duration (e.g., 30m, 1h, 24h)")
 	queryCmd.Flags().IntSliceVarP(&queryPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	queryCmd.Flags().StringVar(&queryOp, "op", "", "filter by operation name (e.g., cudaMemcpy, sched_switch)")
 	queryCmd.Flags().BoolVar(&queryJSON, "json", false, "output as JSON")
@@ -62,9 +62,14 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	}
 	defer s.Close()
 
+	since, err := parseSince(querySince)
+	if err != nil {
+		return err
+	}
+
 	// Build query params.
 	params := store.QueryParams{
-		Since: querySince,
+		Since: since,
 		PIDs:  toUint32Slice(queryPIDs),
 		Limit: queryLimit,
 	}
