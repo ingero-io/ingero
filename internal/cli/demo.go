@@ -172,19 +172,8 @@ func listScenarios() {
 	fmt.Println("  ingero demo --no-gpu all")
 }
 
-// printScenarioHelp prints scenario descriptions for --help output.
-func printScenarioHelp() {
-	fmt.Println()
-	fmt.Println("Scenarios:")
-	fmt.Println()
-	for _, s := range synth.Registry {
-		fmt.Printf("  %-18s %s\n", s.Name, s.Title)
-		fmt.Printf("  %-18s %s\n", "", s.Description)
-		fmt.Println()
-	}
-}
-
-// printScenarioHelpString returns scenario descriptions as a string.
+// printScenarioHelpString returns scenario descriptions as a string for
+// inclusion in the demo command's Long help text.
 func printScenarioHelpString() string {
 	var sb strings.Builder
 	sb.WriteString("\n")
