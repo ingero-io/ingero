@@ -12,7 +12,8 @@
 #   3. Go (bootstrap version — go.mod auto-downloads exact toolchain)
 #   4. Go development tools (staticcheck, gofumpt, bpf2go, cobra-cli)
 #   5. Generates vmlinux.h from WSL kernel BTF
-#   6. Verifies the full pipeline: compile eBPF → generate Go bindings → build
+#   6. WSL GPU library paths (libcuda.so, nvidia-smi for sudo)
+#   7. Verifies the full pipeline: compile eBPF → generate Go bindings → build
 #
 # Prerequisites:
 #   - WSL2 with Ubuntu 22.04 (wsl --install -d Ubuntu-22.04)
@@ -93,7 +94,7 @@ print_info "Repo root: $REPO_ROOT"
 ################################################################################
 # Step 1: System Packages
 ################################################################################
-print_header "Step 1/6: System Packages"
+print_header "Step 1/7: System Packages"
 
 print_info "Updating package lists..."
 sudo apt-get update -qq
@@ -152,26 +153,28 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-# bpftool: WSL has a version mismatch (ubuntu tools 5.15 vs kernel 6.x), but it works
+# bpftool: WSL has a version mismatch (ubuntu tools 5.15 vs kernel 6.x).
+# CRITICAL: /usr/sbin/bpftool is a shim that silently fails (produces empty
+# output) when the installed linux-tools version doesn't match the WSL kernel.
+# Always find the real binary under /usr/lib/linux-tools/ and use it directly.
 BPFTOOL_BIN=""
-if command -v bpftool &>/dev/null 2>&1; then
+
+# First try the real binary directly (bypass the shim)
+for candidate in /usr/lib/linux-tools/*/bpftool; do
+    if [ -f "$candidate" ]; then
+        BPFTOOL_BIN="$candidate"
+        break
+    fi
+done
+
+# Fall back to the shim only if no real binary found
+if [ -z "$BPFTOOL_BIN" ] && command -v bpftool &>/dev/null 2>&1; then
     BPFTOOL_BIN="bpftool"
-else
-    # Find the actual binary (WSL shim warns about version but the real binary exists)
-    BPFTOOL_CANDIDATES=(
-        /usr/lib/linux-tools/*/bpftool
-    )
-    for candidate in "${BPFTOOL_CANDIDATES[@]}"; do
-        if [ -f "$candidate" ]; then
-            BPFTOOL_BIN="$candidate"
-            break
-        fi
-    done
 fi
 
 if [ -n "$BPFTOOL_BIN" ]; then
     BPFTOOL_VER=$($BPFTOOL_BIN version 2>/dev/null | head -1 || echo "found")
-    print_success "bpftool: $BPFTOOL_VER"
+    print_success "bpftool: $BPFTOOL_VER (at $BPFTOOL_BIN)"
     print_info "  Note: bpftool version may not match WSL kernel version — this is normal."
     print_info "  BTF dump still works correctly across kernel versions."
 else
@@ -192,7 +195,7 @@ fi
 ################################################################################
 # Step 2: Go Installation
 ################################################################################
-print_header "Step 2/6: Go Installation"
+print_header "Step 2/7: Go Installation"
 
 GO_BOOTSTRAP_VERSION="1.26.0"
 GO_NEEDED=0
@@ -237,7 +240,7 @@ fi
 ################################################################################
 # Step 3: Go Development Tools
 ################################################################################
-print_header "Step 3/6: Go Development Tools"
+print_header "Step 3/7: Go Development Tools"
 
 # Ensure PATH includes go/bin
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
@@ -288,7 +291,7 @@ fi
 ################################################################################
 # Step 4: BTF & vmlinux.h
 ################################################################################
-print_header "Step 4/6: BTF Support & vmlinux.h Generation"
+print_header "Step 4/7: BTF Support & vmlinux.h Generation"
 
 if [ -f /sys/kernel/btf/vmlinux ]; then
     BTF_SIZE=$(ls -lh /sys/kernel/btf/vmlinux | awk '{print $5}')
@@ -307,7 +310,14 @@ if [ -f /sys/kernel/btf/vmlinux ]; then
         $BPFTOOL_BIN btf dump file /sys/kernel/btf/vmlinux format c > "$REPO_ROOT/bpf/headers/vmlinux.h"
 
         VMLINUX_LINES=$(wc -l < "$REPO_ROOT/bpf/headers/vmlinux.h")
-        print_success "vmlinux.h generated: $VMLINUX_LINES lines"
+        if [ "$VMLINUX_LINES" -lt 1000 ]; then
+            print_fail "vmlinux.h is empty or too small ($VMLINUX_LINES lines)"
+            print_info "  The bpftool shim likely failed silently. Using: $BPFTOOL_BIN"
+            print_info "  Try running directly: $BPFTOOL_BIN btf dump file /sys/kernel/btf/vmlinux format c | head -5"
+            FAILURES=$((FAILURES + 1))
+        else
+            print_success "vmlinux.h generated: $VMLINUX_LINES lines"
+        fi
     else
         print_warn "Skipping vmlinux.h generation (bpftool not found)"
         print_info "Install bpftool and run: make vmlinux"
@@ -320,7 +330,7 @@ fi
 ################################################################################
 # Step 5: Download Go Dependencies
 ################################################################################
-print_header "Step 5/6: Go Module Dependencies"
+print_header "Step 5/7: Go Module Dependencies"
 
 cd "$REPO_ROOT"
 print_info "Downloading Go module dependencies..."
@@ -328,9 +338,66 @@ go mod download 2>&1 | tail -3 || true
 print_success "Go modules downloaded"
 
 ################################################################################
-# Step 6: Verification — Full Build Pipeline
+# Step 6: WSL GPU Library Paths
 ################################################################################
-print_header "Step 6/6: Full Pipeline Verification"
+print_header "Step 6/7: WSL GPU Library Paths"
+
+# WSL2 places NVIDIA driver libraries (libcuda.so, libnvidia-ml.so, nvidia-smi)
+# in /usr/lib/wsl/lib/ instead of standard Linux paths. This causes three problems:
+#   1. ldconfig can't find libcuda.so → ingero check fails
+#   2. sudo strips PATH → nvidia-smi not found when running ingero as root
+#   3. Only versioned libcuda.so.1 exists, no unversioned libcuda.so symlink
+if [ -d /usr/lib/wsl/lib ]; then
+    print_info "WSL GPU library directory found at /usr/lib/wsl/lib/"
+
+    # Add to ldconfig so libcuda.so.1 and libnvidia-ml.so.1 are discoverable
+    if [ ! -f /etc/ld.so.conf.d/wsl-gpu.conf ]; then
+        echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-gpu.conf >/dev/null
+        sudo ldconfig
+        print_success "Added /usr/lib/wsl/lib to ldconfig"
+    else
+        print_success "ldconfig already configured for WSL GPU libs"
+    fi
+
+    # Add /usr/lib/wsl/lib to sudo's secure_path so nvidia-smi works under sudo
+    if [ ! -f /etc/sudoers.d/wsl-gpu ]; then
+        echo 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/wsl/lib"' \
+            | sudo tee /etc/sudoers.d/wsl-gpu >/dev/null
+        sudo chmod 0440 /etc/sudoers.d/wsl-gpu
+        print_success "Added /usr/lib/wsl/lib to sudo secure_path"
+    else
+        print_success "sudo secure_path already configured for WSL GPU libs"
+    fi
+
+    # Create unversioned libcuda.so symlink (WSL only ships libcuda.so.1)
+    if [ -f /usr/lib/wsl/lib/libcuda.so.1 ] && ! ldconfig -p 2>/dev/null | grep -q 'libcuda.so '; then
+        sudo ln -sf /usr/lib/wsl/lib/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
+        sudo ldconfig
+        print_success "Created libcuda.so symlink → /usr/lib/wsl/lib/libcuda.so.1"
+    elif ldconfig -p 2>/dev/null | grep -q 'libcuda.so '; then
+        print_success "libcuda.so already discoverable via ldconfig"
+    else
+        print_warn "libcuda.so.1 not found in /usr/lib/wsl/lib/ — GPU driver may not be installed"
+        print_info "  Install the latest NVIDIA driver on Windows, then restart WSL (wsl --shutdown)"
+    fi
+
+    # Verify nvidia-smi is accessible
+    if command -v nvidia-smi &>/dev/null; then
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        print_success "nvidia-smi: $GPU_NAME"
+    else
+        print_warn "nvidia-smi not found — no NVIDIA GPU detected in WSL"
+        print_info "  This is fine for eBPF development. GPU tracing requires a Windows NVIDIA driver 550+."
+    fi
+else
+    print_info "No WSL GPU library directory found — skipping GPU path setup"
+    print_info "  This is normal if no NVIDIA GPU is present or driver is not installed on Windows."
+fi
+
+################################################################################
+# Step 7: Verification — Full Build Pipeline
+################################################################################
+print_header "Step 7/7: Full Pipeline Verification"
 
 cd "$REPO_ROOT"
 echo ""
@@ -420,6 +487,11 @@ echo "  WSL Kernel:"
 echo "    Version:         $(uname -r)"
 echo "    BTF size:        $(ls -lh /sys/kernel/btf/vmlinux 2>/dev/null | awk '{print $5}' || echo 'N/A')"
 echo ""
+echo "  GPU (WSL passthrough):"
+echo "    nvidia-smi:      $(command -v nvidia-smi &>/dev/null && echo 'available' || echo 'not found')"
+echo "    libcuda.so:      $(ldconfig -p 2>/dev/null | grep -q 'libcuda.so ' && echo 'discoverable' || echo 'not found')"
+echo "    GPU model:       $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none detected')"
+echo ""
 
 if [ "$FAILURES" -gt 0 ]; then
     print_error "$FAILURES verification(s) failed. Review the output above."
@@ -430,13 +502,20 @@ else
     print_info "Your WSL environment is ready for Ingero development."
     echo ""
     echo "  Next steps:"
-    echo "    ${BLUE}source ~/.bashrc${NC}          # Refresh PATH (if Go was just installed)"
+    echo "    ${BLUE}source ~/.bashrc${NC}              # Refresh PATH (if Go was just installed)"
     echo "    ${BLUE}cd $REPO_ROOT${NC}"
-    echo "    ${BLUE}make build${NC}                # Build the ingero binary"
-    echo "    ${BLUE}./bin/ingero check${NC}           # System diagnostics (no GPU expected in WSL)"
-    echo "    ${BLUE}./bin/ingero version${NC}          # Verify version injection"
+    echo "    ${BLUE}make build${NC}                    # Build the ingero binary"
+    echo "    ${BLUE}sudo ./bin/ingero check${NC}       # System diagnostics (verify GPU + eBPF)"
+    echo "    ${BLUE}./bin/ingero version${NC}           # Verify version injection"
     echo ""
-    print_info "For GPU testing, deploy a remote VM:"
-    echo "    ${BLUE}make gpu-deploy${NC}           # TensorDock VM (requires API token in .env)"
-    echo ""
+    if command -v nvidia-smi &>/dev/null; then
+        print_info "GPU detected — you can trace locally:"
+        echo "    ${BLUE}sudo ./bin/ingero trace --stack${NC}  # Trace CUDA calls on this GPU"
+        echo "    ${BLUE}./bin/ingero demo --no-gpu${NC}       # Synthetic smoke test (no GPU needed)"
+        echo ""
+    else
+        print_info "No GPU detected. For GPU testing, deploy a remote VM:"
+        echo "    ${BLUE}make gpu-deploy${NC}               # TensorDock VM (requires API token in .env)"
+        echo ""
+    fi
 fi
