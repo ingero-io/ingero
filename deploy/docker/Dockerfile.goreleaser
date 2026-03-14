@@ -1,0 +1,5 @@
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY ingero /usr/local/bin/ingero
+ENTRYPOINT ["/usr/local/bin/ingero"]
+CMD ["trace", "--record"]

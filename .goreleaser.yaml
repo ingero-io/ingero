@@ -55,5 +55,50 @@ release:
   draft: false
   prerelease: auto
 
+dockers:
+  - image_templates:
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
+    use: buildx
+    dockerfile: deploy/docker/Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=Ingero"
+      - "--label=org.opencontainers.image.description=Production GPU Causal Observability"
+      - "--label=org.opencontainers.image.source=https://github.com/ingero-io/ingero"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+    goarch: amd64
+
+  - image_templates:
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: deploy/docker/Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=Ingero"
+      - "--label=org.opencontainers.image.description=Production GPU Causal Observability"
+      - "--label=org.opencontainers.image.source=https://github.com/ingero-io/ingero"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/ingero-io/ingero:v{{ .Version }}"
+    image_templates:
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/ingero-io/ingero:v{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/ingero-io/ingero:latest"
+    image_templates:
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+
 snapshot:
   version_template: "{{.Tag}}-next"

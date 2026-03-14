@@ -1,5 +1,5 @@
-# Ingero v0.7 — Production GPU Causal Observability
-# Multi-stage build: build Go binary, then minimal runtime image (~50MB)
+# Ingero v0.8 — Production GPU Causal Observability
+# Multi-stage build: build Go binary, then minimal runtime image (~10MB)
 #
 # Required runtime flags for eBPF tracing:
 #   docker run --privileged --pid=host \
@@ -7,7 +7,7 @@
 #     -v /sys/kernel/debug:/sys/kernel/debug \
 #     -v /sys/kernel/btf:/sys/kernel/btf:ro \
 #     -v /var/lib/ingero:/var/lib/ingero \
-#     ghcr.io/ingero-io/ingero:v0.7 trace --record
+#     ghcr.io/ingero-io/ingero:v0.8 trace --record
 #
 # Minimum capabilities (alternative to --privileged):
 #   --cap-add=BPF --cap-add=PERFMON --cap-add=SYS_ADMIN
@@ -27,18 +27,19 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN make generate build
+RUN CGO_ENABLED=0 go build -tags linux -trimpath -ldflags="-s -w" -o /ingero ./cmd/ingero/
 
-FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libbpf0 \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/bin/ingero /usr/local/bin/ingero
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /ingero /usr/local/bin/ingero
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["/usr/local/bin/ingero", "version"]
 
 LABEL org.opencontainers.image.title="Ingero" \
       org.opencontainers.image.description="Production GPU Causal Observability" \
       org.opencontainers.image.source="https://github.com/ingero-io/ingero" \
-      org.opencontainers.image.version="0.7.0"
+      org.opencontainers.image.version="0.8.0"
 
 ENTRYPOINT ["/usr/local/bin/ingero"]
 CMD ["trace", "--record"]
