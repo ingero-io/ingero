@@ -27,7 +27,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -tags linux -trimpath -ldflags="-s -w" -o /ingero ./cmd/ingero/
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+RUN CGO_ENABLED=0 go build -tags linux -trimpath \
+    -ldflags="-s -w \
+      -X github.com/ingero-io/ingero/internal/version.version=${VERSION} \
+      -X github.com/ingero-io/ingero/internal/version.commit=${COMMIT} \
+      -X github.com/ingero-io/ingero/internal/version.date=${BUILD_DATE}" \
+    -o /ingero ./cmd/ingero/
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates

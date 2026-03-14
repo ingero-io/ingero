@@ -152,7 +152,19 @@ docker run --rm --privileged --pid=host \
 
 Minimum capabilities (alternative to `--privileged`): `--cap-add=BPF --cap-add=PERFMON --cap-add=SYS_ADMIN`.
 
-The image is ~10 MB (Alpine 3.20 + statically linked Go binary). See `deploy/docker/Dockerfile` for details.
+> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`).
+
+The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building the dev Dockerfile locally, pass version info via build args:
+
+```bash
+docker build -f deploy/docker/Dockerfile \
+  --build-arg VERSION=0.8.1 \
+  --build-arg COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  -t ingero:local .
+```
+
+GHCR images have version info baked in automatically via GoReleaser. See `deploy/docker/Dockerfile` for details.
 
 ### Build from Source
 
