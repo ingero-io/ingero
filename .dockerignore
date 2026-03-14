@@ -1,0 +1,13 @@
+.git
+bin/
+logs/
+dist/
+.output/
+*.pem
+*.key
+.tensordock-vm.json
+.lambdalabs-vm.json
+.azure-vm.json
+.claude/
+demo/
+.env
