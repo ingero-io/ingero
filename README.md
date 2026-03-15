@@ -106,7 +106,6 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 ## Install
 
-<!--
 ### Binary Release (recommended)
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
@@ -124,11 +123,76 @@ VERSION=0.8.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
--->
+
+### Docker Image
+
+Multi-arch images (amd64 + arm64) are published to GHCR on every release:
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/ingero-io/ingero:latest
+
+# Or pin to a specific version
+docker pull ghcr.io/ingero-io/ingero:v0.8.1
+
+# Quick test (no root, no GPU needed)
+docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
+
+# System readiness check
+docker run --rm --privileged --pid=host ghcr.io/ingero-io/ingero check
+
+# Live eBPF tracing (requires privileges + kernel mounts)
+docker run --rm --privileged --pid=host \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/btf:/sys/kernel/btf:ro \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero trace --record
+```
+
+Minimum capabilities (alternative to `--privileged`): `--cap-add=BPF --cap-add=PERFMON --cap-add=SYS_ADMIN`.
+
+> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`). The `--pid=host` flag shares the host's `/proc` — do **not** also bind-mount `-v /proc:/proc:ro` as this causes OCI runtime errors on Docker Desktop and WSL2.
+
+**Data persistence:** The container stores the SQLite database at `/var/lib/ingero/ingero.db` by default. Mount `-v /var/lib/ingero:/var/lib/ingero` to persist data after the container stops. Without this mount, **all trace data is lost** when the container exits.
+
+**Multiple databases:** Use `--db` or the `INGERO_DB` env var to work with different databases:
+
+```bash
+# Trace to a named database
+docker run --rm --privileged --pid=host \
+  -v /var/lib/ingero:/var/lib/ingero \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/btf:/sys/kernel/btf:ro \
+  ghcr.io/ingero-io/ingero trace --db /var/lib/ingero/training-run-42.db
+
+# Investigate a specific database
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero explain --db /var/lib/ingero/training-run-42.db
+
+# Compare databases from different runs
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero query --db /var/lib/ingero/training-run-41.db --since 1h
+
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero query --db /var/lib/ingero/training-run-42.db --since 1h
+```
+
+The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building the dev Dockerfile locally, pass version info via build args:
+
+```bash
+docker build -f deploy/docker/Dockerfile \
+  --build-arg VERSION=0.8.1 \
+  --build-arg COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  -t ingero:local .
+```
+
+GHCR images have version info baked in automatically via GoReleaser. See `deploy/docker/Dockerfile` for details.
 
 ### Build from Source
-
-> **Note:** Binary releases coming soon. For now, build from source.
 
 ```bash
 # Requires clang-14, Linux kernel with BTF
@@ -568,7 +632,7 @@ No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Yo
 Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
 
 **Does it work in containers?**
-Yes, with `--privileged` or appropriate BPF capabilities. The host kernel must have BTF enabled.
+Yes. eBPF programs execute in kernel space — the container just loads them via syscalls. Run with `--privileged` (or `--cap-add=BPF,PERFMON,SYS_ADMIN`), `--pid=host`, and mount `/proc`, `/sys/kernel/debug`, and `/sys/kernel/btf`. The host kernel must have BTF enabled. Pre-built images are available at `ghcr.io/ingero-io/ingero` — see the [Docker Image](#docker-image) install section. This is the same pattern used by Falco, Tetragon, and other eBPF DaemonSets.
 
 **Where is data stored?**
 Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-based pruning keeps the DB under 10 GB by default. With `--record-all`, this covers a few hours of heavy GPU load; with selective storage (default), it lasts much longer. Configure with `--max-db` (e.g., `--max-db 500m`, `--max-db 0` for unlimited). Use `--db /path/to/file.db` for a custom location.
