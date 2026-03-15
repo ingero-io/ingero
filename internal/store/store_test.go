@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -2173,4 +2174,63 @@ func TestCompact(t *testing.T) {
 		sizeBefore, sizeAfter, 100*(1-float64(sizeAfter)/float64(sizeBefore)), countAfter)
 
 	s.Close()
+}
+
+func TestDefaultDBPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		envDB    string // INGERO_DB env var
+		wantPath string // exact path if envDB set, substring match otherwise
+		exact    bool   // true = exact match, false = suffix match
+	}{
+		{
+			name:     "INGERO_DB overrides default",
+			envDB:    "/var/lib/ingero/custom.db",
+			wantPath: "/var/lib/ingero/custom.db",
+			exact:    true,
+		},
+		{
+			name:     "INGERO_DB with container default",
+			envDB:    "/var/lib/ingero/ingero.db",
+			wantPath: "/var/lib/ingero/ingero.db",
+			exact:    true,
+		},
+		{
+			name:     "empty INGERO_DB falls back to home dir",
+			envDB:    "",
+			wantPath: ".ingero/ingero.db",
+			exact:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Save and restore env var.
+			orig, hadOrig := os.LookupEnv("INGERO_DB")
+			defer func() {
+				if hadOrig {
+					os.Setenv("INGERO_DB", orig)
+				} else {
+					os.Unsetenv("INGERO_DB")
+				}
+			}()
+
+			if tt.envDB != "" {
+				os.Setenv("INGERO_DB", tt.envDB)
+			} else {
+				os.Unsetenv("INGERO_DB")
+			}
+
+			got := DefaultDBPath()
+			if tt.exact {
+				if got != tt.wantPath {
+					t.Errorf("DefaultDBPath() = %q, want %q", got, tt.wantPath)
+				}
+			} else {
+				if !strings.HasSuffix(got, tt.wantPath) {
+					t.Errorf("DefaultDBPath() = %q, want suffix %q", got, tt.wantPath)
+				}
+			}
+		})
+	}
 }

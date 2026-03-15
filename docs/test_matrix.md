@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-225 total tests.
+226 total tests.
 
 ## Summary
 
@@ -15,7 +15,7 @@
 | ebpf/cuda | 5 | CUDA runtime event + stack parsing |
 | ebpf/driver | 5 | CUDA driver event + stack parsing, managed alloc |
 | ebpf/host | 8 | Host kernel event + pod lifecycle parsing |
-| store | 6 | SQLite storage, chain round-trip, batch process names, compact |
+| store | 7 | SQLite storage, chain round-trip, batch process names, compact, INGERO_DB |
 | stats | 22 | Percentiles, anomaly detection, spike patterns |
 | mcp | 9 | TSC compression, aggregate/chain formatting |
 | cli | 11 | Duration format, storage hierarchy, time parsing, since parsing, PID name cache |
@@ -211,6 +211,7 @@
 | 103 | TestLookupTablesCreated | Lookup tables created on DB init | lookup_test.go |
 | 103a | TestRecordProcessNames | Batch PID→name persistence, skip empty, overwrite | store_test.go |
 | 103b | TestCompact | Insert 1000, delete 900, Compact() → >50% size reduction, rows intact | store_test.go |
+| 103c | TestDefaultDBPath | INGERO_DB env var overrides default, empty falls back to ~/.ingero/ | store_test.go |
 
 ## CLI (cli/trace_test.go, pidutil_test.go)
 

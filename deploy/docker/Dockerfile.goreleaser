@@ -1,0 +1,11 @@
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates libc6-compat
+COPY ingero /usr/local/bin/ingero
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=utility,compute
+ENV INGERO_DB=/var/lib/ingero/ingero.db
+VOLUME /var/lib/ingero
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["/usr/local/bin/ingero", "version"]
+ENTRYPOINT ["/usr/local/bin/ingero"]
+CMD ["trace", "--record"]

@@ -29,6 +29,7 @@ internal/           Go packages (cli, ebpf/cuda, ebpf/driver, ebpf/host,
                     cgroup, k8s, dashboard, discover, update, version, ...)
 bpf/                eBPF C programs (kernel-space, GPL-2.0 OR BSD-3-Clause)
 pkg/events/         Shared event types
+deploy/docker/      Dockerfiles (dev multi-stage + GoReleaser single-stage)
 scripts/            GPU VM lifecycle, setup, integration tests
 tests/              Integration tests and GPU workloads
 ```
