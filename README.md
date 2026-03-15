@@ -143,7 +143,6 @@ docker run --rm --privileged --pid=host ghcr.io/ingero-io/ingero check
 
 # Live eBPF tracing (requires privileges + kernel mounts)
 docker run --rm --privileged --pid=host \
-  -v /proc:/proc:ro \
   -v /sys/kernel/debug:/sys/kernel/debug \
   -v /sys/kernel/btf:/sys/kernel/btf:ro \
   -v /var/lib/ingero:/var/lib/ingero \
@@ -152,7 +151,34 @@ docker run --rm --privileged --pid=host \
 
 Minimum capabilities (alternative to `--privileged`): `--cap-add=BPF --cap-add=PERFMON --cap-add=SYS_ADMIN`.
 
-> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`).
+> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`). The `--pid=host` flag shares the host's `/proc` — do **not** also bind-mount `-v /proc:/proc:ro` as this causes OCI runtime errors on Docker Desktop and WSL2.
+
+**Data persistence:** The container stores the SQLite database at `/var/lib/ingero/ingero.db` by default. Mount `-v /var/lib/ingero:/var/lib/ingero` to persist data after the container stops. Without this mount, **all trace data is lost** when the container exits.
+
+**Multiple databases:** Use `--db` or the `INGERO_DB` env var to work with different databases:
+
+```bash
+# Trace to a named database
+docker run --rm --privileged --pid=host \
+  -v /var/lib/ingero:/var/lib/ingero \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/btf:/sys/kernel/btf:ro \
+  ghcr.io/ingero-io/ingero trace --db /var/lib/ingero/training-run-42.db
+
+# Investigate a specific database
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero explain --db /var/lib/ingero/training-run-42.db
+
+# Compare databases from different runs
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero query --db /var/lib/ingero/training-run-41.db --since 1h
+
+docker run --rm \
+  -v /var/lib/ingero:/var/lib/ingero \
+  ghcr.io/ingero-io/ingero query --db /var/lib/ingero/training-run-42.db --since 1h
+```
 
 The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building the dev Dockerfile locally, pass version info via build args:
 

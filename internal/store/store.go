@@ -450,11 +450,16 @@ type AggregateTotals struct {
 
 // DefaultDBPath returns the default database path (~/.ingero/ingero.db).
 //
-// When running via sudo, resolves the invoking user's home directory
-// (via SUDO_USER) so that 'sudo ingero trace' and 'ingero explain'
-// use the same database file. Without this, trace would write to
-// /root/.ingero/ while explain (no sudo) reads from /home/<user>/.ingero/.
+// Precedence:
+//  1. INGERO_DB env var (explicit path, used by container deployments)
+//  2. SUDO_USER home directory (so sudo trace + non-sudo explain share the same DB)
+//  3. Current user's home directory (~/.ingero/ingero.db)
 func DefaultDBPath() string {
+	// Allow containers and automation to override the default path.
+	if dbEnv := os.Getenv("INGERO_DB"); dbEnv != "" {
+		return dbEnv
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "/tmp"
