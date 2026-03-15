@@ -192,37 +192,6 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-# Docker + Buildx (needed for container builds)
-if command -v docker &>/dev/null; then
-    print_success "docker: $(docker --version 2>/dev/null | head -1)"
-
-    # Check if buildx is available
-    if docker buildx version &>/dev/null 2>&1; then
-        print_success "docker buildx: $(docker buildx version 2>/dev/null | head -1)"
-    else
-        print_info "Installing docker-buildx-plugin..."
-        # Try apt first (works if Docker's apt repo is configured)
-        if sudo apt-get install -y -qq docker-buildx-plugin 2>/dev/null; then
-            print_success "docker buildx: installed via apt"
-        else
-            # Manual install as fallback
-            BUILDX_ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-            BUILDX_URL="https://github.com/docker/buildx/releases/latest/download/buildx-v0.21.1.linux-${BUILDX_ARCH}"
-            mkdir -p ~/.docker/cli-plugins
-            if curl -fsSL "$BUILDX_URL" -o ~/.docker/cli-plugins/docker-buildx; then
-                chmod +x ~/.docker/cli-plugins/docker-buildx
-                print_success "docker buildx: installed manually"
-            else
-                print_warn "docker buildx installation failed — docker build will use legacy builder"
-                print_info "  Install manually: sudo apt-get install docker-buildx-plugin"
-            fi
-        fi
-    fi
-else
-    print_info "Docker not installed — skipping buildx check"
-    print_info "  Install Docker: https://docs.docker.com/engine/install/ubuntu/"
-fi
-
 ################################################################################
 # Step 2: Go Installation
 ################################################################################
@@ -392,7 +361,6 @@ if [ -d /usr/lib/wsl/lib ]; then
 
     # Add /usr/lib/wsl/lib to sudo's secure_path so nvidia-smi works under sudo
     if [ ! -f /etc/sudoers.d/wsl-gpu ]; then
-        # Read existing secure_path and append WSL lib dir
         echo 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/wsl/lib"' \
             | sudo tee /etc/sudoers.d/wsl-gpu >/dev/null
         sudo chmod 0440 /etc/sudoers.d/wsl-gpu
@@ -518,10 +486,6 @@ echo ""
 echo "  WSL Kernel:"
 echo "    Version:         $(uname -r)"
 echo "    BTF size:        $(ls -lh /sys/kernel/btf/vmlinux 2>/dev/null | awk '{print $5}' || echo 'N/A')"
-echo ""
-echo "  Docker:"
-echo "    docker:          $(docker --version 2>/dev/null | head -1 || echo 'not installed')"
-echo "    buildx:          $(docker buildx version 2>/dev/null | head -1 || echo 'not installed')"
 echo ""
 echo "  GPU (WSL passthrough):"
 echo "    nvidia-smi:      $(command -v nvidia-smi &>/dev/null && echo 'available' || echo 'not found')"

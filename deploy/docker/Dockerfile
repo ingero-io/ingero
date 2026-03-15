@@ -3,7 +3,6 @@
 #
 # Required runtime flags for eBPF tracing:
 #   docker run --privileged --pid=host \
-#     -v /proc:/proc:ro \
 #     -v /sys/kernel/debug:/sys/kernel/debug \
 #     -v /sys/kernel/btf:/sys/kernel/btf:ro \
 #     -v /var/lib/ingero:/var/lib/ingero \
@@ -18,7 +17,7 @@
 #   docker run ghcr.io/ingero-io/ingero demo --no-gpu          # synthetic demo (no root needed)
 #   docker run --privileged --pid=host ghcr.io/ingero-io/ingero check  # system readiness check
 #   docker run --privileged --pid=host \
-#     -v /proc:/proc:ro -v /sys/kernel/debug:/sys/kernel/debug \
+#     -v /sys/kernel/debug:/sys/kernel/debug \
 #     -v /sys/kernel/btf:/sys/kernel/btf:ro \
 #     ghcr.io/ingero-io/ingero trace                            # live tracing
 
@@ -45,6 +44,11 @@ COPY --from=builder /ingero /usr/local/bin/ingero
 # Without these, nvidia-smi and libcuda.so are not mounted into the container.
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=utility,compute
+
+# Default DB path inside the container — mount a host volume to persist data.
+# Override with --db flag or INGERO_DB env var for multiple databases.
+ENV INGERO_DB=/var/lib/ingero/ingero.db
+VOLUME /var/lib/ingero
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["/usr/local/bin/ingero", "version"]

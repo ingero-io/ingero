@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -124,12 +125,27 @@ var nvidiaVersionRe = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
 
 // runNvidiaSMI executes nvidia-smi with the given arguments. In containers
 // (e.g., Alpine with NVIDIA Container Toolkit), the injected NVIDIA libraries
-// may not be on the default linker search path. If the first attempt fails,
+// may not be on the default linker search path. If the first attempt fails
+// because the binary couldn't be found or loaded (not a legitimate GPU error),
 // retry with LD_LIBRARY_PATH set to common container mount points.
 func runNvidiaSMI(args ...string) ([]byte, error) {
 	// Direct attempt — works on bare metal and glibc-based containers.
-	if out, err := exec.Command("nvidia-smi", args...).Output(); err == nil {
+	out, err := exec.Command("nvidia-smi", args...).Output()
+	if err == nil {
 		return out, nil
+	}
+
+	// Only retry with LD_LIBRARY_PATH for binary-not-found or shared lib
+	// loading failures. Legitimate nvidia-smi errors (GPU in error state,
+	// driver bug) should not be retried.
+	if !errors.Is(err, exec.ErrNotFound) {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Exit code 127 = shell "command not found" or dynamic linker failure.
+			// Any other exit code means nvidia-smi ran but reported a GPU error.
+			if exitErr.ExitCode() != 127 {
+				return nil, err
+			}
+		}
 	}
 
 	// Container fallback: NVIDIA Container Toolkit mounts driver libs to
@@ -232,7 +248,7 @@ func CheckCUDALibrary() CheckResult {
 				Name:     "CUDA runtime",
 				OK:       true,
 				Optional: true,
-				Detail:   "not in container — discovered from host CUDA processes at trace time",
+				Detail:   "container mode — libcudart.so discovered from host CUDA processes at trace time",
 			}
 		}
 		return CheckResult{
