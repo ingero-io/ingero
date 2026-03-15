@@ -38,7 +38,7 @@ RUN CGO_ENABLED=0 go build -tags linux -trimpath \
     -o /ingero ./cmd/ingero/
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates libc6-compat
 COPY --from=builder /ingero /usr/local/bin/ingero
 
 # Tell NVIDIA Container Toolkit to inject GPU driver libs and utilities.
