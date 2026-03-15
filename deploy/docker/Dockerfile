@@ -41,6 +41,11 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /ingero /usr/local/bin/ingero
 
+# Tell NVIDIA Container Toolkit to inject GPU driver libs and utilities.
+# Without these, nvidia-smi and libcuda.so are not mounted into the container.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=utility,compute
+
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["/usr/local/bin/ingero", "version"]
 
