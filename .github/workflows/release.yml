@@ -57,8 +57,6 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: >-
-            release --clean
-            ${{ github.event_name == 'workflow_dispatch' && '--skip=publish' || '' }}
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
