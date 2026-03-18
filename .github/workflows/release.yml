@@ -24,8 +24,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve and checkout tag
+      - name: Resolve tag
         if: github.event_name == 'workflow_dispatch'
+        id: resolve-tag
         run: |
           if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
@@ -33,7 +34,7 @@ jobs:
             TAG=$(git tag --list 'v*' --sort=-version:refname | head -1)
           fi
           echo "Releasing tag: $TAG"
-          git checkout "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -60,3 +61,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.resolve-tag.outputs.tag || github.ref_name }}
