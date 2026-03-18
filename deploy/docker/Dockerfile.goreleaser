@@ -7,5 +7,6 @@ ENV INGERO_DB=/var/lib/ingero/ingero.db
 VOLUME /var/lib/ingero
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["/usr/local/bin/ingero", "version"]
+LABEL io.modelcontextprotocol.server.name="io.github.ingero-io/ingero"
 ENTRYPOINT ["/usr/local/bin/ingero"]
 CMD ["trace", "--record"]

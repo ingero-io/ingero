@@ -1,6 +1,12 @@
 # Ingero — GPU Causal Observability
 
-**Version: 0.8.1**
+[![Go Report Card](https://goreportcard.com/badge/github.com/ingero-io/ingero)](https://goreportcard.com/report/github.com/ingero-io/ingero)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/ingero-io/ingero)](https://github.com/ingero-io/ingero/releases)
+[![CI](https://github.com/ingero-io/ingero/actions/workflows/ci.yml/badge.svg)](https://github.com/ingero-io/ingero/actions/workflows/ci.yml)
+[![MCP](https://img.shields.io/badge/MCP-server-blue)](https://glama.ai/mcp/servers/ingero-io/ingero)
+
+**Version: 0.8.2**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -104,6 +110,17 @@ sudo ingero demo --gpu      # real GPU + eBPF tracing
 
 Every scenario prints a GPU auto-detect header showing GPU model and driver version, then displays real-time ASCII bar charts for system context.
 
+## Featured In
+
+[awesome-ebpf](https://github.com/qmonnet/awesome-ebpf) ·
+[awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
+[awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
+[awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
+[Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
+[awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
+[Glama MCP Registry](https://glama.ai/mcp/servers/ingero-io/ingero) ·
+[mcpservers.org](https://mcpservers.org)
+
 ## Install
 
 ### Binary Release (recommended)
@@ -114,12 +131,12 @@ Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. R
 
 ```bash
 # Linux amd64
-VERSION=0.8.1
+VERSION=0.8.2
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
-VERSION=0.8.1
+VERSION=0.8.2
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -133,7 +150,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 docker pull ghcr.io/ingero-io/ingero:latest
 
 # Or pin to a specific version
-docker pull ghcr.io/ingero-io/ingero:v0.8.1
+docker pull ghcr.io/ingero-io/ingero:v0.8.2
 
 # Quick test (no root, no GPU needed)
 docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
@@ -184,7 +201,7 @@ The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building t
 
 ```bash
 docker build -f deploy/docker/Dockerfile \
-  --build-arg VERSION=0.8.1 \
+  --build-arg VERSION=0.8.2 \
   --build-arg COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
   -t ingero:local .

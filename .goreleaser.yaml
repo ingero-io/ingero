@@ -69,6 +69,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=io.modelcontextprotocol.server.name=io.github.ingero-io/ingero"
     goarch: amd64
 
   - image_templates:
@@ -83,6 +84,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=io.modelcontextprotocol.server.name=io.github.ingero-io/ingero"
     goarch: arm64
 
 docker_manifests:

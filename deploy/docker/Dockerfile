@@ -56,7 +56,8 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 LABEL org.opencontainers.image.title="Ingero" \
       org.opencontainers.image.description="Production GPU Causal Observability" \
       org.opencontainers.image.source="https://github.com/ingero-io/ingero" \
-      org.opencontainers.image.version="0.8.0"
+      org.opencontainers.image.version="0.8.2" \
+      io.modelcontextprotocol.server.name="io.github.ingero-io/ingero"
 
 ENTRYPOINT ["/usr/local/bin/ingero"]
 CMD ["trace", "--record"]

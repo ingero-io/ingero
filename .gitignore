@@ -44,3 +44,6 @@ Thumbs.db
 # Test artifacts
 coverage.out
 *.test
+
+# MCP Registry publisher tokens
+.mcpregistry_*
