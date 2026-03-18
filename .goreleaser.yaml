@@ -54,7 +54,7 @@ release:
     name: ingero
   draft: false
   prerelease: auto
-  mode: replace
+  mode: keep-existing
 
 dockers:
   - image_templates:
