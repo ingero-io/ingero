@@ -54,6 +54,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Delete existing release assets
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          TAG="${{ steps.resolve-tag.outputs.tag }}"
+          gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null | while read -r name; do
+            echo "Deleting asset: $name"
+            gh release delete-asset "$TAG" "$name" --yes
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
