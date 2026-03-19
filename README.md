@@ -14,6 +14,23 @@
 
 Ingero is a production-grade eBPF agent that traces the full chain — from Linux kernel events through CUDA API calls to your Python source lines — with **<2% overhead**, **zero code changes**, and **one binary**.
 
+<img src="docs/assets/readme-demo-incident.gif" width="800" alt="ingero demo incident — CPU contention causes GPU latency spike, full causal chain diagnosis with root cause and fix recommendation">
+
+## Quick Start
+
+```bash
+# Install (Linux amd64 — see below for arm64/Docker)
+VERSION=0.8.2
+curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
+sudo mv ingero /usr/local/bin/
+
+# Trace your GPU workload
+sudo ingero trace
+
+# Diagnose what happened
+ingero explain --since 5m
+```
+
 - **The "Why":** Correlate a `cudaStreamSync` spike with `sched_switch` events — the host kernel preempted your thread.
 - **The "Where":** Map CUDA calls back to **Python source lines** in your PyTorch `forward()` pass.
 - **The "Hidden Kernels":** Trace the CUDA Driver API to see kernel launches by cuBLAS/cuDNN that bypass standard profilers.
@@ -90,6 +107,26 @@ Things no other GPU tool can show you.
 
 ## See It In Action
 
+<details><summary><code>sudo ingero check</code> — system readiness</summary>
+<br>
+<img src="docs/assets/readme-check.gif" width="800" alt="ingero check verifying kernel, BTF, NVIDIA driver, GPU model, CUDA libraries, and active processes">
+</details>
+
+<details><summary><code>sudo ingero trace</code> — live event stream</summary>
+<br>
+<img src="docs/assets/readme-trace.gif" width="800" alt="ingero trace showing live CUDA Runtime and Driver API statistics with rolling p50/p95/p99 latencies and host context">
+</details>
+
+<details><summary><code>ingero explain --since 5m</code> — automated diagnosis</summary>
+<br>
+<img src="docs/assets/readme-explain.gif" width="800" alt="ingero explain producing incident report with causal chains, root cause analysis, and fix recommendations">
+</details>
+
+<details><summary><code>ingero demo --no-gpu incident</code> — try without a GPU</summary>
+<br>
+<img src="docs/assets/readme-demo-nogpu.gif" width="800" alt="ingero demo running in synthetic mode without GPU, showing full causal chain diagnosis">
+</details>
+
 ```bash
 ingero demo                 # run all 6 scenarios (auto-detects GPU)
 ingero demo incident        # full causal chain in 30 seconds
@@ -127,7 +164,7 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.8.1`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.8.2`):
 
 ```bash
 # Linux amd64
@@ -212,6 +249,9 @@ GHCR images have version info baked in automatically via GoReleaser. See `deploy
 ### Build from Source
 
 ```bash
+# Quick setup: install all build dependencies (Go, clang, llvm) on Ubuntu 22.04/24.04
+curl -fsSL https://raw.githubusercontent.com/ingero-io/ingero/main/scripts/install-deps.sh | bash
+
 # Requires clang-14, Linux kernel with BTF
 git clone https://github.com/ingero-io/ingero.git
 cd ingero
@@ -299,6 +339,8 @@ Analyze recorded events from SQLite and produce an incident report with causal c
 ```bash
 ingero explain                         # analyze last 5 minutes
 ingero explain --since 1h             # last hour
+ingero explain --since 2d             # last 2 days
+ingero explain --since 1h30m          # human-friendly durations (also: 1w, 3d12h)
 ingero explain --last 100             # last 100 events
 ingero explain --pid 4821             # filter by specific process
 ingero explain --pid 4821,5032        # filter by multiple processes
@@ -448,7 +490,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.8.1 (commit: 2818c9e, built: 2026-03-04)
+ingero v0.8.2 (commit: 676ab87, built: 2026-03-17)
 ```
 
 ## Stack Tracing
@@ -646,7 +688,7 @@ Yes. eBPF programs are verified by the kernel before loading — they cannot cra
 No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Your application code is untouched. Traces any language — Python, C++, Java — anything linked against libcudart.so.
 
 **What GPUs are supported?**
-Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
+Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64). Works on AWS Deep Learning AMIs (auto-discovers versioned `libcudart.so`).
 
 **Does it work in containers?**
 Yes. eBPF programs execute in kernel space — the container just loads them via syscalls. Run with `--privileged` (or `--cap-add=BPF,PERFMON,SYS_ADMIN`), `--pid=host`, and mount `/proc`, `/sys/kernel/debug`, and `/sys/kernel/btf`. The host kernel must have BTF enabled. Pre-built images are available at `ghcr.io/ingero-io/ingero` — see the [Docker Image](#docker-image) install section. This is the same pattern used by Falco, Tetragon, and other eBPF DaemonSets.
