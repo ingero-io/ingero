@@ -47,3 +47,6 @@ coverage.out
 
 # MCP Registry publisher tokens
 .mcpregistry_*
+
+# Asciinema recordings (large, used to generate GIFs)
+docs/assets/*.cast
