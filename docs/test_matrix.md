@@ -30,7 +30,7 @@
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
 
-## Correlate Engine — Causal Chain Tests
+## Correlate Engine  -  Causal Chain Tests
 
 ### Core Correlation Tests
 
