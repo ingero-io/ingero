@@ -1,4 +1,4 @@
-# Ingero — GPU Causal Observability
+# Ingero  -  GPU Causal Observability
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/ingero-io/ingero)](https://goreportcard.com/report/github.com/ingero-io/ingero)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -10,33 +10,33 @@
 
 **The only GPU observability tool your AI assistant can talk to.**
 
-*"What caused the GPU stall?" → "`forward()` at `train.py:142` — cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
+*"What caused the GPU stall?" → "`forward()` at `train.py:142`  -  cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
 
-Ingero is a production-grade eBPF agent that traces the full chain — from Linux kernel events through CUDA API calls to your Python source lines — with **<2% overhead**, **zero code changes**, and **one binary**.
+Ingero is a production-grade eBPF agent that traces the full chain  -  from Linux kernel events through CUDA API calls to your Python source lines  -  with **<2% overhead**, **zero code changes**, and **one binary**.
 
-- **The "Why":** Correlate a `cudaStreamSync` spike with `sched_switch` events — the host kernel preempted your thread.
+- **The "Why":** Correlate a `cudaStreamSync` spike with `sched_switch` events  -  the host kernel preempted your thread.
 - **The "Where":** Map CUDA calls back to **Python source lines** in your PyTorch `forward()` pass.
 - **The "Hidden Kernels":** Trace the CUDA Driver API to see kernel launches by cuBLAS/cuDNN that bypass standard profilers.
 
-No ClickHouse, no PostgreSQL, no MinIO — just one statically linked Go binary and embedded SQLite.
+No ClickHouse, no PostgreSQL, no MinIO  -  just one statically linked Go binary and embedded SQLite.
 
-See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md) — an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL — just questions and answers.
+See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md)  -  an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL  -  just questions and answers.
 
 ## What It Does
 
 Ingero uses eBPF to trace GPU workloads at three layers, reads system metrics from `/proc`, and assembles causal chains that explain root causes:
 
-1. **CUDA Runtime uprobes** — traces `cudaMalloc`, `cudaFree`, `cudaLaunchKernel`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaStreamSync` / `cudaDeviceSynchronize` via uprobes on `libcudart.so`
-2. **CUDA Driver uprobes** — traces `cuLaunchKernel`, `cuMemcpy`, `cuMemcpyAsync`, `cuCtxSynchronize`, `cuMemAlloc` via uprobes on `libcuda.so`. Captures kernel launches from cuBLAS/cuDNN that bypass the runtime API.
-3. **Host tracepoints** — traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
-4. **System context** — reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
+1. **CUDA Runtime uprobes**  -  traces `cudaMalloc`, `cudaFree`, `cudaLaunchKernel`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaStreamSync` / `cudaDeviceSynchronize` via uprobes on `libcudart.so`
+2. **CUDA Driver uprobes**  -  traces `cuLaunchKernel`, `cuMemcpy`, `cuMemcpyAsync`, `cuCtxSynchronize`, `cuMemAlloc` via uprobes on `libcuda.so`. Captures kernel launches from cuBLAS/cuDNN that bypass the runtime API.
+3. **Host tracepoints**  -  traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
+4. **System context**  -  reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
 
 The **causal engine** correlates events across layers by timestamp and PID to produce automated root cause analysis with severity ranking and fix recommendations.
 
 ```
 $ sudo ingero trace
 
-  Ingero Trace — Live CUDA Event Stream
+  Ingero Trace  -  Live CUDA Event Stream
   Target: PID 4821 (python3)
   Library: /usr/lib/x86_64-linux-gnu/libcudart.so.12
   CUDA probes: 14 attached
@@ -70,7 +70,7 @@ $ sudo ingero trace
   │ process_exit    │      7 │ 7 processes exited                       │
   └─────────────────┴────────┴──────────────────────────────────────────┘
 
-  ⚠ cudaStreamSync p99 = 142ms — correlated with 23 sched_switch events
+  ⚠ cudaStreamSync p99 = 142ms  -  correlated with 23 sched_switch events
     (GPU thread preempted during sync wait, avg 2.1ms off-CPU)
 ```
 
@@ -78,15 +78,15 @@ $ sudo ingero trace
 
 Things no other GPU tool can show you.
 
-**"cuBLAS was launching 17,509 kernels and you couldn't see any of them."** Most profilers trace only the CUDA Runtime API — but cuBLAS calls `cuLaunchKernel` (driver API) directly, bypassing the runtime. Ingero traces both layers: 11,009 runtime + 17,509 driver = complete visibility into every kernel launch.
+**"cuBLAS was launching 17,509 kernels and you couldn't see any of them."** Most profilers trace only the CUDA Runtime API  -  but cuBLAS calls `cuLaunchKernel` (driver API) directly, bypassing the runtime. Ingero traces both layers: 11,009 runtime + 17,509 driver = complete visibility into every kernel launch.
 
 **"Your training slowed because logrotate stole 4 CPU cores."** System Context shows CPU at 94%, Load 12.1. The CUDA table shows cudaStreamSync p99 jumping from 16ms to 142ms. The Host Context shows 847 sched_switch events. `ingero explain` assembles the full causal chain: logrotate preempted the training process → CUDA sync stalled → training throughput dropped 30%. Fix: `nice -n 19 logrotate`, or pin training to dedicated cores.
 
 **"Your model spends 38% of wall-clock time on data movement, not compute."** nvidia-smi says "GPU utilization 98%", but the GPU is busy doing cudaMemcpy, not compute. Ingero's time-fraction breakdown makes this obvious. The fix (pinned memory, async transfers, larger batches) saves 30-50% wall-clock time.
 
-**"Your host is swapping and your GPU doesn't know it."** System Context shows Swap 2.1 GB. cudaMalloc p99 rises from 0.02ms to 8.4ms. No GPU tool shows this — nvidia-smi says GPU memory is fine, but host-side CUDA bookkeeping is hitting swap.
+**"Your host is swapping and your GPU doesn't know it."** System Context shows Swap 2.1 GB. cudaMalloc p99 rises from 0.02ms to 8.4ms. No GPU tool shows this  -  nvidia-smi says GPU memory is fine, but host-side CUDA bookkeeping is hitting swap.
 
-**"Ask your AI: what line of my code caused the GPU stall?"** Your AI assistant calls Ingero's MCP server and answers in one shot: "The issue is in `forward()` at `train.py:142`, calling cudaMalloc through PyTorch. 9,829 calls, avg 3.1ms but spiking to 48.3ms during CPU contention." Resolved Python source lines, native symbols, timing stats — no logs, no manual SQL, no hex addresses. The engineer asks questions in plain English and gets production root causes back.
+**"Ask your AI: what line of my code caused the GPU stall?"** Your AI assistant calls Ingero's MCP server and answers in one shot: "The issue is in `forward()` at `train.py:142`, calling cudaMalloc through PyTorch. 9,829 calls, avg 3.1ms but spiking to 48.3ms during CPU contention." Resolved Python source lines, native symbols, timing stats  -  no logs, no manual SQL, no hex addresses. The engineer asks questions in plain English and gets production root causes back.
 
 ## See It In Action
 
@@ -103,7 +103,7 @@ sudo ingero demo --gpu      # real GPU + eBPF tracing
 |----------|----------------|
 | `incident` | CPU spike + sched_switch storm → cudaStreamSync 8.5x latency spike → full causal chain with root cause and fix |
 | `cold-start` | First CUDA calls take 50-200x longer than steady state (CUDA context init) |
-| `memcpy-bottleneck` | cudaMemcpy dominates wall-clock time (38%), not compute — nvidia-smi lies |
+| `memcpy-bottleneck` | cudaMemcpy dominates wall-clock time (38%), not compute  -  nvidia-smi lies |
 | `periodic-spike` | cudaMalloc spikes 50x every ~200 batches (PyTorch caching allocator) |
 | `cpu-contention` | Host CPU preemption causes CUDA latency spikes |
 | `gpu-steal` | Multi-process GPU time-slicing quantified via CUDA API timing patterns |
@@ -168,7 +168,7 @@ docker run --rm --privileged --pid=host \
 
 Minimum capabilities (alternative to `--privileged`): `--cap-add=BPF --cap-add=PERFMON --cap-add=SYS_ADMIN`.
 
-> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`). The `--pid=host` flag shares the host's `/proc` — do **not** also bind-mount `-v /proc:/proc:ro` as this causes OCI runtime errors on Docker Desktop and WSL2.
+> **Note:** eBPF tracing (`trace`, `demo --gpu`) requires `--privileged --pid=host` plus the kernel volume mounts shown above. Without these, only unprivileged commands work (`demo --no-gpu`, `check`, `version`, `explain`, `query`). The `--pid=host` flag shares the host's `/proc`  -  do **not** also bind-mount `-v /proc:/proc:ro` as this causes OCI runtime errors on Docker Desktop and WSL2.
 
 **Data persistence:** The container stores the SQLite database at `/var/lib/ingero/ingero.db` by default. Mount `-v /var/lib/ingero:/var/lib/ingero` to persist data after the container stops. Without this mount, **all trace data is lost** when the container exits.
 
@@ -215,8 +215,8 @@ GHCR images have version info baked in automatically via GoReleaser. See `deploy
 # Requires clang-14, Linux kernel with BTF
 git clone https://github.com/ingero-io/ingero.git
 cd ingero
-make              # generates eBPF bindings, builds, tests, and lints — single command
-sudo make install # optional — copies binary to /usr/local/bin/ingero
+make              # generates eBPF bindings, builds, tests, and lints  -  single command
+sudo make install # optional  -  copies binary to /usr/local/bin/ingero
                   # or just use ./bin/ingero directly, or: alias ingero=$PWD/bin/ingero
 ```
 
@@ -236,7 +236,7 @@ Check if your system is ready for eBPF-based GPU tracing.
 ```text
 $ ingero check
 
-Ingero — System Readiness Check
+Ingero  -  System Readiness Check
 
   [✓] Kernel version: 5.15.0-144-generic
       need 5.15+
@@ -252,7 +252,7 @@ Ingero — System Readiness Check
   [✓] CUDA processes: 1 found
       PID 4821 (python3)
 
-All checks passed — ready to trace!
+All checks passed  -  ready to trace!
 ```
 
 ### `ingero trace`
@@ -278,7 +278,7 @@ sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 ```
 
-**Only `trace` needs sudo** — it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
+**Only `trace` needs sudo**  -  it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
 
 **Process targeting:**
 - **Default** (no flags): traces all CUDA processes owned by the invoking user (via `SUDO_USER`). On single-user boxes, this means all CUDA processes.
@@ -287,14 +287,14 @@ sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 - **Dynamic child tracking**: fork events auto-enroll child PIDs for host correlation.
 
 The trace display shows four sections:
-1. **System Context** — CPU, memory, load, swap with ASCII bar charts (green/yellow/red)
-2. **CUDA Runtime API** — per-operation p50/p95/p99 latency with anomaly flags (cudaMalloc, cudaLaunchKernel, etc.)
-3. **CUDA Driver API** — driver-level operations (cuLaunchKernel, cuMemAlloc, etc.) that cuBLAS/cuDNN call directly
-4. **Host Context** — scheduler, memory, OOM, and process lifecycle events
+1. **System Context**  -  CPU, memory, load, swap with ASCII bar charts (green/yellow/red)
+2. **CUDA Runtime API**  -  per-operation p50/p95/p99 latency with anomaly flags (cudaMalloc, cudaLaunchKernel, etc.)
+3. **CUDA Driver API**  -  driver-level operations (cuLaunchKernel, cuMemAlloc, etc.) that cuBLAS/cuDNN call directly
+4. **Host Context**  -  scheduler, memory, OOM, and process lifecycle events
 
 ### `ingero explain`
 
-Analyze recorded events from SQLite and produce an incident report with causal chains, root causes, and fix recommendations. Reads from the database populated by `ingero trace` — no root needed.
+Analyze recorded events from SQLite and produce an incident report with causal chains, root causes, and fix recommendations. Reads from the database populated by `ingero trace`  -  no root needed.
 
 ```bash
 ingero explain                         # analyze last 5 minutes
@@ -330,12 +330,12 @@ PER-PROCESS GPU API BREAKDOWN
   ⚠ Multi-process GPU contention: 2 processes sharing GPU with CUDA/Driver ops
 ```
 
-This answers "which process is hogging the GPU?" — essential for diagnosing RAG pipeline contention where embedding, retrieval, and generation compete for GPU time.
+This answers "which process is hogging the GPU?"  -  essential for diagnosing RAG pipeline contention where embedding, retrieval, and generation compete for GPU time.
 
 ```
-INCIDENT REPORT — 2 causal chains found (1 HIGH, 1 MEDIUM)
+INCIDENT REPORT  -  2 causal chains found (1 HIGH, 1 MEDIUM)
 
-[HIGH] cudaStreamSync p99=142ms (8.5x p50) — CPU contention
+[HIGH] cudaStreamSync p99=142ms (8.5x p50)  -  CPU contention
   Timeline:
     15:41:20  [SYSTEM]  CPU 94%, Load 12.1, Swap 2.1GB
     15:41:20  [HOST]    sched_switch: PID 8821 (logrotate) preempted PID 4821
@@ -356,7 +356,7 @@ ingero query --since 1h --pid 4821,5032
 ingero query --since 30m --op cudaMemcpy --json
 ```
 
-Storage uses SQLite with size-based pruning (default 10 GB via `--max-db`). Data is stored locally at `~/.ingero/ingero.db` — nothing leaves your machine.
+Storage uses SQLite with size-based pruning (default 10 GB via `--max-db`). Data is stored locally at `~/.ingero/ingero.db`  -  nothing leaves your machine.
 
 ### `ingero mcp`
 
@@ -368,7 +368,7 @@ ingero mcp --http :8080           # HTTPS on port 8080 (TLS 1.3, auto-generated 
 ingero mcp --http :8080 --tls-cert cert.pem --tls-key key.pem  # custom TLS certificate
 ```
 
-> **Note:** The `--http` flag enables the Streamable HTTP transport — all connections use **TLS 1.3 only** (no plain HTTP). When no `--tls-cert`/`--tls-key` is provided, ingero auto-generates an ephemeral self-signed ECDSA P-256 certificate. Use `curl -k` to skip certificate verification for self-signed certs.
+> **Note:** The `--http` flag enables the Streamable HTTP transport  -  all connections use **TLS 1.3 only** (no plain HTTP). When no `--tls-cert`/`--tls-key` is provided, ingero auto-generates an ephemeral self-signed ECDSA P-256 certificate. Use `curl -k` to skip certificate verification for self-signed certs.
 
 **AI-first analysis**: MCP responses use telegraphic compression (TSC) by default, reducing token count by ~60%. Set `{"tsc": false}` per request for verbose output.
 
@@ -421,7 +421,7 @@ ssh -L 8080:localhost:8080 user@gpu-vm
 # Then open https://localhost:8080 in browser
 ```
 
-**No sudo needed** — the dashboard reads from the SQLite database populated by `ingero trace`.
+**No sudo needed**  -  the dashboard reads from the SQLite database populated by `ingero trace`.
 
 **Security:** TLS 1.3 only. Auto-generates an ephemeral self-signed ECDSA P-256 certificate (valid 24h) if no `--tls-cert`/`--tls-key` provided. DNS rebinding protection rejects requests from non-localhost Host headers.
 
@@ -453,7 +453,7 @@ ingero v0.8.1 (commit: 2818c9e, built: 2026-03-04)
 
 ## Stack Tracing
 
-Stack tracing is **on by default** — every CUDA/Driver API event captures the full userspace call chain. Shows **who called cudaMalloc** — from the CUDA library up through PyTorch, your Python code, and all the way to `main()`. GPU-measured overhead is **0.4-0.6%** (within noise on RTX 3090 through H100). Disable with `--stack=false` if needed.
+Stack tracing is **on by default**  -  every CUDA/Driver API event captures the full userspace call chain. Shows **who called cudaMalloc**  -  from the CUDA library up through PyTorch, your Python code, and all the way to `main()`. GPU-measured overhead is **0.4-0.6%** (within noise on RTX 3090 through H100). Disable with `--stack=false` if needed.
 
 ```bash
 sudo ingero trace --json               # JSON with resolved stack traces (stacks on by default)
@@ -482,7 +482,7 @@ Supported Python versions: **3.10, 3.11, 3.12** (covers Ubuntu 22.04 default, co
 
 ### JSON Output with `--stack`
 
-Real output from a PyTorch ResNet-50 training run on A100 SXM4 — a cuBLAS matmul kernel launch captured via Driver API uprobes, with the full call chain from Python through cuBLAS to the GPU:
+Real output from a PyTorch ResNet-50 training run on A100 SXM4  -  a cuBLAS matmul kernel launch captured via Driver API uprobes, with the full call chain from Python through cuBLAS to the GPU:
 
 ```json
 {
@@ -504,7 +504,7 @@ Real output from a PyTorch ResNet-50 training run on A100 SXM4 — a cuBLAS matm
 }
 ```
 
-This kernel launch is invisible to CUDA Runtime profilers — cuBLAS calls `cuLaunchKernel` directly. Only Ingero's Driver API uprobes capture it.
+This kernel launch is invisible to CUDA Runtime profilers  -  cuBLAS calls `cuLaunchKernel` directly. Only Ingero's Driver API uprobes capture it.
 
 ### Debug Output with `--stack --debug`
 
@@ -520,7 +520,7 @@ This kernel launch is invisible to CUDA Runtime profilers — cuBLAS calls `cuLa
 
 ## OTEL Integration (Optional)
 
-OTEL export is **off by default** — enabled only when you pass `--otlp` or `--prometheus`.
+OTEL export is **off by default**  -  enabled only when you pass `--otlp` or `--prometheus`.
 
 ```bash
 # Prometheus metrics endpoint (pull)
@@ -536,7 +536,7 @@ OTLP uses the HTTP JSON transport (`POST /v1/metrics`). Compatible with: OpenTel
 
 Metrics use OTEL semantic conventions: `gpu.cuda.operation.duration`, `gpu.cuda.operation.count`, `system.cpu.utilization`, `system.memory.utilization`, `ingero.anomaly.count`. Per-operation, per-source granularity.
 
-Zero external dependencies — no OTEL SDK import. The JSON payload is constructed directly using Go's standard library.
+Zero external dependencies  -  no OTEL SDK import. The JSON payload is constructed directly using Go's standard library.
 
 ## How It Works
 
@@ -579,16 +579,16 @@ Zero external dependencies — no OTEL SDK import. The JSON payload is construct
 └────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Discover** — scans `/proc` for processes linked to `libcudart.so`, finds `libcuda.so` automatically
-2. **Attach** — eBPF probes load onto CUDA runtime uprobes, driver uprobes, and host tracepoints
-3. **Capture** — eBPF programs record PID, TID, timestamps into per-layer ring buffers
-4. **System** — reads CPU/memory/load/swap from `/proc` once per second
-5. **Stats** — computes rolling p50/p95/p99 per operation, flags anomalies
-6. **Correlate** — assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver) by timestamp and PID
-7. **Store** — writes events to SQLite with size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
-8. **Export** — pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
-9. **Serve** — exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
-10. **Dashboard** — browser-based HTTPS dashboard reads from SQLite, shows ops/chains/snapshots/capabilities with auto-polling
+1. **Discover**  -  scans `/proc` for processes linked to `libcudart.so`, finds `libcuda.so` automatically
+2. **Attach**  -  eBPF probes load onto CUDA runtime uprobes, driver uprobes, and host tracepoints
+3. **Capture**  -  eBPF programs record PID, TID, timestamps into per-layer ring buffers
+4. **System**  -  reads CPU/memory/load/swap from `/proc` once per second
+5. **Stats**  -  computes rolling p50/p95/p99 per operation, flags anomalies
+6. **Correlate**  -  assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver) by timestamp and PID
+7. **Store**  -  writes events to SQLite with size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
+8. **Export**  -  pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
+9. **Serve**  -  exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
+10. **Dashboard**  -  browser-based HTTPS dashboard reads from SQLite, shows ops/chains/snapshots/capabilities with auto-polling
 
 ## Integration Testing
 
@@ -601,7 +601,7 @@ Validated on 6 GPU models across 3 cloud providers (TensorDock, Lambda Labs, Azu
 | A10 | 24 GB | 80 | 76 | 0 | 4 | -0.1% | 99.2% |
 | H100 (PCIe / SXM5) | 80 GB | 62 | 62 | 0 | 0 | +1.7% | 99.5% |
 | RTX 4090 | 24 GB | 34 | 34 | 0 | 0 | +0.6% | 99.9% |
-| RTX 3090 | 24 GB | 34 | 34 | 0 | 0 | — | — |
+| RTX 3090 | 24 GB | 34 | 34 | 0 | 0 |  -  |  -  |
 
 76/80 integration tests PASS (0 FAIL, 4 WARN) on GPUs tested with v0.8. Tested architectures: x86_64 and aarch64 (GH200 Grace Hopper).
 
@@ -631,7 +631,7 @@ Ingero addresses 25 documented GPU problems across training, inference, and AI a
 | 18 | Noisy neighbor / multi-tenant GPU interference | MEDIUM | Per-cgroup `sched_switch` latency + CUDA API latency correlation. Noisy neighbor detection via cgroup_schedstat |
 | 19 | Cold start / model loading latency | MEDIUM | Full cold start sequence via CUDA API timing. Block I/O completes disk→CPU→GPU pipeline |
 | 20 | Multi-GPU tensor parallel communication overhead | MEDIUM | Host-side straggler detection via `sched_switch` + CUDA sync. TCP retransmit tracing on NCCL ports |
-| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown (`explain --per-process`) — shows which process is hogging GPU time |
+| 21 | RAG pipeline GPU contention | MEDIUM | Per-process CUDA API breakdown (`explain --per-process`)  -  shows which process is hogging GPU time |
 | 22 | Checkpoint save/load failures | MEDIUM | Memory spike detection + I/O blocking in `cudaStreamSync`. Block I/O shows actual write latency + NFS timeouts |
 | 23 | PCIe bottleneck (KV cache swap, model loading) | MEDIUM | `cudaMemcpy` per-operation tracing with direction/size/duration. `cudaMallocManaged` page migration + Block I/O shows NVMe-PCIe contention |
 | 24 | Loss spikes (non-AMP) | LOW-MED | System event correlation with loss timing |
@@ -640,16 +640,16 @@ Ingero addresses 25 documented GPU problems across training, inference, and AI a
 ## FAQ
 
 **Is it safe for production?**
-Yes. eBPF programs are verified by the kernel before loading — they cannot crash the system. Probes add <2% overhead including stack tracing (0.4-0.6% measured across RTX 3090, RTX 4090, A10, A100, H100 with PyTorch workloads).
+Yes. eBPF programs are verified by the kernel before loading  -  they cannot crash the system. Probes add <2% overhead including stack tracing (0.4-0.6% measured across RTX 3090, RTX 4090, A10, A100, H100 with PyTorch workloads).
 
 **Does it require code changes?**
-No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Your application code is untouched. Traces any language — Python, C++, Java — anything linked against libcudart.so.
+No. Ingero attaches to `libcudart.so` and kernel tracepoints at the OS level. Your application code is untouched. Traces any language  -  Python, C++, Java  -  anything linked against libcudart.so.
 
 **What GPUs are supported?**
 Any NVIDIA GPU with driver 550+ and CUDA 11.x/12.x. Tested on GH200 (aarch64), H100, A100, A10, RTX 4090, RTX 3090 (x86_64).
 
 **Does it work in containers?**
-Yes. eBPF programs execute in kernel space — the container just loads them via syscalls. Run with `--privileged` (or `--cap-add=BPF,PERFMON,SYS_ADMIN`), `--pid=host`, and mount `/proc`, `/sys/kernel/debug`, and `/sys/kernel/btf`. The host kernel must have BTF enabled. Pre-built images are available at `ghcr.io/ingero-io/ingero` — see the [Docker Image](#docker-image) install section. This is the same pattern used by Falco, Tetragon, and other eBPF DaemonSets.
+Yes. eBPF programs execute in kernel space  -  the container just loads them via syscalls. Run with `--privileged` (or `--cap-add=BPF,PERFMON,SYS_ADMIN`), `--pid=host`, and mount `/proc`, `/sys/kernel/debug`, and `/sys/kernel/btf`. The host kernel must have BTF enabled. Pre-built images are available at `ghcr.io/ingero-io/ingero`  -  see the [Docker Image](#docker-image) install section. This is the same pattern used by Falco, Tetragon, and other eBPF DaemonSets.
 
 **Where is data stored?**
 Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-based pruning keeps the DB under 10 GB by default. With `--record-all`, this covers a few hours of heavy GPU load; with selective storage (default), it lasts much longer. Configure with `--max-db` (e.g., `--max-db 500m`, `--max-db 0` for unlimited). Use `--db /path/to/file.db` for a custom location.
@@ -659,9 +659,9 @@ Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero check
 
 ## License
 
-**Ingero is 100% free and open source.** Use it for anything — personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
+**Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
 
 Dual-licensed following the standard eBPF split-licensing model (same as Cilium, Falco, and most eBPF projects):
 
-* **User-Space** (Go agent, CLI, causal engine, SQLite, MCP): [Apache License 2.0](LICENSE) — maximum enterprise compatibility, no copyleft.
-* **Kernel-Space** (eBPF C code in `bpf/`): [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html) OR [BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause) — GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
+* **User-Space** (Go agent, CLI, causal engine, SQLite, MCP): [Apache License 2.0](LICENSE)  -  maximum enterprise compatibility, no copyleft.
+* **Kernel-Space** (eBPF C code in `bpf/`): [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html) OR [BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause)  -  GPL-2.0 is required by the Linux kernel's BPF subsystem; BSD-3-Clause permits embedding in non-GPL toolchains.
