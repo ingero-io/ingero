@@ -65,6 +65,7 @@ func New(s *store.Store) *Server {
 	}
 
 	ms.registerTools()
+	ms.registerPrompts()
 	return ms
 }
 
@@ -242,12 +243,12 @@ func (s *Server) registerTools() {
 
 	// Tool 2: get_trace_stats
 	type traceStatsInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m, 1h. Default: all data (0 = no time filter)"`
+		Since string `json:"since,omitempty" jsonschema:"time range relative to NOW, e.g. 1m, 5m, 1h. Omit for saved/offline DBs to query ALL events. Only useful during live tracing."`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true). Set false for verbose output."`
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_trace_stats",
-		Description: "Get CUDA and host operation statistics. Returns p50/p95/p99 for small DBs (≤500K events), count/avg/min/max from aggregates for large DBs.",
+		Description: "Get CUDA and host operation statistics. Returns p50/p95/p99 for small DBs (≤500K events), count/avg/min/max from aggregates for large DBs. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input traceStatsInput) (*gomcp.CallToolResult, struct{}, error) {
 		var since time.Duration
 		if input.Since != "" {
@@ -336,14 +337,14 @@ func (s *Server) registerTools() {
 	// Tool 3: get_causal_chains — returns causal chains with severity.
 	// Stored-chains-first: checks pre-computed chains before attempting replay.
 	type chainsInput struct {
-		Since string `json:"since,omitempty" jsonschema:"time range, e.g. 1m, 5m. Default: all data (0 = no time filter)"`
+		Since string `json:"since,omitempty" jsonschema:"time range relative to NOW, e.g. 1m, 5m. Omit for saved/offline DBs to query ALL events. Only useful during live tracing."`
 		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
 		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_causal_chains",
-		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. AI-first: TSC-compressed by default.",
+		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. AI-first: TSC-compressed by default. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input chainsInput) (*gomcp.CallToolResult, struct{}, error) {
 		var since time.Duration
 		if input.Since != "" {
@@ -665,7 +666,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		Source int    `json:"source,omitempty" jsonschema:"Source filter: 1=CUDA, 3=HOST, 4=DRIVER"`
 		Op     string `json:"op,omitempty" jsonschema:"Operation name (e.g. cudaMalloc, cuLaunchKernel)"`
 		PID    int    `json:"pid,omitempty" jsonschema:"Process ID filter"`
-		Since  string `json:"since,omitempty" jsonschema:"Time window (e.g. 5m, 1h). Default: all data"`
+		Since  string `json:"since,omitempty" jsonschema:"Time window relative to NOW (e.g. 5m, 1h). Omit for saved/offline DBs to query ALL data."`
 		Limit  int    `json:"limit,omitempty" jsonschema:"Max stacks returned (default 10)"`
 		TSC    *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
 	}
@@ -866,6 +867,55 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 	})
 }
 
+func (s *Server) registerPrompts() {
+	s.mcpServer.AddPrompt(&gomcp.Prompt{
+		Name:        "investigate",
+		Title:       "Investigate GPU trace",
+		Description: "Analyze a GPU trace database for performance problems. Works with saved/offline databases.",
+	}, func(ctx context.Context, req *gomcp.GetPromptRequest) (*gomcp.GetPromptResult, error) {
+		return &gomcp.GetPromptResult{
+			Description: "GPU performance investigation prompt",
+			Messages: []*gomcp.PromptMessage{
+				{
+					Role: "user",
+					Content: &gomcp.TextContent{
+						Text: `You are a GPU performance analyst investigating a saved trace database from Ingero (eBPF kernel-level tracing tool).
+
+Your task:
+1. Call get_trace_stats with NO parameters (no "since" - this is a saved database, query all events)
+2. Call get_causal_chains with NO parameters to find root causes
+3. Analyze the results and explain what went wrong in plain language
+4. Provide specific, actionable recommendations based on the ACTUAL trace data
+
+Rules:
+- NEVER recommend nvidia-smi, Nsight, or CUPTI - they cannot see host-side events like context switches
+- NEVER suggest CUDA_LAUNCH_BLOCKING=1 - it serializes GPU execution
+- Base ALL recommendations on specific numbers from the trace (context switch counts, latency values, process IDs)
+- Focus on host-side fixes: CPU pinning (taskset), worker count tuning, persistent_workers, deprioritizing background processes
+- Write in plain language for ML engineers, not GPU kernel developers
+
+Start by calling get_trace_stats to see the overview.`,
+					},
+				},
+			},
+		}, nil
+	})
+}
+
+// mcpAnalysisContext is appended to tool responses that may trigger
+// recommendations from the AI model. It steers the model toward
+// trace-data-driven advice and away from generic GPU debugging suggestions.
+const mcpAnalysisContext = `
+
+---
+CONTEXT FOR ANALYSIS:
+- This data was captured with eBPF kernel-level tracing (Ingero), not nvidia-smi or Nsight.
+- nvidia-smi CANNOT see these problems (context switches, scheduling stalls, page allocations). Do NOT recommend nvidia-smi, Nsight, or CUPTI.
+- Do NOT suggest CUDA_LAUNCH_BLOCKING=1 (it serializes GPU execution and makes performance worse).
+- Base all recommendations on the ACTUAL trace data above (specific context switch counts, specific latency numbers, specific process IDs).
+- Focus on host-side fixes: CPU pinning (taskset), reducing worker count, persistent_workers, deprioritizing background processes.
+- Do NOT hallucinate CUDA API calls in bash syntax. If suggesting code changes, use proper C++/Python syntax.`
+
 func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 	if len(chains) == 0 {
 		return "No causal chains detected. System appears healthy."
@@ -908,7 +958,7 @@ func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 		}
 		result += "\n"
 	}
-	return result
+	return result + mcpAnalysisContext
 }
 
 func formatStoredChains(chains []store.StoredChain, tsc bool) string {
@@ -951,7 +1001,7 @@ func formatStoredChains(chains []store.StoredChain, tsc bool) string {
 		}
 		result += "\n"
 	}
-	return result
+	return result + mcpAnalysisContext
 }
 
 func formatCheckResults(checks []discover.CheckResult) string {
@@ -1030,6 +1080,7 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 				"load_avg", snap.System.LoadAvg1,
 			)
 		}
+		result["_context"] = "Data from eBPF kernel tracing (Ingero). Do NOT recommend nvidia-smi, Nsight, or CUDA_LAUNCH_BLOCKING=1. Base recommendations on the actual trace data above."
 		data, _ := json.Marshal(result)
 		return string(data)
 	}
@@ -1081,7 +1132,7 @@ func formatStatsSnapshot(snap *stats.Snapshot, since time.Duration, eventCount i
 	}
 
 	result += fmt.Sprintf("\nTotal: %d events, %d anomalies", snap.TotalEvents, snap.AnomalyEvents)
-	return result
+	return result + mcpAnalysisContext
 }
 
 // formatAggregateStats formats per-operation aggregate statistics for large DBs
