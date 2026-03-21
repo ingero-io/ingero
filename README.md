@@ -6,6 +6,18 @@
 [![CI](https://github.com/ingero-io/ingero/actions/workflows/ci.yml/badge.svg)](https://github.com/ingero-io/ingero/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-server-blue)](https://glama.ai/mcp/servers/ingero-io/ingero)
 
+**Featured in:**
+[awesome-ebpf](https://github.com/qmonnet/awesome-ebpf) ·
+[awesome-observability](https://github.com/adriannovegil/awesome-observability) ·
+[awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
+[awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
+[awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
+[Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
+[awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
+[MCP Registry](https://registry.modelcontextprotocol.io) ·
+[Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
+[mcpservers.org](https://mcpservers.org)
+
 **Version: 0.8.2**
 
 **The only GPU observability tool your AI assistant can talk to.**
@@ -109,17 +121,6 @@ sudo ingero demo --gpu      # real GPU + eBPF tracing
 | `gpu-steal` | Multi-process GPU time-slicing quantified via CUDA API timing patterns |
 
 Every scenario prints a GPU auto-detect header showing GPU model and driver version, then displays real-time ASCII bar charts for system context.
-
-## Featured In
-
-[awesome-ebpf](https://github.com/qmonnet/awesome-ebpf) ·
-[awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
-[awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
-[awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
-[Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
-[awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
-[Glama MCP Registry](https://glama.ai/mcp/servers/ingero-io/ingero) ·
-[mcpservers.org](https://mcpservers.org)
 
 ## Install
 
