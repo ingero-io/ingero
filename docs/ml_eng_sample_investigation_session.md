@@ -4,9 +4,11 @@
 
 ## Watch: Open-Source AI Investigating a vLLM Latency Spike
 
-MiniMax M2.7 (via Ollama) connected to Ingero's MCP server, investigating why one vLLM request blocked all others for 11 seconds. The AI autonomously calls `get_trace_stats`, `get_causal_chains`, and `get_stacks` to identify CPU scheduling contention as the root cause - no Claude, no cloud API keys.
+MiniMax M2.7 (via Ollama) connected to Ingero's MCP server, investigating why one vLLM request blocked all others for 11 seconds. The AI autonomously calls `get_trace_stats` and `get_causal_chains` to identify CPU scheduling contention as the root cause - no Claude, no cloud API keys.
 
-[![asciicast](https://asciinema.org/a/uzJurRfBT0CjD7Ze.svg)](https://asciinema.org/a/uzJurRfBT0CjD7Ze)
+<img src="assets/minimax-investigation.gif" width="800" alt="MiniMax M2.7 investigating a vLLM latency spike via Ingero MCP - autonomously calling get_trace_stats and get_causal_chains to identify CPU contention as root cause">
+
+[Watch full recording on asciinema](https://asciinema.org/a/RsgEznwho4Vn59Ps) (interactive player, pause/rewind)
 
 ### Reproduce this investigation
 
