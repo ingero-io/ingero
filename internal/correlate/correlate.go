@@ -74,7 +74,7 @@ func (c Correlation) String() string {
 // CausalChain represents a multi-layer root cause chain.
 // Built from system context + host events + CUDA stats.
 type CausalChain struct {
-	ID              string       // unique chain ID (e.g., "chain-001")
+	ID              string       // content-based chain ID (e.g., "tail-medium-cuLaunchKernel")
 	Severity        string       // "HIGH", "MEDIUM", "LOW"
 	Summary         string       // one-line description
 	RootCause       string       // human-readable root cause
@@ -183,7 +183,6 @@ type Engine struct {
 	netWindow  []events.Event  // network socket events
 	maxAge     time.Duration
 	sysCtx     *SystemContext // latest system context, nil if not available
-	chainSeq   int           // sequence counter for chain IDs
 
 	// Throughput-drop detection: track event rates across snapshots.
 	latestTime   time.Time       // latest event timestamp (from AdvanceClock)
@@ -671,9 +670,8 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 
 	// OOM always produces a HIGH chain.
 	if oomCount > 0 {
-		e.chainSeq++
 		chains = append(chains, CausalChain{
-			ID:       fmt.Sprintf("chain-%03d", e.chainSeq),
+			ID:       "oom",
 			Severity: "HIGH",
 			Summary:  fmt.Sprintf("OOM killer triggered %d time(s)", oomCount),
 			RootCause: "host memory exhaustion triggered OOM killer",
@@ -688,13 +686,12 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 
 	// TCP retransmit burst: always produces a chain when > 10 retransmits.
 	if tcpRetransmitCount > 10 {
-		e.chainSeq++
 		severity := "MEDIUM"
 		if tcpRetransmitCount > 100 {
 			severity = "HIGH"
 		}
 		chains = append(chains, CausalChain{
-			ID:        fmt.Sprintf("chain-%03d", e.chainSeq),
+			ID:        fmt.Sprintf("tcp-retransmit-%s", strings.ToLower(severity)),
 			Severity:  severity,
 			Summary:   fmt.Sprintf("%d TCP retransmits during trace window", tcpRetransmitCount),
 			RootCause: "TCP retransmit burst indicates network congestion or packet loss",
@@ -709,9 +706,8 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 
 	// Pod restart: always produces a chain.
 	if podRestartCount > 0 {
-		e.chainSeq++
 		chains = append(chains, CausalChain{
-			ID:        fmt.Sprintf("chain-%03d", e.chainSeq),
+			ID:        "pod-restart",
 			Severity:  "HIGH",
 			Summary:   fmt.Sprintf("K8s pod restart detected (%d restart(s))", podRestartCount),
 			RootCause: "pod container restart concurrent with GPU workload",
@@ -726,9 +722,8 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 
 	// Pod eviction: always produces a chain.
 	if podEvictionCount > 0 {
-		e.chainSeq++
 		chains = append(chains, CausalChain{
-			ID:        fmt.Sprintf("chain-%03d", e.chainSeq),
+			ID:        "pod-eviction",
 			Severity:  "HIGH",
 			Summary:   fmt.Sprintf("K8s pod eviction detected (%d eviction(s))", podEvictionCount),
 			RootCause: "pod evicted by K8s scheduler during GPU workload",
@@ -933,14 +928,13 @@ func (e *Engine) buildChain(
 		Duration: op.P99,
 	})
 
-	e.chainSeq++
 	causeStr := causes[0]
 	for i := 1; i < len(causes); i++ {
 		causeStr += " + " + causes[i]
 	}
 
 	return &CausalChain{
-		ID:       fmt.Sprintf("chain-%03d", e.chainSeq),
+		ID:       fmt.Sprintf("tail-%s-%s", strings.ToLower(severity), op.Op),
 		Severity: severity,
 		Summary: fmt.Sprintf("%s p99=%v (%.1fx p50) — %s",
 			op.Op, op.P99, tailRatio, causeStr),
@@ -1001,13 +995,12 @@ func (e *Engine) detectNoisyNeighbor() *CausalChain {
 			continue
 		}
 
-		e.chainSeq++
 		severity := "MEDIUM"
 		if ratio > 5.0 {
 			severity = "HIGH"
 		}
 		return &CausalChain{
-			ID:       fmt.Sprintf("chain-%03d", e.chainSeq),
+			ID:       fmt.Sprintf("noisy-neighbor-%s", strings.ToLower(severity)),
 			Severity: severity,
 			Summary:  fmt.Sprintf("noisy neighbor: target cgroup off-CPU p99=%v (%.1fx peer median %v)", tp.p99, ratio, peerMedian),
 			RootCause: "another process/cgroup is consuming CPU, starving the GPU workload",
@@ -1210,11 +1203,10 @@ func (e *Engine) buildThroughputDropChain(
 		Detail: fmt.Sprintf("throughput dropped %.0f%% (%.0f → %.0f ops/s)", dropPct, peakRate, currentRate),
 	})
 
-	e.chainSeq++
 	summary := fmt.Sprintf("%s throughput dropped %.0f%% — %s", op.Op, dropPct, strings.Join(causes, " + "))
 
 	return &CausalChain{
-		ID:              fmt.Sprintf("chain-%03d", e.chainSeq),
+		ID:              fmt.Sprintf("drop-%s-%s", strings.ToLower(severity), op.Op),
 		Severity:        severity,
 		Summary:         summary,
 		RootCause:       strings.Join(causes, " + "),

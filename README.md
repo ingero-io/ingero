@@ -18,7 +18,7 @@
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
 [mcpservers.org](https://mcpservers.org)
 
-**Version: 0.8.2**
+**Version: 0.8.2.13**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -421,11 +421,35 @@ ingero mcp --http :8080 --tls-cert cert.pem --tls-key key.pem  # custom TLS cert
 |------|-------------|
 | `get_check` | System diagnostics (kernel, BTF, NVIDIA, CUDA, GPU model) |
 | `get_trace_stats` | CUDA + host statistics (p50/p95/p99 or aggregate fallback for large DBs) |
-| `get_causal_chains` | Causal chains with severity ranking and root cause |
+| `get_causal_chains` | Causal chains with severity ranking and root cause (deduplicated, top 10 by default) |
 | `get_stacks` | Resolved call stacks for CUDA/driver operations (symbols, source files, timing) |
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
 | `run_sql` | Execute read-only SQL for ad-hoc analysis |
+
+**MCP prompts:**
+
+| Prompt | Description |
+|--------|-------------|
+| `/investigate` | Guided investigation workflow - walks the AI through stats, chains, and SQL to diagnose GPU issues. Works with any MCP client. |
+
+**Works with any AI, not just Claude.** Use local open-source models via [ollmcp](https://github.com/jonigl/mcp-client-for-ollama) (Ollama MCP client):
+
+```bash
+# Install ollmcp and pull a model
+pip install mcp-client-for-ollama
+ollama pull minimax-m2.7:cloud
+
+# Create a config pointing to Ingero's MCP server
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"ingero","args":["mcp","--db","trace.db"]}}}
+EOF
+
+# Start investigating - /investigate triggers the guided workflow
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
+
+Tested with MiniMax M2.7 and Qwen 3.5 via Ollama on saved investigation databases. Also works with Claude Desktop, Cursor, and any MCP-compatible client.
 
 **curl examples** (with `--http :8080`):
 

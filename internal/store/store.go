@@ -112,7 +112,7 @@ const migrateAddNamespace = `ALTER TABLE cgroup_metadata ADD COLUMN namespace TE
 
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
-	id              TEXT PRIMARY KEY,       -- e.g. "chain-001"
+	id              TEXT PRIMARY KEY,       -- e.g. "tail-medium-cuLaunchKernel"
 	detected_at     INTEGER NOT NULL,       -- unix nanos (when chain was detected)
 	severity        TEXT NOT NULL,           -- HIGH, MEDIUM, LOW
 	summary         TEXT NOT NULL,           -- one-line description

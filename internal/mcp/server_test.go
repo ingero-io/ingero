@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -181,6 +182,108 @@ func TestFormatCausalChainsMultiple(t *testing.T) {
 		if !strings.Contains(text, s) {
 			t.Errorf("missing %q in output", s)
 		}
+	}
+}
+
+func TestDeduplicateStoredChains(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name      string
+		chains    []store.StoredChain
+		topN      int
+		wantCount int
+		wantFirst string // expected CUDAOp of first result
+	}{
+		{
+			name:      "empty",
+			chains:    nil,
+			topN:      10,
+			wantCount: 0,
+		},
+		{
+			name: "dedup same op+severity keeps highest tail ratio",
+			chains: []store.StoredChain{
+				{ID: "c1", DetectedAt: now, CUDAOp: "cuLaunchKernel", Severity: "MEDIUM", TailRatio: 3.0},
+				{ID: "c2", DetectedAt: now.Add(time.Second), CUDAOp: "cuLaunchKernel", Severity: "MEDIUM", TailRatio: 3.2},
+				{ID: "c3", DetectedAt: now.Add(2 * time.Second), CUDAOp: "cuLaunchKernel", Severity: "MEDIUM", TailRatio: 2.8},
+			},
+			topN:      10,
+			wantCount: 1,
+		},
+		{
+			name: "different ops preserved",
+			chains: []store.StoredChain{
+				{ID: "c1", CUDAOp: "cuLaunchKernel", Severity: "MEDIUM", TailRatio: 3.0},
+				{ID: "c2", CUDAOp: "cudaMemcpyAsync", Severity: "MEDIUM", TailRatio: 5.5},
+				{ID: "c3", CUDAOp: "cudaLaunchKernel", Severity: "HIGH", TailRatio: 192.9},
+			},
+			topN:      10,
+			wantCount: 3,
+			wantFirst: "cudaLaunchKernel", // HIGH sorts first
+		},
+		{
+			name: "HIGH before MEDIUM before LOW",
+			chains: []store.StoredChain{
+				{ID: "c1", CUDAOp: "opA", Severity: "LOW", TailRatio: 100.0},
+				{ID: "c2", CUDAOp: "opB", Severity: "HIGH", TailRatio: 2.0},
+				{ID: "c3", CUDAOp: "opC", Severity: "MEDIUM", TailRatio: 50.0},
+			},
+			topN:      10,
+			wantCount: 3,
+			wantFirst: "opB",
+		},
+		{
+			name: "topN limits output",
+			chains: []store.StoredChain{
+				{ID: "c1", CUDAOp: "op1", Severity: "HIGH", TailRatio: 10.0},
+				{ID: "c2", CUDAOp: "op2", Severity: "HIGH", TailRatio: 8.0},
+				{ID: "c3", CUDAOp: "op3", Severity: "MEDIUM", TailRatio: 5.0},
+				{ID: "c4", CUDAOp: "op4", Severity: "MEDIUM", TailRatio: 3.0},
+				{ID: "c5", CUDAOp: "op5", Severity: "LOW", TailRatio: 1.0},
+			},
+			topN:      3,
+			wantCount: 3,
+			wantFirst: "op1",
+		},
+		{
+			name: "topN=0 returns all",
+			chains: []store.StoredChain{
+				{ID: "c1", CUDAOp: "op1", Severity: "MEDIUM", TailRatio: 3.0},
+				{ID: "c2", CUDAOp: "op2", Severity: "MEDIUM", TailRatio: 5.0},
+			},
+			topN:      0,
+			wantCount: 2,
+		},
+		{
+			name: "60 duplicate chains dedup to few",
+			chains: func() []store.StoredChain {
+				var chains []store.StoredChain
+				for i := 0; i < 60; i++ {
+					chains = append(chains, store.StoredChain{
+						ID:        fmt.Sprintf("c%d", i),
+						CUDAOp:    "cuLaunchKernel",
+						Severity:  "MEDIUM",
+						TailRatio: 3.0 + float64(i)*0.01,
+					})
+				}
+				return chains
+			}(),
+			topN:      10,
+			wantCount: 1, // all same op+severity = 1 unique
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deduplicateStoredChains(tt.chains, tt.topN)
+			if len(got) != tt.wantCount {
+				t.Errorf("got %d chains, want %d", len(got), tt.wantCount)
+			}
+			if tt.wantFirst != "" && len(got) > 0 && got[0].CUDAOp != tt.wantFirst {
+				t.Errorf("first chain op = %q, want %q", got[0].CUDAOp, tt.wantFirst)
+			}
+		})
 	}
 }
 

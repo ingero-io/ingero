@@ -1,6 +1,8 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes seven tools to AI agents:
+// The MCP server exposes seven tools and one prompt to AI agents:
+//
+// Tools:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
 //   - get_trace_stats: Get CUDA/host stats (p50/p95/p99 or aggregate fallback)
 //   - get_causal_chains: Analyze events and return causal chains with severity
@@ -8,6 +10,9 @@
 //   - get_test_report: Return the GPU integration test report (JSON)
 //   - run_sql: Execute read-only SQL for ad-hoc analysis
 //   - get_stacks: Get resolved call stacks for operations (symbol names, source files)
+//
+// Prompts:
+//   - /investigate: Guided investigation workflow for diagnosing GPU issues
 //
 // Usage:
 //
@@ -32,6 +37,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -341,10 +347,11 @@ func (s *Server) registerTools() {
 		PID   int    `json:"pid,omitempty" jsonschema:"filter by single process ID. 0 = all. Deprecated: use pids."`
 		PIDs  []int  `json:"pids,omitempty" jsonschema:"filter by process ID(s). Takes precedence over pid."`
 		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+		TopN  int    `json:"top_n,omitempty" jsonschema:"max chains to return (default 10). Deduplicates by operation, keeps highest severity. Use 0 for all."`
 	}
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_causal_chains",
-		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. AI-first: TSC-compressed by default. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
+		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. Deduplicates by operation, returns top 10 by default (use top_n to adjust). AI-first: TSC-compressed by default. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input chainsInput) (*gomcp.CallToolResult, struct{}, error) {
 		var since time.Duration
 		if input.Since != "" {
@@ -370,6 +377,13 @@ func (s *Server) registerTools() {
 
 		tsc := input.TSC == nil || *input.TSC
 		hasPIDFilter := len(input.PIDs) > 0 || input.PID > 0
+		topN := input.TopN
+		if topN == 0 {
+			topN = 10 // default: return top 10 deduplicated chains
+		}
+		if topN < 0 {
+			topN = 0 // negative means unlimited
+		}
 
 		// Fast path: check stored chains first (pre-computed during live trace).
 		// Skip when PID filter is active — stored chains don't have PID info.
@@ -381,6 +395,7 @@ func (s *Server) registerTools() {
 				fmt.Fprintf(os.Stderr, "warning: querying stored chains: %v\n", err)
 			}
 			if len(stored) > 0 {
+				stored = deduplicateStoredChains(stored, topN)
 				text := formatStoredChains(stored, tsc)
 				return &gomcp.CallToolResult{
 					Content: []gomcp.Content{
@@ -888,10 +903,11 @@ Your task:
 4. Provide specific, actionable recommendations based on the ACTUAL trace data
 
 Rules:
+- NEVER fabricate data. Every number you mention MUST come from a tool response. If a number is not in the data, do not state it.
 - NEVER recommend nvidia-smi, Nsight, or CUPTI - they cannot see host-side events like context switches
 - NEVER suggest CUDA_LAUNCH_BLOCKING=1 - it serializes GPU execution
-- Base ALL recommendations on specific numbers from the trace (context switch counts, latency values, process IDs)
-- Focus on host-side fixes: CPU pinning (taskset), worker count tuning, persistent_workers, deprioritizing background processes
+- NEVER invent shell commands, code snippets, or specific arguments. It is better to say nothing than to say something wrong.
+- Only recommend actions that follow directly from the trace data. If the data does not support a recommendation, omit it.
 - Write in plain language for ML engineers, not GPU kernel developers
 
 Start by calling get_trace_stats to see the overview.`,
@@ -912,9 +928,43 @@ CONTEXT FOR ANALYSIS:
 - This data was captured with eBPF kernel-level tracing (Ingero), not nvidia-smi or Nsight.
 - nvidia-smi CANNOT see these problems (context switches, scheduling stalls, page allocations). Do NOT recommend nvidia-smi, Nsight, or CUPTI.
 - Do NOT suggest CUDA_LAUNCH_BLOCKING=1 (it serializes GPU execution and makes performance worse).
-- Base all recommendations on the ACTUAL trace data above (specific context switch counts, specific latency numbers, specific process IDs).
-- Focus on host-side fixes: CPU pinning (taskset), reducing worker count, persistent_workers, deprioritizing background processes.
-- Do NOT hallucinate CUDA API calls in bash syntax. If suggesting code changes, use proper C++/Python syntax.`
+- NEVER fabricate data. Every number you state MUST appear in the tool response above. Do NOT invent percentages, core counts, byte sizes, or any other values.
+- NEVER invent shell commands or code snippets. It is better to omit a recommendation than to give a wrong one.
+- Only recommend actions that follow directly from the data above.`
+
+// deduplicateStoredChains groups chains by CUDAOp+Severity, keeps the one
+// with the highest tail ratio per group, then sorts HIGH > MEDIUM > LOW.
+// If topN > 0, returns at most topN chains.
+func deduplicateStoredChains(chains []store.StoredChain, topN int) []store.StoredChain {
+	type key struct{ op, sev string }
+	best := make(map[key]store.StoredChain)
+	for _, ch := range chains {
+		k := key{ch.CUDAOp, ch.Severity}
+		if existing, ok := best[k]; !ok || ch.TailRatio > existing.TailRatio {
+			best[k] = ch
+		}
+	}
+
+	deduped := make([]store.StoredChain, 0, len(best))
+	for _, ch := range best {
+		deduped = append(deduped, ch)
+	}
+
+	// Sort: HIGH first, then MEDIUM, then LOW. Within same severity, higher tail ratio first.
+	sevRank := map[string]int{"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+	sort.Slice(deduped, func(i, j int) bool {
+		ri, rj := sevRank[deduped[i].Severity], sevRank[deduped[j].Severity]
+		if ri != rj {
+			return ri > rj
+		}
+		return deduped[i].TailRatio > deduped[j].TailRatio
+	})
+
+	if topN > 0 && len(deduped) > topN {
+		deduped = deduped[:topN]
+	}
+	return deduped
+}
 
 func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 	if len(chains) == 0 {

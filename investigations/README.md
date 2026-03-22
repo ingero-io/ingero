@@ -22,11 +22,15 @@ ingero mcp --db investigations/pytorch-dataloader-starvation.db
 ingero mcp --db investigations/vllm-37343-logprobs-amplification.db --http :8080
 ```
 
-Then ask your AI assistant questions like:
+Then use the built-in `/investigate` prompt to start a guided investigation, or ask questions directly:
+
+- `/investigate` - guided workflow: stats, causal chains, deep-dive SQL (recommended)
 - "What are the causal chains in this trace?"
 - "Show me the CUDA API latency breakdown per process"
 - "Which process had the most context switches?"
 - "Run SQL: SELECT op, COUNT(*), AVG(duration_ns)/1000 as avg_us FROM events GROUP BY op ORDER BY avg_us DESC"
+
+**Works with any MCP client**: Claude Code, Cursor, ollmcp (Ollama + local models like Qwen), or any tool that speaks MCP.
 
 ## Quick Analysis (no MCP needed)
 
