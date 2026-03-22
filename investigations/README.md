@@ -10,27 +10,34 @@ Real-world GPU performance investigations traced with Ingero. Each `.db` file is
 | `vllm-37343-logprobs-amplification.db` | [vllm-project/vllm#37343](https://github.com/vllm-project/vllm/issues/37343) | vLLM n_completions + logprobs blocks all co-scheduled requests for 11+ seconds. 80% kernel throughput drop. |
 | `vllm-37308-hol-blocking.db` | [vllm-project/vllm#37308](https://github.com/vllm-project/vllm/issues/37308) | vLLM head-of-line blocking with prefix caching. 14.5x TTFT regression. Available as [release asset](https://github.com/ingero-io/ingero/releases). |
 
-## Explore with Ingero MCP
+## Investigate with AI (copy & paste)
 
-Connect any MCP-compatible AI assistant (Claude, Cursor, OpenClaw) to investigate these traces:
+Pick a database and run. Type `/investigate` when prompted to start a guided investigation.
 
+**PyTorch DataLoader starvation** ([pytorch/pytorch#154318](https://github.com/pytorch/pytorch/issues/154318)):
 ```bash
-# Start MCP server with a trace database
-ingero mcp --db investigations/pytorch-dataloader-starvation.db
-
-# Or via HTTPS for remote access
-ingero mcp --db investigations/vllm-37343-logprobs-amplification.db --http :8080
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/pytorch-dataloader-starvation.db"]}}}
+EOF
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
 ```
 
-Then use the built-in `/investigate` prompt to start a guided investigation, or ask questions directly:
+**vLLM logprobs amplification** ([vllm-project/vllm#37343](https://github.com/vllm-project/vllm/issues/37343)):
+```bash
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/vllm-37343-logprobs-amplification.db"]}}}
+EOF
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
 
-- `/investigate` - guided workflow: stats, causal chains, deep-dive SQL (recommended)
-- "What are the causal chains in this trace?"
-- "Show me the CUDA API latency breakdown per process"
-- "Which process had the most context switches?"
+Swap `minimax-m2.7:cloud` for any Ollama model (`qwen3.5:cloud`, `llama3.3`, etc.), or use Claude Desktop / Cursor by adding the `mcpServers` block to your MCP config.
+
+### Example questions after `/investigate`
+
+- "What was the core reason for the GPU stall?"
+- "Which CUDA operation was hit the hardest?"
+- "Show me the causal chains"
 - "Run SQL: SELECT op, COUNT(*), AVG(duration_ns)/1000 as avg_us FROM events GROUP BY op ORDER BY avg_us DESC"
-
-**Works with any MCP client**: Claude Code, Cursor, ollmcp (Ollama + local models like Qwen), or any tool that speaks MCP.
 
 ## Quick Analysis (no MCP needed)
 

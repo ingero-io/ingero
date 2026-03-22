@@ -6,9 +6,24 @@
 
 MiniMax M2.7 (via Ollama) connected to Ingero's MCP server, investigating why one vLLM request blocked all others for 11 seconds. The AI autonomously calls `get_trace_stats`, `get_causal_chains`, and `get_stacks` to identify CPU scheduling contention as the root cause - no Claude, no cloud API keys.
 
-<script src="https://asciinema.org/a/uzJurRfBT0CjD7Ze.js" id="asciicast-uzJurRfBT0CjD7Ze" async data-autoplay="true" data-speed="2" data-idle-time-limit="2"></script>
+[![asciicast](https://asciinema.org/a/uzJurRfBT0CjD7Ze.svg)](https://asciinema.org/a/uzJurRfBT0CjD7Ze)
 
-*Try it yourself: `ollmcp -m minimax-m2.7:cloud -j config.json` with any [investigation database](../investigations/).*
+### Reproduce this investigation
+
+```bash
+# Install ollmcp (MCP client for Ollama)
+pip install mcp-client-for-ollama
+
+# Create MCP config pointing to the vLLM investigation DB
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/vllm-37343-logprobs-amplification.db"]}}}
+EOF
+
+# Run the investigation (type /investigate when prompted)
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
+
+For more ready-to-investigate databases with real GPU training and inference traces, see the [investigation database catalog](../investigations/README.md).
 
 ---
 
