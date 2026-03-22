@@ -1,6 +1,14 @@
 # ML Engineer AI-Assisted GPU Investigation Sessions
 
-> Real investigation sessions using Ingero's MCP server against PyTorch training traces. The AI assistant uses **only** the Ingero MCP tools  -  no shell access, no direct database queries. This is how it works in production: the assistant connects to the MCP server on the remote GPU machine and answers the engineer's questions.
+> Real investigation sessions using Ingero's MCP server against GPU traces. The AI assistant uses **only** the Ingero MCP tools  -  no shell access, no direct database queries. This is how it works in production: the assistant connects to the MCP server and answers the engineer's questions.
+
+## Watch: Open-Source AI Investigating a vLLM Latency Spike
+
+MiniMax M2.7 (via Ollama) connected to Ingero's MCP server, investigating why one vLLM request blocked all others for 11 seconds. The AI autonomously calls `get_trace_stats`, `get_causal_chains`, and `get_stacks` to identify CPU scheduling contention as the root cause - no Claude, no cloud API keys.
+
+<script src="https://asciinema.org/a/uzJurRfBT0CjD7Ze.js" id="asciicast-uzJurRfBT0CjD7Ze" async data-autoplay="true" data-speed="2" data-idle-time-limit="2"></script>
+
+*Try it yourself: `ollmcp -m minimax-m2.7:cloud -j config.json` with any [investigation database](../investigations/).*
 
 ---
 
