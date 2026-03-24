@@ -90,15 +90,16 @@ func isClosedError(err error) bool {
 // Send serializes ms as NDJSON and writes it to the connected orchestrator.
 // Non-blocking: silently drops the message if no client is connected or the
 // write exceeds 50ms. Never returns an error.
+// The mutex is held for the full write to prevent acceptLoop from replacing
+// the connection mid-write. The 50ms deadline bounds the lock duration.
 func (s *Server) Send(ms memtrack.MemoryState) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.conn == nil {
-		s.mu.Unlock()
 		atomic.AddUint64(&s.dropped, 1)
 		return
 	}
-	conn := s.conn
-	s.mu.Unlock()
 
 	data, err := json.Marshal(ms)
 	if err != nil {
@@ -107,19 +108,13 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 	}
 	data = append(data, '\n')
 
-	conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-	_, err = conn.Write(data)
+	s.conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	_, err = s.conn.Write(data)
 	if err != nil {
 		atomic.AddUint64(&s.dropped, 1)
 		log.Printf("WARN: remediate: write_failed error=%v dropped=%d", err, atomic.LoadUint64(&s.dropped))
-		// Close connection on any write error (PoC simplicity per Dev Notes).
-		s.mu.Lock()
-		if s.conn == conn {
-			s.conn.Close()
-			s.conn = nil
-		}
-		s.mu.Unlock()
-		return
+		s.conn.Close()
+		s.conn = nil
 	}
 }
 

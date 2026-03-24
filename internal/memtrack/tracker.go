@@ -27,10 +27,10 @@ type pidState struct {
 }
 
 // Tracker maintains per-PID VRAM allocation balances from cudaMalloc/cudaFree events.
-// Thread-safe: protected by sync.RWMutex for concurrent access.
+// Thread-safe: protected by sync.Mutex for concurrent access.
 // Integration: called inline from the trace command's event loop.
 type Tracker struct {
-	mu        sync.RWMutex
+	mu        sync.Mutex
 	pids      map[uint32]*pidState
 	totalVRAM uint64
 	sink      Sink
@@ -94,8 +94,6 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	state, ok := t.pids[evt.PID]
 	if !ok {
 		state = &pidState{}
@@ -106,15 +104,18 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 		state.allocatedBytes += lastAllocSize
 	}
 
-	t.emit(evt.PID, lastAllocSize, evt.Timestamp.UnixNano())
+	ms := t.buildState(evt.PID, lastAllocSize, evt.Timestamp.UnixNano())
+	t.mu.Unlock()
+
+	if t.sink != nil {
+		t.sink(ms)
+	}
 }
 
 // RecordMalloc adds size bytes to the PID's balance. Emits to sink.
 // Exposed for testing. In production, use ProcessEvent with real events.
 func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	state, ok := t.pids[pid]
 	if !ok {
 		state = &pidState{}
@@ -122,7 +123,12 @@ func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
 	}
 
 	state.allocatedBytes += size
-	t.emit(pid, size, timestampNs)
+	ms := t.buildState(pid, size, timestampNs)
+	t.mu.Unlock()
+
+	if t.sink != nil {
+		t.sink(ms)
+	}
 }
 
 // RecordFree subtracts size bytes from the PID's balance, clamping at 0.
@@ -131,8 +137,6 @@ func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
 // does not decrement (see ProcessEvent docs for rationale).
 func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	state, ok := t.pids[pid]
 	if !ok {
 		state = &pidState{}
@@ -145,25 +149,27 @@ func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
 		state.allocatedBytes -= size
 	}
 
-	t.emit(pid, 0, timestampNs)
+	ms := t.buildState(pid, 0, timestampNs)
+	t.mu.Unlock()
+
+	if t.sink != nil {
+		t.sink(ms)
+	}
 }
 
-// emit sends a MemoryState to the sink. Caller must hold t.mu.
-func (t *Tracker) emit(pid uint32, lastAllocSize uint64, timestampNs int64) {
-	if t.sink == nil {
-		return
-	}
+// buildState constructs a MemoryState snapshot. Caller must hold t.mu.
+func (t *Tracker) buildState(pid uint32, lastAllocSize uint64, timestampNs int64) MemoryState {
 	state := t.pids[pid]
 	var utilPct float64
 	if t.totalVRAM > 0 {
 		utilPct = float64(state.allocatedBytes) / float64(t.totalVRAM) * 100
 	}
-	t.sink(MemoryState{
+	return MemoryState{
 		PID:            pid,
 		AllocatedBytes: state.allocatedBytes,
 		TotalVRAM:      t.totalVRAM,
 		UtilizationPct: utilPct,
 		LastAllocSize:  lastAllocSize,
 		TimestampNs:    timestampNs,
-	})
+	}
 }
