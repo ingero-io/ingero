@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-233 total tests.
+240 total tests.
 
 ## Summary
 
@@ -30,6 +30,7 @@
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
 | memtrack | 7 | VRAM balance tracking, underflow clamp, utilization, sink emission |
+| remediate | 7 | UDS server, NDJSON streaming, drop-on-disconnect, reconnection, schema contract |
 
 ## Correlate Engine  -  Causal Chain Tests
 
@@ -385,3 +386,15 @@
 | 231 | TestTracker/independent_pid_tracking | PID A balance unaffected by PID B events | tracker_test.go |
 | 232 | TestTracker/sink_receives_correct_state | MemoryState fields match tracker state after each event | tracker_test.go |
 | 233 | TestTracker/no_sink_no_panic | nil sink processes events without error | tracker_test.go |
+
+## UDS Remediation Server (remediate/server_test.go)
+
+| # | Test | Description | File |
+|---|------|-------------|------|
+| 234 | TestServer/start_and_accept | Server binds UDS and accepts connections | server_test.go |
+| 235 | TestServer/send_writes_valid_ndjson | Send produces valid NDJSON with all 6 fields | server_test.go |
+| 236 | TestServer/send_without_client_drops_silently | Send with no client increments dropped counter, no error | server_test.go |
+| 237 | TestServer/stale_socket_cleanup | Start removes pre-existing socket file and binds successfully | server_test.go |
+| 238 | TestServer/client_reconnect | Server accepts new client after previous disconnects | server_test.go |
+| 239 | TestServer/json_field_names_match_schema | JSON keys exactly match cross-language MemoryState schema | server_test.go |
+| 240 | TestServer/close_removes_socket_file | Close deletes the UDS socket file from filesystem | server_test.go |
