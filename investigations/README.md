@@ -8,6 +8,7 @@ Real-world GPU performance investigations traced with Ingero. Each `.db` file is
 |------|-------|---------------|
 | `pytorch-dataloader-starvation.db` | [pytorch/pytorch#154318](https://github.com/pytorch/pytorch/issues/154318) | PyTorch DataLoader 114x slower than direct indexing. 200K+ context switches, GPU starving for data. |
 | `vllm-37343-logprobs-amplification.db` | [vllm-project/vllm#37343](https://github.com/vllm-project/vllm/issues/37343) | vLLM n_completions + logprobs blocks all co-scheduled requests for 11+ seconds. 80% kernel throughput drop. |
+| `pytorch-173382-empty-cache.db` | [pytorch/pytorch#173382](https://github.com/pytorch/pytorch/issues/173382) | `torch.cuda.empty_cache()` not freeing memory. cudaFree p99=1.9ms, cudaMemcpyAsync 98.6x slowdown from CPU scheduling. |
 | `vllm-37308-hol-blocking.db` | [vllm-project/vllm#37308](https://github.com/vllm-project/vllm/issues/37308) | vLLM head-of-line blocking with prefix caching. 14.5x TTFT regression. Available as [release asset](https://github.com/ingero-io/ingero/releases). |
 
 ## Investigate with AI (copy & paste)
@@ -18,6 +19,14 @@ Pick a database and run. Type `/investigate` when prompted to start a guided inv
 ```bash
 cat > /tmp/ingero-mcp.json << 'EOF'
 {"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/pytorch-dataloader-starvation.db"]}}}
+EOF
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
+
+**PyTorch empty_cache leak** ([pytorch/pytorch#173382](https://github.com/pytorch/pytorch/issues/173382)):
+```bash
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/pytorch-173382-empty-cache.db"]}}}
 EOF
 ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
 ```
