@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-226 total tests.
+233 total tests.
 
 ## Summary
 
@@ -29,6 +29,7 @@
 | synth | 3 | Demo scenario registry, event creation |
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
+| memtrack | 7 | VRAM balance tracking, underflow clamp, utilization, sink emission |
 
 ## Correlate Engine  -  Causal Chain Tests
 
@@ -372,3 +373,15 @@
 | 224 | TestHandleCapabilities | Full capability manifest (available + grayed) | api_test.go |
 | 225 | TestCapabilitiesStructure | All IDs unique, tooltips on unavailable | api_test.go |
 | 226 | TestHandleOpsBadSince | Invalid since param → 400 error | api_test.go |
+
+## Memory Tracker (memtrack/tracker_test.go)
+
+| # | Test | Description | File |
+|---|------|-------------|------|
+| 227 | TestTracker/malloc_increases_balance | Balance == sum of alloc sizes after N mallocs | tracker_test.go |
+| 228 | TestTracker/free_decreases_balance | Balance == (allocs - frees) after interleaved ops | tracker_test.go |
+| 229 | TestTracker/utilization_percentage | Utilization == allocated_bytes / total_vram * 100 | tracker_test.go |
+| 230 | TestTracker/free_without_malloc_clamps_zero | Balance stays 0 on orphan free | tracker_test.go |
+| 231 | TestTracker/independent_pid_tracking | PID A balance unaffected by PID B events | tracker_test.go |
+| 232 | TestTracker/sink_receives_correct_state | MemoryState fields match tracker state after each event | tracker_test.go |
+| 233 | TestTracker/no_sink_no_panic | nil sink processes events without error | tracker_test.go |
