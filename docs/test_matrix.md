@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-244 total tests.
+251 total tests.
 
 ## Summary
 
@@ -29,7 +29,7 @@
 | synth | 3 | Demo scenario registry, event creation |
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
-| memtrack | 11 | VRAM balance tracking, underflow clamp, utilization, sink emission, Driver API allocs |
+| memtrack | 18 | VRAM balance tracking, net balance (alloc/free), underflow clamp, utilization, sink emission, Driver API allocs |
 | remediate | 7 | UDS server, NDJSON streaming, drop-on-disconnect, reconnection, schema contract |
 
 ## Correlate Engine  -  Causal Chain Tests
@@ -390,6 +390,13 @@
 | 233b | TestTracker/driver_cuMemAllocManaged_increases_balance | cuMemAllocManaged (Driver API) increases VRAM balance | tracker_test.go |
 | 233c | TestTracker/driver_non_alloc_ops_ignored | Non-allocation driver ops (launch, memcpy, sync) ignored by tracker | tracker_test.go |
 | 233d | TestTracker/mixed_runtime_and_driver_allocs_accumulate | cudaMalloc + cuMemAlloc_v2 for same PID accumulate correctly | tracker_test.go |
+| 233e | TestTracker/net_balance/alloc_then_free_returns_to_zero | Malloc 1MB, free 1MB via Args[1] → balance = 0 | tracker_test.go |
+| 233f | TestTracker/net_balance/multiple_alloc_partial_free | Malloc 1MB + 2MB, free 1MB → balance = 2MB | tracker_test.go |
+| 233g | TestTracker/net_balance/free_unknown_pointer_no_change | Free with Args[1]=0 → balance unchanged (graceful degradation) | tracker_test.go |
+| 233h | TestTracker/net_balance/free_exceeds_balance_clamps_zero | Malloc 1MB, free 2MB → balance = 0 (underflow clamp) | tracker_test.go |
+| 233i | TestTracker/net_balance/interleaved_pids_independent | PID A alloc/free, PID B alloc → independent balances | tracker_test.go |
+| 233j | TestTracker/net_balance/1000_alloc_free_cycles_returns_to_baseline | 1000 alloc/free cycles → utilization_pct within 5% of 0 | tracker_test.go |
+| 233k | TestTracker/net_balance/utilization_pct_decreases_on_free | Alloc to 80%, free half → utilization_pct = 40% | tracker_test.go |
 
 ## UDS Remediation Server (remediate/server_test.go)
 

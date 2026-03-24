@@ -51,8 +51,8 @@ func NewTracker(totalVRAM uint64, sink Sink) *Tracker {
 // is a memory allocation or free from either the CUDA Runtime API or Driver API.
 //
 // Runtime API (SourceCUDA):
-//   - cudaMalloc: Args[0] = allocation size in bytes
-//   - cudaFree: Args[0] = device pointer (not size). No balance decrement.
+//   - cudaMalloc: Args[0] = allocation size in bytes, Args[1] = devPtr param address
+//   - cudaFree: Args[0] = device pointer, Args[1] = freed size in bytes (0 if unknown)
 //
 // Driver API (SourceDriver):
 //   - cuMemAlloc_v2: Args[0] = allocation size in bytes
@@ -61,11 +61,14 @@ func NewTracker(totalVRAM uint64, sink Sink) *Tracker {
 // PyTorch's caching allocator calls cuMemAlloc_v2 (Driver API) for pool
 // allocations — without Driver API support, those allocations are invisible.
 //
-// The tracker does NOT decrement on free — balance is a monotonically
-// increasing upper bound (conservative for OOM detection).
+// cudaFree events with Args[1] > 0 subtract from the balance. If Args[1] == 0
+// (unknown pointer — pre-existing allocation or BPF map eviction), no decrement
+// occurs (graceful degradation to conservative upper bound).
 func (t *Tracker) ProcessEvent(evt events.Event) {
 	var lastAllocSize uint64
 	var isAlloc bool
+	var isFree bool
+	var freedBytes uint64
 
 	switch evt.Source {
 	case events.SourceCUDA:
@@ -75,8 +78,10 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 			lastAllocSize = evt.Args[0]
 			isAlloc = true
 		case events.CUDAFree:
-			// cudaFree's Args[0] is the device pointer, not the size.
-			// No-op on balance (conservative upper bound). Sink still fires.
+			freedBytes = evt.Args[1] // freed size from eBPF alloc_sizes map (0 if unknown)
+			if freedBytes > 0 {
+				isFree = true
+			}
 		default:
 			return
 		}
@@ -102,6 +107,13 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 
 	if isAlloc {
 		state.allocatedBytes += lastAllocSize
+	}
+	if isFree {
+		if freedBytes > state.allocatedBytes {
+			state.allocatedBytes = 0 // underflow clamp
+		} else {
+			state.allocatedBytes -= freedBytes
+		}
 	}
 
 	ms := t.buildState(evt.PID, lastAllocSize, evt.Timestamp.UnixNano())
