@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-240 total tests.
+244 total tests.
 
 ## Summary
 
@@ -29,7 +29,7 @@
 | synth | 3 | Demo scenario registry, event creation |
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
-| memtrack | 7 | VRAM balance tracking, underflow clamp, utilization, sink emission |
+| memtrack | 11 | VRAM balance tracking, underflow clamp, utilization, sink emission, Driver API allocs |
 | remediate | 7 | UDS server, NDJSON streaming, drop-on-disconnect, reconnection, schema contract |
 
 ## Correlate Engine  -  Causal Chain Tests
@@ -386,6 +386,10 @@
 | 231 | TestTracker/independent_pid_tracking | PID A balance unaffected by PID B events | tracker_test.go |
 | 232 | TestTracker/sink_receives_correct_state | MemoryState fields match tracker state after each event | tracker_test.go |
 | 233 | TestTracker/no_sink_no_panic | nil sink processes events without error | tracker_test.go |
+| 233a | TestTracker/driver_cuMemAlloc_increases_balance | cuMemAlloc_v2 (Driver API) increases VRAM balance | tracker_test.go |
+| 233b | TestTracker/driver_cuMemAllocManaged_increases_balance | cuMemAllocManaged (Driver API) increases VRAM balance | tracker_test.go |
+| 233c | TestTracker/driver_non_alloc_ops_ignored | Non-allocation driver ops (launch, memcpy, sync) ignored by tracker | tracker_test.go |
+| 233d | TestTracker/mixed_runtime_and_driver_allocs_accumulate | cudaMalloc + cuMemAlloc_v2 for same PID accumulate correctly | tracker_test.go |
 
 ## UDS Remediation Server (remediate/server_test.go)
 

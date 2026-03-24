@@ -7,13 +7,25 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// makeCUDAEvent creates a CUDA event with the given PID, op, and size in Args[0].
+// makeCUDAEvent creates a CUDA Runtime API event with the given PID, op, and size in Args[0].
 func makeCUDAEvent(pid uint32, op events.CUDAOp, size uint64) events.Event {
 	return events.Event{
 		Timestamp: time.Unix(0, 1711180800000000000), // fixed for determinism
 		PID:       pid,
 		TID:       pid,
 		Source:    events.SourceCUDA,
+		Op:        uint8(op),
+		Args:      [2]uint64{size, 0},
+	}
+}
+
+// makeDriverEvent creates a CUDA Driver API event with the given PID, op, and size in Args[0].
+func makeDriverEvent(pid uint32, op events.DriverOp, size uint64) events.Event {
+	return events.Event{
+		Timestamp: time.Unix(0, 1711180800000000000),
+		PID:       pid,
+		TID:       pid,
+		Source:    events.SourceDriver,
 		Op:        uint8(op),
 		Args:      [2]uint64{size, 0},
 	}
@@ -139,6 +151,71 @@ func TestTracker(t *testing.T) {
 				}
 				if ms.TimestampNs != evt.Timestamp.UnixNano() {
 					t.Errorf("timestamp_ns = %d, want %d", ms.TimestampNs, evt.Timestamp.UnixNano())
+				}
+			},
+		},
+		{
+			name: "driver_cuMemAlloc_increases_balance",
+			run: func(t *testing.T) {
+				var last MemoryState
+				sink := func(ms MemoryState) { last = ms }
+				tr := NewTracker(16*1024*1024*1024, sink)
+
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverMemAlloc, 2*1024*1024*1024))
+
+				if last.AllocatedBytes != 2*1024*1024*1024 {
+					t.Errorf("allocated_bytes = %d, want %d", last.AllocatedBytes, uint64(2*1024*1024*1024))
+				}
+				if last.PID != 1000 {
+					t.Errorf("pid = %d, want 1000", last.PID)
+				}
+			},
+		},
+		{
+			name: "driver_cuMemAllocManaged_increases_balance",
+			run: func(t *testing.T) {
+				var last MemoryState
+				sink := func(ms MemoryState) { last = ms }
+				tr := NewTracker(16*1024*1024*1024, sink)
+
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverMemAllocManaged, 512*1024*1024))
+
+				if last.AllocatedBytes != 512*1024*1024 {
+					t.Errorf("allocated_bytes = %d, want %d", last.AllocatedBytes, uint64(512*1024*1024))
+				}
+			},
+		},
+		{
+			name: "driver_non_alloc_ops_ignored",
+			run: func(t *testing.T) {
+				callCount := 0
+				sink := func(ms MemoryState) { callCount++ }
+				tr := NewTracker(16*1024*1024*1024, sink)
+
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverLaunchKernel, 0))
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverMemcpy, 4096))
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverCtxSync, 0))
+
+				if callCount != 0 {
+					t.Errorf("sink called %d times, want 0 (non-alloc driver ops should be ignored)", callCount)
+				}
+			},
+		},
+		{
+			name: "mixed_runtime_and_driver_allocs_accumulate",
+			run: func(t *testing.T) {
+				var last MemoryState
+				sink := func(ms MemoryState) { last = ms }
+				tr := NewTracker(16*1024*1024*1024, sink)
+
+				// cudaMalloc (Runtime API)
+				tr.ProcessEvent(makeCUDAEvent(1000, events.CUDAMalloc, 1*1024*1024*1024))
+				// cuMemAlloc_v2 (Driver API)
+				tr.ProcessEvent(makeDriverEvent(1000, events.DriverMemAlloc, 2*1024*1024*1024))
+
+				expected := uint64(3 * 1024 * 1024 * 1024)
+				if last.AllocatedBytes != expected {
+					t.Errorf("allocated_bytes = %d, want %d", last.AllocatedBytes, expected)
 				}
 			},
 		},

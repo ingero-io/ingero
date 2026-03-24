@@ -48,20 +48,48 @@ func NewTracker(totalVRAM uint64, sink Sink) *Tracker {
 }
 
 // ProcessEvent updates the VRAM balance for the event's PID if the event
-// is a cudaMalloc or cudaFree. For all other events, it returns immediately.
+// is a memory allocation or free from either the CUDA Runtime API or Driver API.
 //
-// For cudaMalloc: Args[0] contains the allocation size in bytes.
-// For cudaFree: the eBPF probe captures the device pointer in Args[0], not
-// the size. The tracker does NOT decrement on cudaFree — balance is a
-// monotonically increasing upper bound (conservative for OOM detection).
-// The sink still fires so downstream consumers see every event.
+// Runtime API (SourceCUDA):
+//   - cudaMalloc: Args[0] = allocation size in bytes
+//   - cudaFree: Args[0] = device pointer (not size). No balance decrement.
+//
+// Driver API (SourceDriver):
+//   - cuMemAlloc_v2: Args[0] = allocation size in bytes
+//   - cuMemAllocManaged: Args[0] = allocation size in bytes
+//
+// PyTorch's caching allocator calls cuMemAlloc_v2 (Driver API) for pool
+// allocations — without Driver API support, those allocations are invisible.
+//
+// The tracker does NOT decrement on free — balance is a monotonically
+// increasing upper bound (conservative for OOM detection).
 func (t *Tracker) ProcessEvent(evt events.Event) {
-	if evt.Source != events.SourceCUDA {
-		return
-	}
+	var lastAllocSize uint64
+	var isAlloc bool
 
-	op := events.CUDAOp(evt.Op)
-	if op != events.CUDAMalloc && op != events.CUDAFree {
+	switch evt.Source {
+	case events.SourceCUDA:
+		op := events.CUDAOp(evt.Op)
+		switch op {
+		case events.CUDAMalloc:
+			lastAllocSize = evt.Args[0]
+			isAlloc = true
+		case events.CUDAFree:
+			// cudaFree's Args[0] is the device pointer, not the size.
+			// No-op on balance (conservative upper bound). Sink still fires.
+		default:
+			return
+		}
+	case events.SourceDriver:
+		op := events.DriverOp(evt.Op)
+		switch op {
+		case events.DriverMemAlloc, events.DriverMemAllocManaged:
+			lastAllocSize = evt.Args[0]
+			isAlloc = true
+		default:
+			return
+		}
+	default:
 		return
 	}
 
@@ -74,17 +102,8 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 		t.pids[evt.PID] = state
 	}
 
-	var lastAllocSize uint64
-
-	switch op {
-	case events.CUDAMalloc:
-		size := evt.Args[0]
-		state.allocatedBytes += size
-		lastAllocSize = size
-	case events.CUDAFree:
-		// cudaFree's Args[0] is the device pointer, not the size.
-		// No-op on balance (conservative upper bound). Sink still fires.
-		lastAllocSize = 0
+	if isAlloc {
+		state.allocatedBytes += lastAllocSize
 	}
 
 	t.emit(evt.PID, lastAllocSize, evt.Timestamp.UnixNano())
