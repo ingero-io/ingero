@@ -237,14 +237,14 @@ func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_check",
 		Description: "Run system diagnostics: kernel version, BTF support, NVIDIA driver, CUDA libraries, running GPU processes",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input checkInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input checkInput) (*gomcp.CallToolResult, any, error) {
 		checks := discover.RunAllChecks()
 		text := formatCheckResults(checks)
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: text},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 2: get_trace_stats
@@ -255,7 +255,7 @@ func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_trace_stats",
 		Description: "Get CUDA and host operation statistics. Returns p50/p95/p99 for small DBs (≤500K events), count/avg/min/max from aggregates for large DBs. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input traceStatsInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input traceStatsInput) (*gomcp.CallToolResult, any, error) {
 		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
@@ -265,7 +265,7 @@ func (s *Server) registerTools() {
 						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
 					},
 					IsError: true,
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 			since = d
 		}
@@ -275,7 +275,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first to create and populate the event store."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		tsc := input.TSC == nil || *input.TSC
@@ -289,27 +289,27 @@ func (s *Server) registerTools() {
 			// Large DB: use pre-computed aggregates (count/avg/min/max).
 			ops, err := s.store.QueryAggregatePerOp(qparams)
 			if err != nil {
-				return nil, struct{}{}, fmt.Errorf("querying aggregates: %w", err)
+				return nil, nil, fmt.Errorf("querying aggregates: %w", err)
 			}
 			if len(ops) == 0 {
 				return &gomcp.CallToolResult{
 					Content: []gomcp.Content{
 						&gomcp.TextContent{Text: "No events found in the database."},
 					},
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 			text := formatAggregateStats(ops, tsc, opDescs)
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: text},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		// Small DB: full-fidelity path with percentiles.
 		evts, err := s.store.Query(qparams)
 		if err != nil {
-			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
+			return nil, nil, fmt.Errorf("querying events: %w", err)
 		}
 
 		if len(evts) == 0 {
@@ -317,7 +317,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No events found in the database."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		collector := stats.New()
@@ -337,7 +337,7 @@ func (s *Server) registerTools() {
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: text},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 3: get_causal_chains — returns causal chains with severity.
@@ -352,7 +352,7 @@ func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_causal_chains",
 		Description: "Analyze CUDA + host events and return causal chains with severity, root cause, and recommendations. Deduplicates by operation, returns top 10 by default (use top_n to adjust). AI-first: TSC-compressed by default. Works with both live and saved/offline databases. Omit 'since' for saved DBs.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input chainsInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input chainsInput) (*gomcp.CallToolResult, any, error) {
 		var since time.Duration
 		if input.Since != "" {
 			d, err := time.ParseDuration(input.Since)
@@ -362,7 +362,7 @@ func (s *Server) registerTools() {
 						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
 					},
 					IsError: true,
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 			since = d
 		}
@@ -372,7 +372,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		tsc := input.TSC == nil || *input.TSC
@@ -401,7 +401,7 @@ func (s *Server) registerTools() {
 					Content: []gomcp.Content{
 						&gomcp.TextContent{Text: text},
 					},
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 		}
 
@@ -417,7 +417,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: msg},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		// Small DB: replay events through the chain engine.
@@ -441,7 +441,7 @@ func (s *Server) registerTools() {
 
 		evts, err := s.store.Query(qparams)
 		if err != nil {
-			return nil, struct{}{}, fmt.Errorf("querying events: %w", err)
+			return nil, nil, fmt.Errorf("querying events: %w", err)
 		}
 
 		if len(evts) == 0 {
@@ -449,7 +449,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No events found in the database."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		collector := stats.New()
@@ -482,7 +482,7 @@ func (s *Server) registerTools() {
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: text},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 4: run_demo — runs a synthetic scenario and returns results.
@@ -492,7 +492,7 @@ func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "run_demo",
 		Description: "Run a synthetic demo scenario and return the stats snapshot. No GPU or root needed.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input runDemoInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input runDemoInput) (*gomcp.CallToolResult, any, error) {
 		scenario := synth.Find(input.Scenario)
 		if scenario == nil {
 			names := make([]string, len(synth.Registry))
@@ -503,7 +503,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: fmt.Sprintf("Unknown scenario %q. Available: %s", input.Scenario, strings.Join(names, ", "))},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		ch := make(chan events.Event, 256)
@@ -528,7 +528,7 @@ func (s *Server) registerTools() {
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: text},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 5: get_test_report — returns the JSON test report from gpu-test.sh.
@@ -538,7 +538,7 @@ func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_test_report",
 		Description: "Get the GPU integration test report (JSON). Generated by gpu-test.sh after a full test run. Includes per-test status, timing, and system info.",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input testReportInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input testReportInput) (*gomcp.CallToolResult, any, error) {
 		// Try logs/test-report.json relative to CWD (standard location on GPU VM).
 		data, err := os.ReadFile("logs/test-report.json")
 		if err != nil {
@@ -546,7 +546,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No test report found at logs/test-report.json. Run 'bash scripts/gpu-test.sh' first to generate the report."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		tsc := input.TSC == nil || *input.TSC
@@ -556,7 +556,7 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: string(data)},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		// Pretty-print for human consumption.
@@ -567,14 +567,14 @@ func (s *Server) registerTools() {
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: string(data)},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 		pretty, _ := json.MarshalIndent(parsed, "", "  ")
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: string(pretty)},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 6: run_sql — execute read-only SQL for ad-hoc analysis.
@@ -598,13 +598,13 @@ JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), event
 Sources: 1=CUDA, 3=HOST, 4=DRIVER, 5=IO, 6=TCP, 7=NET. CUDA ops: 1=cudaMalloc, 2=cudaFree, 3=cudaLaunchKernel, 4=cudaMemcpy, 5=cudaStreamSync, 6=cudaDeviceSync, 7=cudaMemcpyAsync, 8=cudaMallocManaged. HOST ops: 1=sched_switch, 2=sched_wakeup, 3=mm_page_alloc, 4=oom_kill, 5=process_exec, 6=process_exit, 7=process_fork, 10=pod_restart, 11=pod_eviction, 12=pod_oom_kill. DRIVER ops: 1=cuLaunchKernel, 2=cuMemcpy, 3=cuMemcpyAsync, 4=cuCtxSynchronize, 5=cuMemAlloc, 6=cuMemAllocManaged. IO ops: 1=block_read, 2=block_write, 3=block_discard. TCP ops: 1=tcp_retransmit. NET ops: 1=net_send, 2=net_recv. arg0/arg1 per op: cudaMalloc/cudaMallocManaged arg0=size_bytes, cudaFree arg0=devPtr, cudaLaunchKernel arg0=kernel_func_ptr, cudaMemcpy/cudaMemcpyAsync arg0=bytes arg1=direction(0=H2H,1=H2D,2=D2H,3=D2D,4=default), cudaStreamSync arg0=stream_handle, mm_page_alloc arg0=page_order(size=4KB<<order), cuMemAlloc/cuMemAllocManaged arg0=size_bytes, block_read/block_write arg0=nr_sectors, net_send/net_recv arg0=bytes. sum_arg0 in event_aggregates = sum of arg0 across bucket (skipped for pointer-valued ops: cudaFree, cudaLaunchKernel, cuLaunchKernel). Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).
 
 Performance: events can have millions of rows. For large DBs, query event_aggregates (per-minute stats, always small) or stack_traces (deduplicated, always small) instead of scanning events. Use get_stacks tool for call stack analysis instead of manual SQL JOINs.`,
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sqlInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input sqlInput) (*gomcp.CallToolResult, any, error) {
 		if s.store == nil {
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		if strings.TrimSpace(input.Query) == "" {
@@ -613,7 +613,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					&gomcp.TextContent{Text: "query parameter is required"},
 				},
 				IsError: true,
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		limit := input.Limit
@@ -642,7 +642,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					&gomcp.TextContent{Text: msg},
 				},
 				IsError: true,
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		// Build JSON response: columns array + data array-of-arrays.
@@ -672,7 +672,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: string(data)},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 
 	// Tool 7: get_stacks — resolved call stacks grouped by operation.
@@ -688,13 +688,13 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
 		Name:        "get_stacks",
 		Description: "Get resolved call stacks for CUDA/driver operations. Returns top stacks by frequency with symbol names, source files, and timing stats. One call answers 'what code path caused this operation?' For older DBs without resolved symbols, falls back to raw IPs (hex addresses).",
-	}, func(ctx context.Context, req *gomcp.CallToolRequest, input stacksInput) (*gomcp.CallToolResult, struct{}, error) {
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input stacksInput) (*gomcp.CallToolResult, any, error) {
 		if s.store == nil {
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
 					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
 				},
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		limit := input.Limit
@@ -727,7 +727,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 						&gomcp.TextContent{Text: fmt.Sprintf("Unknown operation %q. Use CUDA ops (cudaMalloc, cudaLaunchKernel, ...) or driver ops (cuLaunchKernel, cuMemAlloc, ...).", input.Op)},
 					},
 					IsError: true,
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 			query += " AND e.source = ? AND e.op = ?"
 			args = append(args, uint8(src), op)
@@ -749,7 +749,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 						&gomcp.TextContent{Text: fmt.Sprintf("Invalid since duration %q: %v. Use Go duration format (e.g. 5m, 1h, 30s).", input.Since, err)},
 					},
 					IsError: true,
-				}, struct{}{}, nil
+				}, nil, nil
 			}
 			if d > 0 {
 				query += " AND e.timestamp >= ?"
@@ -775,7 +775,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					&gomcp.TextContent{Text: msg},
 				},
 				IsError: true,
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 		defer rows.Close()
 
@@ -841,7 +841,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					&gomcp.TextContent{Text: fmt.Sprintf("row iteration error: %v", err)},
 				},
 				IsError: true,
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		if len(stacks) == 0 {
@@ -854,7 +854,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 					&gomcp.TextContent{Text: msg},
 				},
 				IsError: scanErrs > 0,
-			}, struct{}{}, nil
+			}, nil, nil
 		}
 
 		output := map[string]interface{}{
@@ -878,7 +878,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			Content: []gomcp.Content{
 				&gomcp.TextContent{Text: string(data)},
 			},
-		}, struct{}{}, nil
+		}, nil, nil
 	})
 }
 
