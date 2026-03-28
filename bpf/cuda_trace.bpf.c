@@ -146,6 +146,9 @@ fallback:;
 SEC("uprobe/cudaMalloc")
 int uprobe_cuda_malloc(struct pt_regs *ctx)
 {
+	if (watchdog_is_stale())
+		return 0;
+
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 dev_ptr_ptr = (__u64)PT_REGS_PARM1(ctx);  // void **devPtr
 	__u64 size = (__u64)PT_REGS_PARM2(ctx);
@@ -191,6 +194,9 @@ int uretprobe_cuda_malloc(struct pt_regs *ctx)
 SEC("uprobe/cudaFree")
 int uprobe_cuda_free(struct pt_regs *ctx)
 {
+	if (watchdog_is_stale())
+		return 0;
+
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 pid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
