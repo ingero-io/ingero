@@ -598,10 +598,24 @@ func BuildPyOffsetsFromDWARF(debugPath string, minor int) (*PyOffsets, error) {
 	switch {
 	case minor >= 12:
 		if off, ok := tstateOffsets["current_frame"]; ok {
+			// Upstream CPython 3.12+: current_frame directly in PyThreadState.
 			offsets.TstateFrame = uint64(off)
 			offsets.NewStyleFrames = true
+		} else if off, ok := tstateOffsets["cframe"]; ok {
+			// Distro-patched builds (e.g. Ubuntu 24.04's 3.12.3) retain the
+			// 3.11-style _PyCFrame indirection for ABI stability.
+			offsets.TstateFrame = uint64(off)
+			offsets.NewStyleFrames = true
+
+			cframeOffsets, err := ExtractStructOffsets(debugPath, "_PyCFrame")
+			if err != nil {
+				return nil, fmt.Errorf("_PyCFrame (3.%d cframe fallback): %w", minor, err)
+			}
+			if cfOff, ok := cframeOffsets["current_frame"]; ok {
+				offsets.CframeCurrentFrame = uint64(cfOff)
+			}
 		} else {
-			return nil, fmt.Errorf("PyThreadState.current_frame not found for 3.%d", minor)
+			return nil, fmt.Errorf("PyThreadState.current_frame (or cframe) not found for 3.%d", minor)
 		}
 
 	case minor == 11:
