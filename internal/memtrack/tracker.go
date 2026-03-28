@@ -146,7 +146,7 @@ func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
 // RecordFree subtracts size bytes from the PID's balance, clamping at 0.
 // Used by the test suite to verify underflow protection.
 // In production event flow, cudaFree goes through ProcessEvent which
-// does not decrement (see ProcessEvent docs for rationale).
+// decrements when freed_bytes > 0 (see ProcessEvent docs for details).
 func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
 	t.mu.Lock()
 	state, ok := t.pids[pid]
