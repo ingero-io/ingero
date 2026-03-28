@@ -207,4 +207,13 @@ struct cuda_event_stack {
  * v0.8 noisy-neighbor detection (per-cgroup scheduler latency).
  */
 
+// Watchdog heartbeat map -- orchestrator writes timestamp every 10ms
+// Probes check staleness to bypass remediation if orchestrator is dead
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);  // nanosecond timestamp from bpf_ktime_get_ns()
+} ingero_watchdog SEC(".maps");
+
 #endif /* __INGERO_COMMON_BPF_H */
