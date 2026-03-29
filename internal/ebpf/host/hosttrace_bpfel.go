@@ -86,10 +86,11 @@ type hostTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type hostTraceMapSpecs struct {
-	HostEvents    *ebpf.MapSpec `ebpf:"host_events"`
-	SchedOffMap   *ebpf.MapSpec `ebpf:"sched_off_map"`
-	TargetCgroups *ebpf.MapSpec `ebpf:"target_cgroups"`
-	TargetPids    *ebpf.MapSpec `ebpf:"target_pids"`
+	HostEvents     *ebpf.MapSpec `ebpf:"host_events"`
+	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	SchedOffMap    *ebpf.MapSpec `ebpf:"sched_off_map"`
+	TargetCgroups  *ebpf.MapSpec `ebpf:"target_cgroups"`
+	TargetPids     *ebpf.MapSpec `ebpf:"target_pids"`
 }
 
 // hostTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -119,15 +120,17 @@ func (o *hostTraceObjects) Close() error {
 //
 // It can be passed to loadHostTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type hostTraceMaps struct {
-	HostEvents    *ebpf.Map `ebpf:"host_events"`
-	SchedOffMap   *ebpf.Map `ebpf:"sched_off_map"`
-	TargetCgroups *ebpf.Map `ebpf:"target_cgroups"`
-	TargetPids    *ebpf.Map `ebpf:"target_pids"`
+	HostEvents     *ebpf.Map `ebpf:"host_events"`
+	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	SchedOffMap    *ebpf.Map `ebpf:"sched_off_map"`
+	TargetCgroups  *ebpf.Map `ebpf:"target_cgroups"`
+	TargetPids     *ebpf.Map `ebpf:"target_pids"`
 }
 
 func (m *hostTraceMaps) Close() error {
 	return _HostTraceClose(
 		m.HostEvents,
+		m.IngeroWatchdog,
 		m.SchedOffMap,
 		m.TargetCgroups,
 		m.TargetPids,

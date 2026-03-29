@@ -83,7 +83,8 @@ type tcpTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type tcpTraceMapSpecs struct {
-	TcpEvents *ebpf.MapSpec `ebpf:"tcp_events"`
+	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	TcpEvents      *ebpf.MapSpec `ebpf:"tcp_events"`
 }
 
 // tcpTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -113,11 +114,13 @@ func (o *tcpTraceObjects) Close() error {
 //
 // It can be passed to loadTcpTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type tcpTraceMaps struct {
-	TcpEvents *ebpf.Map `ebpf:"tcp_events"`
+	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	TcpEvents      *ebpf.Map `ebpf:"tcp_events"`
 }
 
 func (m *tcpTraceMaps) Close() error {
 	return _TcpTraceClose(
+		m.IngeroWatchdog,
 		m.TcpEvents,
 	)
 }

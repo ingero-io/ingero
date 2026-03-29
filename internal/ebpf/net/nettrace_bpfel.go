@@ -94,9 +94,10 @@ type netTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type netTraceMapSpecs struct {
-	NetEntryMap   *ebpf.MapSpec `ebpf:"net_entry_map"`
-	NetEvents     *ebpf.MapSpec `ebpf:"net_events"`
-	NetTargetPids *ebpf.MapSpec `ebpf:"net_target_pids"`
+	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	NetEntryMap    *ebpf.MapSpec `ebpf:"net_entry_map"`
+	NetEvents      *ebpf.MapSpec `ebpf:"net_events"`
+	NetTargetPids  *ebpf.MapSpec `ebpf:"net_target_pids"`
 }
 
 // netTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -126,13 +127,15 @@ func (o *netTraceObjects) Close() error {
 //
 // It can be passed to loadNetTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netTraceMaps struct {
-	NetEntryMap   *ebpf.Map `ebpf:"net_entry_map"`
-	NetEvents     *ebpf.Map `ebpf:"net_events"`
-	NetTargetPids *ebpf.Map `ebpf:"net_target_pids"`
+	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	NetEntryMap    *ebpf.Map `ebpf:"net_entry_map"`
+	NetEvents      *ebpf.Map `ebpf:"net_events"`
+	NetTargetPids  *ebpf.Map `ebpf:"net_target_pids"`
 }
 
 func (m *netTraceMaps) Close() error {
 	return _NetTraceClose(
+		m.IngeroWatchdog,
 		m.NetEntryMap,
 		m.NetEvents,
 		m.NetTargetPids,
