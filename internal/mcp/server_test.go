@@ -1,8 +1,12 @@
 package mcp
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -284,6 +288,180 @@ func TestDeduplicateStoredChains(t *testing.T) {
 				t.Errorf("first chain op = %q, want %q", got[0].CUDAOp, tt.wantFirst)
 			}
 		})
+	}
+}
+
+// TestMCPSubprocess is the MCP server subprocess entry point.
+// When TEST_MCP_SUBPROCESS=1, it runs the MCP server on stdio and exits.
+func TestMCPSubprocess(t *testing.T) {
+	if os.Getenv("TEST_MCP_SUBPROCESS") != "1" {
+		t.Skip("helper subprocess, not a real test")
+	}
+	srv := New(nil) // nil store — tools return "no database" messages
+	_ = srv.Run(context.Background())
+}
+
+// TestMCPToolResponseNoStructuredContent verifies that MCP tool responses
+// contain "content" but NOT "structuredContent". Claude Code reads
+// structuredContent when present, so an empty structuredContent:{} causes
+// Claude Code to show {} instead of the actual tool output.
+//
+// Root cause: using struct{} as the Out type in ToolHandlerFor causes the
+// go-sdk to serialize structuredContent:{} in every response. The fix is
+// to use any as the Out type and return nil, which makes the SDK skip
+// structuredContent entirely.
+//
+// This test re-executes the test binary as a subprocess (like Claude Code
+// does with the ingero binary) and communicates via stdio pipes.
+func TestMCPToolResponseNoStructuredContent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping MCP integration test in short mode")
+	}
+
+	// Start self as subprocess running the MCP server.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPSubprocess$")
+	cmd.Env = append(os.Environ(), "TEST_MCP_SUBPROCESS=1")
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stdin.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	// Single reader goroutine — all messages arrive on this channel.
+	msgs := make(chan map[string]interface{}, 100)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			var msg map[string]interface{}
+			if json.Unmarshal(scanner.Bytes(), &msg) == nil {
+				msgs <- msg
+			}
+		}
+		close(msgs)
+	}()
+
+	send := func(msg map[string]interface{}) {
+		b, _ := json.Marshal(msg)
+		b = append(b, '\n')
+		stdin.Write(b)
+	}
+	recvWithTimeout := func(d time.Duration) (map[string]interface{}, bool) {
+		select {
+		case msg, ok := <-msgs:
+			return msg, ok && msg != nil
+		case <-time.After(d):
+			return nil, false
+		}
+	}
+
+	// MCP initialize handshake.
+	send(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]interface{}{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]interface{}{},
+			"clientInfo":      map[string]interface{}{"name": "test", "version": "1.0"},
+		},
+	})
+	initResp, ok := recvWithTimeout(5 * time.Second)
+	if !ok || initResp["id"] != float64(1) {
+		t.Fatalf("init failed: ok=%v resp=%v", ok, initResp)
+	}
+
+	// Drain notifications.
+	recvWithTimeout(500 * time.Millisecond)
+
+	send(map[string]interface{}{
+		"jsonrpc": "2.0", "method": "notifications/initialized",
+	})
+	// Drain post-initialized notifications.
+	for {
+		if _, ok := recvWithTimeout(500 * time.Millisecond); !ok {
+			break
+		}
+	}
+
+	// Call each tool and verify the response format.
+	tools := []struct {
+		name string
+		args map[string]interface{}
+	}{
+		{"get_check", nil},
+		{"get_trace_stats", nil},
+		{"get_causal_chains", nil},
+		{"run_demo", map[string]interface{}{"scenario": "incident"}},
+		{"run_sql", map[string]interface{}{"query": "SELECT 1 as ok"}},
+		{"get_stacks", nil},
+		{"get_test_report", nil},
+	}
+
+	for i, tool := range tools {
+		reqID := float64(100 + i)
+		args := tool.args
+		if args == nil {
+			args = map[string]interface{}{}
+		}
+		send(map[string]interface{}{
+			"jsonrpc": "2.0", "id": reqID, "method": "tools/call",
+			"params": map[string]interface{}{"name": tool.name, "arguments": args},
+		})
+
+		// Read responses, skip notifications.
+		var resp map[string]interface{}
+		for attempt := 0; attempt < 20; attempt++ {
+			msg, ok := recvWithTimeout(5 * time.Second)
+			if !ok {
+				break
+			}
+			if msg["id"] == reqID {
+				resp = msg
+				break
+			}
+		}
+		if resp == nil {
+			t.Errorf("[%s] no response received", tool.name)
+			continue
+		}
+
+		rawJSON, _ := json.Marshal(resp)
+		rawStr := string(rawJSON)
+
+		// CRITICAL: structuredContent must NOT appear in the response.
+		// Claude Code reads structuredContent when present. If it's {} (empty),
+		// Claude Code shows {} instead of the actual content.
+		if strings.Contains(rawStr, "structuredContent") {
+			t.Errorf("[%s] response contains structuredContent — this breaks Claude Code.\n"+
+				"Fix: use 'any' (not struct{}) as the Out type in ToolHandlerFor, return nil.\n"+
+				"Response: %s", tool.name, rawStr[:min(len(rawStr), 300)])
+		}
+
+		// content MUST be present with at least one entry.
+		result, ok := resp["result"].(map[string]interface{})
+		if !ok {
+			t.Errorf("[%s] no result field in response", tool.name)
+			continue
+		}
+		content, hasContent := result["content"]
+		if !hasContent {
+			t.Errorf("[%s] response missing content field", tool.name)
+		} else if arr, ok := content.([]interface{}); !ok || len(arr) == 0 {
+			t.Errorf("[%s] content is empty or not an array", tool.name)
+		}
 	}
 }
 
