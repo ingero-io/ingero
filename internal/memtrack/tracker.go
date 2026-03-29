@@ -7,7 +7,7 @@ import (
 )
 
 // MemoryState represents the current VRAM allocation state for a single PID.
-// JSON field names are the cross-language contract with the Rust orchestrator.
+// JSON field names are the cross-language contract with external consumers (see docs/remediation-protocol.md).
 type MemoryState struct {
 	PID            uint32  `json:"pid"`
 	AllocatedBytes uint64  `json:"allocated_bytes"`

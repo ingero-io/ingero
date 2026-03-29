@@ -245,7 +245,7 @@ func TestTracker(t *testing.T) {
 				tr.RecordFree(1000, 50, 1711180800000000000)
 			},
 		},
-		// --- Net balance tests (Story 2.0) ---
+		// --- Net balance tests (alloc/free tracking) ---
 		{
 			name: "net_balance/alloc_then_free_returns_to_zero",
 			run: func(t *testing.T) {

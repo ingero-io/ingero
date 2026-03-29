@@ -15,12 +15,12 @@ import (
 )
 
 // Server streams MemoryState updates as NDJSON over a Unix domain socket.
-// A single orchestrator connection is supported at a time.
+// A single consumer connection is supported at a time.
 type Server struct {
 	socketPath string
 	listener   net.Listener
 	mu         sync.Mutex
-	conn       net.Conn // current orchestrator connection, nil if none
+	conn       net.Conn // current consumer connection, nil if none
 	dropped    uint64   // messages dropped due to write timeout or no connection
 }
 
@@ -54,7 +54,7 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// acceptLoop runs in a goroutine, accepting one orchestrator connection at a time.
+// acceptLoop runs in a goroutine, accepting one consumer connection at a time.
 func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
@@ -87,7 +87,7 @@ func isClosedError(err error) bool {
 	return err != nil && errors.Is(err, net.ErrClosed)
 }
 
-// Send serializes ms as NDJSON and writes it to the connected orchestrator.
+// Send serializes ms as NDJSON and writes it to the connected consumer.
 // Non-blocking: silently drops the message if no client is connected or the
 // write exceeds 50ms. Never returns an error.
 // The mutex is held for the full write to prevent acceptLoop from replacing

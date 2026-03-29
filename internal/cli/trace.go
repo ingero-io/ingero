@@ -97,7 +97,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoIO, "no-io", false, "disable block I/O tracing")
 	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
-	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint")
+	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -511,6 +511,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// --- Begin remediate wiring ---
 	var tracker *memtrack.Tracker
 	if traceRemediate {
+		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol.md)")
 		totalVRAM, err := detectVRAM()
 		if err != nil {
 			log.Printf("ERROR: remediate: vram_detection_failed error=%v", err)

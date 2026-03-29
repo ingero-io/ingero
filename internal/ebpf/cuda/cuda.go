@@ -71,8 +71,8 @@ func (t *Tracer) Attach() error {
 		return fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
-	// Pin the watchdog map so the orchestrator can open it by path.
-	// Non-fatal: the watchdog is optional (Story 3.3).
+	// Pin the watchdog map so an external remediation service can open it by path.
+	// Non-fatal: the watchdog is optional.
 	if t.objs.IngeroWatchdog != nil {
 		const watchdogPinPath = "/sys/fs/bpf/ingero_watchdog"
 		os.Remove(watchdogPinPath) // Remove stale pin from previous run.
