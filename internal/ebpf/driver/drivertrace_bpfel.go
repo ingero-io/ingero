@@ -111,6 +111,7 @@ type driverTraceMapSpecs struct {
 	DriverConfigMap *ebpf.MapSpec `ebpf:"driver_config_map"`
 	DriverEntryMap  *ebpf.MapSpec `ebpf:"driver_entry_map"`
 	DriverEvents    *ebpf.MapSpec `ebpf:"driver_events"`
+	IngeroWatchdog  *ebpf.MapSpec `ebpf:"ingero_watchdog"`
 }
 
 // driverTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -145,6 +146,7 @@ type driverTraceMaps struct {
 	DriverConfigMap *ebpf.Map `ebpf:"driver_config_map"`
 	DriverEntryMap  *ebpf.Map `ebpf:"driver_entry_map"`
 	DriverEvents    *ebpf.Map `ebpf:"driver_events"`
+	IngeroWatchdog  *ebpf.Map `ebpf:"ingero_watchdog"`
 }
 
 func (m *driverTraceMaps) Close() error {
@@ -152,6 +154,7 @@ func (m *driverTraceMaps) Close() error {
 		m.DriverConfigMap,
 		m.DriverEntryMap,
 		m.DriverEvents,
+		m.IngeroWatchdog,
 	)
 }
 

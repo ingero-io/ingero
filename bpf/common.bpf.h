@@ -207,4 +207,36 @@ struct cuda_event_stack {
  * v0.8 noisy-neighbor detection (per-cgroup scheduler latency).
  */
 
+// Watchdog heartbeat map -- external remediation service writes timestamp
+// Probes check staleness to bypass remediation if the service is dead
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);  // nanosecond timestamp from bpf_ktime_get_ns()
+} ingero_watchdog SEC(".maps");
+
+// ---- Watchdog: remediation service liveness check ----
+// If the orchestrator heartbeat is older than this threshold, cudaMalloc and
+// cudaFree probes skip event processing. 50ms = 50,000,000 nanoseconds.
+// Matches config.toml [watchdog] stale_threshold_ms default.
+#define WATCHDOG_STALE_NS 50000000ULL
+
+/*
+ * watchdog_is_stale -- returns 1 if orchestrator heartbeat is missing or expired.
+ * Reads ingero_watchdog[0] (defined above).
+ * Both this and the remediation service use CLOCK_BOOTTIME (bpf_ktime_get_ns).
+ */
+static __always_inline int watchdog_is_stale(void)
+{
+	__u32 key = 0;
+	__u64 *last_hb = bpf_map_lookup_elem(&ingero_watchdog, &key);
+	if (!last_hb || *last_hb == 0)
+		return 1;  /* no heartbeat ever written -> bypass */
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 delta = now - *last_hb;
+	return delta > WATCHDOG_STALE_NS;
+}
+
 #endif /* __INGERO_COMMON_BPF_H */

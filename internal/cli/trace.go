@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +27,8 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/tcp"
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
+	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/k8s"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
@@ -55,6 +59,7 @@ var (
 	traceNoIO         bool          // Disable block I/O tracing.
 	traceNoTCP        bool          // Disable TCP retransmit tracing.
 	traceNoNet        bool          // Disable network socket tracing.
+	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 )
 
 var traceCmd = &cobra.Command{
@@ -92,6 +97,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoIO, "no-io", false, "disable block I/O tracing")
 	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
+	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -502,6 +508,29 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Fan-in: merge all event channels into one.
 	merged := mergeAllEventChannels(ctx, cudaTracer.Events(), hostTracer, driverTracer, extraChs...)
 
+	// --- Begin remediate wiring ---
+	var tracker *memtrack.Tracker
+	if traceRemediate {
+		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol.md)")
+		totalVRAM, err := detectVRAM()
+		if err != nil {
+			log.Printf("ERROR: remediate: vram_detection_failed error=%v", err)
+			// Fall through — degrade to OSS mode (tracker stays nil).
+		} else {
+			log.Printf("INFO: remediate: vram_detected total_vram_mib=%d total_vram_bytes=%d", totalVRAM/(1024*1024), totalVRAM)
+			srv := remediate.NewServer("")
+			if err := srv.Start(); err != nil {
+				log.Printf("ERROR: remediate: uds_bind_failed path=/tmp/ingero-remediate.sock error=%v", err)
+				// Fall through — degrade to OSS mode (tracker stays nil).
+			} else {
+				tracker = memtrack.NewTracker(totalVRAM, srv.Send)
+				defer srv.Close()
+				log.Printf("INFO: remediate: enabled total_vram=%d socket=/tmp/ingero-remediate.sock", totalVRAM)
+			}
+		}
+	}
+	// --- End remediate wiring ---
+
 	// Start Prometheus server if configured.
 	if promSrv != nil {
 		go promSrv.Start(ctx)
@@ -599,9 +628,30 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, trackPID)
+}
+
+// ---------------------------------------------------------------------------
+// VRAM detection (--remediate)
+// ---------------------------------------------------------------------------
+
+// detectVRAM queries nvidia-smi for total GPU VRAM and returns the value in bytes.
+// For multi-GPU systems, returns the first GPU's value (single-GPU PoC assumption).
+func detectVRAM() (uint64, error) {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0, fmt.Errorf("detectVRAM: %w", err)
+	}
+	// Take first line only (single-GPU assumption).
+	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	line = strings.TrimSpace(line)
+	mib, err := strconv.ParseUint(line, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("detectVRAM: parsing %q: %w", line, err)
+	}
+	return mib * 1024 * 1024, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1144,7 @@ func (c *pidNameCache) Names() map[uint32]string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1226,6 +1276,11 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Stats and correlator see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
+
+			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
+			if memTracker != nil {
+				memTracker.ProcessEvent(evt)
+			}
 
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {
@@ -1647,7 +1702,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1758,6 +1813,11 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Stats see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
+
+			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
+			if memTracker != nil {
+				memTracker.ProcessEvent(evt)
+			}
 
 			// Selective storage: decide whether to store individually.
 			if eventStore != nil {

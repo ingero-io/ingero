@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-226 total tests.
+251 total tests.
 
 ## Summary
 
@@ -29,6 +29,8 @@
 | synth | 3 | Demo scenario registry, event creation |
 | update | 2 | Semver comparison, version parsing |
 | events | 11 | Stack IP parsing, source/op string names |
+| memtrack | 18 | VRAM balance tracking, net balance (alloc/free), underflow clamp, utilization, sink emission, Driver API allocs |
+| remediate | 7 | UDS server, NDJSON streaming, drop-on-disconnect, reconnection, schema contract |
 
 ## Correlate Engine  -  Causal Chain Tests
 
@@ -372,3 +374,38 @@
 | 224 | TestHandleCapabilities | Full capability manifest (available + grayed) | api_test.go |
 | 225 | TestCapabilitiesStructure | All IDs unique, tooltips on unavailable | api_test.go |
 | 226 | TestHandleOpsBadSince | Invalid since param → 400 error | api_test.go |
+
+## Memory Tracker (memtrack/tracker_test.go)
+
+| # | Test | Description | File |
+|---|------|-------------|------|
+| 227 | TestTracker/malloc_increases_balance | Balance == sum of alloc sizes after N mallocs | tracker_test.go |
+| 228 | TestTracker/free_decreases_balance | Balance == (allocs - frees) after interleaved ops | tracker_test.go |
+| 229 | TestTracker/utilization_percentage | Utilization == allocated_bytes / total_vram * 100 | tracker_test.go |
+| 230 | TestTracker/free_without_malloc_clamps_zero | Balance stays 0 on orphan free | tracker_test.go |
+| 231 | TestTracker/independent_pid_tracking | PID A balance unaffected by PID B events | tracker_test.go |
+| 232 | TestTracker/sink_receives_correct_state | MemoryState fields match tracker state after each event | tracker_test.go |
+| 233 | TestTracker/no_sink_no_panic | nil sink processes events without error | tracker_test.go |
+| 233a | TestTracker/driver_cuMemAlloc_increases_balance | cuMemAlloc_v2 (Driver API) increases VRAM balance | tracker_test.go |
+| 233b | TestTracker/driver_cuMemAllocManaged_increases_balance | cuMemAllocManaged (Driver API) increases VRAM balance | tracker_test.go |
+| 233c | TestTracker/driver_non_alloc_ops_ignored | Non-allocation driver ops (launch, memcpy, sync) ignored by tracker | tracker_test.go |
+| 233d | TestTracker/mixed_runtime_and_driver_allocs_accumulate | cudaMalloc + cuMemAlloc_v2 for same PID accumulate correctly | tracker_test.go |
+| 233e | TestTracker/net_balance/alloc_then_free_returns_to_zero | Malloc 1MB, free 1MB via Args[1] → balance = 0 | tracker_test.go |
+| 233f | TestTracker/net_balance/multiple_alloc_partial_free | Malloc 1MB + 2MB, free 1MB → balance = 2MB | tracker_test.go |
+| 233g | TestTracker/net_balance/free_unknown_pointer_no_change | Free with Args[1]=0 → balance unchanged (graceful degradation) | tracker_test.go |
+| 233h | TestTracker/net_balance/free_exceeds_balance_clamps_zero | Malloc 1MB, free 2MB → balance = 0 (underflow clamp) | tracker_test.go |
+| 233i | TestTracker/net_balance/interleaved_pids_independent | PID A alloc/free, PID B alloc → independent balances | tracker_test.go |
+| 233j | TestTracker/net_balance/1000_alloc_free_cycles_returns_to_baseline | 1000 alloc/free cycles → utilization_pct within 5% of 0 | tracker_test.go |
+| 233k | TestTracker/net_balance/utilization_pct_decreases_on_free | Alloc to 80%, free half → utilization_pct = 40% | tracker_test.go |
+
+## UDS Remediation Server (remediate/server_test.go)
+
+| # | Test | Description | File |
+|---|------|-------------|------|
+| 234 | TestServer/start_and_accept | Server binds UDS and accepts connections | server_test.go |
+| 235 | TestServer/send_writes_valid_ndjson | Send produces valid NDJSON with all 6 fields | server_test.go |
+| 236 | TestServer/send_without_client_drops_silently | Send with no client increments dropped counter, no error | server_test.go |
+| 237 | TestServer/stale_socket_cleanup | Start removes pre-existing socket file and binds successfully | server_test.go |
+| 238 | TestServer/client_reconnect | Server accepts new client after previous disconnects | server_test.go |
+| 239 | TestServer/json_field_names_match_schema | JSON keys exactly match cross-language MemoryState schema | server_test.go |
+| 240 | TestServer/close_removes_socket_file | Close deletes the UDS socket file from filesystem | server_test.go |

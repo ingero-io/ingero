@@ -35,6 +35,26 @@ struct {
 	__type(value, struct entry_state);
 } entry_map SEC(".maps");
 
+// alloc_sizes maps {pid, device_pointer} → allocation size.
+// Used to correlate cudaMalloc/cudaMallocManaged return with cudaFree entry
+// for net balance tracking. Uses full 64-bit device pointer (no truncation)
+// to avoid hash collisions on GPUs with >4 GB virtual address space.
+// 16384 entries covers multi-GPU model-parallel workloads with thousands of
+// concurrent live allocations. If full, new inserts silently fail and the
+// corresponding cudaFree emits freed_bytes=0 (graceful degradation).
+struct alloc_key {
+	__u32 pid;
+	__u32 _pad;
+	__u64 dev_ptr;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct alloc_key);
+	__type(value, __u64);  // allocation size in bytes
+} alloc_sizes SEC(".maps");
+
 // ---- Helper functions ----
 
 static __always_inline void save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg1)
@@ -126,10 +146,14 @@ fallback:;
 SEC("uprobe/cudaMalloc")
 int uprobe_cuda_malloc(struct pt_regs *ctx)
 {
+	if (watchdog_is_stale())
+		return 0;
+
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 dev_ptr_ptr = (__u64)PT_REGS_PARM1(ctx);  // void **devPtr
 	__u64 size = (__u64)PT_REGS_PARM2(ctx);
 
-	save_entry(tid, CUDA_OP_MALLOC, size, 0);
+	save_entry(tid, CUDA_OP_MALLOC, size, dev_ptr_ptr);  // arg1 = devPtr param
 	return 0;
 }
 
@@ -147,6 +171,18 @@ int uretprobe_cuda_malloc(struct pt_regs *ctx)
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
 	emit_event(ctx, pid, tid, entry, ret);
 
+	// Record allocation in alloc_sizes map for net balance tracking.
+	// Only record successful allocations (cudaSuccess == 0).
+	if (ret == 0 && entry->arg1 != 0) {
+		__u64 dev_ptr = 0;
+		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
+		if (dev_ptr != 0) {
+			struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
+			__u64 alloc_size = entry->arg0;
+			bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
+		}
+	}
+
 	bpf_map_delete_elem(&entry_map, &tid);
 	return 0;
 }
@@ -158,10 +194,31 @@ int uretprobe_cuda_malloc(struct pt_regs *ctx)
 SEC("uprobe/cudaFree")
 int uprobe_cuda_free(struct pt_regs *ctx)
 {
-	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	if (watchdog_is_stale())
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
 	__u64 dev_ptr = (__u64)PT_REGS_PARM1(ctx);
 
-	save_entry(tid, CUDA_OP_FREE, dev_ptr, 0);
+	// cudaFree(NULL) is a valid no-op in CUDA — skip map lookup
+	if (dev_ptr == 0) {
+		save_entry(tid, CUDA_OP_FREE, 0, 0);
+		return 0;
+	}
+
+	// Look up allocation size from alloc_sizes map
+	struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
+	__u64 *size_ptr = bpf_map_lookup_elem(&alloc_sizes, &akey);
+	__u64 freed_size = 0;
+	if (size_ptr) {
+		freed_size = *size_ptr;
+		bpf_map_delete_elem(&alloc_sizes, &akey);
+	}
+
+	// arg0 = devPtr (existing), arg1 = freed_bytes (new)
+	save_entry(tid, CUDA_OP_FREE, dev_ptr, freed_size);
 	return 0;
 }
 
@@ -339,9 +396,10 @@ SEC("uprobe/cudaMallocManaged")
 int uprobe_cuda_malloc_managed(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 dev_ptr_ptr = (__u64)PT_REGS_PARM1(ctx);  // void **devPtr
 	__u64 size = (__u64)PT_REGS_PARM2(ctx);
 
-	save_entry(tid, CUDA_OP_MALLOC_MANAGED, size, 0);
+	save_entry(tid, CUDA_OP_MALLOC_MANAGED, size, dev_ptr_ptr);
 	return 0;
 }
 
@@ -358,6 +416,19 @@ int uretprobe_cuda_malloc_managed(struct pt_regs *ctx)
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
 	emit_event(ctx, pid, tid, entry, ret);
+
+	// Record managed allocation in alloc_sizes for net balance tracking.
+	// Without this, cudaFree on managed-memory pointers emits freed_bytes=0,
+	// causing monotonic balance drift for Unified Memory workloads.
+	if (ret == 0 && entry->arg1 != 0) {
+		__u64 dev_ptr = 0;
+		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
+		if (dev_ptr != 0) {
+			struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
+			__u64 alloc_size = entry->arg0;
+			bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
+		}
+	}
 
 	bpf_map_delete_elem(&entry_map, &tid);
 	return 0;

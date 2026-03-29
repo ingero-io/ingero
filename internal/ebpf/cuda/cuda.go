@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -67,6 +69,16 @@ func (t *Tracer) Attach() error {
 	// This is where the verifier checks our C code.
 	if err := loadCudaTraceObjects(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading eBPF objects: %w", err)
+	}
+
+	// Pin the watchdog map so an external remediation service can open it by path.
+	// Non-fatal: the watchdog is optional.
+	if t.objs.IngeroWatchdog != nil {
+		const watchdogPinPath = "/sys/fs/bpf/ingero_watchdog"
+		os.Remove(watchdogPinPath) // Remove stale pin from previous run.
+		if err := t.objs.IngeroWatchdog.Pin(watchdogPinPath); err != nil {
+			log.Printf("WARN: watchdog map pin failed: %v", err)
+		}
 	}
 
 	// If anything below fails, clean up accumulated links + loaded objects.

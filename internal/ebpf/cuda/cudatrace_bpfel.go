@@ -13,6 +13,13 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type cudaTraceAllocKey struct {
+	_      structs.HostLayout
+	Pid    uint32
+	Pad    uint32
+	DevPtr uint64
+}
+
 type cudaTraceCudaEvent struct {
 	_   structs.HostLayout
 	Hdr struct {
@@ -112,9 +119,11 @@ type cudaTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaTraceMapSpecs struct {
-	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
-	EntryMap  *ebpf.MapSpec `ebpf:"entry_map"`
-	Events    *ebpf.MapSpec `ebpf:"events"`
+	AllocSizes     *ebpf.MapSpec `ebpf:"alloc_sizes"`
+	ConfigMap      *ebpf.MapSpec `ebpf:"config_map"`
+	EntryMap       *ebpf.MapSpec `ebpf:"entry_map"`
+	Events         *ebpf.MapSpec `ebpf:"events"`
+	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
 }
 
 // cudaTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -146,16 +155,20 @@ func (o *cudaTraceObjects) Close() error {
 //
 // It can be passed to loadCudaTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaTraceMaps struct {
-	ConfigMap *ebpf.Map `ebpf:"config_map"`
-	EntryMap  *ebpf.Map `ebpf:"entry_map"`
-	Events    *ebpf.Map `ebpf:"events"`
+	AllocSizes     *ebpf.Map `ebpf:"alloc_sizes"`
+	ConfigMap      *ebpf.Map `ebpf:"config_map"`
+	EntryMap       *ebpf.Map `ebpf:"entry_map"`
+	Events         *ebpf.Map `ebpf:"events"`
+	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
 }
 
 func (m *cudaTraceMaps) Close() error {
 	return _CudaTraceClose(
+		m.AllocSizes,
 		m.ConfigMap,
 		m.EntryMap,
 		m.Events,
+		m.IngeroWatchdog,
 	)
 }
 

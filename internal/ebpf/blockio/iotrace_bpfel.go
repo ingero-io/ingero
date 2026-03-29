@@ -102,8 +102,9 @@ type ioTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ioTraceMapSpecs struct {
-	IoEvents   *ebpf.MapSpec `ebpf:"io_events"`
-	IoInflight *ebpf.MapSpec `ebpf:"io_inflight"`
+	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	IoEvents       *ebpf.MapSpec `ebpf:"io_events"`
+	IoInflight     *ebpf.MapSpec `ebpf:"io_inflight"`
 }
 
 // ioTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -133,12 +134,14 @@ func (o *ioTraceObjects) Close() error {
 //
 // It can be passed to loadIoTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ioTraceMaps struct {
-	IoEvents   *ebpf.Map `ebpf:"io_events"`
-	IoInflight *ebpf.Map `ebpf:"io_inflight"`
+	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	IoEvents       *ebpf.Map `ebpf:"io_events"`
+	IoInflight     *ebpf.Map `ebpf:"io_inflight"`
 }
 
 func (m *ioTraceMaps) Close() error {
 	return _IoTraceClose(
+		m.IngeroWatchdog,
 		m.IoEvents,
 		m.IoInflight,
 	)
