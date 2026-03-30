@@ -87,6 +87,18 @@ func isClosedError(err error) bool {
 	return err != nil && errors.Is(err, net.ErrClosed)
 }
 
+// typedMessage wraps MemoryState with a type discriminator for the UDS protocol.
+// The "type" field enables the orchestrator to dispatch by message type.
+type typedMessage struct {
+	Type           string  `json:"type"`
+	PID            uint32  `json:"pid"`
+	AllocatedBytes uint64  `json:"allocated_bytes"`
+	TotalVRAM      uint64  `json:"total_vram"`
+	UtilizationPct float64 `json:"utilization_pct"`
+	LastAllocSize  uint64  `json:"last_alloc_size"`
+	TimestampNs    int64   `json:"timestamp_ns"`
+}
+
 // Send serializes ms as NDJSON and writes it to the connected consumer.
 // Non-blocking: silently drops the message if no client is connected or the
 // write exceeds 50ms. Never returns an error.
@@ -101,7 +113,17 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 		return
 	}
 
-	data, err := json.Marshal(ms)
+	msg := typedMessage{
+		Type:           "memory",
+		PID:            ms.PID,
+		AllocatedBytes: ms.AllocatedBytes,
+		TotalVRAM:      ms.TotalVRAM,
+		UtilizationPct: ms.UtilizationPct,
+		LastAllocSize:  ms.LastAllocSize,
+		TimestampNs:    ms.TimestampNs,
+	}
+
+	data, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("WARN: remediate: marshal_failed error=%v", err)
 		return
