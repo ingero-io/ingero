@@ -338,6 +338,182 @@ func TestDetector(t *testing.T) {
 		}
 	})
 
+	t.Run("sustained_re_emission_after_initial_detection", func(t *testing.T) {
+		sink := &testSink{}
+		cfg := DetectorConfig{
+			ThroughputDropPct:    30,
+			SchedSwitchThreshold: 5,
+			CheckInterval:        time.Second,
+		}
+		d := NewDetector(cfg, sink)
+		clk := newTestClock()
+
+		// Build baseline: 3 intervals of 100 ops/sec.
+		for i := 0; i < minBaselineSamples; i++ {
+			feedLaunchKernels(d, pid, 100)
+			d.checkAt(clk.tick())
+		}
+
+		// Initial correlated detection: throughput drop + high sched_switch.
+		feedLaunchKernels(d, pid, 10) // ~90% drop
+		feedSchedSwitches(d, pid, preemptor, 20)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 1 {
+			t.Fatalf("expected 1 emission (initial), got %d", sink.count())
+		}
+		if sink.last().Sustained {
+			t.Error("initial detection should have Sustained=false")
+		}
+
+		// Next tick: throughput recovers (no drop) but sched_switch still high.
+		// Should re-emit with Sustained=true.
+		feedLaunchKernels(d, pid, 100) // normal throughput
+		feedSchedSwitches(d, pid, preemptor, 20)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 2 {
+			t.Fatalf("expected 2 emissions (initial + sustained), got %d", sink.count())
+		}
+		if !sink.last().Sustained {
+			t.Error("re-emission should have Sustained=true")
+		}
+
+		// Another tick with contention still high → another re-emission.
+		feedLaunchKernels(d, pid, 100)
+		feedSchedSwitches(d, pid, preemptor, 10)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 3 {
+			t.Fatalf("expected 3 emissions, got %d", sink.count())
+		}
+	})
+
+	t.Run("no_re_emission_without_prior_correlated_detection", func(t *testing.T) {
+		sink := &testSink{}
+		cfg := DetectorConfig{
+			ThroughputDropPct:    30,
+			SchedSwitchThreshold: 5,
+			CheckInterval:        time.Second,
+		}
+		d := NewDetector(cfg, sink)
+		clk := newTestClock()
+
+		// Build baseline.
+		for i := 0; i < minBaselineSamples; i++ {
+			feedLaunchKernels(d, pid, 100)
+			d.checkAt(clk.tick())
+		}
+
+		// High sched_switch but no throughput drop → no initial correlated detection.
+		feedLaunchKernels(d, pid, 100)
+		feedSchedSwitches(d, pid, preemptor, 50)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 0 {
+			t.Fatalf("expected no emission (contention only, no prior correlation), got %d", sink.count())
+		}
+
+		// Another tick, still contention only → still no emission.
+		feedLaunchKernels(d, pid, 100)
+		feedSchedSwitches(d, pid, preemptor, 50)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 0 {
+			t.Fatalf("expected no emission (still no prior correlation), got %d", sink.count())
+		}
+	})
+
+	t.Run("sched_switch_drop_clears_sustained_state", func(t *testing.T) {
+		sink := &testSink{}
+		cfg := DetectorConfig{
+			ThroughputDropPct:    30,
+			SchedSwitchThreshold: 5,
+			CheckInterval:        time.Second,
+		}
+		d := NewDetector(cfg, sink)
+		clk := newTestClock()
+
+		// Build baseline.
+		for i := 0; i < minBaselineSamples; i++ {
+			feedLaunchKernels(d, pid, 100)
+			d.checkAt(clk.tick())
+		}
+
+		// Initial correlated detection.
+		feedLaunchKernels(d, pid, 10)
+		feedSchedSwitches(d, pid, preemptor, 20)
+		d.checkAt(clk.tick())
+		if sink.count() != 1 {
+			t.Fatalf("expected 1 emission, got %d", sink.count())
+		}
+
+		// Contention ends (low sched_switch) → clears emitted state.
+		feedLaunchKernels(d, pid, 100)
+		feedSchedSwitches(d, pid, preemptor, 2) // below threshold
+		d.checkAt(clk.tick())
+
+		if sink.count() != 1 {
+			t.Fatalf("expected still 1 emission (contention ended), got %d", sink.count())
+		}
+
+		// Contention returns but no throughput drop → should NOT re-emit
+		// because emitted was cleared.
+		feedLaunchKernels(d, pid, 100)
+		feedSchedSwitches(d, pid, preemptor, 20)
+		d.checkAt(clk.tick())
+
+		if sink.count() != 1 {
+			t.Fatalf("expected still 1 emission (emitted cleared, no new correlation), got %d", sink.count())
+		}
+	})
+
+	t.Run("ema_baseline_not_updated_during_sustained_re_emission", func(t *testing.T) {
+		sink := &testSink{}
+		cfg := DetectorConfig{
+			ThroughputDropPct:    30,
+			SchedSwitchThreshold: 5,
+			CheckInterval:        time.Second,
+		}
+		d := NewDetector(cfg, sink)
+		clk := newTestClock()
+
+		// Build baseline at 100 ops/sec.
+		// First checkAt sets prevTime without counting a sample, so we need
+		// minBaselineSamples+1 iterations to fully build the baseline.
+		for i := 0; i < minBaselineSamples+1; i++ {
+			feedLaunchKernels(d, pid, 100)
+			d.checkAt(clk.tick())
+		}
+
+		// Capture baseline before detection.
+		d.mu.Lock()
+		baselineBefore := d.pids[pid].baseline
+		d.mu.Unlock()
+
+		// Initial correlated detection.
+		feedLaunchKernels(d, pid, 10)
+		feedSchedSwitches(d, pid, preemptor, 20)
+		d.checkAt(clk.tick())
+
+		// Several sustained re-emissions with normal throughput.
+		for i := 0; i < 5; i++ {
+			feedLaunchKernels(d, pid, 100)
+			feedSchedSwitches(d, pid, preemptor, 10)
+			d.checkAt(clk.tick())
+		}
+
+		// Baseline should NOT have decayed during sustained re-emission.
+		d.mu.Lock()
+		baselineAfter := d.pids[pid].baseline
+		d.mu.Unlock()
+
+		if baselineAfter != baselineBefore {
+			t.Errorf("baseline changed during sustained re-emission: before=%.1f after=%.1f",
+				baselineBefore, baselineAfter)
+		}
+	})
+
 	t.Run("multiple_pids_independent", func(t *testing.T) {
 		sink := &testSink{}
 		cfg := DetectorConfig{

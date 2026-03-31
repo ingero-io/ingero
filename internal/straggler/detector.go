@@ -31,6 +31,7 @@ type StraggleState struct {
 	SchedSwitchCount  uint32   `json:"sched_switch_count"`
 	PreemptingPIDs    []uint32 `json:"preempting_pids"`
 	TimestampNs       int64    `json:"timestamp_ns"`
+	Sustained         bool     `json:"sustained"`
 }
 
 // Sink receives StraggleState emissions. Implemented by remediate.Server.
@@ -90,6 +91,10 @@ type pidState struct {
 
 	// Idle tracking for eviction.
 	idleIntervals int // consecutive intervals with zero launch events
+
+	// Sustained re-emission state: true after initial correlated detection,
+	// cleared when sched_switch drops below threshold.
+	emitted bool
 }
 
 // Detector watches for correlated throughput drops and CPU scheduling contention.
@@ -272,19 +277,6 @@ func (d *Detector) checkAt(now time.Time) {
 		// Check scheduling contention.
 		contention := int(schedCount) >= d.config.SchedSwitchThreshold
 
-		// Both signals must fire (correlated detection).
-		if !throughputDrop || !contention {
-			// M1 fix: update EMA only when NOT in straggler state.
-			// This prevents baseline decay during sustained contention,
-			// which would self-suppress detection.
-			if ps.samples >= minBaselineSamples {
-				ps.baseline = emaAlpha*currentOps + (1-emaAlpha)*ps.baseline
-			}
-			continue
-		}
-
-		// Straggler detected — do NOT update EMA baseline (M1 fix).
-
 		// Compute actual drop percentage.
 		dropPct := (1 - currentOps/ps.baseline) * 100
 
@@ -294,18 +286,46 @@ func (d *Detector) checkAt(now time.Time) {
 			preemptingPIDs = append(preemptingPIDs, p)
 		}
 
-		state := StraggleState{
-			PID:               pid,
-			ThroughputDropPct: dropPct,
-			SchedSwitchCount:  schedCount,
-			PreemptingPIDs:    preemptingPIDs,
-			TimestampNs:       now.UnixNano(),
+		// Both signals must fire for initial correlated detection.
+		if throughputDrop && contention {
+			ps.emitted = true
+			// Straggler detected — do NOT update EMA baseline (M1 fix).
+			state := StraggleState{
+				PID:               pid,
+				ThroughputDropPct: dropPct,
+				SchedSwitchCount:  schedCount,
+				PreemptingPIDs:    preemptingPIDs,
+				TimestampNs:       now.UnixNano(),
+				Sustained:         false,
+			}
+			log.Printf("INFO: straggler: detected pid=%d drop=%.1f%% sched_switches=%d preemptors=%v",
+				pid, dropPct, schedCount, preemptingPIDs)
+			emissions = append(emissions, state)
+		} else if contention && ps.emitted {
+			// Sustained re-emission: sched_switch still elevated after initial
+			// correlation. Do NOT update EMA baseline (M1 fix preserved).
+			state := StraggleState{
+				PID:               pid,
+				ThroughputDropPct: dropPct,
+				SchedSwitchCount:  schedCount,
+				PreemptingPIDs:    preemptingPIDs,
+				TimestampNs:       now.UnixNano(),
+				Sustained:         true,
+			}
+			log.Printf("INFO: straggler: sustained pid=%d drop=%.1f%% sched_switches=%d",
+				pid, dropPct, schedCount)
+			emissions = append(emissions, state)
+		} else {
+			// No detection and no sustained contention — update EMA baseline.
+			if !contention {
+				ps.emitted = false // Clear sustained state when contention ends
+			}
+			// M1 fix: update EMA only when NOT in straggler state.
+			if ps.samples >= minBaselineSamples {
+				ps.baseline = emaAlpha*currentOps + (1-emaAlpha)*ps.baseline
+			}
+			continue
 		}
-
-		log.Printf("INFO: straggler: detected pid=%d drop=%.1f%% sched_switches=%d preemptors=%v",
-			pid, dropPct, schedCount, preemptingPIDs)
-
-		emissions = append(emissions, state)
 	}
 
 	d.mu.Unlock()
