@@ -400,7 +400,7 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 	// Phase 2: sched_switch burst (10 events, CPU preemption).
 	// Placed at t=1200ms so the full timeline >1s, triggering the windowed
 	// snapshot in ReplayEventsForChains (not just the final/global fallback).
-	// Args[1] = target_pid (matches real eBPF host_trace.bpf.c output).
+	// Args[1] = prev_pid (the process preempting the target, from host_trace.bpf.c).
 	for i := 0; i < 10; i++ {
 		allEvents = append(allEvents, events.Event{
 			Timestamp: now.Add(time.Duration(1200+i) * time.Millisecond),
@@ -409,7 +409,7 @@ func TestSelectiveStoragePreservesSchedSwitchChain(t *testing.T) {
 			Source:    events.SourceHost,
 			Op:        uint8(events.HostSchedSwitch),
 			Duration:  5 * time.Millisecond,
-			Args:      [2]uint64{0, uint64(pid)}, // target_pid in Args[1]
+			Args:      [2]uint64{0, uint64(9999)}, // prev_pid (preemptor) in Args[1]
 		})
 	}
 

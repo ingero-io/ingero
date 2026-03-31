@@ -29,6 +29,7 @@ import (
 	"github.com/ingero-io/ingero/internal/filter"
 	"github.com/ingero-io/ingero/internal/memtrack"
 	"github.com/ingero-io/ingero/internal/remediate"
+	"github.com/ingero-io/ingero/internal/straggler"
 	"github.com/ingero-io/ingero/internal/k8s"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
@@ -510,6 +511,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// --- Begin remediate wiring ---
 	var tracker *memtrack.Tracker
+	var remediateSrv *remediate.Server
 	if traceRemediate {
 		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol.md)")
 		totalVRAM, err := detectVRAM()
@@ -523,6 +525,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				log.Printf("ERROR: remediate: uds_bind_failed path=/tmp/ingero-remediate.sock error=%v", err)
 				// Fall through — degrade to OSS mode (tracker stays nil).
 			} else {
+				remediateSrv = srv
 				tracker = memtrack.NewTracker(totalVRAM, srv.Send)
 				defer srv.Close()
 				log.Printf("INFO: remediate: enabled total_vram=%d socket=/tmp/ingero-remediate.sock", totalVRAM)
@@ -530,6 +533,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 	// --- End remediate wiring ---
+
+	// --- Begin straggler detector wiring ---
+	var stragglerDetector *straggler.Detector
+	if traceRemediate {
+		var sink straggler.Sink
+		if remediateSrv != nil {
+			sink = remediateSrv
+		}
+		stragglerDetector = straggler.NewDetector(straggler.DefaultConfig(), sink)
+		go stragglerDetector.Run(ctx)
+		log.Printf("INFO: straggler: detector_started config=%s", straggler.DefaultConfig())
+	}
+	// --- End straggler detector wiring ---
 
 	// Start Prometheus server if configured.
 	if promSrv != nil {
@@ -628,9 +644,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1160,7 @@ func (c *pidNameCache) Names() map[uint32]string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1280,6 +1296,11 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
 				memTracker.ProcessEvent(evt)
+			}
+
+			// Straggler detector (--remediate): inline consumer, nil when inactive.
+			if stragglerDet != nil {
+				stragglerDet.ProcessEvent(evt)
 			}
 
 			// Selective storage: decide whether to store individually.
@@ -1702,7 +1723,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1817,6 +1838,11 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
 				memTracker.ProcessEvent(evt)
+			}
+
+			// Straggler detector (--remediate): inline consumer, nil when inactive.
+			if stragglerDet != nil {
+				stragglerDet.ProcessEvent(evt)
 			}
 
 			// Selective storage: decide whether to store individually.

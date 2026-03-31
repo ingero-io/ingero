@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/straggler"
 )
 
 // Server streams MemoryState updates as NDJSON over a Unix domain socket.
@@ -138,6 +139,55 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 		s.conn.Close()
 		s.conn = nil
 	}
+}
+
+// straggleMessage wraps StraggleState with a type discriminator for the UDS protocol.
+type straggleMessage struct {
+	Type              string   `json:"type"`
+	PID               uint32   `json:"pid"`
+	ThroughputDropPct float64  `json:"throughput_drop_pct"`
+	SchedSwitchCount  uint32   `json:"sched_switch_count"`
+	PreemptingPIDs    []uint32 `json:"preempting_pids"`
+	TimestampNs       int64    `json:"timestamp_ns"`
+}
+
+// SendStraggle serializes a StraggleState as NDJSON with type "straggle" and
+// writes it to the connected consumer. Non-blocking: silently drops the message
+// if no client is connected or the write exceeds 50ms. Implements straggler.Sink.
+func (s *Server) SendStraggle(ss straggler.StraggleState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		atomic.AddUint64(&s.dropped, 1)
+		return nil
+	}
+
+	msg := straggleMessage{
+		Type:              "straggle",
+		PID:               ss.PID,
+		ThroughputDropPct: ss.ThroughputDropPct,
+		SchedSwitchCount:  ss.SchedSwitchCount,
+		PreemptingPIDs:    ss.PreemptingPIDs,
+		TimestampNs:       ss.TimestampNs,
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("WARN: remediate: straggle_marshal_failed error=%v", err)
+		return nil
+	}
+	data = append(data, '\n')
+
+	s.conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	_, err = s.conn.Write(data)
+	if err != nil {
+		atomic.AddUint64(&s.dropped, 1)
+		log.Printf("WARN: remediate: straggle_write_failed error=%v dropped=%d", err, atomic.LoadUint64(&s.dropped))
+		s.conn.Close()
+		s.conn = nil
+	}
+	return nil
 }
 
 // Close stops the server, closes any active connection, and removes the socket file.
