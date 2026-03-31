@@ -191,8 +191,11 @@ func (s *Server) SendStraggle(ss straggler.StraggleState) error {
 }
 
 // Close stops the server, closes any active connection, and removes the socket file.
+// Safe to call even if Start() was never called or failed.
 func (s *Server) Close() error {
-	s.listener.Close()
+	if s.listener != nil {
+		s.listener.Close()
+	}
 
 	s.mu.Lock()
 	if s.conn != nil {

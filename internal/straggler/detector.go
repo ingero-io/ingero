@@ -70,6 +70,11 @@ const emaAlpha = 0.2
 // Ensures the EMA has a meaningful baseline before flagging drops.
 const minBaselineSamples = 3
 
+// idleEvictIntervals is the number of consecutive zero-activity check intervals
+// before a PID's state is evicted. Prevents unbounded memory growth from
+// short-lived GPU processes.
+const idleEvictIntervals = 30
+
 // pidState tracks per-PID throughput and scheduling contention.
 type pidState struct {
 	// Throughput tracking (cudaLaunchKernel ops/sec via EMA).
@@ -82,6 +87,9 @@ type pidState struct {
 	// Sched_switch tracking (reset each check interval).
 	schedSwitches  uint32
 	preemptingPIDs map[uint32]bool // PIDs seen preempting this PID
+
+	// Idle tracking for eviction.
+	idleIntervals int // consecutive intervals with zero launch events
 }
 
 // Detector watches for correlated throughput drops and CPU scheduling contention.
@@ -141,27 +149,24 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		if events.HostOp(evt.Op) != events.HostSchedSwitch {
 			return
 		}
-		// sched_switch: evt.PID = process being switched OUT,
-		// evt.Args[1] = next PID being switched IN.
-		// Count when target PID is being preempted (switched out).
+		// sched_switch encoding from host_trace.bpf.c:
+		//   evt.PID  = target PID (the process coming BACK on-CPU)
+		//   evt.Args[1] = prev_pid (the process that was running before,
+		//                  i.e., the most recent preemptor)
+		//   evt.Duration = off-CPU duration
+		//
+		// We count this as one preemption event for the target PID and
+		// record prev_pid as a preempting process.
 		d.mu.Lock()
 		ps, ok := d.pids[evt.PID]
 		if ok {
 			ps.schedSwitches++
-			nextPID := uint32(evt.Args[1])
-			if nextPID > 0 && nextPID != evt.PID {
+			preemptorPID := uint32(evt.Args[1])
+			if preemptorPID > 0 && preemptorPID != evt.PID {
 				if ps.preemptingPIDs == nil {
 					ps.preemptingPIDs = make(map[uint32]bool)
 				}
-				ps.preemptingPIDs[nextPID] = true
-			}
-		}
-		// Also count when target PID is in Args[1] (being switched IN means
-		// it was previously preempted — consistent with correlate.Engine).
-		inPID := uint32(evt.Args[1])
-		if inPID != evt.PID {
-			if ps2, ok2 := d.pids[inPID]; ok2 {
-				ps2.schedSwitches++
+				ps.preemptingPIDs[preemptorPID] = true
 			}
 		}
 		d.mu.Unlock()
@@ -190,9 +195,11 @@ func (d *Detector) check() {
 
 // checkAt is the time-parameterized core of check(), enabling deterministic tests.
 func (d *Detector) checkAt(now time.Time) {
+	// Collect emissions under lock, emit outside lock (H1 fix).
+	// This prevents the event loop from stalling on UDS writes.
+	var emissions []StraggleState
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	for pid, ps := range d.pids {
 		// Skip first check (no previous snapshot to compute rate from).
@@ -206,20 +213,18 @@ func (d *Detector) checkAt(now time.Time) {
 
 		elapsed := now.Sub(ps.prevTime).Seconds()
 		if elapsed <= 0 {
+			// L7 fix: reset counters even on clock backwards to avoid
+			// double-sized delta on the next interval.
+			ps.prevTime = now
+			ps.prevCount = ps.launchCount
+			ps.schedSwitches = 0
+			ps.preemptingPIDs = nil
 			continue
 		}
 
 		// Compute current ops/sec.
 		delta := ps.launchCount - ps.prevCount
 		currentOps := float64(delta) / elapsed
-
-		// Update EMA baseline.
-		if ps.samples == 0 {
-			ps.baseline = currentOps
-		} else {
-			ps.baseline = emaAlpha*currentOps + (1-emaAlpha)*ps.baseline
-		}
-		ps.samples++
 
 		// Snapshot and reset counters for next interval.
 		schedCount := ps.schedSwitches
@@ -228,6 +233,27 @@ func (d *Detector) checkAt(now time.Time) {
 		ps.prevTime = now
 		ps.schedSwitches = 0
 		ps.preemptingPIDs = nil
+
+		// M12 fix: evict PIDs with no activity for idleEvictIntervals.
+		if delta == 0 && schedCount == 0 {
+			ps.idleIntervals++
+			if ps.idleIntervals >= idleEvictIntervals {
+				delete(d.pids, pid)
+				continue
+			}
+		} else {
+			ps.idleIntervals = 0
+		}
+
+		// Update EMA baseline. During baseline building (samples < minBaselineSamples),
+		// always update. After baseline is established, update is deferred until after
+		// detection to implement M1 fix (skip update during sustained straggler).
+		if ps.samples == 0 {
+			ps.baseline = currentOps
+		} else if ps.samples < minBaselineSamples {
+			ps.baseline = emaAlpha*currentOps + (1-emaAlpha)*ps.baseline
+		}
+		ps.samples++
 
 		// Need enough baseline data before detection kicks in.
 		if ps.samples < minBaselineSamples {
@@ -248,8 +274,16 @@ func (d *Detector) checkAt(now time.Time) {
 
 		// Both signals must fire (correlated detection).
 		if !throughputDrop || !contention {
+			// M1 fix: update EMA only when NOT in straggler state.
+			// This prevents baseline decay during sustained contention,
+			// which would self-suppress detection.
+			if ps.samples >= minBaselineSamples {
+				ps.baseline = emaAlpha*currentOps + (1-emaAlpha)*ps.baseline
+			}
 			continue
 		}
+
+		// Straggler detected — do NOT update EMA baseline (M1 fix).
 
 		// Compute actual drop percentage.
 		dropPct := (1 - currentOps/ps.baseline) * 100
@@ -271,10 +305,15 @@ func (d *Detector) checkAt(now time.Time) {
 		log.Printf("INFO: straggler: detected pid=%d drop=%.1f%% sched_switches=%d preemptors=%v",
 			pid, dropPct, schedCount, preemptingPIDs)
 
-		if d.sink != nil {
-			if err := d.sink.SendStraggle(state); err != nil {
-				log.Printf("WARN: straggler: send_failed pid=%d error=%v", pid, err)
-			}
+		emissions = append(emissions, state)
+	}
+
+	d.mu.Unlock()
+
+	// H1 fix: emit outside the lock so UDS writes don't block ProcessEvent.
+	if d.sink != nil {
+		for _, state := range emissions {
+			d.sink.SendStraggle(state)
 		}
 	}
 }
