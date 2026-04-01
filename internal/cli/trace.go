@@ -21,6 +21,7 @@ import (
 	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/ebpf/blockio"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
+	"github.com/ingero-io/ingero/internal/ebpf/cudagraph"
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
 	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
@@ -223,6 +224,25 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 	defer cudaTracer.Close()
 	debugf("CUDA tracer: %d probes attached to %s", cudaTracer.ProbeCount(), libPath)
+
+	// Step 2b: Create CUDA Graph tracer (non-fatal — graceful degradation).
+	// Uses the same libcudart.so. If graph API symbols are absent, skips silently.
+	var graphTracer *cudagraph.Tracer
+	graphProbeCount := 0
+	{
+		gt := cudagraph.New(libPath)
+		if err := gt.Attach(); err != nil {
+			fmt.Fprintf(os.Stderr, "  graph probes: skipped (symbols not found)\n")
+			debugf("graph tracer: attach failed: %v", err)
+		} else {
+			graphTracer = gt
+			graphProbeCount = gt.ProbeCount()
+			debugf("graph tracer: %d probes attached to %s", graphProbeCount, libPath)
+		}
+	}
+	if graphTracer != nil {
+		defer graphTracer.Close()
+	}
 
 	// Step 3: Create host tracer (non-fatal — graceful degradation).
 	// Always attach host tracepoints. When no PIDs are targeted, the BPF
@@ -475,7 +495,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}.NewSnapshotFilter()
 
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
+	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), graphProbeCount, hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
 
 	// Step 7: Launch tracers and merge event channels.
 	go cudaTracer.Run(ctx)
@@ -486,8 +506,12 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go driverTracer.Run(ctx)
 	}
 
-	// Launch new tracers (I/O, TCP, net) — each feeds into the merged channel.
+	// Launch new tracers — each feeds into the merged channel.
 	var extraChs [](<-chan events.Event)
+	if graphTracer != nil {
+		go graphTracer.Run(ctx)
+		extraChs = append(extraChs, graphTracer.Events())
+	}
 	if ioTracer != nil {
 		go ioTracer.Run(ctx)
 		extraChs = append(extraChs, ioTracer.Events())
@@ -1329,7 +1353,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
 			}
-			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver) {
+			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver || evt.Source == events.SourceCUDAGraph) {
 				cudaPIDs[evt.PID] = true
 			}
 
@@ -1345,7 +1369,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				switch evt.Source {
 				case events.SourceHost:
 					corr.RecordHost(evt)
-				case events.SourceIO, events.SourceTCP, events.SourceNet:
+				case events.SourceIO, events.SourceTCP, events.SourceNet, events.SourceCUDAGraph:
 					corr.RecordEvent(evt)
 				}
 				// Auto-register target cgroups for noisy neighbor detection.
@@ -1871,7 +1895,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			if evt.Source != events.SourceHost && len(onFork) > 0 && onFork[0] != nil {
 				onFork[0](evt.PID)
 			}
-			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver) {
+			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver || evt.Source == events.SourceCUDAGraph) {
 				cudaPIDs[evt.PID] = true
 			}
 
@@ -1945,7 +1969,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 // contaminating the JSON stream on stdout. This was a known bug through v0.4
 // where the ASCII header mixed with JSONL output, breaking jq, MCP consumers,
 // and any tool expecting valid JSONL on stdout.
-func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, hostProbeCount int, driverProbeCount int, ioProbeCount int, tcpProbeCount int, netProbeCount int, snapFilter *filter.SnapshotFilter) {
+func printTraceHeader(libPath string, pids []int, processNames []string, cudaProbeCount int, graphProbeCount int, hostProbeCount int, driverProbeCount int, ioProbeCount int, tcpProbeCount int, netProbeCount int, snapFilter *filter.SnapshotFilter) {
 	// In JSON mode, redirect header to stderr so stdout is clean JSONL.
 	w := os.Stdout
 	if traceJSON {
@@ -1983,6 +2007,9 @@ func printTraceHeader(libPath string, pids []int, processNames []string, cudaPro
 
 	fmt.Fprintf(w, "  Library: %s\n", libPath)
 	fmt.Fprintf(w, "  CUDA probes: %d attached\n", cudaProbeCount)
+	if graphProbeCount > 0 {
+		fmt.Fprintf(w, "  Graph probes: %d attached\n", graphProbeCount)
+	}
 	if driverProbeCount > 0 {
 		fmt.Fprintf(w, "  Driver probes: %d attached\n", driverProbeCount)
 	}

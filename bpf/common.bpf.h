@@ -12,6 +12,7 @@
 #define EVENT_SRC_IO      5
 #define EVENT_SRC_TCP     6
 #define EVENT_SRC_NET     7
+#define EVENT_SRC_CUDA_GRAPH 8
 
 /* Host kernel operation types */
 #define HOST_OP_SCHED_SWITCH   1
@@ -51,6 +52,16 @@
 /* Network socket operation types */
 #define NET_OP_SEND   1
 #define NET_OP_RECV   2
+
+/* CUDA Graph lifecycle operation types */
+#define GRAPH_OP_BEGIN_CAPTURE  1
+#define GRAPH_OP_END_CAPTURE    2
+#define GRAPH_OP_INSTANTIATE    3
+#define GRAPH_OP_LAUNCH         4
+/* Reserved for P1: */
+#define GRAPH_OP_DESTROY        5
+#define GRAPH_OP_EXEC_UPDATE    6
+#define GRAPH_OP_EXEC_DESTROY   7
 
 /* Per-thread entry state: timestamp + args at CUDA/driver function entry.
  * Shared by cuda_trace.bpf.c and driver_trace.bpf.c.
@@ -155,6 +166,43 @@ struct ingero_net_event {
 	__u32 bytes;            /* bytes sent or received */
 	__u8  direction;        /* NET_OP_SEND or NET_OP_RECV */
 	__u8  _pad_net[7];
+};
+
+/* Per-thread entry state for CUDA Graph probes.
+ * Separate from entry_state to avoid collisions — a thread may be in a
+ * graph API call while another map tracks CUDA runtime calls.
+ * Keyed by TID.
+ */
+struct graph_entry_state {
+	__u64 timestamp_ns;
+	__u8  op;
+	__u8  _pad[7];
+	__u64 stream_handle;
+	__u64 graph_handle;
+	__u64 exec_handle;
+	__u32 capture_mode;
+	__u32 _pad2;
+};
+
+/* CUDA Graph lifecycle event (72 bytes).
+ *
+ * Layout:
+ *   offset  0: hdr              (32 bytes — ingero_event_hdr)
+ *   offset 32: duration_ns      (8)
+ *   offset 40: stream_handle    (8) — stream for BeginCapture/EndCapture/Launch
+ *   offset 48: graph_handle     (8) — graph for EndCapture/Instantiate
+ *   offset 56: exec_handle      (8) — executable for Instantiate/Launch
+ *   offset 64: capture_mode     (4) — for BeginCapture (0=global, 1=thread_local, 2=relaxed)
+ *   offset 68: return_code      (4) — cudaError_t
+ */
+struct cuda_graph_event {
+	struct ingero_event_hdr hdr;
+	__u64 duration_ns;
+	__u64 stream_handle;
+	__u64 graph_handle;
+	__u64 exec_handle;
+	__u32 capture_mode;
+	__s32 return_code;
 };
 
 /*

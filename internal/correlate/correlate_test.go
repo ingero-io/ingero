@@ -1894,3 +1894,203 @@ func TestThroughputDropHighSeverity(t *testing.T) {
 	}
 	t.Error("expected throughput-drop chain with HIGH severity")
 }
+
+// --- CUDA Graph correlation tests ---
+
+func makeGraphEvt(op events.CUDAGraphOp, pid uint32, dur time.Duration, stream, graph, exec uint64, mode uint32, retCode int32) events.Event {
+	return events.Event{
+		Timestamp:    time.Now(),
+		PID:          pid,
+		TID:          pid,
+		Source:       events.SourceCUDAGraph,
+		Op:           uint8(op),
+		Duration:     dur,
+		RetCode:      retCode,
+		StreamHandle: stream,
+		GraphHandle:  graph,
+		ExecHandle:   exec,
+		CaptureMode:  mode,
+	}
+}
+
+func TestGraphCaptureOOM(t *testing.T) {
+	eng := New(WithMaxAge(0)) // no pruning
+
+	pid := uint32(1234)
+
+	// Record a graph capture that failed (retCode != 0).
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0))
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, pid, 5*time.Millisecond, 0xABCD, 0xBEEF, 0, 0, 1)) // retCode=1 = failure
+
+	cudaOps := []stats.OpStats{
+		{Op: "cudaMalloc", OpCode: uint8(events.CUDAMalloc), Source: events.SourceCUDA, Count: 100, P50: time.Millisecond, P99: 50 * time.Millisecond},
+	}
+
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+
+	found := false
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-oom" {
+			found = true
+			if ch.Severity != "HIGH" {
+				t.Errorf("severity = %q, want HIGH", ch.Severity)
+			}
+			if !strings.Contains(ch.RootCause, "OOM") && !strings.Contains(ch.RootCause, "capture failed") {
+				t.Errorf("RootCause should mention OOM or capture failed, got: %s", ch.RootCause)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected graph-capture-oom chain, got none")
+	}
+}
+
+func TestGraphCaptureNoOOM(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+
+	// Record a successful graph capture (retCode=0), no memory pressure.
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0))
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, pid, 5*time.Millisecond, 0xABCD, 0xBEEF, 0, 0, 0))
+
+	cudaOps := []stats.OpStats{
+		{Op: "cudaMalloc", OpCode: uint8(events.CUDAMalloc), Source: events.SourceCUDA, Count: 100, P50: time.Millisecond, P99: 2 * time.Millisecond},
+	}
+
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-oom" {
+			t.Error("should not produce graph-capture-oom chain when capture succeeds and no memory pressure")
+		}
+	}
+}
+
+func TestGraphLaunchCPUContention(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+	now := time.Now()
+
+	// Record a graph launch.
+	launchEvt := makeGraphEvt(events.GraphLaunch, pid, 500*time.Microsecond, 0xABCD, 0, 0xCAFE, 0, 0)
+	launchEvt.Timestamp = now
+	eng.RecordEvent(launchEvt)
+
+	// Record sched_switch events near the launch time.
+	for i := 0; i < 10; i++ {
+		evt := makeHostEvt(events.HostSchedSwitch, pid, 2*time.Millisecond, [2]uint64{0, uint64(pid)})
+		evt.Timestamp = now.Add(-time.Duration(i) * time.Millisecond)
+		eng.RecordHost(evt)
+	}
+
+	cudaOps := []stats.OpStats{}
+
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+	found := false
+	for _, ch := range chains {
+		if ch.ID == "graph-launch-cpu-contention" {
+			found = true
+			if ch.Severity != "MEDIUM" {
+				t.Errorf("severity = %q, want MEDIUM", ch.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected graph-launch-cpu-contention chain")
+	}
+}
+
+func TestGraphLaunchNoCPUContention(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+
+	// Record a graph launch with no sched_switch events.
+	eng.RecordEvent(makeGraphEvt(events.GraphLaunch, pid, 100*time.Microsecond, 0xABCD, 0, 0xCAFE, 0, 0))
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+	for _, ch := range chains {
+		if ch.ID == "graph-launch-cpu-contention" {
+			t.Error("should not produce contention chain without sched_switch events")
+		}
+	}
+}
+
+func TestGraphFrequencyAnomaly(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+	exec := uint64(0xCAFE)
+
+	// Simulate a burst of launches to establish a peak rate, then a drop.
+	now := time.Now()
+
+	// Phase 1: High rate — 100 launches over 1 second (100/s).
+	for i := 0; i < 100; i++ {
+		evt := makeGraphEvt(events.GraphLaunch, pid, 100*time.Microsecond, 0xABCD, 0, exec, 0, 0)
+		evt.Timestamp = now.Add(time.Duration(i) * 10 * time.Millisecond)
+		eng.RecordEvent(evt)
+	}
+
+	// Phase 2: Low rate — 10 launches over 2 seconds (5/s = 95% drop from 100/s).
+	base := now.Add(5 * time.Second)
+	for i := 0; i < 10; i++ {
+		evt := makeGraphEvt(events.GraphLaunch, pid, 100*time.Microsecond, 0xABCD, 0, exec, 0, 0)
+		evt.Timestamp = base.Add(time.Duration(i) * 200 * time.Millisecond)
+		eng.RecordEvent(evt)
+	}
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+	found := false
+	for _, ch := range chains {
+		if strings.HasPrefix(ch.ID, "graph-freq-anomaly") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected graph frequency anomaly chain")
+	}
+}
+
+func TestGraphFrequencyStable(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+	exec := uint64(0xCAFE)
+	now := time.Now()
+
+	// Stable rate — 50 launches over 1 second.
+	for i := 0; i < 50; i++ {
+		evt := makeGraphEvt(events.GraphLaunch, pid, 100*time.Microsecond, 0xABCD, 0, exec, 0, 0)
+		evt.Timestamp = now.Add(time.Duration(i) * 20 * time.Millisecond)
+		eng.RecordEvent(evt)
+	}
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+	for _, ch := range chains {
+		if strings.HasPrefix(ch.ID, "graph-freq-anomaly") {
+			t.Error("should not flag frequency anomaly for stable rate")
+		}
+	}
+}
+
+func TestGraphCorrelationPIDIsolation(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	// PID 1234 has a graph capture failure.
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, 1234, 0, 0xABCD, 0, 0, 0, 0))
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, 1234, 5*time.Millisecond, 0xABCD, 0xBEEF, 0, 0, 1))
+
+	// Query for PID 5678 — should see no graph chains.
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, 5678)
+	for _, ch := range chains {
+		if strings.HasPrefix(ch.ID, "graph-") {
+			t.Errorf("PID 5678 should not see graph chains from PID 1234, got: %s", ch.ID)
+		}
+	}
+}

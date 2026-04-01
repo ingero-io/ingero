@@ -349,6 +349,135 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, Capabilities())
 }
 
+// handleGraphMetrics returns aggregate graph metrics.
+func (s *Server) handleGraphMetrics(w http.ResponseWriter, r *http.Request) {
+	since, err := parseSince(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if s.store == nil {
+		writeJSON(w, map[string]interface{}{
+			"captures": 0, "instantiations": 0, "launches": 0,
+		})
+		return
+	}
+
+	evts, err := s.store.Query(store.QueryParams{
+		Since:  since,
+		Source: uint8(events.SourceCUDAGraph),
+		Limit:  -1,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	captures := 0
+	instantiations := 0
+	launches := 0
+	var totalCaptureDur, totalInstDur time.Duration
+
+	for _, evt := range evts {
+		switch events.CUDAGraphOp(evt.Op) {
+		case events.GraphBeginCapture:
+			captures++
+		case events.GraphEndCapture:
+			totalCaptureDur += evt.Duration
+		case events.GraphInstantiate:
+			instantiations++
+			totalInstDur += evt.Duration
+		case events.GraphLaunch:
+			launches++
+		}
+	}
+
+	resp := map[string]interface{}{
+		"captures":       captures,
+		"instantiations": instantiations,
+		"launches":       launches,
+		"total_events":   len(evts),
+	}
+	if captures > 0 {
+		resp["avg_capture_dur_us"] = int64(totalCaptureDur/time.Duration(captures)) / 1000
+	}
+	if instantiations > 0 {
+		resp["avg_instantiate_dur_us"] = int64(totalInstDur/time.Duration(instantiations)) / 1000
+	}
+	if launches > 0 && len(evts) > 1 {
+		window := evts[len(evts)-1].Timestamp.Sub(evts[0].Timestamp).Seconds()
+		if window > 0 {
+			resp["launch_rate_per_sec"] = float64(launches) / window
+		}
+	}
+
+	writeJSON(w, resp)
+}
+
+// handleGraphEvents returns recent graph events.
+func (s *Server) handleGraphEvents(w http.ResponseWriter, r *http.Request) {
+	since, err := parseSince(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if s.store == nil {
+		writeJSON(w, []interface{}{})
+		return
+	}
+
+	limit := 100
+	evts, err := s.store.Query(store.QueryParams{
+		Since:  since,
+		Source: uint8(events.SourceCUDAGraph),
+		Limit:  limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	type graphEventResp struct {
+		Timestamp    string `json:"timestamp"`
+		PID          uint32 `json:"pid"`
+		Op           string `json:"op"`
+		DurationUS   int64  `json:"duration_us"`
+		StreamHandle string `json:"stream_handle,omitempty"`
+		GraphHandle  string `json:"graph_handle,omitempty"`
+		ExecHandle   string `json:"exec_handle,omitempty"`
+		CaptureMode  uint32 `json:"capture_mode,omitempty"`
+		RetCode      int32  `json:"ret_code"`
+	}
+
+	results := make([]graphEventResp, 0, len(evts))
+	for _, evt := range evts {
+		entry := graphEventResp{
+			Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
+			PID:        evt.PID,
+			Op:         events.CUDAGraphOp(evt.Op).String(),
+			DurationUS: int64(evt.Duration / time.Microsecond),
+			RetCode:    evt.RetCode,
+		}
+		if evt.StreamHandle != 0 {
+			entry.StreamHandle = fmt.Sprintf("0x%x", evt.StreamHandle)
+		}
+		if evt.GraphHandle != 0 {
+			entry.GraphHandle = fmt.Sprintf("0x%x", evt.GraphHandle)
+		}
+		if evt.ExecHandle != 0 {
+			entry.ExecHandle = fmt.Sprintf("0x%x", evt.ExecHandle)
+		}
+		if events.CUDAGraphOp(evt.Op) == events.GraphBeginCapture {
+			entry.CaptureMode = evt.CaptureMode
+		}
+		results = append(results, entry)
+	}
+
+	writeJSON(w, results)
+}
+
 // sourceString converts a source ID to a human-readable string.
 func sourceString(src uint8) string {
 	switch events.Source(src) {
@@ -364,6 +493,8 @@ func sourceString(src uint8) string {
 		return "TCP"
 	case events.SourceNet:
 		return "Net"
+	case events.SourceCUDAGraph:
+		return "CUDAGraph"
 	default:
 		return fmt.Sprintf("src_%d", src)
 	}

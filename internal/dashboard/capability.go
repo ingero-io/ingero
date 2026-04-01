@@ -34,6 +34,7 @@ func Capabilities() []Capability {
 		{ID: "net_io", Label: "Network Socket I/O", Available: true, Source: "eBPF tracepoints (sendto/recvfrom)"},
 		{ID: "causal_chains", Label: "Causal Chains", Available: true, Source: "4-layer correlate engine"},
 		{ID: "stack_traces", Label: "Stack Traces", Available: true, Source: "eBPF + DWARF + Python frames"},
+		{ID: "cuda_graph", Label: "CUDA Graph Lifecycle", Available: true, Source: "eBPF uprobes on libcudart.so (graph APIs)"},
 
 		// Grayed out — not yet collected by Ingero.
 		{ID: "gpu_util", Label: "GPU SM Utilization", Available: false, RequiredTool: "NVML", Tooltip: "Planned: NVML integration (GPU utilization polling)"},
