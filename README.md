@@ -57,8 +57,9 @@ Ingero uses eBPF to trace GPU workloads at three layers, reads system metrics fr
 
 1. **CUDA Runtime uprobes**  -  traces `cudaMalloc`, `cudaFree`, `cudaLaunchKernel`, `cudaMemcpy`, `cudaMemcpyAsync`, `cudaStreamSync` / `cudaDeviceSynchronize` via uprobes on `libcudart.so`
 2. **CUDA Driver uprobes**  -  traces `cuLaunchKernel`, `cuMemcpy`, `cuMemcpyAsync`, `cuCtxSynchronize`, `cuMemAlloc` via uprobes on `libcuda.so`. Captures kernel launches from cuBLAS/cuDNN that bypass the runtime API.
-3. **Host tracepoints**  -  traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
-4. **System context**  -  reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
+3. **CUDA Graph lifecycle uprobes**  -  traces `cudaStreamBeginCapture`, `cudaStreamEndCapture`, `cudaGraphInstantiate`, `cudaGraphLaunch` for graph capture/replay visibility in `torch.compile` and vLLM workloads
+4. **Host tracepoints**  -  traces `sched_switch`, `sched_wakeup`, `mm_page_alloc`, `oom_kill`, `sched_process_exec/exit/fork` for CPU scheduling, memory pressure, and process lifecycle
+5. **System context**  -  reads CPU utilization, memory usage, load average, and swap from `/proc` (no eBPF, no root needed)
 
 The **causal engine** correlates events across layers by timestamp and PID to produce automated root cause analysis with severity ranking and fix recommendations.
 
@@ -115,6 +116,8 @@ Things no other GPU tool can show you.
 
 **"Your host is swapping and your GPU doesn't know it."** System Context shows Swap 2.1 GB. cudaMalloc p99 rises from 0.02ms to 8.4ms. No GPU tool shows this  -  nvidia-smi says GPU memory is fine, but host-side CUDA bookkeeping is hitting swap.
 
+**"Your vLLM inference spiked because a new batch size triggered CUDA Graph re-capture."** Ingero traces `cudaStreamBeginCapture` / `cudaGraphLaunch` via eBPF uprobes  -  no CUPTI, no Nsight, no code changes. When GraphLaunch rate drops 50%, Ingero flags graph pool exhaustion. When capture overlaps with OOM, the causal chain explains why. Works with `torch.compile(mode="reduce-overhead")` and vLLM out of the box.
+
 **"Ask your AI: what line of my code caused the GPU stall?"** Your AI assistant calls Ingero's MCP server and answers in one shot: "The issue is in `forward()` at `train.py:142`, calling cudaMalloc through PyTorch. 9,829 calls, avg 3.1ms but spiking to 48.3ms during CPU contention." Resolved Python source lines, native symbols, timing stats  -  no logs, no manual SQL, no hex addresses. The engineer asks questions in plain English and gets production root causes back.
 
 ## See It In Action
@@ -132,6 +135,16 @@ Things no other GPU tool can show you.
 <details><summary><code>ingero explain --since 5m</code> — automated diagnosis</summary>
 <br>
 <img src="docs/assets/readme-explain.gif" width="800" alt="ingero explain producing incident report with causal chains, root cause analysis, and fix recommendations">
+</details>
+
+<details><summary><code>sudo ingero trace</code> — CUDA Graph lifecycle events</summary>
+<br>
+<img src="docs/assets/cuda-graph-trace.gif" width="800" alt="ingero trace showing CUDA Graph capture, instantiate, and launch events alongside CUDA runtime and host events">
+</details>
+
+<details><summary><code>ingero explain</code> — graph causal chain diagnosis</summary>
+<br>
+<img src="docs/assets/cuda-graph-explain.gif" width="800" alt="ingero explain showing causal chain linking CUDA Graph launch to CPU contention with fix recommendations">
 </details>
 
 <details><summary><code>ingero demo --no-gpu incident</code> — try without a GPU</summary>
@@ -327,11 +340,12 @@ sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 - **`--user`**: target all CUDA processes owned by a specific user (`--user bob`, `--user root`).
 - **Dynamic child tracking**: fork events auto-enroll child PIDs for host correlation.
 
-The trace display shows four sections:
+The trace display shows five sections:
 1. **System Context**  -  CPU, memory, load, swap with ASCII bar charts (green/yellow/red)
-2. **CUDA Runtime API**  -  per-operation p50/p95/p99 latency with anomaly flags (cudaMalloc, cudaLaunchKernel, etc.)
+2. **CUDA Runtime API**  -  per-operation p50/p95/p99 latency with anomaly flags (cudaMalloc, cudaLaunchKernel, graphLaunch, etc.)
 3. **CUDA Driver API**  -  driver-level operations (cuLaunchKernel, cuMemAlloc, etc.) that cuBLAS/cuDNN call directly
 4. **Host Context**  -  scheduler, memory, OOM, and process lifecycle events
+5. **CUDA Graph events**  -  graph capture, instantiate, and launch events (when graph-using workloads are traced)
 
 ### `ingero explain`
 
@@ -423,6 +437,8 @@ ingero mcp --http :8080 --tls-cert cert.pem --tls-key key.pem  # custom TLS cert
 | `get_trace_stats` | CUDA + host statistics (p50/p95/p99 or aggregate fallback for large DBs) |
 | `get_causal_chains` | Causal chains with severity ranking and root cause (deduplicated, top 10 by default) |
 | `get_stacks` | Resolved call stacks for CUDA/driver operations (symbols, source files, timing) |
+| `graph_lifecycle` | CUDA Graph lifecycle timeline for a PID: capture, instantiate, launch sequences |
+| `graph_frequency` | Graph launch frequency per executable: hot/cold classification, pool saturation |
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
 | `run_sql` | Execute read-only SQL for ad-hoc analysis |
@@ -501,6 +517,8 @@ ssh -L 8080:localhost:8080 user@gpu-vm
 | `GET /api/v1/chains?since=1h` | Stored causal chains with severity, root cause, timeline |
 | `GET /api/v1/snapshots?since=60s` | System metric time series (CPU, memory, swap, load) |
 | `GET /api/v1/capabilities` | Metric availability manifest (available vs. grayed-out with required tool) |
+| `GET /api/v1/graph-metrics` | CUDA Graph metrics: capture/launch rates, instantiation durations |
+| `GET /api/v1/graph-events` | Recent CUDA Graph events with handles and durations |
 
 ### `ingero demo`
 
@@ -634,8 +652,10 @@ Zero external dependencies  -  no OTEL SDK import. The JSON payload is construct
 │     ▼              │ └────────────────────┘                    │
 │  ┌─────────┐       │ ┌────────────────────┐                    │
 │  │libcudart│◄──────┘ │  eBPF uprobes      │  (Runtime API)     │
-│  │  .so    │         │  cudaLaunchKernel  │                    │
+│  │  .so    │◄────────│  cudaLaunchKernel  │                    │
 │  └─────────┘         │  cudaMalloc/Memcpy │                    │
+│                      │  Graph: Capture,   │                    │
+│                      │  Instantiate,Launch│                    │
 │                      └────────────────────┘                    │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │  eBPF tracepoints (sched_switch, mm_page_alloc, oom,    │   │
@@ -651,7 +671,7 @@ Zero external dependencies  -  no OTEL SDK import. The JSON payload is construct
 3. **Capture**  -  eBPF programs record PID, TID, timestamps into per-layer ring buffers
 4. **System**  -  reads CPU/memory/load/swap from `/proc` once per second
 5. **Stats**  -  computes rolling p50/p95/p99 per operation, flags anomalies
-6. **Correlate**  -  assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver) by timestamp and PID
+6. **Correlate**  -  assembles causal chains (SYSTEM + HOST + CUDA Runtime + CUDA Driver + CUDA Graph) by timestamp and PID
 7. **Store**  -  writes events to SQLite with size-based pruning (`--max-db 10g` default). Disable recording with `--record=false`
 8. **Export**  -  pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
 9. **Serve**  -  exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
@@ -684,6 +704,7 @@ Ingero addresses 25 documented GPU problems across training, inference, and AI a
 | 4 | Silent data corruption (SDC) | CRITICAL | Anomalous kernel timing as indirect signal (limited) |
 | 5 | Inference cost explosion (multi-step agents) | CRITICAL | CUDA API burst/idle patterns per agent session |
 | 6 | KV cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption. Managed-memory page fault detection |
+| 6b | CUDA Graph re-capture latency spikes (vLLM, torch.compile) | HIGH | Graph lifecycle tracing: capture/instantiate/launch rates, pool exhaustion detection, OOM during capture, CPU contention during launch |
 | 7 | GPU hardware failures at scale | HIGH | `cudaMemcpy` baseline drift, `sched_switch` frequency anomalies |
 | 8 | CPU bottleneck in GPU serving | HIGH | `sched_switch` on inference process + `cudaStreamSync` idle gaps |
 | 9 | GPU idle waste during agent tool execution | HIGH | CUDA API silence periods correlated with host process activity. TCP tracing shows "GPU idle during 2s HTTP tool call" |

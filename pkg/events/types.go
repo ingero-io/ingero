@@ -44,7 +44,8 @@ const (
 	SourceDriver Source = 4
 	SourceIO     Source = 5
 	SourceTCP    Source = 6
-	SourceNet    Source = 7
+	SourceNet       Source = 7
+	SourceCUDAGraph Source = 8
 )
 
 // String implements fmt.Stringer.
@@ -64,6 +65,8 @@ func (s Source) String() string {
 		return "tcp"
 	case SourceNet:
 		return "net"
+	case SourceCUDAGraph:
+		return "cuda_graph"
 	default:
 		return fmt.Sprintf("unknown(%d)", s)
 	}
@@ -258,6 +261,34 @@ func (op NetOp) String() string {
 	}
 }
 
+// CUDAGraphOp identifies a CUDA Graph lifecycle operation.
+//
+// These values MUST match the GRAPH_OP_* defines in bpf/common.bpf.h.
+type CUDAGraphOp uint8
+
+const (
+	GraphBeginCapture CUDAGraphOp = 1
+	GraphEndCapture   CUDAGraphOp = 2
+	GraphInstantiate  CUDAGraphOp = 3
+	GraphLaunch       CUDAGraphOp = 4
+)
+
+// String returns a human-readable name for the CUDA Graph operation.
+func (op CUDAGraphOp) String() string {
+	switch op {
+	case GraphBeginCapture:
+		return "graphBeginCapture"
+	case GraphEndCapture:
+		return "graphEndCapture"
+	case GraphInstantiate:
+		return "graphInstantiate"
+	case GraphLaunch:
+		return "graphLaunch"
+	default:
+		return fmt.Sprintf("graph_op(%d)", op)
+	}
+}
+
 // OpName returns the human-readable name for the Op field of an Event.
 // It dispatches based on the Source to pick the right set of op names.
 func (e Event) OpName() string {
@@ -274,6 +305,8 @@ func (e Event) OpName() string {
 		return TCPOp(e.Op).String()
 	case SourceNet:
 		return NetOp(e.Op).String()
+	case SourceCUDAGraph:
+		return CUDAGraphOp(e.Op).String()
 	default:
 		return fmt.Sprintf("op(%d)", e.Op)
 	}
@@ -360,6 +393,19 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		}
 	}
 
+	// CUDA Graph ops.
+	graphOps := map[string]CUDAGraphOp{
+		"graphbegincapture": GraphBeginCapture,
+		"graphendcapture":   GraphEndCapture,
+		"graphinstantiate":  GraphInstantiate,
+		"graphlaunch":       GraphLaunch,
+	}
+	for k, v := range graphOps {
+		if lower == k {
+			return SourceCUDAGraph, uint8(v), true
+		}
+	}
+
 	// Network socket ops.
 	netOps := map[string]NetOp{
 		"net_send": NetSend,
@@ -407,4 +453,10 @@ type Event struct {
 	RetCode   int32         // CUDA return code (0 = success)
 	Stack     []StackFrame  // userspace stack trace (nil when --stack not enabled)
 	CGroupID  uint64        // cgroup v2 inode ID (0 or 1 = no meaningful cgroup)
+
+	// CUDA Graph fields (only populated for SourceCUDAGraph events):
+	StreamHandle uint64 // stream for BeginCapture/EndCapture/Launch
+	GraphHandle  uint64 // graph for EndCapture/Instantiate
+	ExecHandle   uint64 // executable for Instantiate/Launch
+	CaptureMode  uint32 // for BeginCapture (0=global, 1=thread_local, 2=relaxed)
 }

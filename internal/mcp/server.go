@@ -1,6 +1,6 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes seven tools and one prompt to AI agents:
+// The MCP server exposes nine tools and one prompt to AI agents:
 //
 // Tools:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
@@ -10,6 +10,8 @@
 //   - get_test_report: Return the GPU integration test report (JSON)
 //   - run_sql: Execute read-only SQL for ad-hoc analysis
 //   - get_stacks: Get resolved call stacks for operations (symbol names, source files)
+//   - graph_lifecycle: CUDA Graph lifecycle timeline for a PID
+//   - graph_frequency: Graph launch frequency and hot/cold classification
 //
 // Prompts:
 //   - /investigate: Guided investigation workflow for diagnosing GPU issues
@@ -880,6 +882,142 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			},
 		}, nil, nil
 	})
+
+	// Tool 8: graph_lifecycle
+	type graphLifecycleInput struct {
+		PID   int    `json:"pid" jsonschema:"Process ID to query graph events for (required)"`
+		Since string `json:"since,omitempty" jsonschema:"Time range, e.g. 5m, 1h. Omit for saved DBs."`
+		TSC   *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+	}
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name:        "graph_lifecycle",
+		Description: "Show CUDA Graph lifecycle timeline for a PID: capture → instantiate → launch sequences with timestamps and durations. Identifies graph activity patterns in torch.compile and vLLM workloads.",
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input graphLifecycleInput) (*gomcp.CallToolResult, any, error) {
+		if s.store == nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
+				},
+			}, nil, nil
+		}
+
+		if input.PID <= 0 {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "pid is required. Use get_trace_stats to find active PIDs."},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		q := store.QueryParams{
+			PIDs:   []uint32{uint32(input.PID)},
+			Source: uint8(events.SourceCUDAGraph),
+			Limit:  -1,
+		}
+		if input.Since != "" {
+			d, err := time.ParseDuration(input.Since)
+			if err != nil {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("invalid since: %v", err)},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+			q.Since = d
+		}
+
+		evts, err := s.store.Query(q)
+		if err != nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf("query error: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		tsc := input.TSC == nil || *input.TSC
+		text := formatGraphLifecycle(evts, uint32(input.PID), tsc)
+
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: text},
+			},
+		}, nil, nil
+	})
+
+	// Tool 9: graph_frequency
+	type graphFrequencyInput struct {
+		PID           int    `json:"pid" jsonschema:"Process ID to query graph launch frequency for (required)"`
+		WindowSeconds int    `json:"window_seconds,omitempty" jsonschema:"Analysis window in seconds (default 60)"`
+		Since         string `json:"since,omitempty" jsonschema:"Time range, e.g. 5m, 1h. Omit for saved DBs."`
+		TSC           *bool  `json:"tsc,omitempty" jsonschema:"telegraphic compression (default: true)"`
+	}
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name:        "graph_frequency",
+		Description: "Analyze CUDA Graph launch frequency per executable. Identifies hot graphs (high replay rate), cold graphs (captured but rarely launched), and graph pool saturation. Essential for vLLM batch size tuning.",
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input graphFrequencyInput) (*gomcp.CallToolResult, any, error) {
+		if s.store == nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "No database available. Run 'ingero trace' first."},
+				},
+			}, nil, nil
+		}
+
+		if input.PID <= 0 {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: "pid is required. Use get_trace_stats to find active PIDs."},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		q := store.QueryParams{
+			PIDs:   []uint32{uint32(input.PID)},
+			Source: uint8(events.SourceCUDAGraph),
+			Limit:  -1,
+		}
+		if input.Since != "" {
+			d, err := time.ParseDuration(input.Since)
+			if err != nil {
+				return &gomcp.CallToolResult{
+					Content: []gomcp.Content{
+						&gomcp.TextContent{Text: fmt.Sprintf("invalid since: %v", err)},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+			q.Since = d
+		}
+
+		evts, err := s.store.Query(q)
+		if err != nil {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf("query error: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		windowSec := input.WindowSeconds
+		if windowSec <= 0 {
+			windowSec = 60
+		}
+
+		tsc := input.TSC == nil || *input.TSC
+		text := formatGraphFrequency(evts, uint32(input.PID), windowSec, tsc)
+
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: text},
+			},
+		}, nil, nil
+	})
 }
 
 func (s *Server) registerPrompts() {
@@ -899,8 +1037,9 @@ func (s *Server) registerPrompts() {
 Your task:
 1. Call get_trace_stats with NO parameters (no "since" - this is a saved database, query all events)
 2. Call get_causal_chains with NO parameters to find root causes
-3. Analyze the results and explain what went wrong in plain language
-4. Provide specific, actionable recommendations based on the ACTUAL trace data
+3. If graph events are present (source=cuda_graph in stats), call graph_lifecycle and graph_frequency for active PIDs to understand CUDA Graph behavior
+4. Analyze the results and explain what went wrong in plain language
+5. Provide specific, actionable recommendations based on the ACTUAL trace data
 
 Rules:
 - NEVER fabricate data. Every number you mention MUST come from a tool response. If a number is not in the data, do not state it.
@@ -1247,4 +1386,174 @@ func formatAggregateStats(ops []store.AggregateOpStats, tsc bool, opDescs map[st
 	}
 	result += "\nNote: Use run_sql for percentiles or detailed per-event analysis."
 	return result
+}
+
+// formatGraphLifecycle formats graph events as a chronological lifecycle timeline.
+func formatGraphLifecycle(evts []events.Event, pid uint32, tsc bool) string {
+	if len(evts) == 0 {
+		return fmt.Sprintf("No CUDA Graph events found for PID %d. This process may not use CUDA Graphs (torch.compile, vLLM).", pid)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "CUDA Graph Lifecycle — PID %d (%d events)\n\n", pid, len(evts))
+
+	captureCount := 0
+	instantiateCount := 0
+	launchCount := 0
+
+	for _, evt := range evts {
+		op := events.CUDAGraphOp(evt.Op)
+		ts := evt.Timestamp.Format("15:04:05.000")
+		dur := evt.Duration
+
+		switch op {
+		case events.GraphBeginCapture:
+			captureCount++
+			modeName := "global"
+			switch evt.CaptureMode {
+			case 1:
+				modeName = "thread_local"
+			case 2:
+				modeName = "relaxed"
+			}
+			fmt.Fprintf(&b, "%s  BEGIN_CAPTURE  stream=0x%x mode=%s\n", ts, evt.StreamHandle, modeName)
+		case events.GraphEndCapture:
+			status := "ok"
+			if evt.RetCode != 0 {
+				status = fmt.Sprintf("err=%d", evt.RetCode)
+			}
+			fmt.Fprintf(&b, "%s  END_CAPTURE    stream=0x%x dur=%v %s\n", ts, evt.StreamHandle, dur.Round(time.Microsecond), status)
+		case events.GraphInstantiate:
+			instantiateCount++
+			status := "ok"
+			if evt.RetCode != 0 {
+				status = fmt.Sprintf("err=%d", evt.RetCode)
+			}
+			fmt.Fprintf(&b, "%s  INSTANTIATE   graph=0x%x → exec=0x%x dur=%v %s\n", ts, evt.GraphHandle, evt.ExecHandle, dur.Round(time.Microsecond), status)
+		case events.GraphLaunch:
+			launchCount++
+			fmt.Fprintf(&b, "%s  LAUNCH        exec=0x%x stream=0x%x dur=%v\n", ts, evt.ExecHandle, evt.StreamHandle, dur.Round(time.Microsecond))
+		}
+	}
+
+	fmt.Fprintf(&b, "\nSummary: %d captures, %d instantiations, %d launches", captureCount, instantiateCount, launchCount)
+	if launchCount > 0 && captureCount > 0 {
+		fmt.Fprintf(&b, " (%.1f replays per capture)", float64(launchCount)/float64(captureCount))
+	}
+	fmt.Fprintln(&b)
+
+	return b.String()
+}
+
+// formatGraphFrequency formats graph launch frequency analysis.
+func formatGraphFrequency(evts []events.Event, pid uint32, windowSec int, tsc bool) string {
+	if len(evts) == 0 {
+		return fmt.Sprintf("No CUDA Graph events found for PID %d.", pid)
+	}
+
+	// Count launches per exec_handle.
+	type execStats struct {
+		launchCount      int
+		firstLaunch      time.Time
+		lastLaunch       time.Time
+		instantiateCount int
+	}
+	execMap := make(map[uint64]*execStats)
+	totalCaptures := 0
+	totalInstantiates := 0
+
+	for _, evt := range evts {
+		op := events.CUDAGraphOp(evt.Op)
+		switch op {
+		case events.GraphBeginCapture:
+			totalCaptures++
+		case events.GraphInstantiate:
+			totalInstantiates++
+			es, ok := execMap[evt.ExecHandle]
+			if !ok {
+				es = &execStats{}
+				execMap[evt.ExecHandle] = es
+			}
+			es.instantiateCount++
+		case events.GraphLaunch:
+			es, ok := execMap[evt.ExecHandle]
+			if !ok {
+				es = &execStats{}
+				execMap[evt.ExecHandle] = es
+			}
+			es.launchCount++
+			if es.firstLaunch.IsZero() || evt.Timestamp.Before(es.firstLaunch) {
+				es.firstLaunch = evt.Timestamp
+			}
+			if evt.Timestamp.After(es.lastLaunch) {
+				es.lastLaunch = evt.Timestamp
+			}
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "CUDA Graph Frequency — PID %d\n\n", pid)
+	fmt.Fprintf(&b, "Pool size: %d distinct graph executable(s)\n", len(execMap))
+	fmt.Fprintf(&b, "Total captures: %d | instantiations: %d\n\n", totalCaptures, totalInstantiates)
+
+	if len(execMap) == 0 {
+		fmt.Fprintln(&b, "No graph launches recorded.")
+		return b.String()
+	}
+
+	// Compute rates and classify.
+	type execEntry struct {
+		handle uint64
+		rate   float64
+		stats  *execStats
+	}
+	var entries []execEntry
+	var medianRates []float64
+
+	for handle, es := range execMap {
+		var rate float64
+		if es.launchCount > 1 {
+			elapsed := es.lastLaunch.Sub(es.firstLaunch).Seconds()
+			if elapsed > 0 {
+				rate = float64(es.launchCount) / elapsed
+			}
+		}
+		entries = append(entries, execEntry{handle, rate, es})
+		if rate > 0 {
+			medianRates = append(medianRates, rate)
+		}
+	}
+
+	// Sort by rate descending.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].rate > entries[j].rate
+	})
+
+	// Compute median for hot/cold classification.
+	medianRate := 0.0
+	if len(medianRates) > 0 {
+		sort.Float64s(medianRates)
+		medianRate = medianRates[len(medianRates)/2]
+	}
+
+	fmt.Fprintf(&b, "%-18s %10s %8s %s\n", "Exec Handle", "Launches", "Rate/s", "Class")
+	fmt.Fprintf(&b, "%-18s %10s %8s %s\n", "──────────────────", "────────", "──────", "─────")
+
+	for _, e := range entries {
+		class := "cold"
+		if e.rate > medianRate && e.rate >= 1.0 {
+			class = "HOT"
+		} else if e.stats.launchCount == 0 {
+			class = "never-launched"
+		}
+		fmt.Fprintf(&b, "0x%-16x %10d %8.1f %s\n", e.handle, e.stats.launchCount, e.rate, class)
+	}
+
+	// Re-capture frequency.
+	if totalInstantiates > len(execMap) {
+		reCaptureCount := totalInstantiates - len(execMap)
+		fmt.Fprintf(&b, "\nRe-capture events: %d (new batch sizes triggering graph re-creation)\n", reCaptureCount)
+	}
+
+	return b.String()
 }

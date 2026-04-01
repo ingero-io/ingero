@@ -225,7 +225,9 @@ func parseEvent(raw []byte) (events.Event, error) {
 		dur = time.Duration(he.DurationNs)
 	}
 
-	// target_pid goes in Args[1] for sched events
+	// target_pid goes in Args[1] for sched events.
+	// For sched_switch: this is prev_pid (the process that was running
+	// before the target resumed — the most recent preemptor).
 	args[1] = uint64(he.TargetPid)
 
 	return events.Event{

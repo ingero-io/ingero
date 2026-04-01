@@ -17,6 +17,7 @@ func TestSourceString(t *testing.T) {
 		{SourceIO, "io"},
 		{SourceTCP, "tcp"},
 		{SourceNet, "net"},
+		{SourceCUDAGraph, "cuda_graph"},
 		{Source(0), "unknown(0)"},
 		{Source(99), "unknown(99)"},
 	}
@@ -51,6 +52,28 @@ func TestCUDAOpString(t *testing.T) {
 		got := tt.op.String()
 		if got != tt.want {
 			t.Errorf("CUDAOp(%d).String() = %q, want %q", tt.op, got, tt.want)
+		}
+	}
+}
+
+// TestCUDAGraphOpString verifies human-readable CUDA Graph op names.
+func TestCUDAGraphOpString(t *testing.T) {
+	tests := []struct {
+		op   CUDAGraphOp
+		want string
+	}{
+		{GraphBeginCapture, "graphBeginCapture"},
+		{GraphEndCapture, "graphEndCapture"},
+		{GraphInstantiate, "graphInstantiate"},
+		{GraphLaunch, "graphLaunch"},
+		{CUDAGraphOp(0), "graph_op(0)"},
+		{CUDAGraphOp(99), "graph_op(99)"},
+	}
+
+	for _, tt := range tests {
+		got := tt.op.String()
+		if got != tt.want {
+			t.Errorf("CUDAGraphOp(%d).String() = %q, want %q", tt.op, got, tt.want)
 		}
 	}
 }
@@ -145,6 +168,11 @@ func TestEventOpName(t *testing.T) {
 		{"net send", SourceNet, uint8(NetSend), "net_send"},
 		{"net recv", SourceNet, uint8(NetRecv), "net_recv"},
 		{"net unknown", SourceNet, 99, "net_op(99)"},
+		{"graph begin capture", SourceCUDAGraph, uint8(GraphBeginCapture), "graphBeginCapture"},
+		{"graph end capture", SourceCUDAGraph, uint8(GraphEndCapture), "graphEndCapture"},
+		{"graph instantiate", SourceCUDAGraph, uint8(GraphInstantiate), "graphInstantiate"},
+		{"graph launch", SourceCUDAGraph, uint8(GraphLaunch), "graphLaunch"},
+		{"graph unknown", SourceCUDAGraph, 99, "graph_op(99)"},
 		{"nvidia unknown", SourceNvidia, 1, "op(1)"},
 	}
 
@@ -191,6 +219,10 @@ func TestResolveOp(t *testing.T) {
 		{"pod_restart", SourceHost, uint8(HostPodRestart)},
 		{"pod_eviction", SourceHost, uint8(HostPodEviction)},
 		{"pod_oom_kill", SourceHost, uint8(HostPodOOMKill)},
+		{"graphBeginCapture", SourceCUDAGraph, uint8(GraphBeginCapture)},
+		{"graphEndCapture", SourceCUDAGraph, uint8(GraphEndCapture)},
+		{"graphInstantiate", SourceCUDAGraph, uint8(GraphInstantiate)},
+		{"graphLaunch", SourceCUDAGraph, uint8(GraphLaunch)},
 		{"block_read", SourceIO, uint8(IORead)},
 		{"block_write", SourceIO, uint8(IOWrite)},
 		{"block_discard", SourceIO, uint8(IODiscard)},
@@ -216,7 +248,8 @@ func TestResolveOp(t *testing.T) {
 // TestResolveOp_CaseInsensitive verifies case-insensitive lookup.
 func TestResolveOp_CaseInsensitive(t *testing.T) {
 	cases := []string{"CUDAMALLOC", "CudaMalloc", "cudamalloc", "CULAUNCHKERNEL", "SCHED_SWITCH",
-		"CUDAMALLOCMANAGED", "CUMEMALLOCMANAGED", "BLOCK_READ", "TCP_RETRANSMIT", "NET_SEND", "POD_RESTART"}
+		"CUDAMALLOCMANAGED", "CUMEMALLOCMANAGED", "BLOCK_READ", "TCP_RETRANSMIT", "NET_SEND", "POD_RESTART",
+		"GRAPHBEGINCAPTURE", "GRAPHLAUNCH"}
 	for _, name := range cases {
 		if _, _, ok := ResolveOp(name); !ok {
 			t.Errorf("ResolveOp(%q) should resolve (case-insensitive)", name)
@@ -322,6 +355,19 @@ func TestResolveOp_RoundTrip(t *testing.T) {
 		}
 		if src != SourceNet || resolved != uint8(op) {
 			t.Errorf("ResolveOp(%q) = (%v, %d), want (net, %d)", name, src, resolved, op)
+		}
+	}
+
+	graphOps := []CUDAGraphOp{GraphBeginCapture, GraphEndCapture, GraphInstantiate, GraphLaunch}
+	for _, op := range graphOps {
+		name := op.String()
+		src, resolved, ok := ResolveOp(name)
+		if !ok {
+			t.Errorf("ResolveOp(%q) failed round-trip", name)
+			continue
+		}
+		if src != SourceCUDAGraph || resolved != uint8(op) {
+			t.Errorf("ResolveOp(%q) = (%v, %d), want (cuda_graph, %d)", name, src, resolved, op)
 		}
 	}
 }

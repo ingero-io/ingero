@@ -198,6 +198,7 @@ func TestServer(t *testing.T) {
 		}
 
 		expected := map[string]bool{
+			"type":            true,
 			"pid":             true,
 			"allocated_bytes": true,
 			"total_vram":      true,
@@ -214,6 +215,34 @@ func TestServer(t *testing.T) {
 		}
 		for k := range expected {
 			t.Errorf("missing JSON key: %q", k)
+		}
+	})
+
+	t.Run("type_field_value_is_memory", func(t *testing.T) {
+		srv, path := startServer(t)
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		srv.Send(sampleState())
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal to map: %v", err)
+		}
+
+		typeVal, ok := raw["type"]
+		if !ok {
+			t.Fatal("missing 'type' field in JSON")
+		}
+		if typeVal != "memory" {
+			t.Errorf("type: got %v, want 'memory'", typeVal)
 		}
 	})
 

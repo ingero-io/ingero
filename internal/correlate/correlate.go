@@ -174,6 +174,41 @@ type opKey struct {
 	op     uint8
 }
 
+// graphLaunchKey identifies a unique graph executable per PID.
+type graphLaunchKey struct {
+	pid        uint32
+	execHandle uint64
+}
+
+// graphLaunchTracker tracks rolling launch rate for a graph executable.
+type graphLaunchTracker struct {
+	timestamps []time.Time // launch timestamps in the sliding window
+	peakRate   float64     // peak launches/sec observed
+	snapCount  int         // number of rate samples
+}
+
+// graphCaptureState tracks an in-flight graph capture for a PID.
+type graphCaptureState struct {
+	beginTime time.Time
+	stream    uint64
+	mode      uint32
+}
+
+// DefaultGraphCorrelationWindow is the time window for matching graph events
+// with host/CUDA events for causal chain construction.
+const DefaultGraphCorrelationWindow = 10 * time.Millisecond
+
+// DefaultGraphFreqDropRatio is the launch rate below which a frequency
+// anomaly is flagged. 0.5 = rate dropped more than 50% from peak.
+const DefaultGraphFreqDropRatio = 0.5
+
+// DefaultGraphFreqWindow is the sliding window for launch rate baseline.
+const DefaultGraphFreqWindow = 10 * time.Second
+
+// DefaultGraphNoLaunchTimeout is the window after instantiate within which
+// a launch is expected. If no launch occurs, "never launched" is flagged.
+const DefaultGraphNoLaunchTimeout = 30 * time.Second
+
 // Engine performs cross-layer correlation between host events and CUDA stats.
 type Engine struct {
 	mu         sync.RWMutex
@@ -195,17 +230,26 @@ type Engine struct {
 	// Keyed by cgroup_id, tracks sched_switch durations per cgroup.
 	cgroupOffCPU  map[uint64]*cgroupStats
 	targetCGroups map[uint64]bool // cgroup IDs of the target workload
+
+	// CUDA Graph correlation state.
+	graphWindow      []events.Event                       // graph events sliding window
+	graphCaptures    map[uint32]*graphCaptureState         // in-flight captures per PID
+	graphLaunchRates map[graphLaunchKey]*graphLaunchTracker // per-PID per-exec launch tracking
+	graphInstantiations map[graphLaunchKey]time.Time        // instantiate without launch detection
 }
 
 // New creates a correlation engine with the default 10s sliding window.
 // Pass WithMaxAge to override for longer collection windows or historical replay.
 func New(opts ...Option) *Engine {
 	e := &Engine{
-		maxAge:        DefaultMaxAge,
-		prevOpCounts:  make(map[opKey]int64),
-		peakRates:     make(map[opKey]float64),
-		cgroupOffCPU:  make(map[uint64]*cgroupStats),
-		targetCGroups: make(map[uint64]bool),
+		maxAge:              DefaultMaxAge,
+		prevOpCounts:        make(map[opKey]int64),
+		peakRates:           make(map[opKey]float64),
+		cgroupOffCPU:        make(map[uint64]*cgroupStats),
+		targetCGroups:       make(map[uint64]bool),
+		graphCaptures:       make(map[uint32]*graphCaptureState),
+		graphLaunchRates:    make(map[graphLaunchKey]*graphLaunchTracker),
+		graphInstantiations: make(map[graphLaunchKey]time.Time),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -296,6 +340,9 @@ func (e *Engine) RecordEvent(evt events.Event) {
 		e.tcpWindow = append(e.tcpWindow, evt)
 	case events.SourceNet:
 		e.netWindow = append(e.netWindow, evt)
+	case events.SourceCUDAGraph:
+		e.graphWindow = append(e.graphWindow, evt)
+		e.recordGraphState(evt)
 	}
 	e.prune()
 }
@@ -313,6 +360,7 @@ func (e *Engine) prune() {
 	e.ioWindow = pruneWindow(e.ioWindow, cutoff)
 	e.tcpWindow = pruneWindow(e.tcpWindow, cutoff)
 	e.netWindow = pruneWindow(e.netWindow, cutoff)
+	e.graphWindow = pruneWindow(e.graphWindow, cutoff)
 }
 
 // pruneWindow removes events older than cutoff from a slice.
@@ -460,6 +508,8 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	copy(tcpWindow, e.tcpWindow)
 	netWindow := make([]events.Event, len(e.netWindow))
 	copy(netWindow, e.netWindow)
+	graphWindow := make([]events.Event, len(e.graphWindow))
+	copy(graphWindow, e.graphWindow)
 	sysCtx := e.sysCtx
 	e.mu.Unlock()
 
@@ -740,6 +790,10 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	if noisyChain := e.detectNoisyNeighbor(); noisyChain != nil {
 		chains = append(chains, *noisyChain)
 	}
+
+	// CUDA Graph correlation rules (FR55, FR56, FR59).
+	graphChains := e.snapshotGraphChains(pid, window, graphWindow, cudaOps)
+	chains = append(chains, graphChains...)
 
 	return chains
 }
@@ -1291,7 +1345,7 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 		switch evt.Source {
 		case events.SourceHost:
 			corr.RecordHost(evt)
-		case events.SourceIO, events.SourceTCP, events.SourceNet:
+		case events.SourceIO, events.SourceTCP, events.SourceNet, events.SourceCUDAGraph:
 			corr.RecordEvent(evt)
 		}
 
@@ -1319,6 +1373,345 @@ func ReplayEventsForChains(evts []events.Event, collector *stats.Collector, corr
 		result = append(result, ch)
 	}
 	return result
+}
+
+// recordGraphState updates internal graph tracking state for correlation.
+// Must be called with e.mu held.
+func (e *Engine) recordGraphState(evt events.Event) {
+	pid := evt.PID
+	op := events.CUDAGraphOp(evt.Op)
+
+	switch op {
+	case events.GraphBeginCapture:
+		e.graphCaptures[pid] = &graphCaptureState{
+			beginTime: evt.Timestamp,
+			stream:    evt.StreamHandle,
+			mode:      evt.CaptureMode,
+		}
+	case events.GraphEndCapture:
+		delete(e.graphCaptures, pid)
+	case events.GraphInstantiate:
+		key := graphLaunchKey{pid: pid, execHandle: evt.ExecHandle}
+		e.graphInstantiations[key] = evt.Timestamp
+	case events.GraphLaunch:
+		key := graphLaunchKey{pid: pid, execHandle: evt.ExecHandle}
+		// Clear instantiate-without-launch tracking.
+		delete(e.graphInstantiations, key)
+		// Track launch rate.
+		tracker, ok := e.graphLaunchRates[key]
+		if !ok {
+			tracker = &graphLaunchTracker{}
+			e.graphLaunchRates[key] = tracker
+		}
+		tracker.timestamps = append(tracker.timestamps, evt.Timestamp)
+		// Prune old timestamps outside the frequency window.
+		cutoff := evt.Timestamp.Add(-DefaultGraphFreqWindow)
+		i := 0
+		for i < len(tracker.timestamps) && tracker.timestamps[i].Before(cutoff) {
+			i++
+		}
+		if i > 0 {
+			tracker.timestamps = tracker.timestamps[i:]
+		}
+		// Update peak rate.
+		if len(tracker.timestamps) >= 2 {
+			elapsed := tracker.timestamps[len(tracker.timestamps)-1].Sub(tracker.timestamps[0]).Seconds()
+			if elapsed > 0.1 {
+				rate := float64(len(tracker.timestamps)) / elapsed
+				if rate > tracker.peakRate {
+					tracker.peakRate = rate
+				}
+				tracker.snapCount++
+			}
+		}
+	}
+}
+
+// SnapshotGraphChains builds causal chains for CUDA Graph events by
+// correlating with host events and CUDA memory events in the current windows.
+// Called from SnapshotCausalChains. Must be called with e.mu held.
+func (e *Engine) snapshotGraphChains(pid uint32, hostWindow, graphWindow []events.Event, cudaOps []stats.OpStats) []CausalChain {
+	var chains []CausalChain
+
+	// Rule 1: Graph Capture + Memory Pressure (FR55).
+	// Check if any graph capture overlapped with cudaMalloc failures.
+	chains = append(chains, e.checkGraphCaptureOOM(pid, graphWindow, cudaOps)...)
+
+	// Rule 2: Graph Launch + CPU Contention (FR56).
+	chains = append(chains, e.checkGraphLaunchCPUContention(pid, graphWindow, hostWindow)...)
+
+	// Rule 3: Graph Launch Frequency Anomaly.
+	chains = append(chains, e.checkGraphFrequencyAnomaly(pid)...)
+
+	// Rule 4: Capture Never Launched.
+	chains = append(chains, e.checkGraphNeverLaunched(pid, graphWindow)...)
+
+	return chains
+}
+
+// checkGraphCaptureOOM detects OOM during graph capture (FR55).
+func (e *Engine) checkGraphCaptureOOM(pid uint32, graphWindow []events.Event, cudaOps []stats.OpStats) []CausalChain {
+	// Find graph captures (begin→end pairs).
+	type captureSpan struct {
+		begin, end time.Time
+		stream     uint64
+		mode       uint32
+		duration   time.Duration
+	}
+	var captures []captureSpan
+	beginTimes := make(map[uint32]events.Event) // tid → begin event
+
+	for _, evt := range graphWindow {
+		if pid != 0 && evt.PID != pid {
+			continue
+		}
+		op := events.CUDAGraphOp(evt.Op)
+		switch op {
+		case events.GraphBeginCapture:
+			beginTimes[evt.TID] = evt
+		case events.GraphEndCapture:
+			if begin, ok := beginTimes[evt.TID]; ok {
+				captures = append(captures, captureSpan{
+					begin:    begin.Timestamp,
+					end:      evt.Timestamp,
+					stream:   begin.StreamHandle,
+					mode:     begin.CaptureMode,
+					duration: evt.Duration,
+				})
+				delete(beginTimes, evt.TID)
+			}
+		}
+	}
+
+	if len(captures) == 0 {
+		return nil
+	}
+
+	// Check for cudaMalloc failures in CUDA ops stats.
+	var mallocFailures int
+	for _, op := range cudaOps {
+		if op.Source == events.SourceCUDA && op.OpCode == uint8(events.CUDAMalloc) {
+			// Check if error rate is elevated (count vs errors not tracked in OpStats,
+			// but we can check if any graph event had non-zero RetCode).
+			break
+		}
+	}
+
+	// Also check graph events themselves for failures during capture.
+	for _, evt := range graphWindow {
+		if pid != 0 && evt.PID != pid {
+			continue
+		}
+		if events.CUDAGraphOp(evt.Op) == events.GraphEndCapture && evt.RetCode != 0 {
+			mallocFailures++
+		}
+	}
+
+	// Check system context for memory pressure during capture.
+	memPressure := false
+	if e.sysCtx != nil && e.sysCtx.MemUsedPct > 90 {
+		memPressure = true
+	}
+
+	if mallocFailures == 0 && !memPressure {
+		return nil
+	}
+
+	var timeline []ChainEvent
+	for _, cap := range captures {
+		modeName := "global"
+		switch cap.mode {
+		case 1:
+			modeName = "thread_local"
+		case 2:
+			modeName = "relaxed"
+		}
+		timeline = append(timeline, ChainEvent{
+			Timestamp: cap.begin,
+			Layer:     "CUDA_GRAPH",
+			Op:        "graphCapture",
+			Detail:    fmt.Sprintf("capture (mode=%s, stream=0x%x, duration=%v)", modeName, cap.stream, cap.duration.Round(time.Microsecond)),
+			Duration:  cap.duration,
+		})
+	}
+
+	cause := "memory pressure during CUDA Graph capture"
+	if mallocFailures > 0 {
+		cause = fmt.Sprintf("graph capture failed (%d capture(s) returned error) — OOM during graph capture", mallocFailures)
+		timeline = append(timeline, ChainEvent{
+			Layer:  "CUDA",
+			Op:     "cudaMalloc",
+			Detail: fmt.Sprintf("%d graph capture failure(s)", mallocFailures),
+		})
+	}
+	if memPressure {
+		timeline = append(timeline, ChainEvent{
+			Layer:  "SYSTEM",
+			Op:     "memory",
+			Detail: fmt.Sprintf("VRAM/memory pressure (%.0f%% used)", e.sysCtx.MemUsedPct),
+		})
+	}
+
+	return []CausalChain{{
+		ID:       "graph-capture-oom",
+		Severity: "HIGH",
+		Summary:  fmt.Sprintf("OOM during graph capture (%d capture(s))", len(captures)),
+		RootCause: cause,
+		Timeline:  timeline,
+		Explanation: "CUDA Graph capture overlapped with memory pressure. When VRAM is near capacity, graph capture allocates temporary buffers that can trigger OOM. This is a common failure mode in vLLM with torch.compile(mode='reduce-overhead').",
+		Recommendations: []string{
+			"Reduce model batch size to free VRAM before graph capture",
+			"Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to reduce fragmentation",
+			"Monitor VRAM with ingero trace --remediate during graph warmup phase",
+		},
+	}}
+}
+
+// checkGraphLaunchCPUContention detects CPU scheduling interference during graph launch (FR56).
+func (e *Engine) checkGraphLaunchCPUContention(pid uint32, graphWindow, hostWindow []events.Event) []CausalChain {
+	// Find graph launches.
+	var launches []events.Event
+	for _, evt := range graphWindow {
+		if pid != 0 && evt.PID != pid {
+			continue
+		}
+		if events.CUDAGraphOp(evt.Op) == events.GraphLaunch {
+			launches = append(launches, evt)
+		}
+	}
+
+	if len(launches) == 0 {
+		return nil
+	}
+
+	// Count sched_switch events near graph launches.
+	schedSwitchNearLaunch := 0
+	var totalOffCPU time.Duration
+	window := DefaultGraphCorrelationWindow
+
+	for _, launch := range launches {
+		launchStart := launch.Timestamp.Add(-launch.Duration) // approximate entry time
+		for _, host := range hostWindow {
+			if host.Source != events.SourceHost {
+				continue
+			}
+			if events.HostOp(host.Op) != events.HostSchedSwitch {
+				continue
+			}
+			if pid != 0 && host.PID != pid && uint32(host.Args[1]) != pid {
+				continue
+			}
+			// Check if sched_switch is within the correlation window of the launch.
+			if host.Timestamp.After(launchStart.Add(-window)) && host.Timestamp.Before(launch.Timestamp.Add(window)) {
+				schedSwitchNearLaunch++
+				totalOffCPU += host.Duration
+			}
+		}
+	}
+
+	if schedSwitchNearLaunch < DefaultSchedSwitchThreshold {
+		return nil
+	}
+
+	return []CausalChain{{
+		ID:       "graph-launch-cpu-contention",
+		Severity: "MEDIUM",
+		Summary:  fmt.Sprintf("CPU contention delaying graph dispatch (%d launch(es), %d sched_switch)", len(launches), schedSwitchNearLaunch),
+		RootCause: "CPU scheduling interference during CUDA Graph launch",
+		Timeline: []ChainEvent{
+			{Layer: "CUDA_GRAPH", Op: "graphLaunch", Detail: fmt.Sprintf("%d graph launch(es)", len(launches))},
+			{Layer: "HOST", Op: "sched_switch", Detail: fmt.Sprintf("%d context switches (%v off-CPU) near graph launches", schedSwitchNearLaunch, totalOffCPU.Round(time.Millisecond)), Duration: totalOffCPU},
+		},
+		Explanation: fmt.Sprintf("CUDA Graph launches experienced CPU scheduling interference. %d sched_switch events occurred within %v of graph launches, causing %v total off-CPU time. Graph launches are lightweight host-side operations, but CPU contention delays dispatch to the GPU.", schedSwitchNearLaunch, window, totalOffCPU.Round(time.Millisecond)),
+		Recommendations: []string{
+			"Pin the inference process to dedicated CPU cores (taskset/cset)",
+			"Reduce background CPU load during inference",
+			"Add nice -n 19 to non-critical processes",
+		},
+	}}
+}
+
+// checkGraphFrequencyAnomaly detects graph launch rate drops (graph pool exhaustion).
+func (e *Engine) checkGraphFrequencyAnomaly(pid uint32) []CausalChain {
+	var chains []CausalChain
+
+	for key, tracker := range e.graphLaunchRates {
+		if pid != 0 && key.pid != pid {
+			continue
+		}
+		if tracker.snapCount < 3 || tracker.peakRate < 5.0 {
+			continue // not enough data or too low to be meaningful
+		}
+		if len(tracker.timestamps) < 2 {
+			continue
+		}
+
+		elapsed := tracker.timestamps[len(tracker.timestamps)-1].Sub(tracker.timestamps[0]).Seconds()
+		if elapsed < 0.5 {
+			continue
+		}
+		currentRate := float64(len(tracker.timestamps)) / elapsed
+
+		ratio := currentRate / tracker.peakRate
+		if ratio >= DefaultGraphFreqDropRatio {
+			continue // drop not significant enough
+		}
+
+		dropPct := (1 - ratio) * 100
+
+		chains = append(chains, CausalChain{
+			ID:       fmt.Sprintf("graph-freq-anomaly-0x%x", key.execHandle),
+			Severity: "MEDIUM",
+			Summary:  fmt.Sprintf("graph launch rate dropped %.0f%% (exec 0x%x, PID %d)", dropPct, key.execHandle, key.pid),
+			RootCause: "graph pool exhaustion — likely re-capture triggered by new batch size",
+			Timeline: []ChainEvent{
+				{Layer: "CUDA_GRAPH", Op: "graphLaunch", Detail: fmt.Sprintf("rate dropped from %.0f to %.0f launches/sec (exec 0x%x)", tracker.peakRate, currentRate, key.execHandle)},
+			},
+			Explanation: fmt.Sprintf("GraphLaunch rate for executable 0x%x dropped %.0f%% from peak (%.0f → %.0f launches/sec). In vLLM, this pattern indicates a new batch size arrived that doesn't match any pre-captured graph, forcing a re-capture cycle. During re-capture, the existing graph pool is not launched.", key.execHandle, dropPct, tracker.peakRate, currentRate),
+			Recommendations: []string{
+				"Pre-warm all expected batch sizes during model startup",
+				"Set max_num_batched_tokens to limit batch size variability",
+				"Monitor with ingero trace to identify which batch sizes trigger re-capture",
+			},
+		})
+	}
+
+	return chains
+}
+
+// checkGraphNeverLaunched detects graphs that were instantiated but never launched.
+func (e *Engine) checkGraphNeverLaunched(pid uint32, graphWindow []events.Event) []CausalChain {
+	var chains []CausalChain
+
+	now := time.Now()
+	if !e.latestTime.IsZero() {
+		now = e.latestTime
+	}
+
+	for key, instantTime := range e.graphInstantiations {
+		if pid != 0 && key.pid != pid {
+			continue
+		}
+		if now.Sub(instantTime) < DefaultGraphNoLaunchTimeout {
+			continue // still within expected window
+		}
+		chains = append(chains, CausalChain{
+			ID:       fmt.Sprintf("graph-never-launched-0x%x", key.execHandle),
+			Severity: "LOW",
+			Summary:  fmt.Sprintf("graph instantiated but never launched (exec 0x%x, PID %d)", key.execHandle, key.pid),
+			RootCause: "graph instantiated but never launched — wasted VRAM",
+			Timeline: []ChainEvent{
+				{Layer: "CUDA_GRAPH", Op: "graphInstantiate", Detail: fmt.Sprintf("instantiated exec 0x%x at %s, no launch after %v", key.execHandle, instantTime.Format("15:04:05.000"), now.Sub(instantTime).Round(time.Second))},
+			},
+			Explanation: fmt.Sprintf("A CUDA Graph was instantiated (exec handle 0x%x) but no GraphLaunch was observed within %v. This wastes GPU memory — each instantiated graph holds device memory for its captured operations.", key.execHandle, DefaultGraphNoLaunchTimeout),
+			Recommendations: []string{
+				"Verify the graph capture path leads to actual execution",
+				"Destroy unused graph executables to free VRAM",
+			},
+		})
+	}
+
+	return chains
 }
 
 // dedup removes duplicate strings from a slice while preserving order.

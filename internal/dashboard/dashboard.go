@@ -74,6 +74,8 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/chains", s.handleChains)
 	mux.HandleFunc("/api/v1/snapshots", s.handleSnapshots)
 	mux.HandleFunc("/api/v1/capabilities", s.handleCapabilities)
+	mux.HandleFunc("/api/v1/graph-metrics", s.handleGraphMetrics)
+	mux.HandleFunc("/api/v1/graph-events", s.handleGraphEvents)
 
 	// Static files (embedded HTML/JS).
 	staticSub, err := fs.Sub(staticFiles, "static")

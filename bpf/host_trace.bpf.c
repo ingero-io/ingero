@@ -115,13 +115,16 @@ int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 	// Emit event when a target process comes BACK on-CPU after being preempted.
 	// next_pid is the incoming (resuming) task. If it's a target and has a
 	// recorded off-CPU timestamp, compute the off-CPU duration.
+	// target_pid = prev_pid: the process that was running immediately before
+	// the target resumed — the most recent preemptor. Used by the straggler
+	// detector to populate preempting_pids in StraggleState messages.
 	if (is_target_pid(next_pid)) {
 		__u64 *off_ts = bpf_map_lookup_elem(&sched_off_map, &next_pid);
 		if (off_ts) {
 			__u64 off_cpu_ns = now - *off_ts;
 			emit_host_event(next_pid, next_pid,
 					HOST_OP_SCHED_SWITCH, off_cpu_ns,
-					cpu, next_pid);
+					cpu, prev_pid);
 			bpf_map_delete_elem(&sched_off_map, &next_pid);
 		}
 	}
