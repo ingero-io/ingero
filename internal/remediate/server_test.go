@@ -200,6 +200,7 @@ func TestServer(t *testing.T) {
 		expected := map[string]bool{
 			"type":            true,
 			"pid":             true,
+			"gpu_id":          true,
 			"allocated_bytes": true,
 			"total_vram":      true,
 			"utilization_pct": true,

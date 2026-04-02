@@ -93,6 +93,7 @@ func isClosedError(err error) bool {
 type typedMessage struct {
 	Type           string  `json:"type"`
 	PID            uint32  `json:"pid"`
+	GPUID          uint32  `json:"gpu_id"`
 	AllocatedBytes uint64  `json:"allocated_bytes"`
 	TotalVRAM      uint64  `json:"total_vram"`
 	UtilizationPct float64 `json:"utilization_pct"`
@@ -117,6 +118,7 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 	msg := typedMessage{
 		Type:           "memory",
 		PID:            ms.PID,
+		GPUID:          ms.GPUID,
 		AllocatedBytes: ms.AllocatedBytes,
 		TotalVRAM:      ms.TotalVRAM,
 		UtilizationPct: ms.UtilizationPct,
