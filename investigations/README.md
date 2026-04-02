@@ -79,11 +79,14 @@ ingero explain --db investigations/cuda-graph-cpu-contention.db --since 8760h
 
 GIF recordings from the CUDA Graph demo (v0.9.0), located in `docs/assets/`:
 
-| GIF | What It Shows |
-|-----|---------------|
-| `demo-graph-trace.gif` | Live `ingero trace` on a `torch.compile` workload with CPU contention — graph events streaming alongside CUDA and host events |
-| `demo-graph-investigate.gif` | `ingero explain` showing 8 causal chains including CUDA Graph correlation, then `ingero query` for graph capture events |
-| `demo-graph-ai-mcp.gif` | Real Claude Code session using Ingero MCP tools (`get_trace_stats`, `get_causal_chains`, `graph_lifecycle`, `graph_frequency`) to diagnose the same trace |
+### `ingero trace` — live GPU event streaming with CUDA Graph correlation
+![demo-graph-trace](../docs/assets/demo-graph-trace.gif)
+
+### `ingero explain` — causal chains + `ingero query` for graph events
+![demo-graph-investigate](../docs/assets/demo-graph-investigate.gif)
+
+### AI investigation via MCP — Claude Code using Ingero tools
+![demo-graph-ai-mcp](../docs/assets/demo-graph-ai-mcp.gif)
 
 Editable `.cast` source files are in `docs/demo-recordings/`.
 
