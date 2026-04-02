@@ -1,15 +1,20 @@
 package memtrack
 
 import (
+	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// MemoryState represents the current VRAM allocation state for a single PID.
+// MemoryState represents the current VRAM allocation state for a single PID on a single GPU.
 // JSON field names are the cross-language contract with external consumers (see docs/remediation-protocol.md).
 type MemoryState struct {
 	PID            uint32  `json:"pid"`
+	GPUID          uint32  `json:"gpu_id"`
 	AllocatedBytes uint64  `json:"allocated_bytes"`
 	TotalVRAM      uint64  `json:"total_vram"`
 	UtilizationPct float64 `json:"utilization_pct"`
@@ -21,33 +26,39 @@ type MemoryState struct {
 // nil means non-remediate mode (no emission).
 type Sink func(MemoryState)
 
-// pidState tracks the running allocation balance for a single PID.
-type pidState struct {
+// pidGpuKey is the map key for per-PID per-GPU allocation tracking.
+type pidGpuKey struct {
+	pid   uint32
+	gpuID uint32
+}
+
+// PIDGPUState tracks the running allocation balance for a single PID on a single GPU.
+type PIDGPUState struct {
 	allocatedBytes uint64
 }
 
-// Tracker maintains per-PID VRAM allocation balances from cudaMalloc/cudaFree events.
+// Tracker maintains per-PID per-GPU VRAM allocation balances from cudaMalloc/cudaFree events.
 // Thread-safe: protected by sync.Mutex for concurrent access.
 // Integration: called inline from the trace command's event loop.
 type Tracker struct {
-	mu        sync.Mutex
-	pids      map[uint32]*pidState
-	totalVRAM uint64
-	sink      Sink
+	mu      sync.Mutex
+	pids    map[pidGpuKey]*PIDGPUState
+	gpuVRAM map[uint32]uint64 // per-GPU total VRAM in bytes
+	sink    Sink
 }
 
 // NewTracker creates a memory balance tracker.
-// totalVRAM: total GPU VRAM in bytes (queried from nvidia-smi at startup, passed in).
+// gpuVRAM: map of GPU ID to total VRAM in bytes (queried via DetectGPUVRAM at startup).
 // sink: callback for MemoryState emission. Pass nil for non-remediate mode.
-func NewTracker(totalVRAM uint64, sink Sink) *Tracker {
+func NewTracker(gpuVRAM map[uint32]uint64, sink Sink) *Tracker {
 	return &Tracker{
-		pids:      make(map[uint32]*pidState),
-		totalVRAM: totalVRAM,
-		sink:      sink,
+		pids:    make(map[pidGpuKey]*PIDGPUState),
+		gpuVRAM: gpuVRAM,
+		sink:    sink,
 	}
 }
 
-// ProcessEvent updates the VRAM balance for the event's PID if the event
+// ProcessEvent updates the VRAM balance for the event's PID+GPU if the event
 // is a memory allocation or free from either the CUDA Runtime API or Driver API.
 //
 // Runtime API (SourceCUDA):
@@ -58,12 +69,7 @@ func NewTracker(totalVRAM uint64, sink Sink) *Tracker {
 //   - cuMemAlloc_v2: Args[0] = allocation size in bytes
 //   - cuMemAllocManaged: Args[0] = allocation size in bytes
 //
-// PyTorch's caching allocator calls cuMemAlloc_v2 (Driver API) for pool
-// allocations — without Driver API support, those allocations are invisible.
-//
-// cudaFree events with Args[1] > 0 subtract from the balance. If Args[1] == 0
-// (unknown pointer — pre-existing allocation or BPF map eviction), no decrement
-// occurs (graceful degradation to conservative upper bound).
+// Each event's GPUID field (from BPF cuda_event.gpu_id) determines which GPU's balance is updated.
 func (t *Tracker) ProcessEvent(evt events.Event) {
 	var lastAllocSize uint64
 	var isAlloc bool
@@ -98,11 +104,13 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 		return
 	}
 
+	key := pidGpuKey{pid: evt.PID, gpuID: evt.GPUID}
+
 	t.mu.Lock()
-	state, ok := t.pids[evt.PID]
+	state, ok := t.pids[key]
 	if !ok {
-		state = &pidState{}
-		t.pids[evt.PID] = state
+		state = &PIDGPUState{}
+		t.pids[key] = state
 	}
 
 	if isAlloc {
@@ -116,7 +124,7 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 		}
 	}
 
-	ms := t.buildState(evt.PID, lastAllocSize, evt.Timestamp.UnixNano())
+	ms := t.buildState(key, lastAllocSize, evt.Timestamp.UnixNano())
 	t.mu.Unlock()
 
 	if t.sink != nil {
@@ -124,18 +132,20 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 	}
 }
 
-// RecordMalloc adds size bytes to the PID's balance. Emits to sink.
+// RecordMalloc adds size bytes to the PID+GPU balance. Emits to sink.
 // Exposed for testing. In production, use ProcessEvent with real events.
-func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
+func (t *Tracker) RecordMalloc(pid uint32, gpuID uint32, size uint64, timestampNs int64) {
+	key := pidGpuKey{pid: pid, gpuID: gpuID}
+
 	t.mu.Lock()
-	state, ok := t.pids[pid]
+	state, ok := t.pids[key]
 	if !ok {
-		state = &pidState{}
-		t.pids[pid] = state
+		state = &PIDGPUState{}
+		t.pids[key] = state
 	}
 
 	state.allocatedBytes += size
-	ms := t.buildState(pid, size, timestampNs)
+	ms := t.buildState(key, size, timestampNs)
 	t.mu.Unlock()
 
 	if t.sink != nil {
@@ -143,16 +153,15 @@ func (t *Tracker) RecordMalloc(pid uint32, size uint64, timestampNs int64) {
 	}
 }
 
-// RecordFree subtracts size bytes from the PID's balance, clamping at 0.
-// Used by the test suite to verify underflow protection.
-// In production event flow, cudaFree goes through ProcessEvent which
-// decrements when freed_bytes > 0 (see ProcessEvent docs for details).
-func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
+// RecordFree subtracts size bytes from the PID+GPU balance, clamping at 0.
+func (t *Tracker) RecordFree(pid uint32, gpuID uint32, size uint64, timestampNs int64) {
+	key := pidGpuKey{pid: pid, gpuID: gpuID}
+
 	t.mu.Lock()
-	state, ok := t.pids[pid]
+	state, ok := t.pids[key]
 	if !ok {
-		state = &pidState{}
-		t.pids[pid] = state
+		state = &PIDGPUState{}
+		t.pids[key] = state
 	}
 
 	if size > state.allocatedBytes {
@@ -161,7 +170,7 @@ func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
 		state.allocatedBytes -= size
 	}
 
-	ms := t.buildState(pid, 0, timestampNs)
+	ms := t.buildState(key, 0, timestampNs)
 	t.mu.Unlock()
 
 	if t.sink != nil {
@@ -170,18 +179,51 @@ func (t *Tracker) RecordFree(pid uint32, size uint64, timestampNs int64) {
 }
 
 // buildState constructs a MemoryState snapshot. Caller must hold t.mu.
-func (t *Tracker) buildState(pid uint32, lastAllocSize uint64, timestampNs int64) MemoryState {
-	state := t.pids[pid]
+func (t *Tracker) buildState(key pidGpuKey, lastAllocSize uint64, timestampNs int64) MemoryState {
+	state := t.pids[key]
+	totalVRAM := t.gpuVRAM[key.gpuID]
 	var utilPct float64
-	if t.totalVRAM > 0 {
-		utilPct = float64(state.allocatedBytes) / float64(t.totalVRAM) * 100
+	if totalVRAM > 0 {
+		utilPct = float64(state.allocatedBytes) / float64(totalVRAM) * 100
 	}
 	return MemoryState{
-		PID:            pid,
+		PID:            key.pid,
+		GPUID:          key.gpuID,
 		AllocatedBytes: state.allocatedBytes,
-		TotalVRAM:      t.totalVRAM,
+		TotalVRAM:      totalVRAM,
 		UtilizationPct: utilPct,
 		LastAllocSize:  lastAllocSize,
 		TimestampNs:    timestampNs,
 	}
+}
+
+// DetectGPUVRAM queries nvidia-smi for per-GPU total VRAM and returns a map of
+// GPU index to VRAM in bytes. Each line of nvidia-smi output corresponds to one GPU.
+func DetectGPUVRAM() (map[uint32]uint64, error) {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return nil, fmt.Errorf("DetectGPUVRAM: %w", err)
+	}
+	return parseGPUVRAMOutput(string(out))
+}
+
+// parseGPUVRAMOutput parses nvidia-smi memory.total output into a per-GPU VRAM map.
+func parseGPUVRAMOutput(output string) (map[uint32]uint64, error) {
+	result := make(map[uint32]uint64)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		mib, err := strconv.ParseUint(line, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parseGPUVRAMOutput: GPU %d: parsing %q: %w", i, line, err)
+		}
+		result[uint32(i)] = mib * 1024 * 1024
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("parseGPUVRAMOutput: no GPUs detected")
+	}
+	return result, nil
 }

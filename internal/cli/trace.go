@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -538,21 +536,23 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	var remediateSrv *remediate.Server
 	if traceRemediate {
 		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol.md)")
-		totalVRAM, err := detectVRAM()
+		gpuVRAM, err := memtrack.DetectGPUVRAM()
 		if err != nil {
 			log.Printf("ERROR: remediate: vram_detection_failed error=%v", err)
 			// Fall through — degrade to OSS mode (tracker stays nil).
 		} else {
-			log.Printf("INFO: remediate: vram_detected total_vram_mib=%d total_vram_bytes=%d", totalVRAM/(1024*1024), totalVRAM)
+			for gpuID, vram := range gpuVRAM {
+				log.Printf("INFO: remediate: vram_detected gpu_id=%d total_vram_mib=%d total_vram_bytes=%d", gpuID, vram/(1024*1024), vram)
+			}
 			srv := remediate.NewServer("")
 			if err := srv.Start(); err != nil {
 				log.Printf("ERROR: remediate: uds_bind_failed path=/tmp/ingero-remediate.sock error=%v", err)
 				// Fall through — degrade to OSS mode (tracker stays nil).
 			} else {
 				remediateSrv = srv
-				tracker = memtrack.NewTracker(totalVRAM, srv.Send)
+				tracker = memtrack.NewTracker(gpuVRAM, srv.Send)
 				defer srv.Close()
-				log.Printf("INFO: remediate: enabled total_vram=%d socket=/tmp/ingero-remediate.sock", totalVRAM)
+				log.Printf("INFO: remediate: enabled gpu_count=%d socket=/tmp/ingero-remediate.sock", len(gpuVRAM))
 			}
 		}
 	}
@@ -673,26 +673,6 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, trackPID)
 }
 
-// ---------------------------------------------------------------------------
-// VRAM detection (--remediate)
-// ---------------------------------------------------------------------------
-
-// detectVRAM queries nvidia-smi for total GPU VRAM and returns the value in bytes.
-// For multi-GPU systems, returns the first GPU's value (single-GPU PoC assumption).
-func detectVRAM() (uint64, error) {
-	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
-	if err != nil {
-		return 0, fmt.Errorf("detectVRAM: %w", err)
-	}
-	// Take first line only (single-GPU assumption).
-	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
-	line = strings.TrimSpace(line)
-	mib, err := strconv.ParseUint(line, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("detectVRAM: parsing %q: %w", line, err)
-	}
-	return mib * 1024 * 1024, nil
-}
 
 // ---------------------------------------------------------------------------
 // Selective storage — store only investigation-valuable events, aggregate rest
