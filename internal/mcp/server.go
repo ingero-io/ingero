@@ -1,6 +1,6 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes nine tools and one prompt to AI agents:
+// The MCP server exposes ten tools and one prompt to AI agents:
 //
 // Tools:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
@@ -12,6 +12,7 @@
 //   - get_stacks: Get resolved call stacks for operations (symbol names, source files)
 //   - graph_lifecycle: CUDA Graph lifecycle timeline for a PID
 //   - graph_frequency: Graph launch frequency and hot/cold classification
+//   - query_fleet: Fan-out query across multiple Ingero nodes (chains, ops, overview, sql)
 //
 // Prompts:
 //   - /investigate: Guided investigation workflow for diagnosing GPU issues
@@ -41,10 +42,12 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/ingero-io/ingero/internal/fleet"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/stats"
@@ -55,15 +58,19 @@ import (
 
 // Server wraps the MCP server and its dependencies.
 type Server struct {
-	mcpServer *gomcp.Server
-	store     *store.Store
+	mcpServer   *gomcp.Server
+	store       *store.Store
+	fleetNodes  []string          // fleet.nodes from config (nil = fleet disabled)
+	fleetClient *fleet.Client     // lazily created on first query_fleet call
+	fleetOnce   sync.Once         // guards lazy fleetClient init
+	fleetErr    error             // error from lazy init (if any)
 }
 
 // New creates an MCP server backed by the given SQLite store.
 func New(s *store.Store) *Server {
 	srv := gomcp.NewServer(&gomcp.Implementation{
 		Name:    "ingero",
-		Version: "0.8.0",
+		Version: "0.9.0",
 		Title:   "Ingero GPU Causal Observability — AI-first analysis",
 	}, nil)
 
@@ -75,6 +82,24 @@ func New(s *store.Store) *Server {
 	ms.registerTools()
 	ms.registerPrompts()
 	return ms
+}
+
+// SetFleetNodes configures the MCP server with fleet node addresses for query_fleet.
+func (s *Server) SetFleetNodes(nodes []string) {
+	s.fleetNodes = nodes
+}
+
+// getFleetClient returns the fleet client, creating it lazily on first use.
+// Thread-safe via sync.Once — concurrent query_fleet calls are safe.
+func (s *Server) getFleetClient() (*fleet.Client, error) {
+	s.fleetOnce.Do(func() {
+		s.fleetClient, s.fleetErr = fleet.New(fleet.Config{
+			Nodes:   s.fleetNodes,
+			Timeout: fleet.DefaultTimeout,
+			Limit:   fleet.DefaultLimit,
+		})
+	})
+	return s.fleetClient, s.fleetErr
 }
 
 // Run starts the MCP server on stdio. Blocks until the client disconnects.
@@ -231,6 +256,16 @@ func hostGuard(next http.Handler) http.Handler {
 			http.Error(w, "forbidden: invalid Host header", http.StatusForbidden)
 		}
 	})
+}
+
+// queryFleetInput is the input schema for the query_fleet MCP tool.
+type queryFleetInput struct {
+	Action string `json:"action" jsonschema:"Query type: chains/ops/overview/sql,enum=chains,enum=ops,enum=overview,enum=sql,required"`
+	Since  string `json:"since,omitempty" jsonschema:"Time window (e.g. 5m, 1h). Default: 5m."`
+	PID    int    `json:"pid,omitempty" jsonschema:"Filter by PID (optional, used with ops action)"`
+	SQL    string `json:"sql,omitempty" jsonschema:"SQL query (required when action is sql)"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Max rows per node (default 1000)"`
+	TSC    *bool  `json:"tsc,omitempty" jsonschema:"Telegraphic compression (default: true). Set false for verbose output."`
 }
 
 func (s *Server) registerTools() {
@@ -1018,6 +1053,258 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			},
 		}, nil, nil
 	})
+
+	// Tool 10: query_fleet — fan-out queries across multiple Ingero nodes.
+	gomcp.AddTool(s.mcpServer, &gomcp.Tool{
+		Name:        "query_fleet",
+		Description: "Query multiple Ingero nodes and return merged results. Requires fleet.nodes configured in ingero.yaml. Actions: chains (causal chains sorted by severity), ops (per-op stats), overview (summary per node), sql (raw SQL fan-out with node column).",
+	}, func(ctx context.Context, req *gomcp.CallToolRequest, input queryFleetInput) (*gomcp.CallToolResult, any, error) {
+		return s.handleQueryFleet(ctx, input)
+	})
+}
+
+func (s *Server) handleQueryFleet(ctx context.Context, input queryFleetInput) (*gomcp.CallToolResult, any, error) {
+	// Validate fleet configuration.
+	if len(s.fleetNodes) == 0 {
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: "No fleet nodes configured. Set fleet.nodes in ingero.yaml."},
+			},
+			IsError: true,
+		}, nil, nil
+	}
+
+	// Validate action.
+	action := strings.ToLower(input.Action)
+	if action == "sql" && strings.TrimSpace(input.SQL) == "" {
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: "sql field is required when action is 'sql'"},
+			},
+			IsError: true,
+		}, nil, nil
+	}
+
+	fc, err := s.getFleetClient()
+	if err != nil {
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: fmt.Sprintf("fleet client error: %v", err)},
+			},
+			IsError: true,
+		}, nil, nil
+	}
+
+	tsc := input.TSC == nil || *input.TSC
+	since := input.Since
+	if since == "" {
+		since = "5m"
+	}
+
+	var text string
+	switch action {
+	case "chains":
+		text, err = s.fleetChains(ctx, fc, since, tsc)
+	case "ops":
+		text, err = s.fleetOps(ctx, fc, since, input.PID, tsc)
+	case "overview":
+		text, err = s.fleetOverview(ctx, fc, tsc)
+	case "sql":
+		text, err = s.fleetSQL(ctx, fc, input.SQL, input.Limit, tsc)
+	default:
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: fmt.Sprintf("unknown action %q — use chains, ops, overview, or sql", input.Action)},
+			},
+			IsError: true,
+		}, nil, nil
+	}
+
+	if err != nil {
+		return &gomcp.CallToolResult{
+			Content: []gomcp.Content{
+				&gomcp.TextContent{Text: fmt.Sprintf("fleet query failed: %v", err)},
+			},
+			IsError: true,
+		}, nil, nil
+	}
+
+	// Check clock skew (best-effort, don't fail the query).
+	if skewResults, skewErr := fc.EstimateClockSkew(ctx); skewErr == nil {
+		if skewWarnings := fleet.PrintClockSkewWarnings(skewResults, 10); skewWarnings != "" {
+			text = "Clock Skew Warnings:\n" + skewWarnings + "\n" + text
+		}
+	}
+
+	return &gomcp.CallToolResult{
+		Content: []gomcp.Content{
+			&gomcp.TextContent{Text: text},
+		},
+	}, nil, nil
+}
+
+func (s *Server) fleetChains(ctx context.Context, fc *fleet.Client, since string, tsc bool) (string, error) {
+	result, err := fc.QueryChains(ctx, since)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if len(result.Warnings) > 0 {
+		b.WriteString("Warnings: " + strings.Join(result.Warnings, "; ") + "\n\n")
+	}
+
+	if len(result.Chains) == 0 {
+		b.WriteString("No causal chains found across fleet nodes.\n")
+		return b.String(), nil
+	}
+
+	b.WriteString(fmt.Sprintf("Fleet Chains: %d chain(s)\n", len(result.Chains)))
+	for _, ch := range result.Chains {
+		if tsc {
+			b.WriteString(fmt.Sprintf("[%s] %s | %s | %s\n", ch.Severity, ch.Node, ch.Summary, ch.RootCause))
+		} else {
+			b.WriteString(fmt.Sprintf("\n[%s] Node: %s\n  ID: %s\n  Summary: %s\n  Root cause: %s\n  Explanation: %s\n",
+				ch.Severity, ch.Node, ch.ID, ch.Summary, ch.RootCause, ch.Explanation))
+			if len(ch.Recommendations) > 0 {
+				b.WriteString("  Fix: " + strings.Join(ch.Recommendations, "; ") + "\n")
+			}
+		}
+	}
+	return b.String(), nil
+}
+
+func (s *Server) fleetOps(ctx context.Context, fc *fleet.Client, since string, pid int, tsc bool) (string, error) {
+	path := fmt.Sprintf("/api/v1/ops?since=%s", since)
+	if pid > 0 {
+		path += fmt.Sprintf("&pid=%d", pid)
+	}
+
+	result, err := fc.QueryEndpoint(ctx, path)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if len(result.Warnings) > 0 {
+		b.WriteString("Warnings: " + strings.Join(result.Warnings, "; ") + "\n\n")
+	}
+
+	b.WriteString(fmt.Sprintf("Fleet Ops: %d node(s)\n", len(result.Nodes)))
+	for node, data := range result.Nodes {
+		if tsc {
+			b.WriteString(fmt.Sprintf("--- %s ---\n%s\n", node, string(data)))
+		} else {
+			b.WriteString(fmt.Sprintf("\n=== Node: %s ===\n%s\n", node, string(data)))
+		}
+	}
+	return b.String(), nil
+}
+
+func (s *Server) fleetOverview(ctx context.Context, fc *fleet.Client, tsc bool) (string, error) {
+	result, err := fc.QueryEndpoint(ctx, "/api/v1/overview")
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if len(result.Warnings) > 0 {
+		b.WriteString("Warnings: " + strings.Join(result.Warnings, "; ") + "\n\n")
+	}
+
+	b.WriteString(fmt.Sprintf("Fleet Overview: %d node(s)\n", len(result.Nodes)))
+	for node, data := range result.Nodes {
+		if tsc {
+			b.WriteString(fmt.Sprintf("--- %s ---\n%s\n", node, string(data)))
+		} else {
+			b.WriteString(fmt.Sprintf("\n=== Node: %s ===\n%s\n", node, string(data)))
+		}
+	}
+	return b.String(), nil
+}
+
+func (s *Server) fleetSQL(ctx context.Context, fc *fleet.Client, sql string, limit int, tsc bool) (string, error) {
+	if limit <= 0 {
+		limit = fleet.DefaultLimit
+	}
+
+	// Override limit on the client for this call.
+	sqlClient, err := fleet.New(fleet.Config{
+		Nodes:   s.fleetNodes,
+		Timeout: fleet.DefaultTimeout,
+		Limit:   limit,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	result, err := sqlClient.QuerySQL(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if len(result.Warnings) > 0 {
+		b.WriteString("Warnings: " + strings.Join(result.Warnings, "; ") + "\n\n")
+	}
+
+	if len(result.Rows) == 0 {
+		b.WriteString("No results.\n")
+		return b.String(), nil
+	}
+
+	// Format as TSC table or verbose.
+	if tsc {
+		// Header.
+		b.WriteString(strings.Join(result.Columns, "|") + "\n")
+		for _, row := range result.Rows {
+			vals := make([]string, len(row))
+			for i, v := range row {
+				vals[i] = fmt.Sprintf("%v", v)
+			}
+			b.WriteString(strings.Join(vals, "|") + "\n")
+		}
+	} else {
+		// Padded columns.
+		widths := make([]int, len(result.Columns))
+		for i, col := range result.Columns {
+			widths[i] = len(col)
+		}
+		for _, row := range result.Rows {
+			for i, val := range row {
+				s := fmt.Sprintf("%v", val)
+				if len(s) > widths[i] {
+					widths[i] = len(s)
+				}
+			}
+		}
+		for i, col := range result.Columns {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			fmt.Fprintf(&b, "%-*s", widths[i], col)
+		}
+		b.WriteString("\n")
+		for i, w := range widths {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			b.WriteString(strings.Repeat("-", w))
+		}
+		b.WriteString("\n")
+		for _, row := range result.Rows {
+			for i, val := range row {
+				if i > 0 {
+					b.WriteString("  ")
+				}
+				fmt.Fprintf(&b, "%-*v", widths[i], val)
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("\n%d row(s)\n", len(result.Rows)))
+	return b.String(), nil
 }
 
 func (s *Server) registerPrompts() {

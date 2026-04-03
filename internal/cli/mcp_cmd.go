@@ -112,6 +112,12 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 
 	srv := ingmcp.New(s)
 
+	// Wire fleet.nodes from config for query_fleet tool.
+	if fleetNodes := ReadFleetNodes(); len(fleetNodes) > 0 {
+		srv.SetFleetNodes(fleetNodes)
+		debugf("mcp: fleet nodes configured: %v", fleetNodes)
+	}
+
 	if mcpHTTPAddr != "" {
 		return srv.RunHTTP(ctx, mcpHTTPAddr, mcpTLSCert, mcpTLSKey)
 	}

@@ -10,7 +10,10 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/fleet"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/sysinfo"
@@ -34,6 +38,12 @@ var (
 	explainLast       int
 	explainChains     bool
 	explainPerProcess bool
+	explainNodes      string
+	explainTimeout    string
+	explainCACert     string
+	explainClientCert string
+	explainClientKey  string
+	explainClockSkew  string
 )
 
 var explainCmd = &cobra.Command{
@@ -65,6 +75,12 @@ func init() {
 	explainCmd.Flags().IntVar(&explainLast, "last", 0, "analyze the N most recent events (0 = use --since)")
 	explainCmd.Flags().BoolVar(&explainChains, "chains", false, "show stored causal chains from DB (skip re-analysis)")
 	explainCmd.Flags().BoolVar(&explainPerProcess, "per-process", false, "per-process CUDA API breakdown (RAG/multi-process contention)")
+	explainCmd.Flags().StringVar(&explainNodes, "nodes", "", "comma-separated node addresses (host:port) for fleet fan-out query")
+	explainCmd.Flags().StringVar(&explainTimeout, "timeout", "5s", "per-node timeout for fleet queries")
+	explainCmd.Flags().StringVar(&explainCACert, "ca-cert", "", "CA certificate for mTLS (optional)")
+	explainCmd.Flags().StringVar(&explainClientCert, "client-cert", "", "client certificate for mTLS (optional)")
+	explainCmd.Flags().StringVar(&explainClientKey, "client-key", "", "client key for mTLS (optional)")
+	explainCmd.Flags().StringVar(&explainClockSkew, "clock-skew-threshold", "10ms", "clock skew warning threshold for fleet queries")
 
 	rootCmd.AddCommand(explainCmd)
 }
@@ -77,6 +93,12 @@ func resolveExplainDB() string {
 }
 
 func explainRunE(cmd *cobra.Command, args []string) error {
+	// Fleet fan-out path: if nodes are configured.
+	nodes := resolveFleetNodes(explainNodes)
+	if len(nodes) > 0 {
+		return explainFleetChains(cmd.Context(), nodes)
+	}
+
 	// --chains mode: show pre-computed causal chains from DB.
 	if explainChains {
 		return explainStoredChains()
@@ -528,6 +550,86 @@ func renderChainsJSON(chains []correlate.CausalChain) error {
 		}
 	}
 	fmt.Println("]")
+	return nil
+}
+
+// explainFleetChains queries causal chains from multiple nodes and displays merged results.
+func explainFleetChains(ctx context.Context, nodes []string) error {
+	timeout, err := time.ParseDuration(explainTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid --timeout: %w", err)
+	}
+
+	client, err := fleet.New(fleet.Config{
+		Nodes:      nodes,
+		Timeout:    timeout,
+		CACert:     explainCACert,
+		ClientCert: explainClientCert,
+		ClientKey:  explainClientKey,
+	})
+	if err != nil {
+		return fmt.Errorf("creating fleet client: %w", err)
+	}
+
+	// Run chain query and clock skew estimation in parallel.
+	type chainOut struct {
+		result *fleet.ChainResult
+		err    error
+	}
+	cch := make(chan chainOut, 1)
+	go func() {
+		r, e := client.QueryChains(ctx, explainSince)
+		cch <- chainOut{r, e}
+	}()
+
+	skewResults, _ := client.EstimateClockSkew(ctx)
+	co := <-cch
+	result := co.result
+
+	// Print warnings to stderr.
+	if result != nil {
+		for _, w := range result.Warnings {
+			fmt.Fprintf(os.Stderr, "WARNING: %s\n", w)
+		}
+	}
+
+	// Print clock skew warnings.
+	skewThreshold := parseClockSkewThresholdMs(explainClockSkew)
+	if skewWarnings := fleet.PrintClockSkewWarnings(skewResults, skewThreshold); skewWarnings != "" {
+		fmt.Fprint(os.Stderr, skewWarnings)
+	}
+
+	if co.err != nil {
+		return co.err
+	}
+
+	if len(result.Chains) == 0 {
+		fmt.Println("  No causal chains found across fleet nodes.")
+		return nil
+	}
+
+	if explainJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result.Chains)
+	}
+
+	// Human-readable output.
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("FLEET CAUSAL CHAINS — %d chain(s) from %d node(s)\n\n", len(result.Chains), len(nodes)))
+
+	for _, ch := range result.Chains {
+		b.WriteString(fmt.Sprintf("[%s] [%s] %s\n", ch.Severity, ch.Node, ch.Summary))
+		b.WriteString(fmt.Sprintf("  Root cause: %s\n", ch.RootCause))
+		if len(ch.Recommendations) > 0 {
+			b.WriteString("  Fix: ")
+			b.WriteString(strings.Join(ch.Recommendations, "; "))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	fmt.Print(b.String())
 	return nil
 }
 

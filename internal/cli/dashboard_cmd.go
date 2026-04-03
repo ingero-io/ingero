@@ -44,6 +44,7 @@ var (
 	dashDBPath  string
 	dashTLSCert string
 	dashTLSKey  string
+	dashNoTLS   bool
 )
 
 func init() {
@@ -51,6 +52,7 @@ func init() {
 	dashboardCmd.Flags().StringVar(&dashDBPath, "db", "", "database path (default: ~/.ingero/ingero.db)")
 	dashboardCmd.Flags().StringVar(&dashTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted, a self-signed cert is generated")
 	dashboardCmd.Flags().StringVar(&dashTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
+	dashboardCmd.Flags().BoolVar(&dashNoTLS, "no-tls", false, "serve plain HTTP (for fleet queries on trusted networks)")
 	rootCmd.AddCommand(dashboardCmd)
 }
 
@@ -80,5 +82,6 @@ func dashboardRunE(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	srv := dashboard.New(s, dashAddr, dashTLSCert, dashTLSKey)
+	srv.SetNoTLS(dashNoTLS)
 	return srv.Start(ctx)
 }

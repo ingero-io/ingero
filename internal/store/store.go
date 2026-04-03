@@ -40,18 +40,22 @@ const (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS events (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	timestamp  INTEGER NOT NULL,  -- unix nanos
+	id         TEXT PRIMARY KEY,       -- "{node}:{seq}" node-namespaced ID
+	timestamp  INTEGER NOT NULL,       -- unix nanos
 	pid        INTEGER NOT NULL,
 	tid        INTEGER NOT NULL,
 	source     INTEGER NOT NULL,
 	op         INTEGER NOT NULL,
-	duration   INTEGER NOT NULL,  -- nanos
+	duration   INTEGER NOT NULL,       -- nanos
 	gpu_id     INTEGER NOT NULL DEFAULT 0,
 	arg0       INTEGER NOT NULL DEFAULT 0,
 	arg1       INTEGER NOT NULL DEFAULT 0,
 	ret_code   INTEGER NOT NULL DEFAULT 0,
-	stack_hash INTEGER NOT NULL DEFAULT 0  -- FK to stack_traces.hash (0 = no stack)
+	stack_hash INTEGER NOT NULL DEFAULT 0, -- FK to stack_traces.hash (0 = no stack)
+	node       TEXT NOT NULL DEFAULT '',
+	rank       INTEGER,
+	local_rank INTEGER,
+	world_size INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
@@ -112,7 +116,7 @@ const migrateAddNamespace = `ALTER TABLE cgroup_metadata ADD COLUMN namespace TE
 
 const chainsSchema = `
 CREATE TABLE IF NOT EXISTS causal_chains (
-	id              TEXT PRIMARY KEY,       -- e.g. "tail-medium-cuLaunchKernel"
+	id              TEXT PRIMARY KEY,       -- "{node}:{descriptor}" node-namespaced ID
 	detected_at     INTEGER NOT NULL,       -- unix nanos (when chain was detected)
 	severity        TEXT NOT NULL,           -- HIGH, MEDIUM, LOW
 	summary         TEXT NOT NULL,           -- one-line description
@@ -123,7 +127,8 @@ CREATE TABLE IF NOT EXISTS causal_chains (
 	cuda_p99_us     INTEGER NOT NULL DEFAULT 0,
 	cuda_p50_us     INTEGER NOT NULL DEFAULT 0,
 	tail_ratio      REAL NOT NULL DEFAULT 0,
-	timeline        TEXT NOT NULL DEFAULT '' -- JSON array of timeline events
+	timeline        TEXT NOT NULL DEFAULT '',-- JSON array of timeline events
+	node            TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_chains_detected_at ON causal_chains(detected_at);
@@ -168,7 +173,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 	python_ver TEXT NOT NULL DEFAULT '',
 	ingero_ver TEXT NOT NULL DEFAULT '',
 	pid_filter TEXT NOT NULL DEFAULT '',
-	flags      TEXT NOT NULL DEFAULT ''
+	flags      TEXT NOT NULL DEFAULT '',
+	node       TEXT NOT NULL DEFAULT '',
+	rank       INTEGER,
+	local_rank INTEGER,
+	world_size INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 `
@@ -356,6 +365,18 @@ func populateLookupTables(db *sql.DB) {
 	tx.Commit()
 }
 
+// v0.9 node identity migration — adds node/rank columns to events, sessions, causal_chains.
+// Idempotent: fails silently if columns already exist (new DBs have them from schema).
+const migrateAddEventsNode = `ALTER TABLE events ADD COLUMN node TEXT NOT NULL DEFAULT ''`
+const migrateAddEventsRank = `ALTER TABLE events ADD COLUMN rank INTEGER`
+const migrateAddEventsLocalRank = `ALTER TABLE events ADD COLUMN local_rank INTEGER`
+const migrateAddEventsWorldSize = `ALTER TABLE events ADD COLUMN world_size INTEGER`
+const migrateAddSessionsNode = `ALTER TABLE sessions ADD COLUMN node TEXT NOT NULL DEFAULT ''`
+const migrateAddSessionsRank = `ALTER TABLE sessions ADD COLUMN rank INTEGER`
+const migrateAddSessionsLocalRank = `ALTER TABLE sessions ADD COLUMN local_rank INTEGER`
+const migrateAddSessionsWorldSize = `ALTER TABLE sessions ADD COLUMN world_size INTEGER`
+const migrateAddChainsNode = `ALTER TABLE causal_chains ADD COLUMN node TEXT NOT NULL DEFAULT ''`
+
 // migrateSchema adds columns that may be missing in older databases.
 const migrateAddStackIPs = `ALTER TABLE events ADD COLUMN stack_ips TEXT NOT NULL DEFAULT ''`
 const migrateAddStackHash = `ALTER TABLE events ADD COLUMN stack_hash INTEGER NOT NULL DEFAULT 0`
@@ -375,6 +396,10 @@ type Store struct {
 	stackCache map[uint64]bool
 
 	maxDBSize atomic.Int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
+
+	// Node identity for multi-node correlation (v0.9).
+	node    string       // set via SetNode before Run()
+	eventSeq atomic.Uint64 // monotonic event ID counter
 
 	mu      sync.Mutex
 	closed  bool
@@ -422,6 +447,10 @@ type Session struct {
 	IngeroVer string
 	PIDFilter string
 	Flags     string
+	Node      string // multi-node identity (v0.9)
+	Rank      *int   // distributed training rank (nil = not set)
+	LocalRank *int   // local rank (nil = not set)
+	WorldSize *int   // total ranks (nil = not set)
 }
 
 // Aggregate is a per-minute summary of events that were not individually stored.
@@ -713,6 +742,21 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id → container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
 
+	// v0.9: Add node identity and rank columns. Idempotent — no-op for new DBs.
+	db.Exec(migrateAddEventsNode)
+	db.Exec(migrateAddEventsRank)
+	db.Exec(migrateAddEventsLocalRank)
+	db.Exec(migrateAddEventsWorldSize)
+	db.Exec(migrateAddSessionsNode)
+	db.Exec(migrateAddSessionsRank)
+	db.Exec(migrateAddSessionsLocalRank)
+	db.Exec(migrateAddSessionsWorldSize)
+	db.Exec(migrateAddChainsNode)
+
+	// Update schema version to 0.9.
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.9')")
+	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('node_note', 'Node identity for multi-node correlation. events.id format: {node}:{seq}. causal_chains.id format: {node}:{descriptor}.')")
+
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
 	if dbPath != ":memory:" {
@@ -833,8 +877,8 @@ func (s *Store) flushBatch(batch []events.Event) {
 	}
 
 	// Prepare: event insert uses stack_hash (integer FK) instead of inline JSON.
-	evtStmt, err := tx.Prepare(`INSERT INTO events (timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	evtStmt, err := tx.Prepare(`INSERT INTO events (id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -881,6 +925,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 			}
 		}
 		evtStmt.Exec(
+			s.nextEventID(),
 			evt.Timestamp.UnixNano(),
 			evt.PID,
 			evt.TID,
@@ -893,6 +938,10 @@ func (s *Store) flushBatch(batch []events.Event) {
 			evt.RetCode,
 			stackHash,
 			evt.CGroupID,
+			s.node,
+			nilableInt(evt.Rank),
+			nilableInt(evt.LocalRank),
+			nilableInt(evt.WorldSize),
 		)
 	}
 
@@ -1004,6 +1053,33 @@ func ParseSize(s string) (int64, error) {
 // after every flush and during periodic pruning (every DefaultPruneInterval).
 func (s *Store) SetMaxDBSize(bytes int64) {
 	s.maxDBSize.Store(bytes)
+}
+
+// SetNode sets the node identity used for node-namespaced event and chain IDs.
+// Must be called before Run(). Not safe for concurrent use with Run().
+func (s *Store) SetNode(node string) {
+	s.node = node
+	// Seed the event ID counter from the DB to prevent collisions on restart.
+	// Query the max sequence number for this node's events.
+	var maxSeq uint64
+	row := s.db.QueryRow(
+		"SELECT COALESCE(MAX(CAST(substr(id, instr(id, ':')+1) AS INTEGER)), 0) FROM events WHERE id LIKE ?",
+		node+":%",
+	)
+	if err := row.Scan(&maxSeq); err == nil && maxSeq > 0 {
+		s.eventSeq.Store(maxSeq)
+	}
+}
+
+// Node returns the current node identity.
+func (s *Store) Node() string {
+	return s.node
+}
+
+// nextEventID returns the next node-namespaced event ID: "{node}:{seq}".
+func (s *Store) nextEventID() string {
+	seq := s.eventSeq.Add(1)
+	return fmt.Sprintf("%s:%d", s.node, seq)
 }
 
 // diskUsage returns the total size of the DB file + WAL + SHM in bytes.
@@ -1148,7 +1224,7 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
 		e.gpu_id, e.arg0, e.arg1, e.ret_code,
 		COALESCE(st.frames, ''), COALESCE(st.ips, ''),
-		e.cgroup_id
+		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	WHERE 1=1`
@@ -1217,8 +1293,12 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			framesJSON string
 			ipsJSON    string
 			cgroupID   uint64
+			node       string
+			rank       sql.NullInt64
+			localRank  sql.NullInt64
+			worldSize  sql.NullInt64
 		)
-		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON, &cgroupID); err != nil {
+		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON, &cgroupID, &node, &rank, &localRank, &worldSize); err != nil {
 			return nil, fmt.Errorf("scanning event row: %w", err)
 		}
 		evt := events.Event{
@@ -1232,6 +1312,19 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			Args:      [2]uint64{arg0, arg1},
 			RetCode:   retCode,
 			CGroupID:  cgroupID,
+			Node:      node,
+		}
+		if rank.Valid {
+			v := int(rank.Int64)
+			evt.Rank = &v
+		}
+		if localRank.Valid {
+			v := int(localRank.Int64)
+			evt.LocalRank = &v
+		}
+		if worldSize.Valid {
+			v := int(worldSize.Int64)
+			evt.WorldSize = &v
 		}
 		// Prefer resolved frames; fall back to raw IPs for old DBs.
 		evt.Stack = deserializeStackFrames(framesJSON)
@@ -1274,7 +1367,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		COALESCE(o.name, 'OP_' || e.op),
 		COALESCE(o.description, ''),
 		COALESCE(pn.name, ''),
-		e.cgroup_id
+		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	LEFT JOIN sources s ON e.source = s.id
@@ -1337,10 +1430,15 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			srcName, srcDesc, opName, opDesc string
 			procName   string
 			cgroupID   uint64
+			node       string
+			rank       sql.NullInt64
+			localRank  sql.NullInt64
+			worldSize  sql.NullInt64
 		)
 		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos,
 			&gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON,
-			&srcName, &srcDesc, &opName, &opDesc, &procName, &cgroupID); err != nil {
+			&srcName, &srcDesc, &opName, &opDesc, &procName, &cgroupID,
+			&node, &rank, &localRank, &worldSize); err != nil {
 			return nil, fmt.Errorf("scanning rich event: %w", err)
 		}
 		re := RichEvent{
@@ -1355,12 +1453,25 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 				Args:      [2]uint64{arg0, arg1},
 				RetCode:   retCode,
 				CGroupID:  cgroupID,
+				Node:      node,
 			},
 			SourceName:  srcName,
 			SourceDesc:  srcDesc,
 			OpName:      opName,
 			OpDesc:      opDesc,
 			ProcessName: procName,
+		}
+		if rank.Valid {
+			v := int(rank.Int64)
+			re.Event.Rank = &v
+		}
+		if localRank.Valid {
+			v := int(localRank.Int64)
+			re.Event.LocalRank = &v
+		}
+		if worldSize.Valid {
+			v := int(worldSize.Int64)
+			re.Event.WorldSize = &v
 		}
 		// Prefer resolved frames; fall back to raw IPs for old DBs.
 		re.Event.Stack = deserializeStackFrames(framesJSON)
@@ -1611,6 +1722,7 @@ type StoredChain struct {
 	CUDAP50us       int64
 	TailRatio       float64
 	Timeline        []TimelineEntry
+	Node            string // multi-node identity (v0.9)
 }
 
 // TimelineEntry is a single event in a causal chain timeline.
@@ -1642,8 +1754,8 @@ func (s *Store) RecordChains(chains []StoredChain) {
 	}
 
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO causal_chains
-		(id, detected_at, severity, summary, root_cause, explanation, recommendations, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(id, detected_at, severity, summary, root_cause, explanation, recommendations, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline, node)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -1674,6 +1786,7 @@ func (s *Store) RecordChains(chains []StoredChain) {
 			ch.CUDAP50us,
 			ch.TailRatio,
 			string(tlJSON),
+			ch.Node,
 		)
 	}
 
@@ -1682,7 +1795,7 @@ func (s *Store) RecordChains(chains []StoredChain) {
 
 // QueryChains retrieves causal chains, optionally filtered by time range.
 func (s *Store) QueryChains(since time.Duration) ([]StoredChain, error) {
-	query := "SELECT id, detected_at, severity, summary, root_cause, explanation, recommendations, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline FROM causal_chains"
+	query := "SELECT id, detected_at, severity, summary, root_cause, explanation, recommendations, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline, node FROM causal_chains"
 	var args []interface{}
 
 	if since > 0 {
@@ -1707,7 +1820,7 @@ func (s *Store) QueryChains(since time.Duration) ([]StoredChain, error) {
 		)
 		if err := rows.Scan(&ch.ID, &tsNanos, &ch.Severity, &ch.Summary, &ch.RootCause,
 			&ch.Explanation, &recsJSON, &ch.CUDAOp, &ch.CUDAP99us, &ch.CUDAP50us,
-			&ch.TailRatio, &tlJSON); err != nil {
+			&ch.TailRatio, &tlJSON, &ch.Node); err != nil {
 			return nil, fmt.Errorf("scanning chain row: %w", err)
 		}
 		ch.DetectedAt = time.Unix(0, tsNanos)
@@ -1825,14 +1938,16 @@ func (s *Store) QuerySnapshots(q QueryParams) ([]SystemSnapshot, error) {
 func (s *Store) StartSession(sess Session) (int64, error) {
 	result, err := s.db.Exec(`INSERT INTO sessions
 		(started_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total,
-		 kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags,
+		 node, rank, local_rank, world_size)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.StartedAt.UnixNano(),
 		sess.GPUModel, sess.GPUDriver,
 		sess.CPUModel, sess.CPUCores, sess.MemTotal,
 		sess.Kernel, sess.OSRelease,
 		sess.CUDAVer, sess.PythonVer, sess.IngeroVer,
 		sess.PIDFilter, sess.Flags,
+		sess.Node, nilableInt(sess.Rank), nilableInt(sess.LocalRank), nilableInt(sess.WorldSize),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("inserting session: %w", err)
@@ -2089,7 +2204,8 @@ func (s *Store) QueryAggregatePerProcess(q QueryParams) ([]ProcessOpStats, error
 func (s *Store) QuerySessions(since time.Duration) ([]Session, error) {
 	query := `SELECT id, started_at, stopped_at, gpu_model, gpu_driver,
 		cpu_model, cpu_cores, mem_total, kernel, os_release,
-		cuda_ver, python_ver, ingero_ver, pid_filter, flags
+		cuda_ver, python_ver, ingero_ver, pid_filter, flags,
+		node, rank, local_rank, world_size
 		FROM sessions`
 	var args []interface{}
 
@@ -2111,14 +2227,30 @@ func (s *Store) QuerySessions(since time.Duration) ([]Session, error) {
 			sess              Session
 			startNanos        int64
 			stopNanos         int64
+			rank              sql.NullInt64
+			localRank         sql.NullInt64
+			worldSize         sql.NullInt64
 		)
 		if err := rows.Scan(&sess.ID, &startNanos, &stopNanos,
 			&sess.GPUModel, &sess.GPUDriver,
 			&sess.CPUModel, &sess.CPUCores, &sess.MemTotal,
 			&sess.Kernel, &sess.OSRelease,
 			&sess.CUDAVer, &sess.PythonVer, &sess.IngeroVer,
-			&sess.PIDFilter, &sess.Flags); err != nil {
+			&sess.PIDFilter, &sess.Flags,
+			&sess.Node, &rank, &localRank, &worldSize); err != nil {
 			return nil, fmt.Errorf("scanning session row: %w", err)
+		}
+		if rank.Valid {
+			v := int(rank.Int64)
+			sess.Rank = &v
+		}
+		if localRank.Valid {
+			v := int(localRank.Int64)
+			sess.LocalRank = &v
+		}
+		if worldSize.Valid {
+			v := int(worldSize.Int64)
+			sess.WorldSize = &v
 		}
 		sess.StartedAt = time.Unix(0, startNanos)
 		if stopNanos > 0 {
@@ -2369,4 +2501,13 @@ func migrateInlineStacks(db *sql.DB) {
 
 		tx.Commit()
 	}
+}
+
+// nilableInt converts a *int to a value suitable for SQL insertion.
+// Returns nil (SQL NULL) if the pointer is nil, otherwise the int value.
+func nilableInt(p *int) interface{} {
+	if p == nil {
+		return nil
+	}
+	return *p
 }

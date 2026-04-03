@@ -459,4 +459,10 @@ type Event struct {
 	GraphHandle  uint64 // graph for EndCapture/Instantiate
 	ExecHandle   uint64 // executable for Instantiate/Launch
 	CaptureMode  uint32 // for BeginCapture (0=global, 1=thread_local, 2=relaxed)
+
+	// Multi-node identity fields (v0.9). Populated when --node is set.
+	Node      string // node identity (hostname or --node flag value)
+	Rank      *int   // distributed training rank (nil = not in distributed training)
+	LocalRank *int   // local rank within this node (nil = not set)
+	WorldSize *int   // total number of ranks (nil = not set)
 }

@@ -118,3 +118,74 @@ All traces captured on TensorDock RTX 4090 (24GB), Ubuntu 22.04, kernel 5.15, NV
 - PyTorch investigation: PyTorch 2.10.0+cu128
 - vLLM investigations: vLLM 0.17.1, Qwen/Qwen2.5-0.5B-Instruct with prefix caching
 - CUDA Graph demo: EC2 g4dn.xlarge (Tesla T4, 15GB), Ubuntu 24.04, kernel 6.17, NVIDIA 580.126.09, PyTorch 2.10+CUDA 12.0
+
+## Multi-Node Investigation Samples
+
+Sample SQLite databases from a 3-node GPU cluster for reproducing the [multi-node investigation walkthrough](../README.md#multi-node-investigation-walkthrough) in the main README. Demonstrates node identity tagging, fleet fan-out queries, offline database merge, Perfetto timeline export, and clock skew detection.
+
+### Multi-Node Databases
+
+| File | Issue / Scenario | What It Shows |
+|------|-----------------|---------------|
+| `sample-gpu-node-01.db` | Multi-node straggler (node 1) | PyTorch workload with CPU contention — HIGH severity chains (1024 sched_switch, cuLaunchKernel 45.8x p50). 200 events. |
+| `sample-gpu-node-02.db` | Multi-node healthy (node 2) | CUDA alloc workload with I/O — MEDIUM chains (cuMemAlloc 410x p50). 200 events. |
+| `sample-gpu-node-03.db` | Multi-node healthy (node 3) | CUDA alloc workload with I/O — MEDIUM chains (cuMemAlloc 137x p50). 200 events. |
+| `sample-cluster.db` | Merged 3-node cluster | All 3 nodes merged — 600 events, 6 chains, 9 unique stacks. Node-namespaced IDs, zero collisions. |
+| `sample-cluster-trace.json` | Perfetto timeline | Chrome Trace Event Format — open in [ui.perfetto.dev](https://ui.perfetto.dev). 3 process tracks, severity-colored chain markers. |
+
+### Investigate Multi-Node with AI
+
+```bash
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/sample-cluster.db"]}}}
+EOF
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
+
+Example questions:
+- "Which node has the worst GPU latency?"
+- "Show causal chains grouped by node"
+- "Run SQL: SELECT node, source, count(*) FROM events GROUP BY node, source"
+
+### Quick Multi-Node Analysis
+
+```bash
+# Query the merged database — see events per node
+ingero query --db investigations/sample-cluster.db --since 8760h
+
+# Causal chains from all 3 nodes
+ingero explain --db investigations/sample-cluster.db --chains
+
+# Per-process breakdown across nodes
+ingero explain --db investigations/sample-cluster.db --per-process --since 8760h
+
+# Export to Perfetto timeline
+ingero export --format perfetto --db investigations/sample-cluster.db -o trace.json
+# Open trace.json in https://ui.perfetto.dev
+
+# Re-merge from individual node databases
+ingero merge investigations/sample-gpu-node-01.db investigations/sample-gpu-node-02.db investigations/sample-gpu-node-03.db -o my-cluster.db
+```
+
+### Multi-Node Demo Recordings
+
+GIF recordings from the multi-node fleet demo (v0.9.0), located in `docs/assets/`:
+
+#### `ingero query --nodes` — fan-out SQL across 3 GPU nodes
+![fleet-query](../docs/assets/fleet-query.gif)
+
+#### `ingero explain --nodes` — cross-node causal chains with severity
+![fleet-explain](../docs/assets/fleet-explain.gif)
+
+#### `ingero merge` + `ingero export` — offline merge and Perfetto export
+![merge-export](../docs/assets/merge-export.gif)
+
+### Multi-Node Environment
+
+All traces captured on 3 x AWS EC2 g4dn.xlarge (Tesla T4, 15GB), Ubuntu 24.04, kernel 6.17, NVIDIA 580.126.09.
+- Node 1: PyTorch 2.5.1+cu124, `torch.mm()` matrix multiplication (2000x2000)
+- Node 2/3: CUDA Runtime `cudaMalloc`/`cudaFree` loop via ctypes
+- Each database trimmed to 200 events (most recent) with aggregates removed for minimal file size
+- Generated 2026-04-03 on 3 x g4dn.xlarge instances
+
+> **Note:** The multi-node features above (fan-out queries, offline merge, Perfetto export) are interim solutions for cross-node GPU investigation. A dedicated cluster-level observability and diagnostics tool with native multi-node support is coming soon.

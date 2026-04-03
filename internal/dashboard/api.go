@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
@@ -240,6 +241,7 @@ type chainEntry struct {
 	CUDAP50US       int64            `json:"cuda_p50_us,omitempty"`
 	TailRatio       float64          `json:"tail_ratio,omitempty"`
 	Timeline        []timelineEntry  `json:"timeline,omitempty"`
+	Node            string           `json:"node,omitempty"`
 }
 
 type timelineEntry struct {
@@ -280,6 +282,7 @@ func (s *Server) handleChains(w http.ResponseWriter, r *http.Request) {
 			CUDAP99US:       ch.CUDAP99us,
 			CUDAP50US:       ch.CUDAP50us,
 			TailRatio:       ch.TailRatio,
+			Node:            ch.Node,
 		}
 		for _, te := range ch.Timeline {
 			e.Timeline = append(e.Timeline, timelineEntry{
@@ -476,6 +479,68 @@ func (s *Server) handleGraphEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, results)
+}
+
+// handleTime returns the server's wall-clock time for clock skew estimation.
+// Lightweight — no DB access. Used by fleet client's EstimateClockSkew().
+func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, struct {
+		TimestampNS int64 `json:"timestamp_ns"`
+	}{TimestampNS: time.Now().UnixNano()})
+}
+
+// handleQuery executes a read-only SQL query against the local SQLite and
+// returns JSON rows. Used by fleet fan-out clients.
+//
+// POST /api/v1/query
+// Body: { "sql": "SELECT ...", "limit": 1000 }
+// Response: { "columns": ["col1", "col2"], "rows": [[val1, val2], ...] }
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if s.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "no store available")
+		return
+	}
+
+	var req struct {
+		SQL   string `json:"sql"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.SQL) == "" {
+		writeError(w, http.StatusBadRequest, "empty SQL query")
+		return
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	cols, rows, _, err := s.store.ExecuteReadOnly(r.Context(), req.SQL, limit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Convert rows to [][]any for JSON.
+	jsonRows := make([][]any, len(rows))
+	for i, row := range rows {
+		jsonRows[i] = row
+	}
+
+	writeJSON(w, struct {
+		Columns []string `json:"columns"`
+		Rows    [][]any  `json:"rows"`
+	}{
+		Columns: cols,
+		Rows:    jsonRows,
+	})
 }
 
 // sourceString converts a source ID to a human-readable string.

@@ -218,6 +218,7 @@ type Engine struct {
 	netWindow  []events.Event  // network socket events
 	maxAge     time.Duration
 	sysCtx     *SystemContext // latest system context, nil if not available
+	node       string         // node identity for chain ID prefixing (v0.9)
 
 	// Throughput-drop detection: track event rates across snapshots.
 	latestTime   time.Time       // latest event timestamp (from AdvanceClock)
@@ -255,6 +256,23 @@ func New(opts ...Option) *Engine {
 		opt(e)
 	}
 	return e
+}
+
+// SetNode sets the node identity used for chain ID prefixing.
+// Must be called before any chains are generated.
+func (e *Engine) SetNode(node string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.node = node
+}
+
+// chainID returns a node-namespaced chain ID: "{node}:{descriptor}".
+// If node is empty, returns the descriptor as-is for backward compatibility.
+func (e *Engine) chainID(descriptor string) string {
+	if e.node == "" {
+		return descriptor
+	}
+	return e.node + ":" + descriptor
 }
 
 // RecordHost adds a host event to the sliding window.
@@ -721,7 +739,7 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	// OOM always produces a HIGH chain.
 	if oomCount > 0 {
 		chains = append(chains, CausalChain{
-			ID:       "oom",
+			ID:       e.chainID("oom"),
 			Severity: "HIGH",
 			Summary:  fmt.Sprintf("OOM killer triggered %d time(s)", oomCount),
 			RootCause: "host memory exhaustion triggered OOM killer",
@@ -741,7 +759,7 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 			severity = "HIGH"
 		}
 		chains = append(chains, CausalChain{
-			ID:        fmt.Sprintf("tcp-retransmit-%s", strings.ToLower(severity)),
+			ID:        e.chainID(fmt.Sprintf("tcp-retransmit-%s", strings.ToLower(severity))),
 			Severity:  severity,
 			Summary:   fmt.Sprintf("%d TCP retransmits during trace window", tcpRetransmitCount),
 			RootCause: "TCP retransmit burst indicates network congestion or packet loss",
@@ -757,7 +775,7 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	// Pod restart: always produces a chain.
 	if podRestartCount > 0 {
 		chains = append(chains, CausalChain{
-			ID:        "pod-restart",
+			ID:        e.chainID("pod-restart"),
 			Severity:  "HIGH",
 			Summary:   fmt.Sprintf("K8s pod restart detected (%d restart(s))", podRestartCount),
 			RootCause: "pod container restart concurrent with GPU workload",
@@ -773,7 +791,7 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 	// Pod eviction: always produces a chain.
 	if podEvictionCount > 0 {
 		chains = append(chains, CausalChain{
-			ID:        "pod-eviction",
+			ID:        e.chainID("pod-eviction"),
 			Severity:  "HIGH",
 			Summary:   fmt.Sprintf("K8s pod eviction detected (%d eviction(s))", podEvictionCount),
 			RootCause: "pod evicted by K8s scheduler during GPU workload",
@@ -988,7 +1006,7 @@ func (e *Engine) buildChain(
 	}
 
 	return &CausalChain{
-		ID:       fmt.Sprintf("tail-%s-%s", strings.ToLower(severity), op.Op),
+		ID:       e.chainID(fmt.Sprintf("tail-%s-%s", strings.ToLower(severity), op.Op)),
 		Severity: severity,
 		Summary: fmt.Sprintf("%s p99=%v (%.1fx p50) — %s",
 			op.Op, op.P99, tailRatio, causeStr),
@@ -1054,7 +1072,7 @@ func (e *Engine) detectNoisyNeighbor() *CausalChain {
 			severity = "HIGH"
 		}
 		return &CausalChain{
-			ID:       fmt.Sprintf("noisy-neighbor-%s", strings.ToLower(severity)),
+			ID:       e.chainID(fmt.Sprintf("noisy-neighbor-%s", strings.ToLower(severity))),
 			Severity: severity,
 			Summary:  fmt.Sprintf("noisy neighbor: target cgroup off-CPU p99=%v (%.1fx peer median %v)", tp.p99, ratio, peerMedian),
 			RootCause: "another process/cgroup is consuming CPU, starving the GPU workload",
@@ -1260,7 +1278,7 @@ func (e *Engine) buildThroughputDropChain(
 	summary := fmt.Sprintf("%s throughput dropped %.0f%% — %s", op.Op, dropPct, strings.Join(causes, " + "))
 
 	return &CausalChain{
-		ID:              fmt.Sprintf("drop-%s-%s", strings.ToLower(severity), op.Op),
+		ID:              e.chainID(fmt.Sprintf("drop-%s-%s", strings.ToLower(severity), op.Op)),
 		Severity:        severity,
 		Summary:         summary,
 		RootCause:       strings.Join(causes, " + "),
@@ -1553,7 +1571,7 @@ func (e *Engine) checkGraphCaptureOOM(pid uint32, graphWindow []events.Event, cu
 	}
 
 	return []CausalChain{{
-		ID:       "graph-capture-oom",
+		ID:       e.chainID("graph-capture-oom"),
 		Severity: "HIGH",
 		Summary:  fmt.Sprintf("OOM during graph capture (%d capture(s))", len(captures)),
 		RootCause: cause,
@@ -1614,7 +1632,7 @@ func (e *Engine) checkGraphLaunchCPUContention(pid uint32, graphWindow, hostWind
 	}
 
 	return []CausalChain{{
-		ID:       "graph-launch-cpu-contention",
+		ID:       e.chainID("graph-launch-cpu-contention"),
 		Severity: "MEDIUM",
 		Summary:  fmt.Sprintf("CPU contention delaying graph dispatch (%d launch(es), %d sched_switch)", len(launches), schedSwitchNearLaunch),
 		RootCause: "CPU scheduling interference during CUDA Graph launch",
@@ -1660,7 +1678,7 @@ func (e *Engine) checkGraphFrequencyAnomaly(pid uint32) []CausalChain {
 		dropPct := (1 - ratio) * 100
 
 		chains = append(chains, CausalChain{
-			ID:       fmt.Sprintf("graph-freq-anomaly-0x%x", key.execHandle),
+			ID:       e.chainID(fmt.Sprintf("graph-freq-anomaly-0x%x", key.execHandle)),
 			Severity: "MEDIUM",
 			Summary:  fmt.Sprintf("graph launch rate dropped %.0f%% (exec 0x%x, PID %d)", dropPct, key.execHandle, key.pid),
 			RootCause: "graph pool exhaustion — likely re-capture triggered by new batch size",
@@ -1696,7 +1714,7 @@ func (e *Engine) checkGraphNeverLaunched(pid uint32, graphWindow []events.Event)
 			continue // still within expected window
 		}
 		chains = append(chains, CausalChain{
-			ID:       fmt.Sprintf("graph-never-launched-0x%x", key.execHandle),
+			ID:       e.chainID(fmt.Sprintf("graph-never-launched-0x%x", key.execHandle)),
 			Severity: "LOW",
 			Summary:  fmt.Sprintf("graph instantiated but never launched (exec 0x%x, PID %d)", key.execHandle, key.pid),
 			RootCause: "graph instantiated but never launched — wasted VRAM",

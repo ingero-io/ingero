@@ -118,6 +118,8 @@ Things no other GPU tool can show you.
 
 **"Your vLLM inference spiked because a new batch size triggered CUDA Graph re-capture."** Ingero traces `cudaStreamBeginCapture` / `cudaGraphLaunch` via eBPF uprobes  -  no CUPTI, no Nsight, no code changes. When GraphLaunch rate drops 50%, Ingero flags graph pool exhaustion. When capture overlaps with OOM, the causal chain explains why. Works with `torch.compile(mode="reduce-overhead")` and vLLM out of the box.
 
+**"Rank 3 stalled for 200ms while ranks 0-2 waited  -  one query shows all 4 nodes."** With `ingero query --nodes`, one command fans out to every node in your cluster and merges the results. `ingero merge` combines offline databases for air-gapped analysis. `ingero export --format perfetto` produces a timeline you can open in Perfetto UI  -  one track per node/rank, immediately spotting the straggler. Clock skew between nodes is detected automatically.
+
 **"Ask your AI: what line of my code caused the GPU stall?"** Your AI assistant calls Ingero's MCP server and answers in one shot: "The issue is in `forward()` at `train.py:142`, calling cudaMalloc through PyTorch. 9,829 calls, avg 3.1ms but spiking to 48.3ms during CPU contention." Resolved Python source lines, native symbols, timing stats  -  no logs, no manual SQL, no hex addresses. The engineer asks questions in plain English and gets production root causes back.
 
 ## See It In Action
@@ -171,6 +173,191 @@ sudo ingero demo --gpu      # real GPU + eBPF tracing
 | `gpu-steal` | Multi-process GPU time-slicing quantified via CUDA API timing patterns |
 
 Every scenario prints a GPU auto-detect header showing GPU model and driver version, then displays real-time ASCII bar charts for system context.
+
+## Multi-Node Investigation Walkthrough
+
+A complete example: diagnosing a distributed training stall across a 4-node GPU cluster using every multi-node feature. Sample databases are available in [`investigations/`](investigations/#multi-node-investigation-samples) to reproduce these examples locally.
+
+### Setup: Tag Each Node
+
+On each node, trace with a node identity. Rank is auto-detected from `torchrun` environment variables (`RANK`, `LOCAL_RANK`, `WORLD_SIZE`).
+
+```bash
+# Node 1 (rank 0)
+sudo ingero trace --node gpu-node-01
+
+# Node 2 (rank 1)
+sudo ingero trace --node gpu-node-02
+
+# Node 3 (rank 2)
+sudo ingero trace --node gpu-node-03
+
+# Node 4 (rank 3)
+sudo ingero trace --node gpu-node-04
+```
+
+Events are tagged with node identity and rank. Event IDs are node-namespaced (`gpu-node-01:1`, `gpu-node-01:2`, ...) to prevent collisions.
+
+### Step 1: Start Dashboards for Fleet Queries
+
+On each node, start the dashboard API (plain HTTP on trusted VPC):
+
+```bash
+ingero dashboard --no-tls --addr :8080
+```
+
+Or configure once in `ingero.yaml`:
+
+```yaml
+fleet:
+  nodes:
+    - gpu-node-01:8080
+    - gpu-node-02:8080
+    - gpu-node-03:8080
+    - gpu-node-04:8080
+```
+
+### Step 2: Fan-Out Query  -  Find the Straggler
+
+<img src="docs/assets/fleet-query.gif" width="800" alt="ingero query --nodes fan-out across 3 GPU nodes showing events per node with node column prepended">
+
+From any node, query the entire cluster with one command:
+
+```bash
+$ ingero query --nodes gpu-node-01:8080,gpu-node-02:8080,gpu-node-03:8080,gpu-node-04:8080 \
+    "SELECT node, source, count(*) as cnt, avg(duration)/1000 as avg_us FROM events GROUP BY node, source"
+
+node              node           source  cnt    avg_us
+----------------  -------------  ------  -----  ------
+gpu-node-01:8080  gpu-node-01    4       11009  5.2
+gpu-node-01:8080  gpu-node-01    3       847    18400
+gpu-node-02:8080  gpu-node-02    4       10892  5.1
+gpu-node-02:8080  gpu-node-02    3       412    2100
+gpu-node-03:8080  gpu-node-03    4       10847  5.3
+gpu-node-03:8080  gpu-node-03    3       398    1900
+gpu-node-04:8080  gpu-node-04    4       10901  5.0
+gpu-node-04:8080  gpu-node-04    3       421    2200
+
+  8 rows from 4 node(s)
+```
+
+Node 1 has 847 host events with 18.4ms average duration  -  much higher than the other nodes (~2ms). That's the straggler.
+
+### Step 3: Fan-Out Explain  -  Cross-Node Causal Chains
+
+<img src="docs/assets/fleet-explain.gif" width="800" alt="ingero explain --nodes showing causal chains from multiple GPU nodes with severity and node attribution">
+
+```bash
+$ ingero explain --nodes gpu-node-01:8080,gpu-node-02:8080,gpu-node-03:8080,gpu-node-04:8080
+
+FLEET CAUSAL CHAINS — 2 chain(s) from 4 node(s)
+
+[HIGH] [gpu-node-01] cuLaunchKernel p99=843us (63.9x p50) — 847 sched_switch events + heavy block I/O
+  Root cause: 847 sched_switch events + heavy block I/O
+  Fix: Pin training process to dedicated cores with taskset; Add nice -n 19 to background jobs
+
+[MEDIUM] [gpu-node-01] cuMemAlloc p99=932us (5.0x p50) — 855 sched_switch events + heavy block I/O
+  Root cause: 855 sched_switch events + heavy block I/O
+  Fix: Pin training process to dedicated cores with taskset
+```
+
+Both chains are on `gpu-node-01`  -  the other 3 nodes are healthy. The root cause is CPU contention from block I/O on node 1.
+
+### Step 4: AI Fleet Investigation via MCP
+
+Your AI assistant queries the fleet in one MCP tool call:
+
+```
+User: "Which node is causing the distributed training stall?"
+
+AI calls: query_fleet(action="chains")
+
+AI: "gpu-node-01 has two causal chains — HIGH severity cuLaunchKernel latency
+spike (63.9x p50) caused by 847 scheduler preemptions and heavy block I/O.
+The other 3 nodes are clean. Recommendation: pin the training process to
+dedicated cores on gpu-node-01 and investigate the I/O source (likely
+checkpoint writes or log rotation)."
+```
+
+### Step 5: Offline Merge for Air-Gapped Analysis
+
+<img src="docs/assets/merge-export.gif" width="800" alt="ingero merge combining 3 node databases and ingero export producing a Perfetto timeline JSON">
+
+SCP databases from each node and merge locally:
+
+```bash
+$ scp gpu-node-01:~/.ingero/ingero.db node-01.db
+$ scp gpu-node-02:~/.ingero/ingero.db node-02.db
+$ scp gpu-node-03:~/.ingero/ingero.db node-03.db
+$ scp gpu-node-04:~/.ingero/ingero.db node-04.db
+
+$ ingero merge node-01.db node-02.db node-03.db node-04.db -o cluster.db
+
+  Merging node-01.db...
+    47,003 events, 2 chains, 8 stacks
+  Merging node-02.db...
+    42,891 events, 0 chains, 6 stacks
+  Merging node-03.db...
+    41,204 events, 0 chains, 5 stacks
+  Merging node-04.db...
+    43,102 events, 0 chains, 6 stacks
+
+  Merged 4 database(s) → cluster.db: 174,200 events, 2 chains, 12 unique stacks
+```
+
+The merged DB works with all standard tools:
+
+```bash
+ingero query -d cluster.db --since 1h
+ingero explain -d cluster.db --chains
+```
+
+### Step 6: Perfetto Timeline  -  Visual Diagnosis
+
+Export the merged database as a Perfetto trace:
+
+```bash
+$ ingero export --format perfetto -d cluster.db -o cluster-trace.json
+
+  Exported 174,200 events + 2 chains → cluster-trace.json (16.2 MB)
+```
+
+Open `cluster-trace.json` in [ui.perfetto.dev](https://ui.perfetto.dev):
+
+```
+Process tracks:
+  gpu-node-01 (rank 0)  ████████░░░░████████████████████░░████████  ← I/O gaps visible
+  gpu-node-02 (rank 1)  ████████████████████████████████████████████  ← smooth
+  gpu-node-03 (rank 2)  ████████████████████████████████████████████  ← smooth
+  gpu-node-04 (rank 3)  ████████████████████████████████████████████  ← smooth
+
+Causal chain markers:
+  [HIGH] gpu-node-01: cuLaunchKernel 63.9x p50
+  [MEDIUM] gpu-node-01: cuMemAlloc 5.0x p50
+```
+
+Each node appears as a separate process track. CUDA events are duration spans. Causal chains are severity-colored instant markers. The I/O gaps on node 1 are immediately visible in the timeline.
+
+### Step 7: Clock Skew Detection
+
+If nodes have drifted clocks, Ingero warns automatically:
+
+```bash
+$ ingero query --nodes gpu-node-01:8080,gpu-node-02:8080 --clock-skew-threshold 5ms \
+    "SELECT node, count(*) FROM events GROUP BY node"
+
+WARNING: gpu-node-02 is ~47ms ahead of gpu-node-01 (RTT: 2ms)
+node              node           count(*)
+----------------  -------------  --------
+gpu-node-01:8080  gpu-node-01    47003
+gpu-node-02:8080  gpu-node-02    42891
+
+  2 rows from 2 node(s)
+```
+
+This prevents false causal conclusions  -  if you see "node-A's event happened 20ms before node-B's stall," the clock skew warning tells you whether that ordering is real or an artifact.
+
+> **Note:** The multi-node features above (fan-out queries, offline merge, Perfetto export) are interim solutions for cross-node GPU investigation. A dedicated cluster-level observability and diagnostics tool with native multi-node support is coming soon.
 
 ## Install
 
@@ -330,6 +517,7 @@ sudo ingero trace --deadband 5              # suppress idle snapshots (5% thresh
 sudo ingero trace --deadband 5 --heartbeat 30s  # deadband + force report every 30s
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
+sudo ingero trace --node gpu-node-07      # tag events with node identity (for multi-node)
 ```
 
 **Only `trace` needs sudo**  -  it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
@@ -364,6 +552,9 @@ ingero explain --json                 # JSON output for pipelines
 ingero explain --from "15:40" --to "15:45"  # absolute time range
 ingero explain --per-process              # per-process CUDA API breakdown
 ingero explain --per-process --json       # JSON output for pipelines
+
+# Multi-node fleet queries (fan-out to multiple Ingero dashboard APIs)
+ingero explain --nodes host1:8080,host2:8080,host3:8080  # cross-node causal chains
 ```
 
 #### Per-Process Breakdown
@@ -404,14 +595,22 @@ INCIDENT REPORT  -  2 causal chains found (1 HIGH, 1 MEDIUM)
 
 ### `ingero query`
 
-Query stored events by time range, PID, and operation type.
+Query stored events by time range, PID, and operation type. Supports multi-node fleet queries with `--nodes`.
 
 ```bash
 ingero query --since 1h
 ingero query --since 1h --pid 4821
 ingero query --since 1h --pid 4821,5032
 ingero query --since 30m --op cudaMemcpy --json
+
+# Multi-node fleet queries (fan-out to multiple Ingero dashboard APIs)
+ingero query --nodes host1:8080,host2:8080 "SELECT node, source, count(*) FROM events GROUP BY node, source"
+ingero query --nodes host1:8080,host2:8080,host3:8080 "SELECT node, count(*) FROM events GROUP BY node"
 ```
+
+Fleet queries fan out the SQL to each node's `/api/v1/query` endpoint, concatenate results with a `node` column prepended, and display a unified table. Partial failures return results from reachable nodes with warnings for unreachable ones. Clock skew between nodes is detected automatically (configurable via `--clock-skew-threshold`, default 10ms).
+
+Configure default fleet nodes in `ingero.yaml` under `fleet.nodes` to avoid repeating `--nodes` on every command.
 
 Storage uses SQLite with size-based pruning (default 10 GB via `--max-db`). Data is stored locally at `~/.ingero/ingero.db`  -  nothing leaves your machine.
 
@@ -442,6 +641,7 @@ ingero mcp --http :8080 --tls-cert cert.pem --tls-key key.pem  # custom TLS cert
 | `run_demo` | Run synthetic demo scenarios |
 | `get_test_report` | GPU integration test report (JSON) |
 | `run_sql` | Execute read-only SQL for ad-hoc analysis |
+| `query_fleet` | Fan-out query across multiple Ingero nodes (chains, ops, overview, sql) with clock skew detection |
 
 **MCP prompts:**
 
@@ -498,6 +698,7 @@ ingero dashboard                           # HTTPS on :8080 (self-signed TLS 1.3
 ingero dashboard --addr :9090              # custom port
 ingero dashboard --db /path/to/ingero.db   # custom database
 ingero dashboard --tls-cert cert.pem --tls-key key.pem  # custom TLS certificate
+ingero dashboard --no-tls                  # plain HTTP (for fleet queries on trusted networks)
 
 # Remote access via SSH tunnel:
 ssh -L 8080:localhost:8080 user@gpu-vm
@@ -519,6 +720,39 @@ ssh -L 8080:localhost:8080 user@gpu-vm
 | `GET /api/v1/capabilities` | Metric availability manifest (available vs. grayed-out with required tool) |
 | `GET /api/v1/graph-metrics` | CUDA Graph metrics: capture/launch rates, instantiation durations |
 | `GET /api/v1/graph-events` | Recent CUDA Graph events with handles and durations |
+| `POST /api/v1/query` | Execute read-only SQL (used by fleet fan-out queries) |
+| `GET /api/v1/time` | Server wall-clock timestamp (used for clock skew detection) |
+
+### `ingero merge`
+
+Merge SQLite databases from multiple Ingero nodes into a single queryable database for offline cross-node analysis. Useful in air-gapped environments or when you prefer offline analysis over fan-out queries.
+
+```bash
+ingero merge node-a.db node-b.db node-c.db -o cluster.db       # merge 3 node databases
+ingero merge old.db --force-node legacy-node -o merged.db       # assign node identity to legacy DBs
+
+# Then use standard tools on the merged database
+ingero query -d cluster.db --since 1h
+ingero explain -d cluster.db --chains
+ingero export --format perfetto -d cluster.db -o trace.json
+```
+
+Node-namespaced event IDs (`{node}:{seq}`) ensure zero collisions on merge. Stack traces are deduplicated by hash. Sessions are re-keyed. Clock skew between traces is detected and warned (configurable via `--clock-skew-threshold`, default 100ms).
+
+### `ingero export`
+
+Export event data to visualization formats. Currently supports Perfetto/Chrome Trace Event Format for timeline visualization in [ui.perfetto.dev](https://ui.perfetto.dev) or `chrome://tracing`.
+
+```bash
+# From a local or merged database
+ingero export --format perfetto -d ~/.ingero/ingero.db -o trace.json
+ingero export --format perfetto -d cluster.db -o trace.json --since 5m
+
+# Fan-out mode (fetches from multiple nodes via fleet API)
+ingero export --format perfetto --nodes node-1:8080,node-2:8080 -o trace.json
+```
+
+Opens in Perfetto UI with one process track per node/rank, CUDA events as duration spans, and causal chains as severity-colored instant markers. Multi-node traces show side-by-side timelines for spotting which rank stalled while others waited.
 
 ### `ingero demo`
 
@@ -676,6 +910,7 @@ Zero external dependencies  -  no OTEL SDK import. The JSON payload is construct
 8. **Export**  -  pushes metrics via OTLP or serves Prometheus `/metrics` (optional)
 9. **Serve**  -  exposes diagnostics to AI agents via MCP (stdio or HTTPS/TLS 1.3)
 10. **Dashboard**  -  browser-based HTTPS dashboard reads from SQLite, shows ops/chains/snapshots/capabilities with auto-polling
+11. **Fleet**  -  fan-out queries across multiple nodes via dashboard API, merge offline databases, detect clock skew, export to Perfetto timeline
 
 ## Integration Testing
 
