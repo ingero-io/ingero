@@ -772,6 +772,17 @@ func New(dbPath string) (*Store, error) {
 		stackCache: make(map[uint64]bool),
 	}
 
+	// Seed eventSeq from existing events so reopening a DB doesn't
+	// restart the counter at 0 and generate duplicate IDs.
+	var maxSeq uint64
+	row := db.QueryRow(
+		"SELECT COALESCE(MAX(CAST(substr(id, instr(id, ':')+1) AS INTEGER)), 0) FROM events WHERE id LIKE ?",
+		":%",
+	)
+	if err := row.Scan(&maxSeq); err == nil && maxSeq > 0 {
+		s.eventSeq.Store(maxSeq)
+	}
+
 	return s, nil
 }
 

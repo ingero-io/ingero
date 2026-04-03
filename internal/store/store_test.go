@@ -2128,7 +2128,7 @@ func TestCompact(t *testing.T) {
 	<-done
 
 	// Delete 4900 of 5000 rows to create heavy fragmentation.
-	s.db.Exec("DELETE FROM events WHERE id > 100")
+	s.db.Exec("DELETE FROM events WHERE CAST(substr(id, instr(id, ':')+1) AS INTEGER) > 100")
 
 	// Checkpoint WAL so disk reflects current state.
 	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
