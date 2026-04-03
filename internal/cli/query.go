@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ingero-io/ingero/internal/fleet"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/sysinfo"
@@ -16,24 +18,35 @@ import (
 )
 
 var (
-	queryDBPath string
-	querySince  string
-	queryPIDs   []int
-	queryOp     string
-	queryJSON   bool
-	queryLimit  int
+	queryDBPath    string
+	querySince     string
+	queryPIDs      []int
+	queryOp        string
+	queryJSON      bool
+	queryLimit     int
+	queryNodes     string
+	queryTimeout   string
+	queryCACert    string
+	queryClientCert string
+	queryClientKey  string
+	queryClockSkew  string
 )
 
 var queryCmd = &cobra.Command{
-	Use:   "query",
+	Use:   "query [sql]",
 	Short: "Query stored events from the SQLite database",
 	Long: `Query events previously recorded with 'ingero trace'.
+
+When --nodes is specified (or fleet.nodes is configured in ingero.yaml),
+the query is fanned out to each node's dashboard API and results are
+concatenated with a "node" column prepended.
 
 Examples:
   ingero query --since 1h
   ingero query --since 1h --pid 4821
   ingero query --since 1h --op cudaMemcpy --json
-  ingero query --since 30m --limit 100`,
+  ingero query --since 30m --limit 100
+  ingero query --nodes host1:8443,host2:8443 "SELECT source, count(*) FROM events GROUP BY source"`,
 
 	RunE: queryRunE,
 }
@@ -44,12 +57,30 @@ func init() {
 	queryCmd.Flags().IntSliceVarP(&queryPIDs, "pid", "p", nil, "filter by process ID(s), comma-separated (default: all)")
 	queryCmd.Flags().StringVar(&queryOp, "op", "", "filter by operation name (e.g., cudaMemcpy, sched_switch)")
 	queryCmd.Flags().BoolVar(&queryJSON, "json", false, "output as JSON")
-	queryCmd.Flags().IntVar(&queryLimit, "limit", 0, "max results (0 = 10000)")
+	queryCmd.Flags().IntVar(&queryLimit, "limit", 0, "max results (0 = 10000, applies per-node for fleet queries)")
+	queryCmd.Flags().StringVar(&queryNodes, "nodes", "", "comma-separated node addresses (host:port) for fleet fan-out query")
+	queryCmd.Flags().StringVar(&queryTimeout, "timeout", "5s", "per-node timeout for fleet queries")
+	queryCmd.Flags().StringVar(&queryCACert, "ca-cert", "", "CA certificate for mTLS (optional)")
+	queryCmd.Flags().StringVar(&queryClientCert, "client-cert", "", "client certificate for mTLS (optional)")
+	queryCmd.Flags().StringVar(&queryClientKey, "client-key", "", "client key for mTLS (optional)")
+	queryCmd.Flags().StringVar(&queryClockSkew, "clock-skew-threshold", "10ms", "clock skew warning threshold for fleet queries")
 
 	rootCmd.AddCommand(queryCmd)
 }
 
 func queryRunE(cmd *cobra.Command, args []string) error {
+	// Resolve fleet nodes: CLI --nodes > config fleet.nodes > empty (local mode).
+	nodes := resolveFleetNodes(queryNodes)
+
+	// Fleet fan-out path: if nodes are configured and a SQL argument is provided.
+	if len(nodes) > 0 && len(args) > 0 {
+		return queryFleetSQL(cmd.Context(), nodes, args[0])
+	}
+	if len(nodes) > 0 && len(args) == 0 {
+		return fmt.Errorf("fleet query requires a SQL argument: ingero query --nodes host:port \"SELECT ...\"")
+	}
+
+	// Local path: query local SQLite (existing behavior).
 	dbPath := queryDBPath
 	if dbPath == "" {
 		dbPath = store.DefaultDBPath()
@@ -97,6 +128,174 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 		return queryOutputJSON(evts)
 	}
 	return queryOutputTable(evts, params, dbPath, &aggTotals)
+}
+
+// queryFleetSQL fans out a SQL query to multiple nodes and displays concatenated results.
+func queryFleetSQL(ctx context.Context, nodes []string, sql string) error {
+	timeout, err := time.ParseDuration(queryTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid --timeout: %w", err)
+	}
+
+	limit := queryLimit
+	if limit <= 0 {
+		limit = fleet.DefaultLimit
+	}
+
+	client, err := fleet.New(fleet.Config{
+		Nodes:      nodes,
+		Timeout:    timeout,
+		Limit:      limit,
+		CACert:     queryCACert,
+		ClientCert: queryClientCert,
+		ClientKey:  queryClientKey,
+	})
+	if err != nil {
+		return fmt.Errorf("creating fleet client: %w", err)
+	}
+
+	// Run query and clock skew estimation in parallel.
+	type queryOut struct {
+		result *fleet.QueryResult
+		err    error
+	}
+	qch := make(chan queryOut, 1)
+	go func() {
+		r, e := client.QuerySQL(ctx, sql)
+		qch <- queryOut{r, e}
+	}()
+
+	skewResults, _ := client.EstimateClockSkew(ctx)
+	qo := <-qch
+
+	result := qo.result
+
+	// Print warnings to stderr.
+	if result != nil {
+		for _, w := range result.Warnings {
+			fmt.Fprintf(os.Stderr, "WARNING: %s\n", w)
+		}
+	}
+
+	// Print clock skew warnings.
+	skewThreshold := parseClockSkewThresholdMs(queryClockSkew)
+	if skewWarnings := fleet.PrintClockSkewWarnings(skewResults, skewThreshold); skewWarnings != "" {
+		fmt.Fprint(os.Stderr, skewWarnings)
+	}
+
+	if qo.err != nil {
+		return qo.err
+	}
+
+	if queryJSON {
+		return fleetOutputJSON(result)
+	}
+	return fleetOutputTable(result)
+}
+
+// fleetOutputTable renders a fleet query result as a text table.
+func fleetOutputTable(result *fleet.QueryResult) error {
+	if len(result.Rows) == 0 {
+		fmt.Println("  No results.")
+		return nil
+	}
+
+	// Compute column widths.
+	widths := make([]int, len(result.Columns))
+	for i, col := range result.Columns {
+		widths[i] = len(col)
+	}
+	for _, row := range result.Rows {
+		for i, val := range row {
+			s := fmt.Sprintf("%v", val)
+			if len(s) > widths[i] {
+				widths[i] = len(s)
+			}
+		}
+	}
+
+	// Print header.
+	var header strings.Builder
+	for i, col := range result.Columns {
+		if i > 0 {
+			header.WriteString("  ")
+		}
+		fmt.Fprintf(&header, "%-*s", widths[i], col)
+	}
+	fmt.Println(header.String())
+	// Separator.
+	var sep strings.Builder
+	for i, w := range widths {
+		if i > 0 {
+			sep.WriteString("  ")
+		}
+		sep.WriteString(strings.Repeat("-", w))
+	}
+	fmt.Println(sep.String())
+
+	// Print rows.
+	for _, row := range result.Rows {
+		var line strings.Builder
+		for i, val := range row {
+			if i > 0 {
+				line.WriteString("  ")
+			}
+			fmt.Fprintf(&line, "%-*v", widths[i], val)
+		}
+		fmt.Println(line.String())
+	}
+
+	fmt.Fprintf(os.Stderr, "\n  %d rows from %d node(s)\n", len(result.Rows), countNodes(result))
+	return nil
+}
+
+func countNodes(r *fleet.QueryResult) int {
+	seen := make(map[string]bool)
+	for _, row := range r.Rows {
+		if len(row) > 0 {
+			if n, ok := row[0].(string); ok {
+				seen[n] = true
+			}
+		}
+	}
+	return len(seen)
+}
+
+// fleetOutputJSON renders a fleet query result as JSON.
+func fleetOutputJSON(result *fleet.QueryResult) error {
+	out := make([]map[string]any, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		m := make(map[string]any, len(result.Columns))
+		for i, col := range result.Columns {
+			if i < len(row) {
+				m[col] = row[i]
+			}
+		}
+		out = append(out, m)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// resolveFleetNodes returns the node list from CLI flag or config.
+// CLI --nodes takes precedence over config fleet.nodes.
+func resolveFleetNodes(cliFlag string) []string {
+	if cliFlag != "" {
+		// Strip surrounding brackets to support inline format: [host1:port,host2:port]
+		val := strings.TrimSpace(cliFlag)
+		val = strings.TrimPrefix(val, "[")
+		val = strings.TrimSuffix(val, "]")
+		var nodes []string
+		for _, n := range strings.Split(val, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				nodes = append(nodes, n)
+			}
+		}
+		return nodes
+	}
+	return ReadFleetNodes()
 }
 
 func queryOutputJSON(evts []events.Event) error {
@@ -234,4 +433,13 @@ func queryOutputTable(evts []events.Event, params store.QueryParams, dbPath stri
 	fmt.Println()
 
 	return nil
+}
+
+// parseClockSkewThresholdMs parses the --clock-skew-threshold flag as milliseconds.
+func parseClockSkewThresholdMs(s string) float64 {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 10 // default 10ms
+	}
+	return float64(d) / float64(time.Millisecond)
 }

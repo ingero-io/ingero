@@ -250,8 +250,8 @@ func TestSchemaInfo(t *testing.T) {
 	defer s.Close()
 
 	info := s.SchemaInfo()
-	if info["version"] != "0.8" {
-		t.Errorf("version = %q, want 0.8", info["version"])
+	if info["version"] != "0.9" {
+		t.Errorf("version = %q, want 0.9", info["version"])
 	}
 	if info["timestamp_unit"] == "" {
 		t.Error("timestamp_unit missing")

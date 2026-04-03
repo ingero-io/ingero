@@ -60,6 +60,7 @@ var (
 	traceNoTCP        bool          // Disable TCP retransmit tracing.
 	traceNoNet        bool          // Disable network socket tracing.
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
+	traceNode         string        // Node identity for multi-node correlation.
 )
 
 var traceCmd = &cobra.Command{
@@ -98,6 +99,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
+	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -107,6 +109,16 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func traceRunE(cmd *cobra.Command, args []string) error {
+	// Resolve node identity early — fail fast if name contains colon.
+	nodeIdentity, err := ResolveNodeIdentity(traceNode)
+	if err != nil {
+		return err
+	}
+	debugf("node identity: %s", nodeIdentity)
+
+	// Rank cache for distributed training rank detection (reads /proc/[pid]/environ).
+	rankCache := discover.NewRankCache()
+
 	// --log: redirect log output (stderr-style debug messages) to a file.
 	// Append mode, no rotation — intended for debugging, not production logging.
 	// Production deployments should use systemd journal or kubectl logs.
@@ -369,6 +381,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Step 4: Create stats collector and correlation engine.
 	collector := stats.New()
 	corr := correlate.New()
+	corr.SetNode(nodeIdentity)
 
 	// Step 4b: Create OTEL exporters (disabled by default).
 	var otlpExporter *export.OTLPExporter
@@ -403,7 +416,8 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("opening database for recording: %w", err)
 		}
 		eventStore = s
-		debugf("recording to %s", dbPath)
+		eventStore.SetNode(nodeIdentity)
+		debugf("recording to %s (node=%s)", dbPath, nodeIdentity)
 
 		// Set size-based DB limit if --max-db is specified.
 		if traceMaxDB != "" && traceMaxDB != "0" {
@@ -432,6 +446,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			IngeroVer: version.String(),
 			PIDFilter: formatPIDFilter(targetPIDs),
 			Flags:     formatTraceFlags(),
+			Node:      nodeIdentity,
+		}
+		// Detect distributed training rank from the first target PID.
+		if len(targetPIDs) > 0 && targetPIDs[0] > 0 {
+			ri := rankCache.Lookup(uint32(targetPIDs[0]))
+			session.Rank = ri.Rank
+			session.LocalRank = ri.LocalRank
+			session.WorldSize = ri.WorldSize
 		}
 		sessionID, err = eventStore.StartSession(session)
 		if err != nil {
@@ -668,9 +690,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
 }
 
 
@@ -1164,7 +1186,7 @@ func (c *pidNameCache) Names() map[uint32]string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1283,6 +1305,13 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 
 			// Resolve cgroup → container ID for K8s container correlation.
 			resolveCGroup(&evt, cgroupCache, eventStore, podCache)
+
+			// Set node identity and rank on every event for multi-node correlation.
+			evt.Node = nodeIdentity
+			ri := rankCache.Lookup(evt.PID)
+			evt.Rank = ri.Rank
+			evt.LocalRank = ri.LocalRank
+			evt.WorldSize = ri.WorldSize
 
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
@@ -1727,7 +1756,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1825,6 +1854,13 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 
 			// Resolve cgroup → container ID for K8s container correlation.
 			resolveCGroup(&evt, cgroupCache, eventStore, podCache)
+
+			// Set node identity and rank on every event for multi-node correlation.
+			evt.Node = nodeIdentity
+			ri := rankCache.Lookup(evt.PID)
+			evt.Rank = ri.Rank
+			evt.LocalRank = ri.LocalRank
+			evt.WorldSize = ri.WorldSize
 
 			// Resolve stack symbols if enabled.
 			if resolver != nil && len(evt.Stack) > 0 {
@@ -2235,6 +2271,11 @@ func chainsToStored(chains []correlate.CausalChain) []store.StoredChain {
 			p50us = int64(float64(p99us) / tailRatio)
 		}
 
+		// Extract node from chain ID if node-namespaced (format: "{node}:{descriptor}").
+		chainNode := ""
+		if idx := strings.Index(ch.ID, ":"); idx > 0 {
+			chainNode = ch.ID[:idx]
+		}
 		out[i] = store.StoredChain{
 			ID:              ch.ID,
 			DetectedAt:      now,
@@ -2248,6 +2289,7 @@ func chainsToStored(chains []correlate.CausalChain) []store.StoredChain {
 			CUDAP50us:       p50us,
 			TailRatio:       tailRatio,
 			Timeline:        tl,
+			Node:            chainNode,
 		}
 	}
 	return out

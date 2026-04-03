@@ -6,6 +6,8 @@ agent:
   max_overhead_percent: 2.0
   # Log level: debug, info, warn, error
   log_level: info
+  # Node identity for multi-node correlation (empty = auto-detect via os.Hostname())
+  node: ""
 
 # Probe configuration
 probes:
@@ -49,3 +51,10 @@ otlp:
 prometheus:
   enabled: false
   listen: ":9090"
+
+# Fleet configuration for multi-node queries
+fleet:
+  # Node addresses for fan-out queries (host:port)
+  # Used by: ingero query --nodes, ingero explain --nodes
+  # CLI --nodes flag overrides this list
+  nodes: []

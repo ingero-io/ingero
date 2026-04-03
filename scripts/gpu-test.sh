@@ -34,6 +34,16 @@ set -uo pipefail
 export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/go/bin:$HOME/.local/bin:$PATH
 export HOME="${HOME:-/home/$(whoami)}"
 
+# Auto-detect Python with PyTorch available.
+# Some machines install PyTorch into /opt/pytorch rather than the system Python.
+if python3 -c "import torch" 2>/dev/null; then
+    PYTHON=python3
+elif /opt/pytorch/bin/python3 -c "import torch" 2>/dev/null; then
+    PYTHON=/opt/pytorch/bin/python3
+else
+    PYTHON=python3  # fallback; PyTorch tests will fail with a clear error
+fi
+
 # Colors
 if [ -t 1 ]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -120,7 +130,7 @@ trap cleanup EXIT
 # Helper: start a PyTorch matmul workload in background
 start_workload() {
     local duration="${1:-15}"
-    python3 -c "
+    $PYTHON -c "
 import torch, time, os
 print(f'Workload PID: {os.getpid()}', flush=True)
 d = torch.device('cuda:0')
@@ -221,7 +231,7 @@ _GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 _GPU_NAME=$(echo "$_GPU_INFO" | cut -d',' -f1 | xargs)
 _DRIVER_VER=$(echo "$_GPU_INFO" | cut -d',' -f2 | xargs)
 _KERNEL_VER=$(uname -r)
-_PYTORCH_VER=$(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo "N/A")
+_PYTORCH_VER=$($PYTHON -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo "N/A")
 _GO_VER=$(go version 2>/dev/null | awk '{print $3}')
 
 log "GPU: $_GPU_INFO"
@@ -302,7 +312,7 @@ done
 # T09: 4 synthetic workloads in parallel (max 60s each)
 for script in alloc_stress memcpy_stress launch_storm sync_stall; do
     bg_start "t1_${script}" "logs/bg-t1-${script}.out" \
-        timeout 60 python3 "tests/workloads/synthetic/${script}.py"
+        timeout 60 $PYTHON "tests/workloads/synthetic/${script}.py"
 done
 
 # ── T03+T07 merged: ONE trace session → check total events AND cuLaunchKernel ──
@@ -571,7 +581,7 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-python3 $TEST_TMP/pytest.py &
+$PYTHON $TEST_TMP/pytest.py &
 PY_PID=$!
 cleanup_pids+=("$PY_PID")
 sleep 3
@@ -646,7 +656,7 @@ _test_start=$SECONDS
 log "Test 13: explain chain detection (GPU + CPU contention)"
 
 # Launch 3 competing GPU workers (creates GPU time-slicing contention).
-python3 tests/workloads/pathological/gpu_contention_driver.py \
+$PYTHON tests/workloads/pathological/gpu_contention_driver.py \
     --workers 3 --duration 40 --matrix-size 2048 > logs/contention-workers.log 2>&1 &
 CONTENTION_PID=$!
 cleanup_pids+=("$CONTENTION_PID")
@@ -996,7 +1006,7 @@ run_bench() {
     local outfile="$3"
 
     # Start a matmul workload that runs long enough
-    python3 -c "
+    $PYTHON -c "
 import torch, time
 d = torch.device('cuda:0')
 a = torch.randn(2048, 2048, device=d)
@@ -1775,7 +1785,7 @@ IO_CHAIN_PIDS=""
 
 if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
     # GPU contention: 5 workers + small matrix → frequent kernel launches, high GPU queue.
-    python3 tests/workloads/pathological/gpu_contention_driver.py \
+    $PYTHON tests/workloads/pathological/gpu_contention_driver.py \
         --workers 5 --duration 45 --matrix-size 1024 > /dev/null 2>&1 &
     IO_CHAIN_PIDS="$!"
     cleanup_pids+=("$!")
@@ -1835,7 +1845,7 @@ NET_CHAIN_PIDS=""
 
 if [ -f tests/workloads/pathological/gpu_contention_driver.py ]; then
     # GPU contention: 3 workers.
-    python3 tests/workloads/pathological/gpu_contention_driver.py \
+    $PYTHON tests/workloads/pathological/gpu_contention_driver.py \
         --workers 3 --duration 40 --matrix-size 2048 > /dev/null 2>&1 &
     NET_CHAIN_PIDS="$!"
     cleanup_pids+=("$!")
@@ -1900,7 +1910,7 @@ rm -f "$NN_CHAIN_DB"* 2>/dev/null || true
 
 if [ -f tests/workloads/pathological/gpu_contention_driver.py ] && command -v stress-ng &>/dev/null; then
     # GPU workload → get PID.
-    python3 tests/workloads/pathological/gpu_contention_driver.py \
+    $PYTHON tests/workloads/pathological/gpu_contention_driver.py \
         --workers 1 --duration 40 --matrix-size 2048 > /dev/null 2>&1 &
     WL_PID=$!
     sleep 3
@@ -2049,7 +2059,7 @@ echo ""
     echo "Kernel: $(uname -r)"
     echo "GPU: $(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
     echo "Go: $(go version 2>/dev/null | awk '{print $3}')"
-    echo "PyTorch: $(python3 -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo 'N/A')"
+    echo "PyTorch: $($PYTHON -c 'import torch; print(f"{torch.__version__}, CUDA {torch.version.cuda}")' 2>/dev/null || echo 'N/A')"
     echo ""
     echo "Results: PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  SKIP=$SKIP_COUNT  WARN=$WARN_COUNT  Total=$TOTAL"
     echo ""

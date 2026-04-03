@@ -32,6 +32,7 @@ type Server struct {
 	addr     string
 	certFile string
 	keyFile  string
+	noTLS    bool     // serve plain HTTP instead of HTTPS
 	gpuInfo  *gpuInfo // cached at startup, nil if no GPU
 }
 
@@ -46,6 +47,12 @@ func New(s *store.Store, addr, certFile, keyFile string) *Server {
 	// Cache GPU info at startup (doesn't change at runtime).
 	srv.gpuInfo = probeGPUInfo()
 	return srv
+}
+
+// SetNoTLS configures the server to serve plain HTTP instead of HTTPS.
+// Used for fleet queries on trusted networks (private subnets, VPNs, WireGuard).
+func (s *Server) SetNoTLS(noTLS bool) {
+	s.noTLS = noTLS
 }
 
 // probeGPUInfo queries nvidia-smi for GPU model, driver version, and CUDA version.
@@ -76,6 +83,8 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/graph-metrics", s.handleGraphMetrics)
 	mux.HandleFunc("/api/v1/graph-events", s.handleGraphEvents)
+	mux.HandleFunc("/api/v1/query", s.handleQuery)
+	mux.HandleFunc("/api/v1/time", s.handleTime)
 
 	// Static files (embedded HTML/JS).
 	staticSub, err := fs.Sub(staticFiles, "static")
@@ -84,8 +93,41 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 
-	// Host guard against DNS rebinding.
-	guardedMux := hostGuard(mux)
+	// For fleet queries on trusted networks, allow any Host header.
+	// For HTTPS mode, guard against DNS rebinding.
+	var handler http.Handler
+	if s.noTLS {
+		handler = mux
+	} else {
+		handler = hostGuard(mux)
+	}
+
+	// Plain HTTP mode (--no-tls) for fleet queries on trusted networks.
+	if s.noTLS {
+		httpSrv := &http.Server{
+			Addr:    s.addr,
+			Handler: handler,
+		}
+		go func() {
+			<-ctx.Done()
+			httpSrv.Close()
+		}()
+
+		fmt.Fprintf(os.Stderr, "Dashboard HTTP server listening on %s (plain HTTP, no TLS)\n", s.addr)
+		fmt.Fprintf(os.Stderr, "  WARNING: no encryption — use only on trusted networks\n")
+
+		ln, err := net.Listen("tcp", s.addr)
+		if err != nil {
+			return err
+		}
+		defer ln.Close()
+
+		err = httpSrv.Serve(ln)
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	}
 
 	// TLS 1.3 minimum.
 	tlsCfg := &tls.Config{
@@ -111,7 +153,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	httpSrv := &http.Server{
 		Addr:      s.addr,
-		Handler:   guardedMux,
+		Handler:   handler,
 		TLSConfig: tlsCfg,
 	}
 
