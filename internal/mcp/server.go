@@ -263,7 +263,8 @@ type queryFleetInput struct {
 	Action string `json:"action" jsonschema:"Query type: chains/ops/overview/sql,enum=chains,enum=ops,enum=overview,enum=sql,required"`
 	Since  string `json:"since,omitempty" jsonschema:"Time window (e.g. 5m, 1h). Default: 5m."`
 	PID    int    `json:"pid,omitempty" jsonschema:"Filter by PID (optional, used with ops action)"`
-	SQL    string `json:"sql,omitempty" jsonschema:"SQL query (required when action is sql)"`
+	Query  string `json:"query,omitempty" jsonschema:"SQL query to execute across fleet nodes (required when action is sql)"`
+	SQL    string `json:"sql,omitempty" jsonschema:"Alias for query — SQL query (required when action is sql)"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Max rows per node (default 1000)"`
 	TSC    *bool  `json:"tsc,omitempty" jsonschema:"Telegraphic compression (default: true). Set false for verbose output."`
 }
@@ -1074,12 +1075,18 @@ func (s *Server) handleQueryFleet(ctx context.Context, input queryFleetInput) (*
 		}, nil, nil
 	}
 
+	// Coalesce query and sql fields — "query" takes precedence.
+	sqlText := input.Query
+	if sqlText == "" {
+		sqlText = input.SQL
+	}
+
 	// Validate action.
 	action := strings.ToLower(input.Action)
-	if action == "sql" && strings.TrimSpace(input.SQL) == "" {
+	if action == "sql" && strings.TrimSpace(sqlText) == "" {
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: "sql field is required when action is 'sql'"},
+				&gomcp.TextContent{Text: "query (or sql) field is required when action is 'sql'"},
 			},
 			IsError: true,
 		}, nil, nil
@@ -1110,7 +1117,7 @@ func (s *Server) handleQueryFleet(ctx context.Context, input queryFleetInput) (*
 	case "overview":
 		text, err = s.fleetOverview(ctx, fc, tsc)
 	case "sql":
-		text, err = s.fleetSQL(ctx, fc, input.SQL, input.Limit, tsc)
+		text, err = s.fleetSQL(ctx, fc, sqlText, input.Limit, tsc)
 	default:
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{

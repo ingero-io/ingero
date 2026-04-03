@@ -16,14 +16,17 @@ import (
 )
 
 var (
-	exportFormat  string
-	exportDBPath  string
-	exportOutput  string
-	exportNodes   string
-	exportSince   string
-	exportPIDs    []int
-	exportLimit   int
-	exportTimeout string
+	exportFormat     string
+	exportDBPath     string
+	exportOutput     string
+	exportNodes      string
+	exportSince      string
+	exportPIDs       []int
+	exportLimit      int
+	exportTimeout    string
+	exportCACert     string
+	exportClientCert string
+	exportClientKey  string
 )
 
 var exportCmd = &cobra.Command{
@@ -58,6 +61,9 @@ func init() {
 	exportCmd.Flags().IntSliceVarP(&exportPIDs, "pid", "p", nil, "filter by process ID(s)")
 	exportCmd.Flags().IntVar(&exportLimit, "limit", 1000, "max events per node (fan-out mode)")
 	exportCmd.Flags().StringVar(&exportTimeout, "timeout", "10s", "per-node timeout (fan-out mode)")
+	exportCmd.Flags().StringVar(&exportCACert, "ca-cert", "", "CA certificate for mTLS (optional)")
+	exportCmd.Flags().StringVar(&exportClientCert, "client-cert", "", "client certificate for mTLS (optional)")
+	exportCmd.Flags().StringVar(&exportClientKey, "client-key", "", "client key for mTLS (optional)")
 
 	rootCmd.AddCommand(exportCmd)
 }
@@ -155,9 +161,12 @@ func loadFromFleet(ctx context.Context, nodes []string) ([]events.Event, []store
 	}
 
 	client, err := fleet.New(fleet.Config{
-		Nodes:   nodes,
-		Timeout: timeout,
-		Limit:   exportLimit,
+		Nodes:      nodes,
+		Timeout:    timeout,
+		Limit:      exportLimit,
+		CACert:     exportCACert,
+		ClientCert: exportClientCert,
+		ClientKey:  exportClientKey,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating fleet client: %w", err)

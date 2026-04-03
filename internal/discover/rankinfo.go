@@ -35,7 +35,11 @@ func NewRankCache() *RankCache {
 // Lookup returns rank info for the given PID.
 // Returns a cached result if available, otherwise reads /proc/[pid]/environ.
 // On non-Linux or if the process is gone, returns a zero RankInfo (all nil).
+// A nil receiver is safe and returns a zero RankInfo.
 func (rc *RankCache) Lookup(pid uint32) *RankInfo {
+	if rc == nil {
+		return &RankInfo{}
+	}
 	rc.mu.RLock()
 	if ri, ok := rc.cache[pid]; ok {
 		rc.mu.RUnlock()

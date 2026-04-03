@@ -287,6 +287,20 @@ func TestResolveFleetNodes_CLIOverridesConfig(t *testing.T) {
 	}
 }
 
+func TestResolveFleetNodes_CLIBrackets(t *testing.T) {
+	// Brackets around node list should be stripped (inline YAML format).
+	nodes := resolveFleetNodes("[172.31.43.134:8080,172.31.40.229:8080]")
+	if len(nodes) != 2 {
+		t.Fatalf("resolveFleetNodes() = %v, want 2 nodes", nodes)
+	}
+	if nodes[0] != "172.31.43.134:8080" {
+		t.Errorf("nodes[0] = %q, want %q", nodes[0], "172.31.43.134:8080")
+	}
+	if nodes[1] != "172.31.40.229:8080" {
+		t.Errorf("nodes[1] = %q, want %q", nodes[1], "172.31.40.229:8080")
+	}
+}
+
 func TestResolveFleetNodes_NoFlag_FallsToConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "ingero.yaml")

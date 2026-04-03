@@ -282,8 +282,12 @@ func fleetOutputJSON(result *fleet.QueryResult) error {
 // CLI --nodes takes precedence over config fleet.nodes.
 func resolveFleetNodes(cliFlag string) []string {
 	if cliFlag != "" {
+		// Strip surrounding brackets to support inline format: [host1:port,host2:port]
+		val := strings.TrimSpace(cliFlag)
+		val = strings.TrimPrefix(val, "[")
+		val = strings.TrimSuffix(val, "]")
 		var nodes []string
-		for _, n := range strings.Split(cliFlag, ",") {
+		for _, n := range strings.Split(val, ",") {
 			n = strings.TrimSpace(n)
 			if n != "" {
 				nodes = append(nodes, n)

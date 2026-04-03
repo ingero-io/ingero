@@ -180,8 +180,8 @@ func TestFleetSQLMissingField(t *testing.T) {
 	if !result.IsError {
 		t.Error("expected error for missing sql field")
 	}
-	if !strings.Contains(extractText(result), "sql field is required") {
-		t.Errorf("expected 'sql field is required', got: %s", extractText(result))
+	if !strings.Contains(extractText(result), "field is required") {
+		t.Errorf("expected 'field is required', got: %s", extractText(result))
 	}
 }
 
