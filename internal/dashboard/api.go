@@ -528,18 +528,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert rows to [][]any for JSON.
-	jsonRows := make([][]any, len(rows))
-	for i, row := range rows {
-		jsonRows[i] = row
-	}
-
 	writeJSON(w, struct {
 		Columns []string `json:"columns"`
 		Rows    [][]any  `json:"rows"`
 	}{
 		Columns: cols,
-		Rows:    jsonRows,
+		Rows:    rows,
 	})
 }
 
