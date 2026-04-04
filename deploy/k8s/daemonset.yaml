@@ -1,26 +1,20 @@
-# Ingero DaemonSet — runs one agent pod per GPU node.
+# Ingero OSS DaemonSet — runs one observability pod per GPU node.
 #
 # Prerequisites:
 #   - NVIDIA GPU Operator installed (provides nvidia.com/gpu.present label)
 #   - Namespace: kubectl apply -f namespace.yaml
 #   - RBAC: kubectl apply -f rbac.yaml
 #
-# The agent runs 'ingero trace --record' which attaches eBPF probes to
-# libcudart.so and libcuda.so on the host, traces CUDA API calls, and
-# stores events in SQLite at /var/lib/ingero/ingero.db on the host.
+# Deployment modes:
+#   1. Observation-only (default): monitors GPU workloads via eBPF, zero risk.
+#   2. Remediation: add "--remediate" to args to enable memory tracker,
+#      straggler detector, and UDS server for orchestrator communication.
 #
-# Why privileged + hostPID:
-#   - eBPF probe attachment requires CAP_BPF + CAP_PERFMON + CAP_SYS_ADMIN
-#   - hostPID allows tracing processes in other containers on the same node
-#   - /proc must be the host's /proc (not container /proc) for PID resolution
+# Graduated trust: deploy observation-only first, add orchestrator later.
 #
-# Query the agent via kubectl exec:
+# Query via kubectl exec:
 #   kubectl exec -n ingero-system ds/ingero -- ingero explain --since 5m
 #   kubectl exec -n ingero-system ds/ingero -- ingero query --since 1m --json
-#
-# MCP access via port-forward:
-#   kubectl port-forward -n ingero-system ds/ingero 8080:8080
-#   # Then: ingero mcp --http :8080 (from inside the pod)
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,11 +22,11 @@ metadata:
   namespace: ingero-system
   labels:
     app.kubernetes.io/name: ingero
-    app.kubernetes.io/version: "0.8.0"
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/version: "0.9.1"
 spec:
-  # OnDelete: prevents event loss during rolling updates. eBPF probes detach
-  # when the old pod dies and reattach when the new pod starts — there's a gap
-  # where events are missed. OnDelete lets the operator control the upgrade pace.
+  # OnDelete: prevents eBPF event loss during rolling updates. Probes detach
+  # when the old pod dies — OnDelete lets the operator control upgrade pace.
   updateStrategy:
     type: OnDelete
   selector:
@@ -42,14 +36,12 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: ingero
-        app.kubernetes.io/version: "0.8.0"
+        app.kubernetes.io/component: observability
+        app.kubernetes.io/version: "0.9.1"
     spec:
       hostPID: true
       terminationGracePeriodSeconds: 30
       serviceAccountName: ingero
-      # Tolerate GPU node taints. Without these, the DaemonSet silently fails
-      # to schedule on GPU nodes that use nvidia.com/gpu taints (common in
-      # mixed CPU/GPU clusters).
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
@@ -57,58 +49,101 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoExecute
-      # Only schedule on GPU nodes. Requires NVIDIA GPU Operator which sets
-      # this label. On clusters without GPU Operator, remove this selector
-      # and use a toleration-only approach.
       nodeSelector:
         nvidia.com/gpu.present: "true"
       containers:
         - name: ingero
-          image: ghcr.io/ingero-io/ingero:v0.8
+          image: ghcr.io/ingero-io/ingero:latest
           imagePullPolicy: IfNotPresent
+          # Default: observation-only mode. To enable remediation, add "--remediate":
+          # args: ["trace", "--record", "--node", "$(MY_NODE_NAME)", "--remediate"]
+          args:
+            - "trace"
+            - "--record"
+            - "--node"
+            - "$(MY_NODE_NAME)"
+            - "--db"
+            - "/var/lib/ingero/ingero.db"
+            - "--max-db"
+            - "100g"
           env:
             - name: MY_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-          args:
-            - "trace"
-            - "--record"
-            - "--db"
-            - "/var/lib/ingero/ingero.db"
-            - "--max-db"
-            - "100g"
+            # NVIDIA Container Toolkit: inject GPU driver libs into container
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility,compute"
           securityContext:
+            # eBPF uprobe attachment to host process libraries requires
+            # privileged mode (cross-namespace ELF access + BPF + perf).
+            # CAP_BPF+CAP_PERFMON+CAP_SYS_ADMIN insufficient due to
+            # kernel LSM/seccomp restrictions in container runtimes.
             privileged: true
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/ingero", "version"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -x ingero > /dev/null"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
           volumeMounts:
-            - name: proc
-              mountPath: /proc
-              readOnly: true
-            - name: debugfs
-              mountPath: /sys/kernel/debug
             - name: btf
               mountPath: /sys/kernel/btf
               readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: tmp
+              mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm
             - name: data
               mountPath: /var/lib/ingero
+            - name: log
+              mountPath: /var/log/ingero
           resources:
             requests:
-              memory: 256Mi
-              cpu: 100m
+              cpu: 50m
+              memory: 100Mi
             limits:
-              memory: 512Mi
-              cpu: "1"
+              cpu: 200m
+              memory: 256Mi
       volumes:
-        - name: proc
-          hostPath:
-            path: /proc
-        - name: debugfs
-          hostPath:
-            path: /sys/kernel/debug
         - name: btf
           hostPath:
             path: /sys/kernel/btf
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: tmp
+          hostPath:
+            path: /tmp
+            type: Directory
+        - name: shm
+          hostPath:
+            path: /dev/shm
+            type: Directory
         - name: data
           hostPath:
             path: /var/lib/ingero
+            type: DirectoryOrCreate
+        - name: log
+          hostPath:
+            path: /var/log/ingero
             type: DirectoryOrCreate

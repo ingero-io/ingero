@@ -1,13 +1,40 @@
+# VCS and build artifacts
 .git
 bin/
 logs/
 dist/
 .output/
+
+# Documentation (keep Makefile)
+docs/
+*.md
+!Makefile
+
+# BMad artifacts
+_bmad*
+
+# Secrets and credentials
 *.pem
 *.key
+.env
+
+# Cloud VM configs
 .tensordock-vm.json
 .lambdalabs-vm.json
 .azure-vm.json
+
+# IDE and editor configs
 .claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test fixtures and workloads
+tests/workloads/
+investigations/
+
+# Demo and release artifacts
 demo/
-.env
+glama.json
+server.json
