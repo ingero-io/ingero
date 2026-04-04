@@ -18,7 +18,7 @@
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
 [mcpservers.org](https://mcpservers.org)
 
-**Version: 0.9.0**
+**Version: 0.9.1**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
