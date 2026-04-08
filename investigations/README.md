@@ -2,14 +2,16 @@
 
 Real-world GPU performance investigations traced with Ingero. Each `.db` file is a SQLite database containing CUDA API call timings, host kernel events, and causal chain analysis.
 
-## Databases
+> **Looking for multi-node investigations?** Jump to [Multi-Node Fleet Investigation](#multi-node-fleet-investigation) for cross-node fan-out queries, offline merge, Perfetto export, and clock skew detection.
+
+## Single-Node Databases
 
 | File | Issue | What It Shows |
 |------|-------|---------------|
 | `pytorch-dataloader-starvation.db` | [pytorch/pytorch#154318](https://github.com/pytorch/pytorch/issues/154318) | PyTorch DataLoader 114x slower than direct indexing. 200K+ context switches, GPU starving for data. |
 | `vllm-37343-logprobs-amplification.db` | [vllm-project/vllm#37343](https://github.com/vllm-project/vllm/issues/37343) | vLLM n_completions + logprobs blocks all co-scheduled requests for 11+ seconds. 80% kernel throughput drop. |
 | `pytorch-173382-empty-cache.db` | [pytorch/pytorch#173382](https://github.com/pytorch/pytorch/issues/173382) | `torch.cuda.empty_cache()` not freeing memory. cudaFree p99=1.9ms, cudaMemcpyAsync 98.6x slowdown from CPU scheduling. |
-| `vllm-37308-hol-blocking.db` | [vllm-project/vllm#37308](https://github.com/vllm-project/vllm/issues/37308) | vLLM head-of-line blocking with prefix caching. 14.5x TTFT regression. Available as [release asset](https://github.com/ingero-io/ingero/releases). |
+| `vllm-37308-hol-blocking.db` | [vllm-project/vllm#37308](https://github.com/vllm-project/vllm/issues/37308) | vLLM head-of-line blocking with prefix caching. 14.5x TTFT regression. |
 | `cuda-graph-cpu-contention.db` | CUDA Graph + CPU contention | `torch.compile` inference with batch size change triggering graph re-capture under CPU contention. 71% graph launch rate drop, 33x cudaLaunchKernel p99 blowup. CUDA Graph lifecycle events (capture, instantiate, launch) with causal correlation. **Captured 2026-04-02 04:38–04:39 UTC** (~50s window, 147K events). When using `--since`, note that event timestamps are from this date — use `--since 24h` or a wide window if querying after the capture date. |
 
 ## Investigate with AI (copy & paste)
@@ -36,6 +38,14 @@ ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
 ```bash
 cat > /tmp/ingero-mcp.json << 'EOF'
 {"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/vllm-37343-logprobs-amplification.db"]}}}
+EOF
+ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
+```
+
+**vLLM HOL blocking** ([vllm-project/vllm#37308](https://github.com/vllm-project/vllm/issues/37308)):
+```bash
+cat > /tmp/ingero-mcp.json << 'EOF'
+{"mcpServers":{"ingero":{"command":"./bin/ingero","args":["mcp","--db","investigations/vllm-37308-hol-blocking.db"]}}}
 EOF
 ollmcp -m minimax-m2.7:cloud -j /tmp/ingero-mcp.json
 ```
@@ -119,7 +129,9 @@ All traces captured on TensorDock RTX 4090 (24GB), Ubuntu 22.04, kernel 5.15, NV
 - vLLM investigations: vLLM 0.17.1, Qwen/Qwen2.5-0.5B-Instruct with prefix caching
 - CUDA Graph demo: EC2 g4dn.xlarge (Tesla T4, 15GB), Ubuntu 24.04, kernel 6.17, NVIDIA 580.126.09, PyTorch 2.10+CUDA 12.0
 
-## Multi-Node Investigation Walkthrough
+---
+
+# Multi-Node Fleet Investigation
 
 A complete example: diagnosing a distributed training stall across a 4-node GPU cluster using every multi-node feature. Sample databases are in the [Multi-Node Investigation Samples](#multi-node-investigation-samples) section below.
 
@@ -304,7 +316,7 @@ This prevents false causal conclusions - if you see "node-A's event happened 20m
 
 > **Note:** The multi-node features above (fan-out queries, offline merge, Perfetto export) are interim solutions for cross-node GPU investigation. A dedicated cluster-level observability and diagnostics tool with native multi-node support is coming soon.
 
-## Multi-Node Investigation Samples
+## Multi-Node Samples
 
 Sample SQLite databases from a 3-node GPU cluster for reproducing the walkthrough above. Demonstrates node identity tagging, fleet fan-out queries, offline database merge, Perfetto timeline export, and clock skew detection.
 
