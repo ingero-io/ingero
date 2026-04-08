@@ -3,7 +3,7 @@
   "name": "io.github.ingero-io/ingero",
   "title": "Ingero",
   "description": "eBPF-based GPU causal observability with 7 MCP tools for AI-assisted GPU debugging",
-  "version": "0.8.2",
+  "version": "0.9.1",
   "repository": {
     "url": "https://github.com/ingero-io/ingero",
     "source": "github"
@@ -12,7 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/ingero-io/ingero:v0.8.2",
+      "identifier": "ghcr.io/ingero-io/ingero:v0.9.1",
       "transport": {
         "type": "stdio"
       }

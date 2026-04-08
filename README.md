@@ -32,7 +32,7 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 ```bash
 # Install (Linux amd64 — see below for arm64/Docker)
-VERSION=0.9.0
+VERSION=0.9.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
@@ -186,16 +186,16 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.9.0`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.9.1`):
 
 ```bash
 # Linux amd64
-VERSION=0.9.0
+VERSION=0.9.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
-VERSION=0.9.0
+VERSION=0.9.1
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -209,7 +209,7 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 docker pull ghcr.io/ingero-io/ingero:latest
 
 # Or pin to a specific version
-docker pull ghcr.io/ingero-io/ingero:v0.9.0
+docker pull ghcr.io/ingero-io/ingero:v0.9.1
 
 # Quick test (no root, no GPU needed)
 docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
@@ -260,7 +260,7 @@ The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building t
 
 ```bash
 docker build -f deploy/docker/Dockerfile \
-  --build-arg VERSION=0.9.0 \
+  --build-arg VERSION=0.9.1 \
   --build-arg COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
   -t ingero:local .
@@ -588,7 +588,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.9.0 (commit: 676ab87, built: 2026-03-17)
+ingero v0.9.1 (commit: 01af280, built: 2026-04-06)
 ```
 
 ## Stack Tracing
