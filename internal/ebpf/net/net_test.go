@@ -9,22 +9,23 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// Compile-time size assertion: ensures bpf2go-generated struct matches 56 bytes.
+// Compile-time size assertion: ensures bpf2go-generated struct matches 72 bytes (v0.10).
 //
 //	struct ingero_net_event {
-//	    struct ingero_event_hdr hdr;  // offset 0-31  (32 bytes)
-//	    __u64 duration_ns;           // offset 32-39
-//	    __u32 fd;                    // offset 40-43
-//	    __u32 bytes;                 // offset 44-47
-//	    __u8  direction;             // offset 48
-//	    __u8  _pad_net[7];          // offset 49-55
-//	};                               // total: 56 bytes
-var _ [56 - unsafe.Sizeof(netTraceIngeroNetEvent{})]byte
+//	    struct ingero_event_hdr hdr;  // offset 0-47  (48 bytes, includes comm[16])
+//	    __u64 duration_ns;           // offset 48-55
+//	    __u32 fd;                    // offset 56-59
+//	    __u32 bytes;                 // offset 60-63
+//	    __u8  direction;             // offset 64
+//	    __u8  _pad_net[7];          // offset 65-71
+//	};                               // total: 72 bytes
+var _ [72 - unsafe.Sizeof(netTraceIngeroNetEvent{})]byte
 
 // buildNetEventBytes constructs a raw byte buffer matching the C struct layout.
+// comm is NUL-padded into the 16-byte slot in hdr (truncated to 15 chars + NUL if too long).
 func buildNetEventBytes(tsNs uint64, pid, tid uint32, op uint8,
-	durationNs uint64, fd, bytesTransferred uint32, direction uint8, cgroupID uint64) []byte {
-	buf := make([]byte, 56)
+	durationNs uint64, fd, bytesTransferred uint32, direction uint8, cgroupID uint64, comm string) []byte {
+	buf := make([]byte, 72)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
@@ -33,10 +34,15 @@ func buildNetEventBytes(tsNs uint64, pid, tid uint32, op uint8,
 	// buf[18:20] = _pad (zeros)
 	// buf[20:24] = _pad2 (zeros)
 	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
-	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
-	binary.LittleEndian.PutUint32(buf[40:44], fd)
-	binary.LittleEndian.PutUint32(buf[44:48], bytesTransferred)
-	buf[48] = direction
+	commBytes := []byte(comm)
+	if len(commBytes) > 15 {
+		commBytes = commBytes[:15]
+	}
+	copy(buf[32:48], commBytes)
+	binary.LittleEndian.PutUint64(buf[48:56], durationNs)
+	binary.LittleEndian.PutUint32(buf[56:60], fd)
+	binary.LittleEndian.PutUint32(buf[60:64], bytesTransferred)
+	buf[64] = direction
 	return buf
 }
 
@@ -47,7 +53,8 @@ func TestParseEventNetSend(t *testing.T) {
 		5,      // fd
 		4096,   // bytes sent
 		uint8(events.NetSend),
-		88, // cgroup_id
+		88,        // cgroup_id
+		"vllm",    // comm
 	)
 
 	tr := &Tracer{}
@@ -80,6 +87,9 @@ func TestParseEventNetSend(t *testing.T) {
 	if evt.CGroupID != 88 {
 		t.Errorf("CGroupID = %d, want 88", evt.CGroupID)
 	}
+	if evt.Comm != "vllm" {
+		t.Errorf("Comm = %q, want %q", evt.Comm, "vllm")
+	}
 }
 
 func TestParseEventNetRecv(t *testing.T) {
@@ -89,6 +99,7 @@ func TestParseEventNetRecv(t *testing.T) {
 		8192,    // bytes received
 		uint8(events.NetRecv),
 		0,
+		"", // comm
 	)
 
 	tr := &Tracer{}
@@ -116,6 +127,7 @@ func TestParseEventNetZeroBytes(t *testing.T) {
 		0,      // zero bytes
 		uint8(events.NetSend),
 		0,
+		"", // comm
 	)
 
 	tr := &Tracer{}
@@ -144,6 +156,7 @@ func TestParseEventNetLargeTransfer(t *testing.T) {
 		bigBytes,
 		uint8(events.NetRecv),
 		123,
+		"", // comm
 	)
 
 	tr := &Tracer{}

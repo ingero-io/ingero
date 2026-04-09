@@ -212,15 +212,15 @@ func (t *Tracer) Run(ctx context.Context) {
 
 // stackEventSize is sizeof(cuda_event_stack) — derived from the bpf2go-generated
 // base struct size to prevent silent misparsing when BPF struct sizes change.
-// Layout: base (64) + 2 (stack_depth) + 6 (pad) + 512 (64 * uint64 IPs) = 584.
+// Layout: base (80, v0.10 with hdr.comm; was 64) + 2 (stack_depth) + 6 (pad) + 512 (64 * uint64 IPs) = 600.
 var stackEventSize = int(unsafe.Sizeof(cudaTraceCudaEvent{})) + 8 + 512 // base + depth/pad + ips
 
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (64 bytes) and stack events (584 bytes).
+// Handles both base events (80 bytes) and stack events (600 bytes).
 //
 // The Go parser distinguishes by record length:
-//   - 64 bytes  → cuda_event (no stack)
-//   - 584 bytes → cuda_event_stack (with stack trace)
+//   - 80 bytes  → cuda_event (no stack)
+//   - 600 bytes → cuda_event_stack (with stack trace)
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(cudaTraceCudaEvent{}))
 	if len(raw) < baseSize {
@@ -234,6 +234,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		Timestamp: events.KtimeToWallClock(ce.Hdr.TimestampNs),
 		PID:       ce.Hdr.Pid,
 		TID:       ce.Hdr.Tid,
+		Comm:      events.CommToString(ce.Hdr.Comm),
 		Source:    events.Source(ce.Hdr.Source),
 		Op:        ce.Hdr.Op,
 		Duration:  time.Duration(ce.DurationNs),

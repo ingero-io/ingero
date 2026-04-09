@@ -38,6 +38,7 @@ struct io_req_val {
 	__u32 nr_sector;
 	__u8  rwbs;
 	__u8  _pad[3];
+	char  comm[16];      // captured at issue time (issuing task), propagated to complete event
 };
 
 struct {
@@ -80,6 +81,10 @@ int handle_block_rq_issue(struct trace_event_raw_block_rq *ctx)
 		.nr_sector = ctx->nr_sector,
 		.rwbs = classify_rwbs_str(ctx->rwbs),
 	};
+	// Capture issuing task's comm at queue time. block_rq_complete runs in
+	// IRQ context where bpf_get_current_comm() would return the interrupted
+	// task — wrong attribution. Read directly from current task at issue.
+	bpf_get_current_comm(&val.comm, sizeof(val.comm));
 
 	bpf_map_update_elem(&io_inflight, &key, &val, BPF_ANY);
 	return 0;
@@ -117,6 +122,7 @@ int handle_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx)
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = val->cgroup_id; // captured at issue time (complete runs in IRQ context)
+	__builtin_memcpy(&evt->hdr.comm, val->comm, sizeof(evt->hdr.comm)); // ditto
 	evt->duration_ns = duration_ns;
 	evt->dev = ctx->dev;
 	evt->nr_sector = val->nr_sector;

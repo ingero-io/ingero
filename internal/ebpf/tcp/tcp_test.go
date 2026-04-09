@@ -8,23 +8,24 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// Compile-time size assertion: ensures bpf2go-generated struct matches 48 bytes.
+// Compile-time size assertion: ensures bpf2go-generated struct matches 64 bytes (v0.10).
 //
 //	struct ingero_tcp_event {
-//	    struct ingero_event_hdr hdr;  // offset 0-31  (32 bytes)
-//	    __u32 saddr;                 // offset 32-35
-//	    __u32 daddr;                 // offset 36-39
-//	    __u16 sport;                 // offset 40-41
-//	    __u16 dport;                 // offset 42-43
-//	    __u8  state;                 // offset 44
-//	    __u8  _pad_tcp[3];          // offset 45-47
-//	};                               // total: 48 bytes
-var _ [48 - unsafe.Sizeof(tcpTraceIngeroTcpEvent{})]byte
+//	    struct ingero_event_hdr hdr;  // offset 0-47  (48 bytes, includes comm[16])
+//	    __u32 saddr;                 // offset 48-51
+//	    __u32 daddr;                 // offset 52-55
+//	    __u16 sport;                 // offset 56-57
+//	    __u16 dport;                 // offset 58-59
+//	    __u8  state;                 // offset 60
+//	    __u8  _pad_tcp[3];          // offset 61-63
+//	};                               // total: 64 bytes
+var _ [64 - unsafe.Sizeof(tcpTraceIngeroTcpEvent{})]byte
 
 // buildTCPEventBytes constructs a raw byte buffer matching the C struct layout.
+// comm is NUL-padded into the 16-byte slot in hdr (truncated to 15 chars + NUL if too long).
 func buildTCPEventBytes(tsNs uint64, pid, tid uint32, op uint8,
-	saddr, daddr uint32, sport, dport uint16, state uint8, cgroupID uint64) []byte {
-	buf := make([]byte, 48)
+	saddr, daddr uint32, sport, dport uint16, state uint8, cgroupID uint64, comm string) []byte {
+	buf := make([]byte, 64)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
@@ -33,11 +34,16 @@ func buildTCPEventBytes(tsNs uint64, pid, tid uint32, op uint8,
 	// buf[18:20] = _pad (zeros)
 	// buf[20:24] = _pad2 (zeros)
 	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
-	binary.LittleEndian.PutUint32(buf[32:36], saddr)
-	binary.LittleEndian.PutUint32(buf[36:40], daddr)
-	binary.LittleEndian.PutUint16(buf[40:42], sport)
-	binary.LittleEndian.PutUint16(buf[42:44], dport)
-	buf[44] = state
+	commBytes := []byte(comm)
+	if len(commBytes) > 15 {
+		commBytes = commBytes[:15]
+	}
+	copy(buf[32:48], commBytes)
+	binary.LittleEndian.PutUint32(buf[48:52], saddr)
+	binary.LittleEndian.PutUint32(buf[52:56], daddr)
+	binary.LittleEndian.PutUint16(buf[56:58], sport)
+	binary.LittleEndian.PutUint16(buf[58:60], dport)
+	buf[60] = state
 	return buf
 }
 
@@ -51,7 +57,7 @@ func TestParseEventRetransmit(t *testing.T) {
 	state := uint8(1) // TCP_ESTABLISHED
 
 	raw := buildTCPEventBytes(tsNs, 1234, 1235, uint8(events.TCPRetransmit),
-		saddr, daddr, sport, dport, state, 42)
+		saddr, daddr, sport, dport, state, 42, "nccl-bench")
 
 	tr := &Tracer{}
 	evt, ok := tr.parseEvent(raw)
@@ -92,6 +98,9 @@ func TestParseEventRetransmit(t *testing.T) {
 	if evt.CGroupID != 42 {
 		t.Errorf("CGroupID = %d, want 42", evt.CGroupID)
 	}
+	if evt.Comm != "nccl-bench" {
+		t.Errorf("Comm = %q, want %q", evt.Comm, "nccl-bench")
+	}
 }
 
 func TestParseEventRetransmitZeroPorts(t *testing.T) {
@@ -103,6 +112,7 @@ func TestParseEventRetransmitZeroPorts(t *testing.T) {
 		0, 0,       // zero ports
 		6, // TCP_TIME_WAIT
 		0,
+		"", // comm
 	)
 
 	tr := &Tracer{}
@@ -128,7 +138,7 @@ func TestParseEventRetransmitAddressPacking(t *testing.T) {
 	saddr := uint32(0xFFFFFFFF) // 255.255.255.255
 	daddr := uint32(0x01020304) // 1.2.3.4
 	raw := buildTCPEventBytes(4000000000, 200, 201, uint8(events.TCPRetransmit),
-		saddr, daddr, 8080, 80, 1, 0)
+		saddr, daddr, 8080, 80, 1, 0, "")
 
 	tr := &Tracer{}
 	evt, ok := tr.parseEvent(raw)

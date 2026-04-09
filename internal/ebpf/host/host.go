@@ -234,6 +234,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		Timestamp: events.KtimeToWallClock(he.Hdr.TimestampNs),
 		PID:       he.Hdr.Pid,
 		TID:       he.Hdr.Tid,
+		Comm:      events.CommToString(he.Hdr.Comm),
 		Source:    events.Source(he.Hdr.Source),
 		Op:        he.Hdr.Op,
 		Duration:  dur,

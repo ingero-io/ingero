@@ -490,11 +490,11 @@ func TestSchemaMigration(t *testing.T) {
 		t.Errorf("migration: old event node = %q, want empty string", node)
 	}
 
-	// Verify schema version is 0.9.
+	// Verify schema version is 0.10 (v0.10 added events.comm).
 	var version string
 	s.db.QueryRow("SELECT value FROM schema_info WHERE key = 'version'").Scan(&version)
-	if version != "0.9" {
-		t.Errorf("schema version = %q, want %q", version, "0.9")
+	if version != "0.10" {
+		t.Errorf("schema version = %q, want %q", version, "0.10")
 	}
 }
 
@@ -507,7 +507,7 @@ func TestSchemaVersion(t *testing.T) {
 
 	var version string
 	s.db.QueryRow("SELECT value FROM schema_info WHERE key = 'version'").Scan(&version)
-	if version != "0.9" {
-		t.Errorf("schema version = %q, want %q", version, "0.9")
+	if version != "0.10" {
+		t.Errorf("schema version = %q, want %q", version, "0.10")
 	}
 }

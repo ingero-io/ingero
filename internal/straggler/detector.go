@@ -25,8 +25,14 @@ import (
 
 // StraggleState represents a detected straggler condition for a single PID.
 // JSON field names are the cross-language contract with the orchestrator.
+//
+// v0.10: Comm carries the kernel-captured process name from bpf_get_current_comm()
+// for human-readable orchestrator logs and PID-reuse detection. May be empty when
+// the BPF probe could not capture comm or when the detector hasn't seen a non-empty
+// comm for the PID yet (e.g., only sched_switch events with NULL comm so far).
 type StraggleState struct {
 	PID               uint32   `json:"pid"`
+	Comm              string   `json:"comm,omitempty"`
 	ThroughputDropPct float64  `json:"throughput_drop_pct"`
 	SchedSwitchCount  uint32   `json:"sched_switch_count"`
 	PreemptingPIDs    []uint32 `json:"preempting_pids"`
@@ -95,6 +101,11 @@ type pidState struct {
 	// Sustained re-emission state: true after initial correlated detection,
 	// cleared when sched_switch drops below threshold.
 	emitted bool
+
+	// v0.10: most recent non-empty comm observed for this PID. Sourced from
+	// CUDA/Driver event captures (sched_switch events use ctx->next_comm which
+	// is also propagated). Empty string until first observation.
+	comm string
 }
 
 // Detector watches for correlated throughput drops and CPU scheduling contention.
@@ -139,6 +150,9 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		d.mu.Lock()
 		ps := d.getOrCreate(evt.PID)
 		ps.launchCount++
+		if evt.Comm != "" {
+			ps.comm = evt.Comm
+		}
 		d.mu.Unlock()
 
 	case events.SourceDriver:
@@ -148,6 +162,9 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		d.mu.Lock()
 		ps := d.getOrCreate(evt.PID)
 		ps.launchCount++
+		if evt.Comm != "" {
+			ps.comm = evt.Comm
+		}
 		d.mu.Unlock()
 
 	case events.SourceHost:
@@ -156,6 +173,7 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		}
 		// sched_switch encoding from host_trace.bpf.c:
 		//   evt.PID  = target PID (the process coming BACK on-CPU)
+		//   evt.Comm = next_comm from tracepoint context (the resuming target's comm)
 		//   evt.Args[1] = prev_pid (the process that was running before,
 		//                  i.e., the most recent preemptor)
 		//   evt.Duration = off-CPU duration
@@ -166,6 +184,9 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		ps, ok := d.pids[evt.PID]
 		if ok {
 			ps.schedSwitches++
+			if evt.Comm != "" {
+				ps.comm = evt.Comm
+			}
 			preemptorPID := uint32(evt.Args[1])
 			if preemptorPID > 0 && preemptorPID != evt.PID {
 				if ps.preemptingPIDs == nil {
@@ -292,28 +313,30 @@ func (d *Detector) checkAt(now time.Time) {
 			// Straggler detected — do NOT update EMA baseline (M1 fix).
 			state := StraggleState{
 				PID:               pid,
+				Comm:              ps.comm,
 				ThroughputDropPct: dropPct,
 				SchedSwitchCount:  schedCount,
 				PreemptingPIDs:    preemptingPIDs,
 				TimestampNs:       now.UnixNano(),
 				Sustained:         false,
 			}
-			log.Printf("INFO: straggler: detected pid=%d drop=%.1f%% sched_switches=%d preemptors=%v",
-				pid, dropPct, schedCount, preemptingPIDs)
+			log.Printf("INFO: straggler: detected pid=%d comm=%q drop=%.1f%% sched_switches=%d preemptors=%v",
+				pid, ps.comm, dropPct, schedCount, preemptingPIDs)
 			emissions = append(emissions, state)
 		} else if contention && ps.emitted {
 			// Sustained re-emission: sched_switch still elevated after initial
 			// correlation. Do NOT update EMA baseline (M1 fix preserved).
 			state := StraggleState{
 				PID:               pid,
+				Comm:              ps.comm,
 				ThroughputDropPct: dropPct,
 				SchedSwitchCount:  schedCount,
 				PreemptingPIDs:    preemptingPIDs,
 				TimestampNs:       now.UnixNano(),
 				Sustained:         true,
 			}
-			log.Printf("INFO: straggler: sustained pid=%d drop=%.1f%% sched_switches=%d",
-				pid, dropPct, schedCount)
+			log.Printf("INFO: straggler: sustained pid=%d comm=%q drop=%.1f%% sched_switches=%d",
+				pid, ps.comm, dropPct, schedCount)
 			emissions = append(emissions, state)
 		} else {
 			// No detection and no sustained contention — update EMA baseline.

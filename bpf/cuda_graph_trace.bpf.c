@@ -16,7 +16,7 @@
 
 // Ring buffer for graph events (4MB).
 // GraphLaunch can fire at 100-1000+/sec in production (vLLM replays).
-// At 72 bytes/event, 4MB holds ~58K events (~58s at 1000/sec).
+// At 88 bytes/event (v0.10 with hdr.comm; was 72), 4MB holds ~47K events (~47s at 1000/sec).
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 4 * 1024 * 1024);
@@ -69,6 +69,7 @@ static __always_inline void graph_emit_event(__u32 pid, __u32 tid,
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = bpf_ktime_get_ns() - entry->timestamp_ns;
 	evt->stream_handle = entry->stream_handle;
 	evt->graph_handle = graph_handle ? graph_handle : entry->graph_handle;

@@ -9,9 +9,9 @@
 #include "common.bpf.h"
 
 // Ring buffer for sending events to userspace.
-// 8MB: with --stack, events are 584 bytes (v0.7); at 49K events/sec
-// ~14,300 stack events fit (~292ms buffer). Without --stack (64 bytes),
-// ~131,000 events fit (~2.7s buffer). Increased from 2MB after H100
+// 8MB: with --stack, events are 600 bytes (v0.10, +16 for hdr.comm); at 49K events/sec
+// ~13,900 stack events fit (~284ms buffer). Without --stack (80 bytes),
+// ~104,800 events fit (~2.1s buffer). Increased from 2MB after H100
 // testing showed 3.5% stack coverage at high event rates.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -69,8 +69,8 @@ static __always_inline void save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg
 }
 
 // emit_event pushes a completed event to the ring buffer.
-// When config.capture_stack is set, emits cuda_event_stack (584 bytes)
-// with bpf_get_stack(BPF_F_USER_STACK); otherwise emits cuda_event (64 bytes).
+// When config.capture_stack is set, emits cuda_event_stack (600 bytes)
+// with bpf_get_stack(BPF_F_USER_STACK); otherwise emits cuda_event (80 bytes).
 // Go parser distinguishes by record length.
 static __always_inline void emit_event(struct pt_regs *ctx,
 				       __u32 pid, __u32 tid,
@@ -95,6 +95,7 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 		sevt->hdr._pad = 0;
 		sevt->hdr._pad2 = 0;
 		sevt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+		bpf_get_current_comm(&sevt->hdr.comm, sizeof(sevt->hdr.comm));
 		sevt->duration_ns = now - entry->timestamp_ns;
 		sevt->arg0 = entry->arg0;
 		sevt->arg1 = entry->arg1;
@@ -131,6 +132,7 @@ fallback:;
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = now - entry->timestamp_ns;
 	evt->arg0 = entry->arg0;
 	evt->arg1 = entry->arg1;

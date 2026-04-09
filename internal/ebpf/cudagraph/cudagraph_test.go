@@ -3,17 +3,25 @@ package cudagraph
 import (
 	"encoding/binary"
 	"testing"
+	"unsafe"
 
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// buildGraphEventBytes constructs a raw 72-byte cuda_graph_event for testing.
+// Compile-time size assertion: ensures bpf2go-generated struct matches 88 bytes
+// (v0.10: 48-byte header with cgroup_id+comm + 40 bytes payload).
+// Fails compilation immediately if the struct size changes, preventing silent
+// misparsing of ring buffer events.
+var _ [88 - unsafe.Sizeof(cudaGraphTraceCudaGraphEvent{})]byte
+
+// buildGraphEventBytes constructs a raw 88-byte cuda_graph_event for testing
+// (v0.10: header grew from 32 to 48 bytes for comm[16]).
 func buildGraphEventBytes(source uint8, op uint8, durationNs uint64,
 	stream, graph, exec uint64, captureMode uint32, retCode int32) []byte {
 
-	buf := make([]byte, 72)
+	buf := make([]byte, 88)
 
-	// Header (32 bytes): timestamp(8), pid(4), tid(4), source(1), op(1), pad(2), pad2(4), cgroup(8)
+	// Header (48 bytes, v0.10): timestamp(8), pid(4), tid(4), source(1), op(1), pad(2), pad2(4), cgroup(8), comm(16)
 	binary.LittleEndian.PutUint64(buf[0:8], 1000000) // timestamp_ns
 	binary.LittleEndian.PutUint32(buf[8:12], 1234)    // pid
 	binary.LittleEndian.PutUint32(buf[12:16], 5678)   // tid
@@ -21,14 +29,15 @@ func buildGraphEventBytes(source uint8, op uint8, durationNs uint64,
 	buf[17] = op                                       // op
 	// pad[18:20], pad2[20:24] = 0
 	binary.LittleEndian.PutUint64(buf[24:32], 42) // cgroup_id
+	// buf[32:48] = comm[16] — left as zeros (empty comm) for these tests; tolerated by parseGraphEvent.
 
-	// Body
-	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
-	binary.LittleEndian.PutUint64(buf[40:48], stream)
-	binary.LittleEndian.PutUint64(buf[48:56], graph)
-	binary.LittleEndian.PutUint64(buf[56:64], exec)
-	binary.LittleEndian.PutUint32(buf[64:68], captureMode)
-	binary.LittleEndian.PutUint32(buf[68:72], uint32(retCode))
+	// Body (offsets shifted by +16 from v0.9)
+	binary.LittleEndian.PutUint64(buf[48:56], durationNs)
+	binary.LittleEndian.PutUint64(buf[56:64], stream)
+	binary.LittleEndian.PutUint64(buf[64:72], graph)
+	binary.LittleEndian.PutUint64(buf[72:80], exec)
+	binary.LittleEndian.PutUint32(buf[80:84], captureMode)
+	binary.LittleEndian.PutUint32(buf[84:88], uint32(retCode))
 
 	return buf
 }
@@ -177,7 +186,9 @@ func TestParseGraphEvent_AllOps(t *testing.T) {
 }
 
 func TestParseGraphEvent_TooShort(t *testing.T) {
-	short := make([]byte, 40) // less than 72
+	// Buffer one byte short of the v0.10 88-byte event — exercises the
+	// boundary condition rather than just being trivially short.
+	short := make([]byte, 87)
 	_, err := parseGraphEvent(short)
 	if err == nil {
 		t.Error("expected error for short event, got nil")

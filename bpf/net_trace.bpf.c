@@ -113,6 +113,7 @@ int handle_sys_exit_sendto(struct trace_event_raw_sys_exit *ctx)
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = now - entry->timestamp_ns;
 	evt->fd = entry->fd;
 	evt->bytes = ret > 0 ? (__u32)ret : 0;
@@ -174,6 +175,7 @@ int handle_sys_exit_recvfrom(struct trace_event_raw_sys_exit *ctx)
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = now - entry->timestamp_ns;
 	evt->fd = entry->fd;
 	evt->bytes = ret > 0 ? (__u32)ret : 0;

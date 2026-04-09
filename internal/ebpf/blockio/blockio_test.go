@@ -9,23 +9,24 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// Compile-time size assertion: ensures bpf2go-generated struct matches 64 bytes.
+// Compile-time size assertion: ensures bpf2go-generated struct matches 80 bytes (v0.10).
 //
 //	struct ingero_io_event {
-//	    struct ingero_event_hdr hdr;  // offset 0-31  (32 bytes)
-//	    __u64 duration_ns;           // offset 32-39
-//	    __u32 dev;                   // offset 40-43
-//	    __u32 nr_sector;             // offset 44-47
-//	    __u64 sector;                // offset 48-55
-//	    __u8  rwbs;                  // offset 56
-//	    __u8  _pad_io[7];           // offset 57-63
-//	};                               // total: 64 bytes
-var _ [64 - unsafe.Sizeof(ioTraceIngeroIoEvent{})]byte
+//	    struct ingero_event_hdr hdr;  // offset 0-47  (48 bytes, includes comm[16])
+//	    __u64 duration_ns;           // offset 48-55
+//	    __u32 dev;                   // offset 56-59
+//	    __u32 nr_sector;             // offset 60-63
+//	    __u64 sector;                // offset 64-71
+//	    __u8  rwbs;                  // offset 72
+//	    __u8  _pad_io[7];           // offset 73-79
+//	};                               // total: 80 bytes
+var _ [80 - unsafe.Sizeof(ioTraceIngeroIoEvent{})]byte
 
 // buildIOEventBytes constructs a raw byte buffer matching the C struct layout.
+// comm is NUL-padded into the 16-byte slot in hdr (truncated to 15 chars + NUL if too long).
 func buildIOEventBytes(tsNs uint64, pid, tid uint32, op uint8,
-	durationNs uint64, dev, nrSector uint32, sector uint64, rwbs uint8, cgroupID uint64) []byte {
-	buf := make([]byte, 64)
+	durationNs uint64, dev, nrSector uint32, sector uint64, rwbs uint8, cgroupID uint64, comm string) []byte {
+	buf := make([]byte, 80)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
@@ -34,11 +35,16 @@ func buildIOEventBytes(tsNs uint64, pid, tid uint32, op uint8,
 	// buf[18:20] = _pad (zeros)
 	// buf[20:24] = _pad2 (zeros)
 	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
-	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
-	binary.LittleEndian.PutUint32(buf[40:44], dev)
-	binary.LittleEndian.PutUint32(buf[44:48], nrSector)
-	binary.LittleEndian.PutUint64(buf[48:56], sector)
-	buf[56] = rwbs
+	commBytes := []byte(comm)
+	if len(commBytes) > 15 {
+		commBytes = commBytes[:15]
+	}
+	copy(buf[32:48], commBytes)
+	binary.LittleEndian.PutUint64(buf[48:56], durationNs)
+	binary.LittleEndian.PutUint32(buf[56:60], dev)
+	binary.LittleEndian.PutUint32(buf[60:64], nrSector)
+	binary.LittleEndian.PutUint64(buf[64:72], sector)
+	buf[72] = rwbs
 	return buf
 }
 
@@ -51,6 +57,7 @@ func TestParseEventBlockRead(t *testing.T) {
 		1024,    // starting sector
 		1,       // rwbs = read
 		99,      // cgroup_id
+		"dataloader", // comm
 	)
 
 	tr := &Tracer{}
@@ -86,6 +93,9 @@ func TestParseEventBlockRead(t *testing.T) {
 	if evt.CGroupID != 99 {
 		t.Errorf("CGroupID = %d, want 99", evt.CGroupID)
 	}
+	if evt.Comm != "dataloader" {
+		t.Errorf("Comm = %q, want %q", evt.Comm, "dataloader")
+	}
 }
 
 func TestParseEventBlockWrite(t *testing.T) {
@@ -96,6 +106,7 @@ func TestParseEventBlockWrite(t *testing.T) {
 		8192,
 		2, // rwbs = write
 		0,
+		"", // comm — empty exercises tolerance
 	)
 
 	tr := &Tracer{}
@@ -109,6 +120,9 @@ func TestParseEventBlockWrite(t *testing.T) {
 	}
 	if evt.Duration != 10*time.Millisecond {
 		t.Errorf("Duration = %v, want 10ms", evt.Duration)
+	}
+	if evt.Comm != "" {
+		t.Errorf("Comm = %q, want empty string", evt.Comm)
 	}
 }
 

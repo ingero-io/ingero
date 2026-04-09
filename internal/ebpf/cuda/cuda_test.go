@@ -10,14 +10,14 @@ import (
 )
 
 // Compile-time size assertion: ensures the bpf2go-generated struct matches
-// the expected 64 bytes (v0.7: 32-byte header with cgroup_id + 32 bytes payload).
+// the expected 80 bytes (v0.10: 48-byte header with cgroup_id+comm + 32 bytes payload).
 // Fails compilation immediately if the struct size changes, preventing silent
 // misparsing of ring buffer events.
-var _ [64 - unsafe.Sizeof(cudaTraceCudaEvent{})]byte
+var _ [80 - unsafe.Sizeof(cudaTraceCudaEvent{})]byte
 
 // buildCUDAEventBytes constructs a raw byte buffer matching the C struct cuda_event layout:
 //
-//	struct ingero_event_hdr {   // 32 bytes (v0.7)
+//	struct ingero_event_hdr {   // 48 bytes (v0.10)
 //	    __u64 timestamp_ns;     // offset 0
 //	    __u32 pid;              // offset 8
 //	    __u32 tid;              // offset 12
@@ -26,18 +26,23 @@ var _ [64 - unsafe.Sizeof(cudaTraceCudaEvent{})]byte
 //	    __u16 _pad;             // offset 18
 //	    __u32 _pad2;            // offset 20 (explicit alignment padding)
 //	    __u64 cgroup_id;        // offset 24
+//	    char  comm[16];         // offset 32 (v0.10 PID hardening)
 //	};
 //	struct cuda_event {
-//	    struct ingero_event_hdr hdr;  // 0-31
-//	    __u64 duration_ns;           // 32
-//	    __u64 arg0;                  // 40
-//	    __u64 arg1;                  // 48
-//	    __s32 return_code;           // 56
-//	    __u32 gpu_id;                // 60
-//	};                               // total: 64 bytes
+//	    struct ingero_event_hdr hdr;  // 0-47
+//	    __u64 duration_ns;           // 48
+//	    __u64 arg0;                  // 56
+//	    __u64 arg1;                  // 64
+//	    __s32 return_code;           // 72
+//	    __u32 gpu_id;                // 76
+//	};                               // total: 80 bytes
+//
+// comm is a Go string copied into the 16-byte field, NUL-padded; longer
+// strings are truncated to TASK_COMM_LEN-1 with a trailing NUL terminator
+// (matching the Linux kernel's invariant for comm).
 func buildCUDAEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
-	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32, cgroupID uint64) []byte {
-	buf := make([]byte, 64)
+	durationNs, arg0, arg1 uint64, retCode int32, gpuID uint32, cgroupID uint64, comm string) []byte {
+	buf := make([]byte, 80)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
@@ -46,11 +51,17 @@ func buildCUDAEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
 	// buf[18:20] = _pad (zeros)
 	// buf[20:24] = _pad2 (zeros)
 	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
-	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
-	binary.LittleEndian.PutUint64(buf[40:48], arg0)
-	binary.LittleEndian.PutUint64(buf[48:56], arg1)
-	binary.LittleEndian.PutUint32(buf[56:60], uint32(retCode))
-	binary.LittleEndian.PutUint32(buf[60:64], gpuID)
+	// buf[32:48] = comm[16] — NUL-padded; truncated to 15 chars + NUL if too long.
+	commBytes := []byte(comm)
+	if len(commBytes) > 15 {
+		commBytes = commBytes[:15]
+	}
+	copy(buf[32:48], commBytes)
+	binary.LittleEndian.PutUint64(buf[48:56], durationNs)
+	binary.LittleEndian.PutUint64(buf[56:64], arg0)
+	binary.LittleEndian.PutUint64(buf[64:72], arg1)
+	binary.LittleEndian.PutUint32(buf[72:76], uint32(retCode))
+	binary.LittleEndian.PutUint32(buf[76:80], gpuID)
 	return buf
 }
 
@@ -64,6 +75,7 @@ func TestParseEventCUDAMalloc(t *testing.T) {
 		0,    // success
 		0,    // gpu 0
 		42,   // cgroup_id
+		"python3", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -95,6 +107,9 @@ func TestParseEventCUDAMalloc(t *testing.T) {
 	if evt.CGroupID != 42 {
 		t.Errorf("CGroupID = %d, want 42", evt.CGroupID)
 	}
+	if evt.Comm != "python3" {
+		t.Errorf("Comm = %q, want %q", evt.Comm, "python3")
+	}
 	if evt.Stack != nil {
 		t.Errorf("Stack should be nil for base event")
 	}
@@ -109,6 +124,7 @@ func TestParseEventCUDAFree(t *testing.T) {
 		0,              // success
 		0,              // gpu 0
 		0,              // bare-metal (no cgroup)
+		"",             // comm — exercises empty-comm tolerance (BPF edge case)
 	)
 
 	evt, err := parseEvent(raw)
@@ -128,6 +144,9 @@ func TestParseEventCUDAFree(t *testing.T) {
 	if evt.CGroupID != 0 {
 		t.Errorf("CGroupID = %d, want 0", evt.CGroupID)
 	}
+	if evt.Comm != "" {
+		t.Errorf("Comm = %q, want empty string", evt.Comm)
+	}
 }
 
 func TestParseEventTooShort(t *testing.T) {
@@ -138,16 +157,17 @@ func TestParseEventTooShort(t *testing.T) {
 }
 
 func TestParseEventWithStack(t *testing.T) {
-	// Build a 584-byte stack event: 64 base + 2 depth + 6 pad + 512 IPs.
+	// Build a 600-byte stack event: 80 base (v0.10 with comm) + 2 depth + 6 pad + 512 IPs.
 	buf := buildCUDAEventBytes(2000000000, 5678, 5679,
 		uint8(events.SourceCUDA), uint8(events.CUDALaunchKernel),
 		10000, // 10µs
 		0xDEADBEEF, 0,
 		0, 0,
-		99, // cgroup_id
+		99,         // cgroup_id
+		"workload", // comm
 	)
-	// Extend to 584 bytes.
-	stackSection := make([]byte, 584-64)
+	// Extend to 600 bytes (80 base + 520 stack section).
+	stackSection := make([]byte, 600-80)
 	// stack_depth = 3 at offset 0 of stack section.
 	binary.LittleEndian.PutUint16(stackSection[0:2], 3)
 	// IPs start at offset 8 of stack section.
@@ -181,7 +201,8 @@ func TestParseEventTruncatedStack(t *testing.T) {
 		uint8(events.SourceCUDA), uint8(events.CUDAMemcpy),
 		1000, 1024, 1, // 1KB H2D copy
 		0, 0,
-		0, // cgroup_id
+		0,  // cgroup_id
+		"", // comm
 	)
 	// Only 4 extra bytes — not enough for stack section.
 	buf = append(buf, 0, 0, 0, 0)

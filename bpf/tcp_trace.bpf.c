@@ -45,6 +45,9 @@ int BPF_PROG(handle_tcp_retransmit, const struct sock *sk,
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	// Caveat: tcp_retransmit_skb may fire in softirq — current task is the
+	// preempted task, not the socket owner. Same fidelity caveat as PID.
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 
 	// Extract IPv4 addresses from sock_common.
 	// For IPv6, these will be 0 (v0.8 scope: IPv4 only).

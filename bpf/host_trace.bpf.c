@@ -13,8 +13,8 @@
 #include "common.bpf.h"
 
 // Separate ring buffer from CUDA — independent reader avoids head-of-line blocking.
-// 1MB: host events are 48 bytes each (struct host_event, v0.7 with cgroup_id);
-// at heavy contention (~100K mm_page_alloc/sec), ~21,800 events fit (218ms buffer).
+// 1MB: host events are 64 bytes each (struct host_event, v0.10 with hdr.comm; was 48 in v0.9);
+// at heavy contention (~100K mm_page_alloc/sec), ~16,400 events fit (164ms buffer).
 // Sized smaller than CUDA/driver buffers since host events have lower per-PID throughput.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -67,9 +67,18 @@ static __always_inline bool is_target_pid(__u32 pid)
 	return bpf_map_lookup_elem(&target_pids, &pid) != NULL;
 }
 
+// emit_host_event populates and submits a host event.
+//
+// comm_src: optional pointer to a kernel-resident TASK_COMM_LEN buffer. If
+// non-NULL, hdr.comm is read from this address (used by sched_switch where
+// the event's PID is next_pid, not current — so bpf_get_current_comm() would
+// capture the scheduler/preemptor, not the resuming target). If NULL, falls
+// back to bpf_get_current_comm() which is correct when the event PID matches
+// the current task (mm_page_alloc, process_exec, process_exit, fork, wakeup).
 static __always_inline void emit_host_event(__u32 pid, __u32 tid,
 					    __u8 op, __u64 duration_ns,
-					    __u32 cpu, __u32 target_pid)
+					    __u32 cpu, __u32 target_pid,
+					    const char *comm_src)
 {
 	struct host_event *evt;
 
@@ -85,6 +94,15 @@ static __always_inline void emit_host_event(__u32 pid, __u32 tid,
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	// Defensive zero-init: bpf_ringbuf_reserve does NOT zero its memory.
+	// If bpf_probe_read_kernel below fails (very unlikely for tracepoint ctx
+	// fields, but defensive against future verifier-permitted variants), the
+	// comm field would otherwise leak whatever bytes were in the ringbuf slot.
+	__builtin_memset(&evt->hdr.comm, 0, sizeof(evt->hdr.comm));
+	if (comm_src)
+		bpf_probe_read_kernel(&evt->hdr.comm, sizeof(evt->hdr.comm), comm_src);
+	else
+		bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = duration_ns;
 	evt->cpu = cpu;
 	evt->target_pid = target_pid;
@@ -122,9 +140,12 @@ int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 		__u64 *off_ts = bpf_map_lookup_elem(&sched_off_map, &next_pid);
 		if (off_ts) {
 			__u64 off_cpu_ns = now - *off_ts;
+			// next_comm is the resuming target's comm — captured by the
+			// scheduler in tracepoint context. bpf_get_current_comm() would
+			// return the outgoing task's comm (wrong attribution).
 			emit_host_event(next_pid, next_pid,
 					HOST_OP_SCHED_SWITCH, off_cpu_ns,
-					cpu, prev_pid);
+					cpu, prev_pid, ctx->next_comm);
 			bpf_map_delete_elem(&sched_off_map, &next_pid);
 		}
 	}
@@ -145,9 +166,10 @@ int handle_sched_wakeup(struct trace_event_raw_sched_wakeup_template *ctx)
 	__u32 waker_tgid = (__u32)(pid_tgid >> 32);
 	__u32 waker_tid = (__u32)pid_tgid;
 
+	// Event PID = waker (current task), so bpf_get_current_comm() is correct.
 	emit_host_event(waker_tgid, waker_tid,
 			HOST_OP_SCHED_WAKEUP, 0,
-			bpf_get_smp_processor_id(), wakee_pid);
+			bpf_get_smp_processor_id(), wakee_pid, NULL);
 
 	return 0;
 }
@@ -172,7 +194,7 @@ int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
 
 	emit_host_event(tgid, tid,
 			HOST_OP_PAGE_ALLOC, alloc_bytes,
-			bpf_get_smp_processor_id(), 0);
+			bpf_get_smp_processor_id(), 0, NULL);
 
 	return 0;
 }
@@ -186,9 +208,11 @@ int handle_oom_kill(struct trace_event_raw_mark_victim *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u32 tid = (__u32)pid_tgid;
 
+	// OOM killer fires from the allocator's task context, which may or may
+	// not be the victim. Use current task comm — same fidelity caveat as PID.
 	emit_host_event(tgid, tid,
 			HOST_OP_OOM_KILL, 0,
-			bpf_get_smp_processor_id(), ctx->pid);
+			bpf_get_smp_processor_id(), ctx->pid, NULL);
 
 	return 0;
 }
@@ -207,7 +231,7 @@ int handle_process_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 	emit_host_event(tgid, tid,
 			HOST_OP_PROCESS_EXEC, 0,
-			bpf_get_smp_processor_id(), 0);
+			bpf_get_smp_processor_id(), 0, NULL);
 
 	return 0;
 }
@@ -226,7 +250,7 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 
 	emit_host_event(tgid, tid,
 			HOST_OP_PROCESS_EXIT, 0,
-			bpf_get_smp_processor_id(), 0);
+			bpf_get_smp_processor_id(), 0, NULL);
 
 	return 0;
 }
@@ -246,9 +270,10 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 	__u32 tid = (__u32)pid_tgid;
 	__u32 child_pid = ctx->child_pid;
 
+	// Event PID = parent (current task), so current_comm is correct.
 	emit_host_event(tgid, tid,
 			HOST_OP_PROCESS_FORK, 0,
-			bpf_get_smp_processor_id(), child_pid);
+			bpf_get_smp_processor_id(), child_pid, NULL);
 
 	return 0;
 }
