@@ -83,7 +83,7 @@ struct entry_state {
 
 /* Base event header — all events start with this.
  *
- * Layout with explicit padding (32 bytes total):
+ * Layout with explicit padding (48 bytes total):
  *   offset 0:  timestamp_ns  (u64)
  *   offset 8:  pid           (u32)
  *   offset 12: tid           (u32)
@@ -92,9 +92,12 @@ struct entry_state {
  *   offset 18: _pad          (u16)
  *   offset 20: _pad2         (u32) — explicit; replaces implicit compiler padding
  *   offset 24: cgroup_id     (u64) — bpf_get_current_cgroup_id() for K8s container scoping
+ *   offset 32: comm          (char[16]) — bpf_get_current_comm() for PID-reuse-resilient process identity
  *
  * v0.6 header was 24 bytes (20 explicit + 4 implicit padding).
- * v0.7 adds cgroup_id at offset 24, making the header 32 bytes (+8 net).
+ * v0.7 added cgroup_id at offset 24, making the header 32 bytes (+8 net).
+ * v0.10 adds comm[16] at offset 32, making the header 48 bytes (+16 net).
+ * comm is 16 bytes naturally (matches TASK_COMM_LEN), keeps 8-byte alignment.
  */
 struct ingero_event_hdr {
 	__u64 timestamp_ns;
@@ -105,9 +108,10 @@ struct ingero_event_hdr {
 	__u16 _pad;
 	__u32 _pad2;        /* explicit alignment padding (was implicit in v0.6) */
 	__u64 cgroup_id;    /* cgroup v2 inode ID; 0 or 1 = no meaningful cgroup */
+	char  comm[16];     /* process name from bpf_get_current_comm() — TASK_COMM_LEN */
 };
 
-/* CUDA runtime event (64 bytes, was 56 in v0.6) */
+/* CUDA runtime event (80 bytes, was 64 in v0.9, 56 in v0.6) */
 struct cuda_event {
 	struct ingero_event_hdr hdr;
 	__u64 duration_ns;
@@ -126,7 +130,7 @@ struct nvidia_event {
 	__u32 context_id;
 };
 
-/* Host kernel event (48 bytes, was 40 in v0.6) */
+/* Host kernel event (64 bytes, was 48 in v0.9, 40 in v0.6) */
 struct host_event {
 	struct ingero_event_hdr hdr;
 	__u64 duration_ns;
@@ -134,7 +138,7 @@ struct host_event {
 	__u32 target_pid;    /* for sched events: who was affected */
 };
 
-/* Block I/O event (64 bytes) — block_rq_issue / block_rq_complete.
+/* Block I/O event (80 bytes) — block_rq_issue / block_rq_complete.
  * Prefixed with ingero_ to avoid colliding with kernel's struct io_event in vmlinux.h.
  */
 struct ingero_io_event {
@@ -147,7 +151,7 @@ struct ingero_io_event {
 	__u8  _pad_io[7];
 };
 
-/* TCP event (48 bytes) — tcp_retransmit_skb */
+/* TCP event (64 bytes) — tcp_retransmit_skb */
 struct ingero_tcp_event {
 	struct ingero_event_hdr hdr;
 	__u32 saddr;            /* source IPv4 address */
@@ -158,7 +162,7 @@ struct ingero_tcp_event {
 	__u8  _pad_tcp[3];
 };
 
-/* Network socket event (56 bytes) — sendto/recvfrom syscalls */
+/* Network socket event (72 bytes) — sendto/recvfrom syscalls */
 struct ingero_net_event {
 	struct ingero_event_hdr hdr;
 	__u64 duration_ns;      /* syscall duration (entry → exit) */
@@ -184,16 +188,16 @@ struct graph_entry_state {
 	__u32 _pad2;
 };
 
-/* CUDA Graph lifecycle event (72 bytes).
+/* CUDA Graph lifecycle event (88 bytes).
  *
  * Layout:
- *   offset  0: hdr              (32 bytes — ingero_event_hdr)
- *   offset 32: duration_ns      (8)
- *   offset 40: stream_handle    (8) — stream for BeginCapture/EndCapture/Launch
- *   offset 48: graph_handle     (8) — graph for EndCapture/Instantiate
- *   offset 56: exec_handle      (8) — executable for Instantiate/Launch
- *   offset 64: capture_mode     (4) — for BeginCapture (0=global, 1=thread_local, 2=relaxed)
- *   offset 68: return_code      (4) — cudaError_t
+ *   offset  0: hdr              (48 bytes — ingero_event_hdr)
+ *   offset 48: duration_ns      (8)
+ *   offset 56: stream_handle    (8) — stream for BeginCapture/EndCapture/Launch
+ *   offset 64: graph_handle     (8) — graph for EndCapture/Instantiate
+ *   offset 72: exec_handle      (8) — executable for Instantiate/Launch
+ *   offset 80: capture_mode     (4) — for BeginCapture (0=global, 1=thread_local, 2=relaxed)
+ *   offset 84: return_code      (4) — cudaError_t
  */
 struct cuda_graph_event {
 	struct ingero_event_hdr hdr;
@@ -219,18 +223,18 @@ struct ingero_config {
  *
  * When config.capture_stack == 1, the uretprobe emits this instead of the
  * base cuda_event. The Go parser distinguishes by record length:
- *   64 bytes  → cuda_event (no stack)
- *   584 bytes → cuda_event_stack (with stack)
+ *   80 bytes  → cuda_event (no stack)
+ *   600 bytes → cuda_event_stack (with stack)
  *
  * stack_ips[] is filled by bpf_get_stack(BPF_F_USER_STACK). The helper
  * writes raw instruction pointers (IPs) from the userspace call chain.
  * Symbol resolution happens in Go, not in eBPF.
  *
  * This struct is allocated via bpf_ringbuf_reserve(), NOT on the eBPF
- * stack (which is limited to 512 bytes). 584 bytes in ring buffer is fine.
+ * stack (which is limited to 512 bytes). 600 bytes in ring buffer is fine.
  */
 struct cuda_event_stack {
-	struct ingero_event_hdr hdr;       /* 32 bytes (was 20+4pad in v0.6) */
+	struct ingero_event_hdr hdr;       /* 48 bytes (was 32 in v0.9, 20+4pad in v0.6) */
 	__u64 duration_ns;                 /* 8 */
 	__u64 arg0;                        /* 8 */
 	__u64 arg1;                        /* 8 */
@@ -241,7 +245,7 @@ struct cuda_event_stack {
 	__u16 _stack_pad[3];               /* 6: align stack_ips to 8-byte boundary */
 	__u64 stack_ips[MAX_STACK_DEPTH];  /* 512: raw instruction pointers */
 };
-/* Total: 32 + 8+8+8+4+4 + 2+6+512 = 584 bytes (was 576 in v0.6) */
+/* Total: 48 + 8+8+8+4+4 + 2+6+512 = 600 bytes (was 584 in v0.9, 576 in v0.6) */
 
 /*
  * target_cgroups — in-kernel cgroup filter map (defined in host_trace.bpf.c).

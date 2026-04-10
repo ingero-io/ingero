@@ -355,12 +355,44 @@ func renderPerProcessReport(stats []store.ProcessOpStats, s *store.Store) {
 		g.totalOps += st.Count
 	}
 
-	// Resolve process names from DB.
-	for _, pid := range order {
-		g := groups[pid]
-		var name string
-		s.DB().QueryRow("SELECT name FROM process_names WHERE pid = ?", pid).Scan(&name)
-		g.name = name
+	// Resolve process names from DB in a single batched query to avoid N+1.
+	// Prefer the kernel-captured events.comm (v0.10+, accurate at event time)
+	// over the lazy /proc-based process_names table. Fall back to process_names
+	// for legacy rows where events.comm is empty (pre-v0.10 snapshots).
+	//
+	// Both columns are NULLIF-wrapped because process_names.name is
+	// NOT NULL DEFAULT '' — an empty pn.name would otherwise short-circuit
+	// the COALESCE before reaching the trailing fallback.
+	if len(order) > 0 {
+		// Build a VALUES clause carrying the PID set so the lookup is one
+		// round trip instead of N. SQLite supports `(VALUES (?), (?), …)`
+		// as a derived table.
+		valuesParts := make([]string, len(order))
+		args := make([]interface{}, len(order))
+		for i, pid := range order {
+			valuesParts[i] = "(?)"
+			args[i] = pid
+		}
+		sql := `
+			SELECT p.pid, COALESCE(
+				NULLIF((SELECT comm FROM events WHERE pid = p.pid AND comm != '' ORDER BY id DESC LIMIT 1), ''),
+				NULLIF((SELECT name FROM process_names WHERE pid = p.pid), ''),
+				''
+			) AS name
+			FROM (VALUES ` + strings.Join(valuesParts, ", ") + `) AS p(pid)`
+		rows, err := s.DB().Query(sql, args...)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var pid uint32
+				var name string
+				if err := rows.Scan(&pid, &name); err == nil {
+					if g, ok := groups[pid]; ok {
+						g.name = name
+					}
+				}
+			}
+		}
 	}
 
 	// Render each process.

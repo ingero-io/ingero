@@ -189,7 +189,7 @@ func (t *Tracer) Run(ctx context.Context) {
 var stackEventSize = int(unsafe.Sizeof(driverTraceCudaEvent{})) + 8 + 512
 
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (64 bytes) and stack events (584 bytes).
+// Handles both base events (80 bytes, v0.10) and stack events (600 bytes, v0.10).
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(driverTraceCudaEvent{}))
 	if len(raw) < baseSize {
@@ -202,6 +202,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		Timestamp: events.KtimeToWallClock(ce.Hdr.TimestampNs),
 		PID:       ce.Hdr.Pid,
 		TID:       ce.Hdr.Tid,
+		Comm:      events.CommToString(ce.Hdr.Comm),
 		Source:    events.Source(ce.Hdr.Source),
 		Op:        ce.Hdr.Op,
 		Duration:  time.Duration(ce.DurationNs),
@@ -211,7 +212,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		CGroupID:  ce.Hdr.CgroupId,
 	}
 
-	// Check for stack event (584 bytes).
+	// Check for stack event (600 bytes, v0.10).
 	if len(raw) >= stackEventSize {
 		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}

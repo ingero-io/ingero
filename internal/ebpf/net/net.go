@@ -149,6 +149,7 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 		Timestamp: events.KtimeToWallClock(e.Hdr.TimestampNs),
 		PID:       e.Hdr.Pid,
 		TID:       e.Hdr.Tid,
+		Comm:      events.CommToString(e.Hdr.Comm),
 		Source:    events.SourceNet,
 		Op:        e.Hdr.Op,
 		Duration:  time.Duration(e.DurationNs),

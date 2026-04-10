@@ -25,6 +25,7 @@ type hostTraceHostEvent struct {
 		Pad         uint16
 		Pad2        uint32
 		CgroupId    uint64
+		Comm        [16]int8
 	}
 	DurationNs uint64
 	Cpu        uint32

@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS events (
 	node       TEXT NOT NULL DEFAULT '',
 	rank       INTEGER,
 	local_rank INTEGER,
-	world_size INTEGER
+	world_size INTEGER,
+	comm       TEXT NOT NULL DEFAULT '' -- v0.10: process name from bpf_get_current_comm() (≤16 chars, '' = pre-v0.10 row or unknown)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
@@ -94,6 +95,42 @@ const migrateAddSumArg0 = `ALTER TABLE event_aggregates ADD COLUMN sum_arg0 INTE
 // cgroup v2 inode ID from bpf_get_current_cgroup_id(). 0 = no meaningful cgroup.
 // Idempotent: fails silently if column already exists.
 const migrateAddCGroupID = `ALTER TABLE events ADD COLUMN cgroup_id INTEGER NOT NULL DEFAULT 0`
+
+// migrateAddComm adds the comm column to the events table (v0.10).
+// Process name from bpf_get_current_comm(), ≤16 chars. Empty string ('') for
+// pre-v0.10 rows where no comm was captured. Empty is a valid runtime value
+// too (some BPF contexts return empty bytes), so reads must tolerate it.
+// Idempotent: fails silently if column already exists.
+const migrateAddComm = `ALTER TABLE events ADD COLUMN comm TEXT NOT NULL DEFAULT ''`
+
+// hasEventsCommColumn returns true if events.comm exists. Used to gate the
+// schema_info version bump after migrateAddComm so a silently-failed ALTER
+// (read-only DB, disk full) doesn't leave an inconsistent state where the
+// version says 0.10 but the column doesn't exist.
+func hasEventsCommColumn(db *sql.DB) bool {
+	rows, err := db.Query("PRAGMA table_info(events)")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false
+		}
+		if name == "comm" {
+			return true
+		}
+	}
+	return false
+}
 
 // cgroupMetadataSchema stores cgroup_id → container_id + pod metadata mappings.
 // One row per cgroup — populated lazily during tracing when cgroup_id > 1.
@@ -757,6 +794,25 @@ func New(dbPath string) (*Store, error) {
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.9')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('node_note', 'Node identity for multi-node correlation. events.id format: {node}:{seq}. causal_chains.id format: {node}:{descriptor}.')")
 
+	// v0.10: Add comm column to events table (PID hardening).
+	// Captured kernel-side via bpf_get_current_comm() at event emission time —
+	// immune to PID reuse and process exit, unlike the lazy /proc-based
+	// process_names table (which is preserved as a read-side fallback).
+	// Idempotent — no-op for new DBs that already have it from schema.
+	//
+	// Migration error gating: ALTER TABLE may silently fail on read-only DBs,
+	// disk full, or other I/O errors. We bump schema_info to 0.10 ONLY after
+	// confirming via PRAGMA that the column actually exists — protects against
+	// inconsistent state where the version says 0.10 but the column is missing.
+	db.Exec(migrateAddComm)
+
+	if hasEventsCommColumn(db) {
+		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.10')")
+		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('comm_note', 'events.comm captured kernel-side at event time. Empty for pre-v0.10 rows (fall back to process_names LEFT JOIN for legacy display).')")
+	}
+	// On read-only DBs the version stays at 0.9 — read paths must use
+	// hasColumn() guards if they want to be tolerant of either schema.
+
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
 	if dbPath != ":memory:" {
@@ -888,8 +944,8 @@ func (s *Store) flushBatch(batch []events.Event) {
 	}
 
 	// Prepare: event insert uses stack_hash (integer FK) instead of inline JSON.
-	evtStmt, err := tx.Prepare(`INSERT INTO events (id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	evtStmt, err := tx.Prepare(`INSERT INTO events (id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size, comm)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return
@@ -953,6 +1009,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 			nilableInt(evt.Rank),
 			nilableInt(evt.LocalRank),
 			nilableInt(evt.WorldSize),
+			evt.Comm,
 		)
 	}
 
@@ -1231,11 +1288,15 @@ func appendPIDFilter(query string, args []interface{}, q QueryParams, colPrefix 
 // Query retrieves events matching the given parameters.
 // Stack traces are resolved via LEFT JOIN against the stack_traces interning table.
 // Prefers resolved frames over raw IPs for historical investigation.
+//
+// v0.10: events.comm is selected directly. Pre-v0.10 rows have empty comm; the
+// QueryRich path falls back to process_names for those. Plain Query() callers
+// must tolerate empty Comm — see project-context.md PID hardening notes.
 func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
 		e.gpu_id, e.arg0, e.arg1, e.ret_code,
 		COALESCE(st.frames, ''), COALESCE(st.ips, ''),
-		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size
+		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size, e.comm
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	WHERE 1=1`
@@ -1308,14 +1369,16 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 			rank       sql.NullInt64
 			localRank  sql.NullInt64
 			worldSize  sql.NullInt64
+			comm       string
 		)
-		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON, &cgroupID, &node, &rank, &localRank, &worldSize); err != nil {
+		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos, &gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON, &cgroupID, &node, &rank, &localRank, &worldSize, &comm); err != nil {
 			return nil, fmt.Errorf("scanning event row: %w", err)
 		}
 		evt := events.Event{
 			Timestamp: time.Unix(0, tsNanos),
 			PID:       pid,
 			TID:       tid,
+			Comm:      comm,
 			Source:    events.Source(source),
 			Op:        op,
 			Duration:  time.Duration(durNanos),
@@ -1358,17 +1421,36 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 
 // RichEvent is an event enriched with human-readable names from the lookup tables.
 // Produced by QueryRich using SELECT JOIN against sources and ops tables.
+//
+// v0.10 semantic change for ProcessName: previously sourced exclusively from
+// the lazy /proc-based process_names table (set by `RecordProcessName` from
+// `/proc/[pid]/comm` reads). Now resolved as
+// COALESCE(NULLIF(events.comm,''), NULLIF(process_names.name,''), '')
+// — kernel-captured comm at event time is preferred; process_names as
+// the fallback for pre-v0.10 rows. Both wrapped in NULLIF to avoid
+// empty-string short-circuiting the COALESCE chain. Callers comparing
+// ProcessName against a *currently-running* /proc snapshot may see the
+// historical name (the name the process had when the event was emitted)
+// instead of the current name. This is the intended behavior under PID
+// hardening — the embedded `Event.Comm` field carries the same value.
 type RichEvent struct {
 	events.Event
 	SourceName  string
 	SourceDesc  string
 	OpName      string
 	OpDesc      string
-	ProcessName string // from process_names table (empty if unknown)
+	ProcessName string // v0.10: prefers events.comm, falls back to process_names.name
 }
 
 // QueryRich retrieves events with JOIN against lookup tables for human-readable names.
 // Use this for AI/MCP output where self-describing data matters.
+//
+// v0.10: events.comm (kernel-side captured at event time) is preferred over
+// process_names.name (lazy /proc lookup). The process_names LEFT JOIN is
+// preserved as a fallback for pre-v0.10 rows where events.comm is empty.
+// ProcessName resolution: COALESCE(NULLIF(e.comm,''), NULLIF(pn.name,''), '').
+// Both columns are NULLIF-wrapped because process_names.name is NOT NULL DEFAULT ''
+// — without NULLIF on pn.name, an empty pn.name short-circuits the COALESCE.
 func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 	query := `SELECT e.timestamp, e.pid, e.tid, e.source, e.op, e.duration,
 		e.gpu_id, e.arg0, e.arg1, e.ret_code,
@@ -1377,8 +1459,8 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		COALESCE(s.description, ''),
 		COALESCE(o.name, 'OP_' || e.op),
 		COALESCE(o.description, ''),
-		COALESCE(pn.name, ''),
-		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size
+		COALESCE(NULLIF(e.comm, ''), NULLIF(pn.name, ''), ''),
+		e.cgroup_id, e.node, e.rank, e.local_rank, e.world_size, e.comm
 	FROM events e
 	LEFT JOIN stack_traces st ON e.stack_hash = st.hash
 	LEFT JOIN sources s ON e.source = s.id
@@ -1445,11 +1527,12 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			rank       sql.NullInt64
 			localRank  sql.NullInt64
 			worldSize  sql.NullInt64
+			comm       string
 		)
 		if err := rows.Scan(&tsNanos, &pid, &tid, &source, &op, &durNanos,
 			&gpuID, &arg0, &arg1, &retCode, &framesJSON, &ipsJSON,
 			&srcName, &srcDesc, &opName, &opDesc, &procName, &cgroupID,
-			&node, &rank, &localRank, &worldSize); err != nil {
+			&node, &rank, &localRank, &worldSize, &comm); err != nil {
 			return nil, fmt.Errorf("scanning rich event: %w", err)
 		}
 		re := RichEvent{
@@ -1457,6 +1540,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 				Timestamp: time.Unix(0, tsNanos),
 				PID:       pid,
 				TID:       tid,
+				Comm:      comm,
 				Source:    events.Source(source),
 				Op:        op,
 				Duration:  time.Duration(durNanos),
@@ -1470,7 +1554,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			SourceDesc:  srcDesc,
 			OpName:      opName,
 			OpDesc:      opDesc,
-			ProcessName: procName,
+			ProcessName: procName, // already resolved via COALESCE(NULLIF(e.comm,''), NULLIF(pn.name,''), '')
 		}
 		if rank.Valid {
 			v := int(rank.Int64)

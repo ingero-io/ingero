@@ -630,9 +630,9 @@ func (s *Server) registerTools() {
 		Name: "run_sql",
 		Description: `Execute read-only SQL on the Ingero database. For ad-hoc analysis the fixed tools can't do: temporal bucketing, threshold queries, per-PID breakdowns, throughput calculations. Timeout: 30s.
 
-Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id INT default 0), system_snapshots(id, timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur, sum_arg0), stack_traces(hash, ips TEXT JSON, frames TEXT JSON resolved symbols), cgroup_metadata(cgroup_id PK, container_id TEXT, cgroup_path TEXT), cgroup_schedstat(cgroup_id PK, p99_off_cpu_ns, total_off_cpu_ns, event_count, window_start, window_end), schema_info(key, value).
+Schema: events(id, timestamp INT nanos, pid, tid, source, op, duration INT nanos, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id INT default 0, comm TEXT default '' — process name from bpf_get_current_comm(), v0.10+, empty for pre-v0.10 rows), system_snapshots(id, timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg), causal_chains(id TEXT, detected_at, severity, summary, root_cause, explanation, recommendations JSON, cuda_op, cuda_p99_us, cuda_p50_us, tail_ratio, timeline JSON), sessions(id, started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total, kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags), sources(id, name, description), ops(source_id, op_id, name, description), process_names(pid, name, seen_at — LEGACY: lazy /proc-based PID→name table, used as read-side fallback when events.comm is empty), event_aggregates(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur, sum_arg0), stack_traces(hash, ips TEXT JSON, frames TEXT JSON resolved symbols), cgroup_metadata(cgroup_id PK, container_id TEXT, cgroup_path TEXT), cgroup_schedstat(cgroup_id PK, p99_off_cpu_ns, total_off_cpu_ns, event_count, window_start, window_end), schema_info(key, value).
 
-JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), events.stack_hash=stack_traces.hash, events.cgroup_id=cgroup_metadata.cgroup_id (K8s container context), events.pid=process_names.pid (ALWAYS qualify pid as e.pid when joining - pid exists in both tables).
+JOINs: events.source=sources.id, events.(source,op)=ops.(source_id,op_id), events.stack_hash=stack_traces.hash, events.cgroup_id=cgroup_metadata.cgroup_id (K8s container context), events.pid=process_names.pid (ALWAYS qualify pid as e.pid when joining - pid exists in both tables). For process names prefer events.comm directly (faster, no JOIN); use COALESCE(NULLIF(e.comm,''), NULLIF(pn.name,''), '') only when also reading legacy pre-v0.10 rows.
 Sources: 1=CUDA, 3=HOST, 4=DRIVER, 5=IO, 6=TCP, 7=NET. CUDA ops: 1=cudaMalloc, 2=cudaFree, 3=cudaLaunchKernel, 4=cudaMemcpy, 5=cudaStreamSync, 6=cudaDeviceSync, 7=cudaMemcpyAsync, 8=cudaMallocManaged. HOST ops: 1=sched_switch, 2=sched_wakeup, 3=mm_page_alloc, 4=oom_kill, 5=process_exec, 6=process_exit, 7=process_fork, 10=pod_restart, 11=pod_eviction, 12=pod_oom_kill. DRIVER ops: 1=cuLaunchKernel, 2=cuMemcpy, 3=cuMemcpyAsync, 4=cuCtxSynchronize, 5=cuMemAlloc, 6=cuMemAllocManaged. IO ops: 1=block_read, 2=block_write, 3=block_discard. TCP ops: 1=tcp_retransmit. NET ops: 1=net_send, 2=net_recv. arg0/arg1 per op: cudaMalloc/cudaMallocManaged arg0=size_bytes, cudaFree arg0=devPtr, cudaLaunchKernel arg0=kernel_func_ptr, cudaMemcpy/cudaMemcpyAsync arg0=bytes arg1=direction(0=H2H,1=H2D,2=D2H,3=D2D,4=default), cudaStreamSync arg0=stream_handle, mm_page_alloc arg0=page_order(size=4KB<<order), cuMemAlloc/cuMemAllocManaged arg0=size_bytes, block_read/block_write arg0=nr_sectors, net_send/net_recv arg0=bytes. sum_arg0 in event_aggregates = sum of arg0 across bucket (skipped for pointer-valued ops: cudaFree, cudaLaunchKernel, cuLaunchKernel). Timestamps: unix nanos. Duration: nanos (÷1e3=µs, ÷1e6=ms).
 
 Performance: events can have millions of rows. For large DBs, query event_aggregates (per-minute stats, always small) or stack_traces (deduplicated, always small) instead of scanning events. Use get_stacks tool for call stack analysis instead of manual SQL JOINs.`,
@@ -747,12 +747,17 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 		}
 
 		// Build WHERE clause from filters.
+		// proc_names: prefer kernel-captured events.comm (v0.10+, accurate at
+		// event time), fall back to lazy process_names.name for pre-v0.10 rows.
+		// Both columns are NULLIF-wrapped because process_names.name is NOT NULL
+		// DEFAULT '' — without NULLIF on pn.name, an empty pn.name would inject
+		// a literal "" entry into the GROUP_CONCAT output instead of being skipped.
 		query := `SELECT e.stack_hash, COALESCE(st.frames, ''), COALESCE(st.ips, ''),
 			COUNT(*) as n,
 			MIN(e.duration) as min_dur, MAX(e.duration) as max_dur,
 			SUM(e.duration)/COUNT(*) as avg_dur,
 			SUM(e.arg0) as sum_arg0,
-			GROUP_CONCAT(DISTINCT pn.name) as proc_names
+			GROUP_CONCAT(DISTINCT COALESCE(NULLIF(e.comm, ''), NULLIF(pn.name, ''))) as proc_names
 		FROM events e
 		JOIN stack_traces st ON e.stack_hash = st.hash
 		LEFT JOIN process_names pn ON e.pid = pn.pid
@@ -1692,7 +1697,11 @@ func formatGraphLifecycle(evts []events.Event, pid uint32, tsc bool) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "CUDA Graph Lifecycle — PID %d (%d events)\n\n", pid, len(evts))
+	comm := ""
+	if len(evts) > 0 {
+		comm = evts[0].Comm
+	}
+	fmt.Fprintf(&b, "CUDA Graph Lifecycle — PID %d (%s) (%d events)\n\n", pid, comm, len(evts))
 
 	captureCount := 0
 	instantiateCount := 0
@@ -1789,7 +1798,11 @@ func formatGraphFrequency(evts []events.Event, pid uint32, windowSec int, tsc bo
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "CUDA Graph Frequency — PID %d\n\n", pid)
+	comm := ""
+	if len(evts) > 0 {
+		comm = evts[0].Comm
+	}
+	fmt.Fprintf(&b, "CUDA Graph Frequency — PID %d (%s)\n\n", pid, comm)
 	fmt.Fprintf(&b, "Pool size: %d distinct graph executable(s)\n", len(execMap))
 	fmt.Fprintf(&b, "Total captures: %d | instantiations: %d\n\n", totalCaptures, totalInstantiates)
 

@@ -10,6 +10,31 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// CommToString converts a fixed-size [16]int8 byte buffer (as produced by
+// bpf2go for `char comm[16]`) into a Go string, trimming at the first NUL.
+// Empty input or all-NUL input returns "" — callers must tolerate empty comm
+// (BPF helpers can return zero bytes in softirq/edge contexts).
+func CommToString(comm [16]int8) string {
+	for i, c := range comm {
+		if c == 0 {
+			if i == 0 {
+				return ""
+			}
+			b := make([]byte, i)
+			for j := 0; j < i; j++ {
+				b[j] = byte(comm[j])
+			}
+			return string(b)
+		}
+	}
+	// No NUL found — full 16 bytes are valid (rare; comm is usually NUL-padded).
+	b := make([]byte, 16)
+	for j := 0; j < 16; j++ {
+		b[j] = byte(comm[j])
+	}
+	return string(b)
+}
+
 // ktimeOffset is the difference between wall-clock time and CLOCK_MONOTONIC.
 // bpf_ktime_get_ns() uses CLOCK_MONOTONIC, so to convert to wall-clock time
 // we add this offset: wall = ktime + ktimeOffset.
@@ -440,6 +465,7 @@ type Event struct {
 	Timestamp time.Time     // when the operation completed (kernel monotonic clock)
 	PID       uint32        // process ID (tgid in kernel terms)
 	TID       uint32        // thread ID (pid in kernel terms — yes, confusing)
+	Comm      string        // process name from bpf_get_current_comm() (≤TASK_COMM_LEN=16, may be empty)
 	Source    Source        // which eBPF layer: cuda, nvidia, host
 	Op        uint8         // operation type (cast to CUDAOp, etc. based on Source)
 	Duration  time.Duration // how long the operation took (entry→return)

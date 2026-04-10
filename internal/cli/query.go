@@ -306,6 +306,7 @@ func queryOutputJSON(evts []events.Event) error {
 		Timestamp  string           `json:"timestamp"`
 		PID        uint32           `json:"pid"`
 		TID        uint32           `json:"tid"`
+		Comm       string           `json:"comm,omitempty"` // v0.10: process name from kernel-side bpf_get_current_comm()
 		Source     string           `json:"source"`
 		Op         string           `json:"op"`
 		DurationNs int64            `json:"duration_ns"`
@@ -323,6 +324,7 @@ func queryOutputJSON(evts []events.Event) error {
 			Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
 			PID:        evt.PID,
 			TID:        evt.TID,
+			Comm:       evt.Comm,
 			Source:     evt.Source.String(),
 			Op:         evt.OpName(),
 			DurationNs: evt.Duration.Nanoseconds(),

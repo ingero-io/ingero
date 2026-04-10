@@ -185,8 +185,10 @@ func (t *Tracer) Dropped() uint64 {
 }
 
 // parseGraphEvent converts raw bytes from the graph ring buffer into a typed Event.
+// Size is derived from the bpf2go-generated struct so it auto-updates when the
+// BPF event header grows (e.g. v0.10 added comm[16], shifting from 72 to 88 bytes).
 func parseGraphEvent(raw []byte) (events.Event, error) {
-	const eventSize = 72 // sizeof(cuda_graph_event)
+	eventSize := int(unsafe.Sizeof(cudaGraphTraceCudaGraphEvent{}))
 	if len(raw) < eventSize {
 		return events.Event{}, fmt.Errorf("graph event too short: %d bytes, need %d", len(raw), eventSize)
 	}
@@ -197,6 +199,7 @@ func parseGraphEvent(raw []byte) (events.Event, error) {
 		Timestamp:    events.KtimeToWallClock(ge.Hdr.TimestampNs),
 		PID:          ge.Hdr.Pid,
 		TID:          ge.Hdr.Tid,
+		Comm:         events.CommToString(ge.Hdr.Comm),
 		Source:       events.Source(ge.Hdr.Source),
 		Op:           ge.Hdr.Op,
 		Duration:     time.Duration(ge.DurationNs),
