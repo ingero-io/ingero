@@ -1426,8 +1426,9 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 // the lazy /proc-based process_names table (set by `RecordProcessName` from
 // `/proc/[pid]/comm` reads). Now resolved as
 // COALESCE(NULLIF(events.comm,''), NULLIF(process_names.name,''), '')
-// — kernel-captured comm at event time is preferred when present, with
-// process_names as the fallback for pre-v0.10 rows. Callers comparing
+// — kernel-captured comm at event time is preferred; process_names as
+// the fallback for pre-v0.10 rows. Both wrapped in NULLIF to avoid
+// empty-string short-circuiting the COALESCE chain. Callers comparing
 // ProcessName against a *currently-running* /proc snapshot may see the
 // historical name (the name the process had when the event was emitted)
 // instead of the current name. This is the intended behavior under PID
@@ -1553,7 +1554,7 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 			SourceDesc:  srcDesc,
 			OpName:      opName,
 			OpDesc:      opDesc,
-			ProcessName: procName, // already resolved via COALESCE(NULLIF(e.comm,''), pn.name, '')
+			ProcessName: procName, // already resolved via COALESCE(NULLIF(e.comm,''), NULLIF(pn.name,''), '')
 		}
 		if rank.Valid {
 			v := int(rank.Int64)
