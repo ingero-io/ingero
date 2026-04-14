@@ -1549,9 +1549,11 @@ func (c *libMismatchChecker) Check(pid uint32) {
 // Python runtime state lifecycle (--py-walker=ebpf)
 // ---------------------------------------------------------------------------
 
-// tryPushPyRuntimeState detects whether the given PID is a CPython 3.12
-// process and, if so, pushes its _PyRuntime address and struct offsets into
-// the BPF py_runtime_map so the in-kernel walker can unwind Python frames.
+// tryPushPyRuntimeState detects whether the given PID is a CPython 3.10,
+// 3.11, or 3.12 process and, if so, pushes its _PyRuntime address and
+// struct offsets into the BPF py_runtime_map so the in-kernel walker can
+// unwind Python frames. The walker dispatches per-version based on the
+// PythonMinor field in the pushed state.
 //
 // Best-effort: any failure (not Python, unsupported version, libpython
 // missing, offset out of uint16 range, map write error) is logged at debug
@@ -1570,8 +1572,11 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 		debugf("py-walker: PID %d not a Python process — skipping", pid)
 		return
 	}
-	if info.Minor != 12 {
-		debugf("py-walker: PID %d is Python %s — only 3.12 supported for eBPF walker", pid, info.Version)
+	// Previously this function returned early if minor != 12.
+	// Now we support 10, 11, and 12 via per-version dispatch in the
+	// BPF walker (see bpf/python_walker.bpf.h).
+	if info.Minor != 10 && info.Minor != 11 && info.Minor != 12 {
+		debugf("py-walker: PID %d is Python %s — python_minor %d not supported by BPF walker (only 3.10/3.11/3.12); userspace walker will handle", pid, info.Version, info.Minor)
 		return
 	}
 
@@ -1587,7 +1592,7 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 		return
 	}
 
-	state, err := pyRuntimeStateFromOffsets(runtimeAddr, offsets)
+	state, err := pyRuntimeStateFromOffsets(runtimeAddr, offsets, info.Minor)
 	if err != nil {
 		debugf("py-walker: converting offsets for PID %d: %v", pid, err)
 		return
@@ -1597,7 +1602,14 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 		debugf("py-walker: writing py_runtime_map for PID %d: %v", pid, err)
 		return
 	}
-	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, offsets=%s)", pid, runtimeAddr, offsets.Version)
+	if info.Minor != 12 {
+		// INFO-level log (once per PID) to surface multi-version support
+		// when a non-3.12 Python gets the BPF walker attached.
+		slog.Info("py-walker: pushed runtime state for non-3.12 Python process",
+			"pid", pid, "python_version", info.Version, "python_minor", info.Minor,
+			"runtime_addr", fmt.Sprintf("0x%x", runtimeAddr))
+	}
+	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s)", pid, runtimeAddr, info.Minor, offsets.Version)
 }
 
 // pyRuntimeStateFromOffsets converts a symtab.PyOffsets (uint64 fields —
@@ -1605,7 +1617,11 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 // required by the BPF py_runtime_state struct. Returns an error if any
 // offset exceeds uint16 — this would indicate a corrupt offset table or a
 // future CPython layout change that needs wider fields on the BPF side.
-func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets) (pytrace.PyRuntimeState, error) {
+//
+// `minor` is the CPython minor version (10, 11, or 12). It is stored in
+// the PythonMinor field so the BPF dispatcher can select the right
+// per-version walker variant.
+func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor int) (pytrace.PyRuntimeState, error) {
 	fields := []struct {
 		name string
 		val  uint64
@@ -1628,6 +1644,9 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets) (pytrace
 			return pytrace.PyRuntimeState{}, fmt.Errorf("offset %s=%d exceeds uint16 range", f.name, f.val)
 		}
 	}
+	if o.CframeCurrentFrame > 0xFFFF {
+		return pytrace.PyRuntimeState{}, fmt.Errorf("offset CframeCurrentFrame=%d exceeds uint16 range", o.CframeCurrentFrame)
+	}
 	return pytrace.PyRuntimeState{
 		RuntimeAddr:                runtimeAddr,
 		OffRuntimeInterpretersHead: uint16(o.RuntimeInterpretersHead),
@@ -1642,6 +1661,10 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets) (pytrace
 		OffCodeFirstLineNo:         uint16(o.CodeFirstLineNo),
 		OffUnicodeState:            uint16(o.UnicodeState),
 		OffUnicodeData:             uint16(o.UnicodeData),
+		PythonMinor:                uint8(minor),
+		// CframeCurrentFrame is populated only for 3.11 by
+		// symtab.GetPyOffsets; 0 for 3.10/3.12 by design.
+		OffCframeCurrentFrame: uint16(o.CframeCurrentFrame),
 	}, nil
 }
 

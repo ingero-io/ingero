@@ -8,7 +8,7 @@ import (
 )
 
 func TestPyRuntimeStateSize(t *testing.T) {
-	want := 32
+	want := 36
 	if pyRuntimeStateSize != want {
 		t.Errorf("pyRuntimeStateSize = %d, want %d", pyRuntimeStateSize, want)
 	}
@@ -63,4 +63,42 @@ func TestPyRuntimeStateMarshalRoundtrip(t *testing.T) {
 	// Verify all bytes accounted for (no padding gaps).
 	zero := bytes.Count(buf, []byte{0})
 	t.Logf("marshaled bytes: %x (zero count: %d)", buf, zero)
+}
+
+// TestPyRuntimeStateMarshalRoundtrip_AllVersions verifies that the v2
+// appended fields (PythonMinor, OffCframeCurrentFrame) land at the
+// correct byte offsets for each supported CPython minor version.
+func TestPyRuntimeStateMarshalRoundtrip_AllVersions(t *testing.T) {
+	cases := []struct {
+		name  string
+		minor uint8
+		off   uint16 // OffCframeCurrentFrame
+	}{
+		{"python_310", 10, 0},
+		{"python_311", 11, 8}, // CPython 3.11 _PyCFrame.current_frame is typically at offset 8
+		{"python_312", 12, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := PyRuntimeState{
+				RuntimeAddr:           0xDEADBEEF,
+				PythonMinor:           c.minor,
+				OffCframeCurrentFrame: c.off,
+			}
+			buf, err := s.MarshalBinary()
+			if err != nil {
+				t.Fatalf("MarshalBinary: %v", err)
+			}
+			if len(buf) != 36 {
+				t.Errorf("len=%d, want 36", len(buf))
+			}
+			if buf[32] != c.minor {
+				t.Errorf("byte[32] = %d, want %d", buf[32], c.minor)
+			}
+			got := binary.LittleEndian.Uint16(buf[34:36])
+			if got != c.off {
+				t.Errorf("OffCframeCurrentFrame at byte 34-35 = %d, want %d", got, c.off)
+			}
+		})
+	}
 }

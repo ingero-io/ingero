@@ -269,10 +269,16 @@ struct cuda_event_stack {
  * this to know where _PyRuntime lives and what the offset table is.
  *
  * All offsets are byte offsets within their respective CPython structs.
- * Currently only Python 3.12 is supported — userspace must verify
- * version before pushing state.
+ * Supports CPython 3.10, 3.11, and 3.12 via python_minor dispatch in
+ * the walker.
  *
- * Layout: 8 + 12*2 = 32 bytes total. ABI-stable append-only.
+ * Layout: 8 (runtime_addr) + 12*2 (legacy uint16 offsets) + 1 (python_minor)
+ *       + 1 (pad) + 2 (off_cframe_current_frame) = 36 bytes total.
+ * ABI-stable append-only: the v1 layout was 32 bytes (3.12-only). v2
+ * appends python_minor + pad + off_cframe_current_frame (4 extra bytes).
+ * Older 32-byte writes (legacy 3.12-only clients) leave the appended
+ * fields zero, which the walker interprets as python_minor==0 => assume
+ * 3.12 to preserve backward compatibility.
  */
 struct py_runtime_state {
 	__u64 runtime_addr;                  /* address of _PyRuntime in target process */
@@ -280,14 +286,20 @@ struct py_runtime_state {
 	__u16 off_tstate_head;               /* PyInterpreterState.threads.head offset */
 	__u16 off_tstate_next;               /* PyThreadState.next offset */
 	__u16 off_tstate_native_tid;         /* PyThreadState.native_thread_id offset */
-	__u16 off_tstate_frame;              /* PyThreadState.current_frame offset */
-	__u16 off_frame_back;                /* _PyInterpreterFrame.previous offset */
-	__u16 off_frame_code;                /* _PyInterpreterFrame.executable offset */
+	__u16 off_tstate_frame;              /* PyThreadState.current_frame (3.12) or .frame (3.10) or .cframe (3.11) offset */
+	__u16 off_frame_back;                /* _PyInterpreterFrame.previous (3.11/12) or PyFrameObject.f_back (3.10) */
+	__u16 off_frame_code;                /* _PyInterpreterFrame.executable (3.11/12) or PyFrameObject.f_code (3.10) */
 	__u16 off_code_filename;             /* PyCodeObject.co_filename offset */
 	__u16 off_code_name;                 /* PyCodeObject.co_name offset */
 	__u16 off_code_firstlineno;          /* PyCodeObject.co_firstlineno offset */
 	__u16 off_unicode_state;             /* PyASCIIObject.state offset */
 	__u16 off_unicode_data;              /* PyASCIIObject.data inline offset */
+	/* v2 fields — appended for multi-version support. Older 32-byte
+	 * writes (3.12-only clients) leave these zero, which the walker
+	 * interprets as "assume 3.12" to preserve backward compatibility. */
+	__u8  python_minor;                  /* 10, 11, or 12; 0 = legacy caller, treat as 12 */
+	__u8  _pad3;
+	__u16 off_cframe_current_frame;      /* _PyCFrame.current_frame offset (3.11 only; 0 for others) */
 };
 
 /* Single Python frame extracted by the BPF walker. */

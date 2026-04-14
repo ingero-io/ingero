@@ -29,7 +29,13 @@ import (
 )
 
 // PyRuntimeState mirrors `struct py_runtime_state` in bpf/common.bpf.h.
-// Layout: u64 + 12 * u16 = 32 bytes total. Field order MUST match C.
+// Layout: u64 + 12 * u16 + u8 + u8(pad) + u16 = 36 bytes total.
+// Field order MUST match C.
+//
+// The v2 fields (PythonMinor, OffCframeCurrentFrame) were appended for
+// multi-version support (3.10, 3.11, 3.12). When the walker reads
+// PythonMinor == 0 (legacy 32-byte write, treat as 3.12), it preserves
+// the original 3.12-only semantics. See bpf/python_walker.bpf.h.
 type PyRuntimeState struct {
 	RuntimeAddr                uint64 // address of _PyRuntime in target process
 	OffRuntimeInterpretersHead uint16
@@ -44,11 +50,15 @@ type PyRuntimeState struct {
 	OffCodeFirstLineNo         uint16
 	OffUnicodeState            uint16
 	OffUnicodeData             uint16
+	PythonMinor                uint8  // 10, 11, or 12; 0 = legacy (walker treats as 12)
+	_                          uint8  // pad — not serialized directly (zero-filled by MarshalBinary)
+	OffCframeCurrentFrame      uint16 // _PyCFrame.current_frame offset (3.11 only)
 }
 
 // pyRuntimeStateSize is the marshaled size of PyRuntimeState in bytes.
-// This must match the C struct layout (u64 + 12 * u16 = 32 bytes).
-const pyRuntimeStateSize = 8 + 12*2
+// This must match the C struct layout
+// (u64 + 12 * u16 + u8 + u8(pad) + u16 = 36 bytes).
+const pyRuntimeStateSize = 8 + 12*2 + 1 + 1 + 2
 
 // MarshalBinary serializes the struct to little-endian bytes for writing
 // to the BPF map. The map value is opaque bytes from the kernel's view —
@@ -68,6 +78,10 @@ func (s *PyRuntimeState) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint16(buf[26:28], s.OffCodeFirstLineNo)
 	binary.LittleEndian.PutUint16(buf[28:30], s.OffUnicodeState)
 	binary.LittleEndian.PutUint16(buf[30:32], s.OffUnicodeData)
+	// v2 fields (appended for 3.10/3.11/3.12 dispatch).
+	buf[32] = s.PythonMinor
+	buf[33] = 0 // explicit pad byte — make() already zero-filled, but be explicit
+	binary.LittleEndian.PutUint16(buf[34:36], s.OffCframeCurrentFrame)
 	return buf, nil
 }
 
