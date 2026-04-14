@@ -52,18 +52,27 @@ func (r *Resolver) ResolveStack(evt *events.Event) {
 	}
 
 	// Get or refresh the /proc/[pid]/maps for this process.
+	// Process may have exited — in that case, regions will be nil and we
+	// skip native resolution, but BPF Python frames (captured at event
+	// time in kernel) are still valid and can be merged.
 	regions := r.getRegions(evt.PID)
-	if regions == nil {
-		return // Process may have exited
-	}
 
-	// Resolve native symbols.
-	for i := range evt.Stack {
-		r.resolveFrame(&evt.Stack[i], regions)
+	// Resolve native symbols (skipped if no regions — e.g. process exited).
+	if regions != nil {
+		for i := range evt.Stack {
+			r.resolveFrame(&evt.Stack[i], regions)
+		}
 	}
 
 	// Attempt Python frame extraction.
-	if r.pyWalker != nil {
+	//
+	// Precedence: when the BPF walker (--py-walker=ebpf) has already
+	// captured frames for this event, use those directly — no /proc/pid/mem
+	// read, no ptrace_scope dependency. Fall back to the userspace walker
+	// only when the kernel-side walker produced nothing.
+	if len(evt.PythonFrames) > 0 {
+		r.mergeBPFPythonFrames(evt)
+	} else if regions != nil && r.pyWalker != nil {
 		pyFrames, err := r.pyWalker.WalkPythonFrames(evt.PID, evt.TID)
 		if err != nil {
 			symDebugf("Python frame walk failed for PID %d TID %d: %v", evt.PID, evt.TID, err)
@@ -74,6 +83,30 @@ func (r *Resolver) ResolveStack(evt *events.Event) {
 			r.mergePythonFrames(evt, pyFrames)
 		}
 	}
+}
+
+// mergeBPFPythonFrames adapts BPF-captured frames (events.PyFrame, with
+// kernel-truncated strings) to the userspace PyFrame representation and
+// then delegates to the existing merge logic. This keeps the merge
+// insertion strategy (before the first libpython frame) identical for
+// both capture paths.
+//
+// The two PyFrame types are structurally identical today — the conversion
+// is defensive: keeping the boundary means events.PyFrame may add fields
+// (column offsets, qualname) without breaking the merge invariants.
+func (r *Resolver) mergeBPFPythonFrames(evt *events.Event) {
+	if len(evt.PythonFrames) == 0 {
+		return
+	}
+	pyFrames := make([]PyFrame, 0, len(evt.PythonFrames))
+	for _, f := range evt.PythonFrames {
+		pyFrames = append(pyFrames, PyFrame{
+			Filename: f.Filename,
+			Function: f.Function,
+			Line:     f.Line,
+		})
+	}
+	r.mergePythonFrames(evt, pyFrames)
 }
 
 // resolveFrame resolves a single stack frame.

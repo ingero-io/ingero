@@ -1,12 +1,14 @@
 package cuda
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -16,6 +18,29 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/ingero-io/ingero/pkg/events"
 )
+
+// lookupMapField returns a *ebpf.Map field on the given map-bundle struct by
+// name, or nil if the field is absent. Used so that callers can request maps
+// that may not yet be present in the generated bindings (e.g., py_runtime_map
+// which is emitted only after bpf2go regenerates post-walker-header-include).
+func lookupMapField(maps interface{}, fieldName string) *ebpf.Map {
+	v := reflect.ValueOf(maps)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return nil
+	}
+	f := v.FieldByName(fieldName)
+	if !f.IsValid() || f.IsZero() {
+		return nil
+	}
+	m, ok := f.Interface().(*ebpf.Map)
+	if !ok {
+		return nil
+	}
+	return m
+}
 
 // Tracer attaches eBPF uprobes to CUDA Runtime API functions and streams
 // events to a Go channel.
@@ -239,19 +264,43 @@ func (t *Tracer) Run(ctx context.Context) {
 // Layout: base (80, v0.10 with hdr.comm; was 64) + 2 (stack_depth) + 6 (pad) + 512 (64 * uint64 IPs) = 600.
 var stackEventSize = int(unsafe.Sizeof(cudaTraceCudaEvent{})) + 8 + 512 // base + depth/pad + ips
 
+// Python walker result layout (mirrors bpf/common.bpf.h :: py_walk_result).
+// Defined as compile-time constants rather than derived from bpf2go because
+// py_walk_result is not currently exported via the CUDA tracer's bpf2go
+// `-type` flag. If the kernel-side layout changes, update these constants
+// AND the decode loop in parsePyFrames together.
+const (
+	pyWalkResultHeaderSize = 8                 // 1+1 + 6 pad
+	pyFrameFilenameLen     = 128               // char filename[128]
+	pyFrameFuncnameLen     = 128               // char funcname[128]
+	pyFrameSize            = 264               // 128 + 128 + s32 + u32 pad
+	pyMaxFrames            = 16                // PY_MAX_FRAMES
+	pyWalkResultSize       = pyWalkResultHeaderSize + pyFrameSize*pyMaxFrames
+)
+
+// stackPyEventSize is sizeof(cuda_event_stack_py): stack record + py result.
+// Today: 600 + 4232 = 4832. Used to distinguish the extended record from
+// the plain stack record on the ring buffer.
+var stackPyEventSize = stackEventSize + pyWalkResultSize
+
+// ingeroEventFlagPyFrames mirrors INGERO_EVENT_FLAG_PY_FRAMES in
+// bpf/common.bpf.h. Stored in ingero_event_hdr._pad (u16 on the wire;
+// bpf2go maps the field to Pad uint16).
+const ingeroEventFlagPyFrames uint16 = 0x0001
+
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (80 bytes) and stack events (600 bytes).
+// Dispatches on record length and the INGERO_EVENT_FLAG_PY_FRAMES bit:
 //
-// The Go parser distinguishes by record length:
-//   - 80 bytes  → cuda_event (no stack)
-//   - 600 bytes → cuda_event_stack (with stack trace)
+//	  80 bytes → cuda_event            (no stack, no python)
+//	 600 bytes → cuda_event_stack      (stack only)
+//	4832 bytes → cuda_event_stack_py   (stack + python; flag bit set)
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(cudaTraceCudaEvent{}))
 	if len(raw) < baseSize {
 		return events.Event{}, fmt.Errorf("event too short: %d bytes, need %d", len(raw), baseSize)
 	}
 
-	// Zero-copy parse of the base event fields (same layout for both sizes).
+	// Zero-copy parse of the base event fields (same layout for all sizes).
 	ce := (*cudaTraceCudaEvent)(unsafe.Pointer(&raw[0]))
 
 	evt := events.Event{
@@ -268,12 +317,80 @@ func parseEvent(raw []byte) (events.Event, error) {
 		CGroupID:  ce.Hdr.CgroupId,
 	}
 
-	// Check for stack event (584 bytes).
+	// Stack event or extended (stack + python) event — stack layout is
+	// at the same offset in both variants.
 	if len(raw) >= stackEventSize {
 		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}
 
+	// Extended event: decode Python frames trailing after cuda_event_stack.
+	// Guard on both the flag bit (set by the BPF program when attaching
+	// frames) and the record length (belt-and-suspenders against partial
+	// writes or future struct-layout drift).
+	if (ce.Hdr.Pad&ingeroEventFlagPyFrames) != 0 && len(raw) >= stackPyEventSize {
+		pyData := raw[stackEventSize : stackEventSize+pyWalkResultSize]
+		evt.PythonFrames = parsePyFrames(pyData)
+	}
+
 	return evt, nil
+}
+
+// parsePyFrames decodes the trailing py_walk_result bytes produced by the
+// in-kernel walker (bpf/python_walker.bpf.h). pyData MUST be exactly
+// pyWalkResultSize bytes; callers are expected to slice precisely.
+func parsePyFrames(pyData []byte) []events.PyFrame {
+	if len(pyData) < pyWalkResultHeaderSize {
+		return nil
+	}
+	depth := int(pyData[0])
+	// pyData[1] is `truncated` — surfacing it on Event is a future
+	// enhancement (would become Event.PythonFramesTruncated bool).
+	// Bytes [2..8) are pad and are ignored.
+
+	if depth <= 0 {
+		return nil
+	}
+	if depth > pyMaxFrames {
+		depth = pyMaxFrames
+	}
+
+	frames := make([]events.PyFrame, 0, depth)
+	for i := 0; i < depth; i++ {
+		off := pyWalkResultHeaderSize + i*pyFrameSize
+		if off+pyFrameSize > len(pyData) {
+			break
+		}
+		filename := cstring(pyData[off : off+pyFrameFilenameLen])
+		funcname := cstring(pyData[off+pyFrameFilenameLen : off+pyFrameFilenameLen+pyFrameFuncnameLen])
+		lineOff := off + pyFrameFilenameLen + pyFrameFuncnameLen
+		line := int32(binary.LittleEndian.Uint32(pyData[lineOff : lineOff+4]))
+
+		// If both strings are empty, the kernel walker failed to read
+		// the code object (e.g. non-compact ASCII or bad pointer). Skip
+		// rather than leak a blank entry into the resolver.
+		if filename == "" && funcname == "" {
+			continue
+		}
+		frames = append(frames, events.PyFrame{
+			Filename: filename,
+			Function: funcname,
+			Line:     int(line),
+		})
+	}
+	return frames
+}
+
+// cstring converts a fixed-width, NUL-padded char buffer into a Go string,
+// trimming at the first NUL. Returns "" when the buffer begins with NUL.
+func cstring(buf []byte) string {
+	n := bytes.IndexByte(buf, 0)
+	if n < 0 {
+		n = len(buf)
+	}
+	if n == 0 {
+		return ""
+	}
+	return string(buf[:n])
 }
 
 // Close releases all eBPF resources. Safe to call multiple times (idempotent).
@@ -326,6 +443,22 @@ func (t *Tracer) SetSamplingRate(rate uint32) error {
 // LibPath returns the path to the libcudart.so being traced.
 func (t *Tracer) LibPath() string {
 	return t.libPath
+}
+
+// PyRuntimeMap returns the py_runtime_map loaded as part of cuda_trace.bpf.c
+// (via the included bpf/python_walker.bpf.h header). Callers use this to
+// push per-PID CPython runtime state for the in-kernel Python frame walker
+// invoked by --py-walker=ebpf.
+//
+// Returns nil when the map is not present in the generated bindings — this
+// happens before `make generate` is run after adding the walker header.
+// The caller must nil-check and fall back to the userspace walker.
+//
+// The lookup is reflection-based so the cuda package compiles both before
+// and after bpf2go regenerates to include py_runtime_map. Once the field
+// is present in cudaTraceMaps, the reflection path resolves it at runtime.
+func (t *Tracer) PyRuntimeMap() *ebpf.Map {
+	return lookupMapField(&t.objs.cudaTraceMaps, "PyRuntimeMap")
 }
 
 // ProbeCount returns the number of attached probes.

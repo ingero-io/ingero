@@ -4,22 +4,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+
+	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// PyFrame represents a single Python frame in the call stack.
-type PyFrame struct {
-	Filename string // e.g., "train.py"
-	Function string // e.g., "forward"
-	Line     int    // e.g., 47
-}
-
-// String returns a human-readable representation: "train.py:47 in forward()"
-func (f PyFrame) String() string {
-	if f.Line > 0 {
-		return fmt.Sprintf("%s:%d in %s()", f.Filename, f.Line, f.Function)
-	}
-	return fmt.Sprintf("%s in %s()", f.Filename, f.Function)
-}
+// PyFrame is re-exported from pkg/events so callers that used to import
+// it from this package continue to compile unchanged. The canonical
+// definition lives in events — both this userspace walker and the eBPF
+// walker's userspace parser produce values of that shape.
+type PyFrame = events.PyFrame
 
 // maxPyFrameDepth limits how deep we walk the Python frame chain.
 const maxPyFrameDepth = 64
@@ -185,6 +178,15 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 	}
 	w.cache[pid] = state
 	return state, nil
+}
+
+// FindPyRuntimeAddr is the exported wrapper for findPyRuntimeAddr, used by
+// external packages (notably internal/cli for the --py-walker=ebpf lifecycle
+// hook, which must push the _PyRuntime address into a BPF map on process
+// exec). Semantics identical to findPyRuntimeAddr — kept as a thin alias so
+// internal callers continue to use the lower-case name.
+func FindPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
+	return findPyRuntimeAddr(pid, info)
 }
 
 // findPyRuntimeAddr locates the _PyRuntime symbol in the process's memory.

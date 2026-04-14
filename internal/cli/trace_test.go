@@ -1013,3 +1013,40 @@ func TestAdaptiveSamplingFullProgression(t *testing.T) {
 		t.Fatalf("after 6 quiet: rate=%d, want 1", rate)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// --py-walker flag validation
+// ---------------------------------------------------------------------------
+
+// TestParsePyWalkerFlag covers every accepted value plus representative
+// invalid inputs. Validation happens early in traceRunE and must fail
+// fast on anything outside the closed enum.
+func TestParsePyWalkerFlag(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantErr bool
+	}{
+		{"auto", false},
+		{"ebpf", false},
+		{"userspace", false},
+		{"invalid", true},
+		{"", true},
+		{"EBPF", true},       // case-sensitive by design
+		{"auto ", true},      // no trimming
+		{"ebpf,userspace", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			err := validatePyWalker(tt.input)
+			gotErr := err != nil
+			if gotErr != tt.wantErr {
+				t.Errorf("validatePyWalker(%q) err=%v, wantErr=%v", tt.input, err, tt.wantErr)
+			}
+			// Error messages should reference the offending value so users
+			// can correct their invocation.
+			if gotErr && !strings.Contains(err.Error(), "py-walker") {
+				t.Errorf("validatePyWalker(%q) error %q should mention --py-walker", tt.input, err.Error())
+			}
+		})
+	}
+}

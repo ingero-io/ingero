@@ -489,6 +489,30 @@ type StackFrame struct {
 	PyLine     int    `json:"py_line,omitempty"` // Python source line (Phase C)
 }
 
+// PyFrame represents a single Python source frame in the call stack.
+//
+// Produced by either the userspace CPython walker (internal/symtab) or
+// the in-kernel eBPF walker (bpf/python_walker.bpf.h → parseEvent). The
+// events package owns the type so symtab, ebpf, and resolver layers can
+// pass frames around without an import cycle.
+//
+// Line holds PyCodeObject.co_firstlineno — the first line of the function
+// definition, not the currently executing line. Precise current-line
+// resolution requires decoding co_linetable and is a future enhancement.
+type PyFrame struct {
+	Filename string `json:"filename,omitempty"` // e.g., "train.py"
+	Function string `json:"function,omitempty"` // e.g., "forward"
+	Line     int    `json:"line,omitempty"`     // e.g., 47 (co_firstlineno)
+}
+
+// String returns a human-readable representation: "train.py:47 in forward()".
+func (f PyFrame) String() string {
+	if f.Line > 0 {
+		return fmt.Sprintf("%s:%d in %s()", f.Filename, f.Line, f.Function)
+	}
+	return fmt.Sprintf("%s in %s()", f.Filename, f.Function)
+}
+
 // Event is the common envelope for all traced events.
 // Single struct with Source discriminator — simplifies channel, stats, and storage.
 type Event struct {
@@ -509,6 +533,13 @@ type Event struct {
 	RetCode   int32         // CUDA return code (0 = success)
 	Stack     []StackFrame  // userspace stack trace (nil when --stack not enabled)
 	CGroupID  uint64        // cgroup v2 inode ID (0 or 1 = no meaningful cgroup)
+
+	// PythonFrames is populated by the event parser when the in-kernel
+	// Python frame walker (--py-walker=ebpf) captured frames for this
+	// event. Nil when the BPF walker is disabled or produced no frames.
+	// The resolver uses this slice in preference to invoking the
+	// userspace walker.
+	PythonFrames []PyFrame `json:"python_frames,omitempty"`
 
 	// CUDA Graph fields (only populated for SourceCUDAGraph events):
 	StreamHandle uint64 // stream for BeginCapture/EndCapture/Launch

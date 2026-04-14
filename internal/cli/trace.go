@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/spf13/cobra"
 
 	"github.com/ingero-io/ingero/internal/cgroup"
@@ -27,6 +28,7 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
 	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
+	"github.com/ingero-io/ingero/internal/ebpf/pytrace"
 	"github.com/ingero-io/ingero/internal/ebpf/tcp"
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
@@ -68,6 +70,7 @@ var (
 	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
 	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
 	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
+	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
 )
 
 var traceCmd = &cobra.Command{
@@ -110,8 +113,22 @@ func init() {
 	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
 	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
 	traceCmd.Flags().Uint32Var(&traceSamplingRate, "sampling-rate", 0, "event sampling rate (0 = adaptive, 1 = emit all, N > 1 = emit 1 in N). Adaptive mode auto-increases rate under sustained drop pressure.")
+	traceCmd.Flags().StringVar(&tracePyWalker, "py-walker", "auto",
+		"Python frame walker: auto (userspace, default), ebpf (kernel-side, requires Python 3.12), userspace (force userspace)")
 
 	rootCmd.AddCommand(traceCmd)
+}
+
+// validatePyWalker returns nil if s is one of the supported --py-walker
+// values, or a descriptive error otherwise. Exported (package-private)
+// so the selection logic is unit-testable without invoking traceRunE.
+func validatePyWalker(s string) error {
+	switch s {
+	case "auto", "ebpf", "userspace":
+		return nil
+	default:
+		return fmt.Errorf("invalid --py-walker %q (must be auto, ebpf, or userspace)", s)
+	}
 }
 
 // parseRingBufSize parses a human-readable size string (e.g., "32m", "16m",
@@ -172,6 +189,11 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 	if ringBufBytes > 0 {
 		debugf("ring buffer override applied to cuda/driver/host only (high-throughput probes): %d bytes", ringBufBytes)
+	}
+
+	// Validate --py-walker early — fail fast on invalid input.
+	if err := validatePyWalker(tracePyWalker); err != nil {
+		return err
 	}
 
 	// Resolve node identity early — fail fast if name contains colon.
@@ -355,6 +377,21 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// Use first CUDA tracer as the "primary" for probe count display.
 	cudaTracer := cudaTracers[0]
+
+	// --py-walker=ebpf: obtain the py_runtime_map from the cuda tracer.
+	// The map is part of cuda_trace.bpf.c via the included python_walker.bpf.h
+	// header, so it's loaded by the cuda tracer's bpf2go-generated bindings.
+	// A nil map means bpf2go hasn't yet regenerated the bindings with the
+	// walker header — fail loudly so operators run `make generate`.
+	var pyMap *ebpf.Map
+	if tracePyWalker == "ebpf" {
+		pyMap = cudaTracers[0].PyRuntimeMap()
+		if pyMap == nil {
+			return fmt.Errorf("--py-walker=ebpf requires py_runtime_map " +
+				"(run 'make generate' after the walker header was added to cuda_trace.bpf.c)")
+		}
+		slog.Info("Python walker: using kernel-side eBPF walker (--py-walker=ebpf)")
+	}
 
 	// Step 3: Create host tracer (non-fatal — graceful degradation).
 	// Always attach host tracepoints. When no PIDs are targeted, the BPF
@@ -880,13 +917,25 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Warns once per PID if there's a mismatch (e.g., venv library vs system).
 	mismatchCheck := newLibMismatchChecker(attachedLibs)
 
+	// Seed py_runtime_map for already-running target Python processes.
+	// Processes discovered later (via process_exec) are seeded in the event
+	// loop below. Seeding at startup avoids a race where Python is already
+	// past module init by the time the ebpf walker becomes active.
+	if pyMap != nil {
+		for _, pid := range targetPIDs {
+			if pid > 0 {
+				tryPushPyRuntimeState(uint32(pid), pyMap)
+			}
+		}
+	}
+
 	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,6 +1546,106 @@ func (c *libMismatchChecker) Check(pid uint32) {
 }
 
 // ---------------------------------------------------------------------------
+// Python runtime state lifecycle (--py-walker=ebpf)
+// ---------------------------------------------------------------------------
+
+// tryPushPyRuntimeState detects whether the given PID is a CPython 3.12
+// process and, if so, pushes its _PyRuntime address and struct offsets into
+// the BPF py_runtime_map so the in-kernel walker can unwind Python frames.
+//
+// Best-effort: any failure (not Python, unsupported version, libpython
+// missing, offset out of uint16 range, map write error) is logged at debug
+// level and returns nil — the trace continues without per-kernel frame
+// walking for this PID. Callers should not treat failures as fatal.
+//
+// pyMap nil is a no-op — simplifies callers that conditionally enable the
+// ebpf walker without threading an "enabled" bool through every caller.
+func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
+	if pyMap == nil || pid == 0 {
+		return
+	}
+
+	info := symtab.DetectPython(pid)
+	if info == nil {
+		debugf("py-walker: PID %d not a Python process — skipping", pid)
+		return
+	}
+	if info.Minor != 12 {
+		debugf("py-walker: PID %d is Python %s — only 3.12 supported for eBPF walker", pid, info.Version)
+		return
+	}
+
+	runtimeAddr, err := symtab.FindPyRuntimeAddr(pid, info)
+	if err != nil || runtimeAddr == 0 {
+		debugf("py-walker: _PyRuntime not found for PID %d: %v", pid, err)
+		return
+	}
+
+	offsets := symtab.GetPyOffsetsBest(info.LibPath, info.Minor)
+	if offsets == nil {
+		debugf("py-walker: no offsets available for Python %s (PID %d)", info.Version, pid)
+		return
+	}
+
+	state, err := pyRuntimeStateFromOffsets(runtimeAddr, offsets)
+	if err != nil {
+		debugf("py-walker: converting offsets for PID %d: %v", pid, err)
+		return
+	}
+
+	if err := pytrace.SetPyRuntimeState(pyMap, pid, state); err != nil {
+		debugf("py-walker: writing py_runtime_map for PID %d: %v", pid, err)
+		return
+	}
+	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, offsets=%s)", pid, runtimeAddr, offsets.Version)
+}
+
+// pyRuntimeStateFromOffsets converts a symtab.PyOffsets (uint64 fields —
+// CPython offsets are always small but typed wide) into the uint16 fields
+// required by the BPF py_runtime_state struct. Returns an error if any
+// offset exceeds uint16 — this would indicate a corrupt offset table or a
+// future CPython layout change that needs wider fields on the BPF side.
+func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets) (pytrace.PyRuntimeState, error) {
+	fields := []struct {
+		name string
+		val  uint64
+	}{
+		{"RuntimeInterpretersHead", o.RuntimeInterpretersHead},
+		{"InterpTstateHead", o.InterpTstateHead},
+		{"TstateNext", o.TstateNext},
+		{"TstateNativeThreadID", o.TstateNativeThreadID},
+		{"TstateFrame", o.TstateFrame},
+		{"FrameBack", o.FrameBack},
+		{"FrameCode", o.FrameCode},
+		{"CodeFilename", o.CodeFilename},
+		{"CodeName", o.CodeName},
+		{"CodeFirstLineNo", o.CodeFirstLineNo},
+		{"UnicodeState", o.UnicodeState},
+		{"UnicodeData", o.UnicodeData},
+	}
+	for _, f := range fields {
+		if f.val > 0xFFFF {
+			return pytrace.PyRuntimeState{}, fmt.Errorf("offset %s=%d exceeds uint16 range", f.name, f.val)
+		}
+	}
+	return pytrace.PyRuntimeState{
+		RuntimeAddr:                runtimeAddr,
+		OffRuntimeInterpretersHead: uint16(o.RuntimeInterpretersHead),
+		OffTstateHead:              uint16(o.InterpTstateHead),
+		OffTstateNext:              uint16(o.TstateNext),
+		OffTstateNativeTid:         uint16(o.TstateNativeThreadID),
+		OffTstateFrame:             uint16(o.TstateFrame),
+		OffFrameBack:               uint16(o.FrameBack),
+		OffFrameCode:               uint16(o.FrameCode),
+		OffCodeFilename:            uint16(o.CodeFilename),
+		OffCodeName:                uint16(o.CodeName),
+		OffCodeFirstLineNo:         uint16(o.CodeFirstLineNo),
+		OffUnicodeState:            uint16(o.UnicodeState),
+		OffUnicodeData:             uint16(o.UnicodeData),
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // PID → process name cache
 // ---------------------------------------------------------------------------
 
@@ -1565,7 +1714,9 @@ func (c *pidNameCache) Names() map[uint32]string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, droppedDetailFn func() string, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, onFork ...func(uint32)) error {
+// pyMap is the py_runtime_map for the --py-walker=ebpf lifecycle hooks
+// (nil when the kernel-side walker is not active).
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, droppedDetailFn func() string, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, pyMap *ebpf.Map, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1784,6 +1935,21 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				}
 				if procNames != nil && childPID > 0 {
 					procNames.Lookup(childPID)
+				}
+			}
+
+			// --py-walker=ebpf lifecycle: push runtime state on process_exec
+			// (after the binary is loaded so libpython is visible in /proc/maps),
+			// clear on process_exit to prevent map growth from dead PIDs. Both
+			// are best-effort — any failure is logged and skipped.
+			if pyMap != nil && evt.Source == events.SourceHost {
+				switch events.HostOp(evt.Op) {
+				case events.HostProcessExec:
+					tryPushPyRuntimeState(evt.PID, pyMap)
+				case events.HostProcessExit:
+					if err := pytrace.ClearPID(pyMap, evt.PID); err != nil {
+						debugf("py-walker: ClearPID(%d) failed: %v", evt.PID, err)
+					}
 				}
 			}
 
@@ -2177,7 +2343,8 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, onFork ...func(uint32)) error {
+// pyMap is the py_runtime_map for --py-walker=ebpf (nil = walker off).
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, pyMap *ebpf.Map, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -2351,6 +2518,20 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				}
 				if procNames != nil && childPID > 0 {
 					procNames.Lookup(childPID)
+				}
+			}
+
+			// --py-walker=ebpf lifecycle: push runtime state on process_exec,
+			// clear on process_exit. Mirrors the runTableMode hook — same
+			// semantics (best-effort; failures logged at debug).
+			if pyMap != nil && evt.Source == events.SourceHost {
+				switch events.HostOp(evt.Op) {
+				case events.HostProcessExec:
+					tryPushPyRuntimeState(evt.PID, pyMap)
+				case events.HostProcessExit:
+					if err := pytrace.ClearPID(pyMap, evt.PID); err != nil {
+						debugf("py-walker: ClearPID(%d) failed: %v", evt.PID, err)
+					}
 				}
 			}
 
@@ -2661,6 +2842,9 @@ func formatTraceFlags() string {
 	}
 	if traceMaxDB != "" && traceMaxDB != "0" {
 		flags = append(flags, "max-db="+traceMaxDB)
+	}
+	if tracePyWalker != "" && tracePyWalker != "auto" {
+		flags = append(flags, "py-walker="+tracePyWalker)
 	}
 	return strings.Join(flags, ",")
 }
