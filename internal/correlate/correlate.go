@@ -447,6 +447,22 @@ func (e *Engine) SnapshotCorrelations(cudaOps []stats.OpStats, pid uint32) []Cor
 			}
 		case events.HostOOMKill:
 			oomCount++
+		case events.HostMmPageAllocSummary:
+			// Aggregated non-target mm_page_alloc events. Only counted
+			// when pid=0 (global view) — target PIDs still emit raw
+			// HostPageAlloc events counted above.
+			if pid == 0 {
+				pageAllocCount += int(evt.Args[0])
+				totalAllocBytes += evt.Args[1]
+			}
+		case events.HostSchedSwitchSummary:
+			// Aggregated non-target sched_switch transitions. Only
+			// counted when pid=0 — target PIDs still emit raw
+			// HostSchedSwitch events counted above.
+			if pid == 0 {
+				schedSwitchCount += int(evt.Args[0])
+				totalOffCPU += time.Duration(evt.Args[1])
+			}
 		}
 	}
 
@@ -575,6 +591,20 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 			podEvictionCount++
 		case events.HostPodOOMKill:
 			oomCount++ // K8s OOM kill treated same as kernel OOM
+		case events.HostMmPageAllocSummary:
+			// Aggregated non-target mm_page_alloc events — only
+			// contribute to the global view (pid=0). See
+			// SnapshotCorrelations for the same convention.
+			if pid == 0 {
+				pageAllocCount += int(evt.Args[0])
+				totalAllocBytes += evt.Args[1]
+			}
+		case events.HostSchedSwitchSummary:
+			// Aggregated non-target sched_switch transitions.
+			if pid == 0 {
+				schedSwitchCount += int(evt.Args[0])
+				totalOffCPU += time.Duration(evt.Args[1])
+			}
 		}
 	}
 

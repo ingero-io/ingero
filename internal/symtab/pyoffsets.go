@@ -293,7 +293,15 @@ func readDebugOffsets(mem *ProcMem, runtimeAddr uint64, minor int) (*PyOffsets, 
 // If no debug info is found, falls back to GetPyOffsets() which returns the
 // hardcoded upstream offsets. Returns nil if neither path produces offsets.
 func GetPyOffsetsBest(libPath string, minor int) *PyOffsets {
-	// Try DWARF first.
+	// Try known-offsets DB first — fastest path, no DWARF parsing needed.
+	if dbOffsets, err := LookupByBuildID(libPath); err != nil {
+		symDebugf("known-offsets DB lookup failed: %v", err)
+	} else if dbOffsets != nil {
+		slog.Info("using known offsets from DB", "python_version", fmt.Sprintf("3.%d", minor), "source", dbOffsets.Version)
+		return dbOffsets
+	}
+
+	// Try DWARF next.
 	symDebugf("searching for DWARF debug info for %s (Python 3.%d)", libPath, minor)
 	debugPath, err := FindDebugFile(libPath)
 	if err != nil {

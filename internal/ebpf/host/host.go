@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"reflect"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -13,6 +16,58 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/ingero-io/ingero/pkg/events"
 )
+
+// reflectMapField looks up a named field on a hostTraceObjects value and
+// returns it as *ebpf.Map. Returns nil if the field does not exist (the
+// bpf2go bindings haven't been regenerated after adding a new map in the
+// C source) or if the field is nil (objects not yet loaded).
+//
+// This indirection keeps the code compiling on Windows where `make
+// generate` cannot be run. Once the bindings catch up, this can be
+// replaced with direct field access: `t.objs.MmAllocAgg`.
+func reflectMapField(objs *hostTraceObjects, fieldName string) *ebpf.Map {
+	if objs == nil {
+		return nil
+	}
+	v := reflect.ValueOf(objs).Elem()
+	// Fields live on the embedded hostTraceMaps struct.
+	mapsField := v.FieldByName("hostTraceMaps")
+	if !mapsField.IsValid() {
+		return nil
+	}
+	f := mapsField.FieldByName(fieldName)
+	if !f.IsValid() || f.IsNil() {
+		return nil
+	}
+	m, ok := f.Interface().(*ebpf.Map)
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+// Aggregation map key/value layouts must mirror the C structs in
+// bpf/host_trace.bpf.c exactly. bpf2go regenerates typed bindings on Linux,
+// but we define these explicitly so the drain code is readable regardless
+// of which bpf2go version is in use.
+
+// mmAllocStats mirrors `struct mm_alloc_stats` in host_trace.bpf.c.
+type mmAllocStats struct {
+	Count      uint64
+	TotalBytes uint64
+	LastTs     uint64
+}
+
+// schedSwitchStats mirrors `struct sched_switch_stats` in host_trace.bpf.c.
+type schedSwitchStats struct {
+	Count         uint64
+	TotalOffCPUNs uint64
+	LastTs        uint64
+}
+
+// drainTickInterval is the period at which aggregation maps are drained
+// and summary events emitted to the event channel.
+const drainTickInterval = 1 * time.Second
 
 // Tracer attaches eBPF tracepoints to kernel scheduler and memory subsystem
 // events and streams them to a Go channel. Host events are correlated with
@@ -198,6 +253,11 @@ func (t *Tracer) Events() <-chan events.Event {
 
 // Run starts reading events from the eBPF ring buffer and sending them
 // to the Events() channel. Blocks until ctx is cancelled.
+//
+// In addition to the ring buffer reader, Run launches drainAggregationMaps
+// which periodically reads the mm_alloc_agg and sched_switch_agg
+// PERCPU_HASH maps, emits summary events for non-target PIDs, and clears
+// the maps. See drainAggregationMaps for details.
 func (t *Tracer) Run(ctx context.Context) {
 	defer close(t.eventCh)
 
@@ -205,6 +265,8 @@ func (t *Tracer) Run(ctx context.Context) {
 		<-ctx.Done()
 		t.reader.Close()
 	}()
+
+	go t.drainAggregationMaps(ctx)
 
 	for {
 		record, err := t.reader.Read()
@@ -269,6 +331,182 @@ func parseEvent(raw []byte) (events.Event, error) {
 		RetCode:   0,
 		CGroupID:  he.Hdr.CgroupId,
 	}, nil
+}
+
+// drainAggregationMaps periodically reads the mm_alloc_agg and
+// sched_switch_agg BPF maps, emits summary events to eventCh, and
+// clears the maps. Called from Run() as a goroutine.
+//
+// Period: drainTickInterval (1 second). Summary events use
+// HostMmPageAllocSummary and HostSchedSwitchSummary ops with aggregated
+// counts in Args[]. See pkg/events/types.go for the argument packing
+// conventions.
+//
+// Returns immediately when ctx is cancelled.
+func (t *Tracer) drainAggregationMaps(ctx context.Context) {
+	ticker := time.NewTicker(drainTickInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.drainMmAlloc(ctx)
+			t.drainSchedSwitch(ctx)
+		}
+	}
+}
+
+// aggregationMaps returns the two aggregation maps if they exist in the
+// loaded objects. Older bpf2go bindings (pre-regeneration) will not expose
+// these fields, so we look them up reflectively via the reserved map name
+// in t.objs.hostTraceMaps. We keep this as a method so drainMmAlloc /
+// drainSchedSwitch can be exercised in unit tests with nil maps.
+func (t *Tracer) aggregationMaps() (mmAgg, schedAgg *ebpf.Map) {
+	return lookupAggMap(&t.objs, "MmAllocAgg"), lookupAggMap(&t.objs, "SchedSwitchAgg")
+}
+
+// lookupAggMap resolves an aggregation map by field name via reflection.
+// Returns nil if the field is absent (e.g., bindings haven't been
+// regenerated yet) or the field value is nil. This keeps the Go code
+// compatible with the current bpf2go bindings while allowing a smooth
+// transition once `make generate` is run.
+func lookupAggMap(objs *hostTraceObjects, fieldName string) *ebpf.Map {
+	// Use reflect via unsafe-free path: direct field access is not
+	// possible if the generated struct lacks the field. We fall back to
+	// the "reflect" package only here and only at startup frequency (1Hz)
+	// — cost is negligible.
+	return reflectMapField(objs, fieldName)
+}
+
+// drainMmAlloc reads every entry in the mm_alloc_agg PERCPU_HASH map,
+// sums per-CPU values into a single mmAllocStats, emits one
+// HostMmPageAllocSummary event per PID, and deletes the entry.
+//
+// The drain is best-effort: if emission fails (full channel) we still
+// delete the map entry to avoid unbounded growth. Failures are counted
+// via t.dropped (same counter as ring buffer drops, since they represent
+// the same loss — data that made it to userspace but not to downstream).
+func (t *Tracer) drainMmAlloc(ctx context.Context) {
+	mmAgg, _ := t.aggregationMaps()
+	if mmAgg == nil {
+		return
+	}
+
+	numCPU := runtime.NumCPU()
+	perCPU := make([]mmAllocStats, numCPU)
+	var key uint32
+	iter := mmAgg.Iterate()
+	var keysToDelete []uint32
+
+	for iter.Next(&key, &perCPU) {
+		var agg mmAllocStats
+		var latestTs uint64
+		for _, v := range perCPU {
+			agg.Count += v.Count
+			agg.TotalBytes += v.TotalBytes
+			if v.LastTs > latestTs {
+				latestTs = v.LastTs
+			}
+		}
+		agg.LastTs = latestTs
+		keysToDelete = append(keysToDelete, key)
+
+		if agg.Count == 0 {
+			continue
+		}
+
+		evt := events.Event{
+			Timestamp: events.KtimeToWallClock(agg.LastTs),
+			PID:       key,
+			TID:       0,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostMmPageAllocSummary),
+			Args:      [2]uint64{agg.Count, agg.TotalBytes},
+		}
+
+		select {
+		case t.eventCh <- evt:
+		case <-ctx.Done():
+			return
+		default:
+			t.dropped.Add(1)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		slog.Debug("mm_alloc_agg iterate error", "err", err)
+	}
+
+	for _, k := range keysToDelete {
+		if err := mmAgg.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			slog.Debug("mm_alloc_agg delete error", "pid", k, "err", err)
+		}
+	}
+}
+
+// drainSchedSwitch drains sched_switch_agg analogously to drainMmAlloc,
+// emitting one HostSchedSwitchSummary event per (prev_pid, next_pid)
+// transition. The composite key is unpacked into PID (next_pid) and
+// TID (prev_pid) per the convention documented in pkg/events/types.go.
+func (t *Tracer) drainSchedSwitch(ctx context.Context) {
+	_, schedAgg := t.aggregationMaps()
+	if schedAgg == nil {
+		return
+	}
+
+	numCPU := runtime.NumCPU()
+	perCPU := make([]schedSwitchStats, numCPU)
+	var key uint64
+	iter := schedAgg.Iterate()
+	var keysToDelete []uint64
+
+	for iter.Next(&key, &perCPU) {
+		var agg schedSwitchStats
+		var latestTs uint64
+		for _, v := range perCPU {
+			agg.Count += v.Count
+			agg.TotalOffCPUNs += v.TotalOffCPUNs
+			if v.LastTs > latestTs {
+				latestTs = v.LastTs
+			}
+		}
+		agg.LastTs = latestTs
+		keysToDelete = append(keysToDelete, key)
+
+		if agg.Count == 0 {
+			continue
+		}
+
+		prevPID := uint32(key >> 32)
+		nextPID := uint32(key & 0xffffffff)
+
+		evt := events.Event{
+			Timestamp: events.KtimeToWallClock(agg.LastTs),
+			PID:       nextPID,
+			TID:       prevPID,
+			Source:    events.SourceHost,
+			Op:        uint8(events.HostSchedSwitchSummary),
+			Args:      [2]uint64{agg.Count, agg.TotalOffCPUNs},
+		}
+
+		select {
+		case t.eventCh <- evt:
+		case <-ctx.Done():
+			return
+		default:
+			t.dropped.Add(1)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		slog.Debug("sched_switch_agg iterate error", "err", err)
+	}
+
+	for _, k := range keysToDelete {
+		if err := schedAgg.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			slog.Debug("sched_switch_agg delete error", "key", k, "err", err)
+		}
+	}
 }
 
 // Close releases all eBPF resources. Safe to call multiple times (idempotent).

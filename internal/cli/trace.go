@@ -67,6 +67,7 @@ var (
 	traceNode         string        // Node identity for multi-node correlation.
 	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
 	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
+	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
 )
 
 var traceCmd = &cobra.Command{
@@ -108,6 +109,7 @@ func init() {
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
 	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
 	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
+	traceCmd.Flags().Uint32Var(&traceSamplingRate, "sampling-rate", 0, "event sampling rate (0 = adaptive, 1 = emit all, N > 1 = emit 1 in N). Adaptive mode auto-increases rate under sustained drop pressure.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -840,6 +842,34 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Apply initial sampling rate (fixed or adaptive baseline).
+	// Rate 0 from the flag means "adaptive" — start at 1 (emit all) and
+	// let runAdaptiveSamplingMonitor adjust based on drop pressure.
+	initialRate := traceSamplingRate
+	if initialRate == 0 {
+		initialRate = 1
+	}
+	for _, ct := range cudaTracers {
+		if err := ct.SetSamplingRate(initialRate); err != nil {
+			debugf("setting cuda sampling rate: %v", err)
+		}
+	}
+	if driverTracer != nil {
+		if err := driverTracer.SetSamplingRate(initialRate); err != nil {
+			debugf("setting driver sampling rate: %v", err)
+		}
+	}
+	for _, gt := range graphTracers {
+		if err := gt.SetSamplingRate(initialRate); err != nil {
+			debugf("setting graph sampling rate: %v", err)
+		}
+	}
+
+	// Launch adaptive sampling monitor if --sampling-rate was not set (or was 0).
+	if traceSamplingRate == 0 {
+		go runAdaptiveSamplingMonitor(ctx, cudaTracers, driverTracer, graphTracers, droppedFn)
+	}
+
 	// Step 8: Build PID→name cache for JSON output enrichment.
 	procNames = newPIDNameCache(targetPIDs, processNames)
 
@@ -857,6 +887,117 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, trackPID)
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive sampling monitor
+// ---------------------------------------------------------------------------
+
+// adaptiveSamplingWindowDropsThreshold is the per-5s-window drop count that
+// counts as "high pressure". At 5s windows, 1000 drops ≈ 200/sec sustained.
+const adaptiveSamplingWindowDropsThreshold = 1000
+
+// adaptiveSamplingMaxRate caps the sampling divisor. Beyond 1-in-100 the
+// loss of fidelity outweighs the throughput win for investigations.
+const adaptiveSamplingMaxRate uint32 = 100
+
+// nextSamplingRate returns the next sampling rate and updated pressure/quiet
+// counters given the current rate and window drop count. Extracted as a pure
+// function so the rate-selection logic is unit-testable without a goroutine.
+//
+// Strategy:
+//   - windowDrops > threshold for 2 consecutive windows (≥10s sustained):
+//     bump rate 1 → 10 → 100 (capped at adaptiveSamplingMaxRate).
+//   - windowDrops == 0 for 6 consecutive windows (≥30s quiet): reset to 1.
+//   - Otherwise: hold rate, reset both counters.
+//
+// Returns (newRate, newHighPressureCount, newQuietCount).
+func nextSamplingRate(currentRate uint32, windowDrops uint64, highPressureCount, quietCount int) (uint32, int, int) {
+	if windowDrops > adaptiveSamplingWindowDropsThreshold {
+		quietCount = 0
+		// Already at cap — no point tracking pressure we can't act on.
+		if currentRate >= adaptiveSamplingMaxRate {
+			return currentRate, highPressureCount, quietCount
+		}
+		highPressureCount++
+		if highPressureCount >= 2 {
+			newRate := currentRate * 10
+			if newRate < currentRate { // overflow guard
+				newRate = adaptiveSamplingMaxRate
+			}
+			if newRate > adaptiveSamplingMaxRate {
+				newRate = adaptiveSamplingMaxRate
+			}
+			return newRate, 0, 0
+		}
+		return currentRate, highPressureCount, quietCount
+	}
+	if windowDrops == 0 {
+		quietCount++
+		highPressureCount = 0
+		if quietCount >= 6 && currentRate > 1 {
+			return 1, 0, 0
+		}
+		return currentRate, highPressureCount, quietCount
+	}
+	// Mixed: some drops but below threshold. Hold rate, reset counters.
+	return currentRate, 0, 0
+}
+
+// runAdaptiveSamplingMonitor watches the drop rate and adjusts BPF sampling
+// to reduce pressure. Checks every 5 seconds; see nextSamplingRate for the
+// rate-change strategy.
+func runAdaptiveSamplingMonitor(ctx context.Context, cudaTracers []*cuda.Tracer, driverTracer *driver.Tracer, graphTracers []*cudagraph.Tracer, droppedFn func() uint64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var rate uint32 = 1
+	var highPressureCount, quietCount int
+	var lastDropCount uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentDrops := droppedFn()
+			windowDrops := currentDrops - lastDropCount
+			lastDropCount = currentDrops
+
+			newRate, hp, q := nextSamplingRate(rate, windowDrops, highPressureCount, quietCount)
+			highPressureCount = hp
+			quietCount = q
+			if newRate != rate {
+				applyRate(cudaTracers, driverTracer, graphTracers, newRate)
+				if newRate > rate {
+					slog.Info("adaptive sampling: increased rate due to sustained drops", "old_rate", rate, "new_rate", newRate, "window_drops", windowDrops)
+				} else {
+					slog.Info("adaptive sampling: reset to 1 (no drops for 30s)", "old_rate", rate)
+				}
+				rate = newRate
+			}
+		}
+	}
+}
+
+// applyRate writes the sampling rate to every attached tracer's BPF
+// config_map. Errors are logged via debugf (best-effort — tracers that
+// fail to update stay at the previous rate until the next attempt).
+func applyRate(cudaTracers []*cuda.Tracer, driverTracer *driver.Tracer, graphTracers []*cudagraph.Tracer, rate uint32) {
+	for _, ct := range cudaTracers {
+		if err := ct.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: cuda rate update failed: %v", err)
+		}
+	}
+	if driverTracer != nil {
+		if err := driverTracer.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: driver rate update failed: %v", err)
+		}
+	}
+	for _, gt := range graphTracers {
+		if err := gt.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: graph rate update failed: %v", err)
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Selective storage — store only investigation-valuable events, aggregate rest

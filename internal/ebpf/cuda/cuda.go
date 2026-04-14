@@ -2,6 +2,7 @@ package cuda
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -167,9 +168,13 @@ func (t *Tracer) Attach() error {
 	}
 
 	// Enable stack capture in the eBPF config map if requested.
+	// ingero_config is 12 bytes on x86_64 (capture_stack + pad1[3] +
+	// sampling_rate + pad2 — natural u32 alignment adds no trailing
+	// padding). Always write the full struct so sampling_rate is zeroed
+	// to "emit all" by default until SetSamplingRate() overrides it.
 	if t.stackEnabled && t.objs.ConfigMap != nil {
-		// ingero_config: { uint8 capture_stack, uint8[7] pad }
-		cfg := [8]byte{1}
+		var cfg [12]byte
+		cfg[0] = 1 // capture_stack = 1; sampling_rate (offset 4) stays 0.
 		if err := t.objs.ConfigMap.Put(uint32(0), cfg[:]); err != nil {
 			return fmt.Errorf("enabling stack capture: %w", err)
 		}
@@ -294,6 +299,28 @@ func (t *Tracer) Close() error {
 		errs = append(errs, fmt.Errorf("closing eBPF objects: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// SetSamplingRate updates the BPF sampling rate for this tracer.
+// Rate 0 or 1 = emit all events. Rate N > 1 = emit 1 in N events
+// (per-CPU, so actual ratio varies slightly).
+//
+// Must be called after Attach(). Thread-safe.
+func (t *Tracer) SetSamplingRate(rate uint32) error {
+	if t.objs.ConfigMap == nil {
+		return fmt.Errorf("config map not initialized — call Attach first")
+	}
+	// Build the full 12-byte ingero_config struct (u32 alignment, no trailing pad).
+	var cfg [12]byte
+	if t.stackEnabled {
+		cfg[0] = 1
+	}
+	// sampling_rate at offset 4 (little-endian uint32)
+	binary.LittleEndian.PutUint32(cfg[4:8], rate)
+	if err := t.objs.ConfigMap.Put(uint32(0), cfg[:]); err != nil {
+		return fmt.Errorf("updating sampling rate: %w", err)
+	}
+	return nil
 }
 
 // LibPath returns the path to the libcudart.so being traced.

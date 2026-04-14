@@ -925,3 +925,91 @@ func TestLibMismatchChecker(t *testing.T) {
 	var nilChecker *libMismatchChecker
 	nilChecker.Check(5678)
 }
+
+// ---------------------------------------------------------------------------
+// Adaptive sampling rate progression tests
+// ---------------------------------------------------------------------------
+
+// TestAdaptiveSamplingRateProgression verifies the rate progression logic
+// (1 → 10 → 100, capped) and the quiet-period reset (→ 1).
+func TestAdaptiveSamplingRateProgression(t *testing.T) {
+	tests := []struct {
+		name                  string
+		currentRate           uint32
+		windowDrops           uint64
+		highPressureCount     int
+		quietCount            int
+		wantRate              uint32
+		wantHighPressureCount int
+		wantQuietCount        int
+	}{
+		// First high-pressure window: bump pressure counter, don't yet change rate.
+		{"first_high_pressure", 1, 5000, 0, 0, 1, 1, 0},
+		// Second high-pressure window at rate 1: bump to 10, reset counters.
+		{"second_high_pressure_rate1", 1, 5000, 1, 0, 10, 0, 0},
+		// Second high-pressure window at rate 10: bump to 100.
+		{"second_high_pressure_rate10", 10, 5000, 1, 0, 100, 0, 0},
+		// Second high-pressure window at rate 100: stay capped at 100.
+		{"capped_at_100", 100, 5000, 1, 0, 100, 1, 0},
+		// Drops below threshold but >0: hold, reset counters.
+		{"mild_drops_hold", 10, 500, 1, 0, 10, 0, 0},
+		// First quiet window while elevated: bump quiet counter.
+		{"first_quiet_at_rate10", 10, 0, 0, 0, 10, 0, 1},
+		// Quiet for 6 consecutive windows: reset to 1.
+		{"quiet_reset", 10, 0, 0, 5, 1, 0, 0},
+		// Quiet for <6 windows: keep rate.
+		{"quiet_not_yet", 10, 0, 0, 4, 10, 0, 5},
+		// Quiet at rate 1: stay at 1 regardless of quietCount.
+		{"quiet_at_rate1", 1, 0, 0, 10, 1, 0, 11},
+		// High pressure resets the quiet counter.
+		{"high_pressure_resets_quiet", 10, 5000, 0, 4, 10, 1, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRate, gotHP, gotQ := nextSamplingRate(tt.currentRate, tt.windowDrops, tt.highPressureCount, tt.quietCount)
+			if gotRate != tt.wantRate {
+				t.Errorf("rate: got %d, want %d", gotRate, tt.wantRate)
+			}
+			if gotHP != tt.wantHighPressureCount {
+				t.Errorf("highPressureCount: got %d, want %d", gotHP, tt.wantHighPressureCount)
+			}
+			if gotQ != tt.wantQuietCount {
+				t.Errorf("quietCount: got %d, want %d", gotQ, tt.wantQuietCount)
+			}
+		})
+	}
+}
+
+// TestAdaptiveSamplingFullProgression simulates the full rate progression
+// across multiple ticks to verify end-to-end behavior: sustained drops
+// escalate 1 → 10 → 100, then a quiet period resets to 1.
+func TestAdaptiveSamplingFullProgression(t *testing.T) {
+	var rate uint32 = 1
+	var hp, q int
+
+	// Two consecutive high-pressure windows: 1 → 10.
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 1 {
+		t.Fatalf("after 1 high-pressure: rate=%d, want 1", rate)
+	}
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 10 {
+		t.Fatalf("after 2 high-pressure: rate=%d, want 10", rate)
+	}
+
+	// Two more: 10 → 100.
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 100 {
+		t.Fatalf("after 4 high-pressure: rate=%d, want 100", rate)
+	}
+
+	// 6 quiet windows: reset to 1.
+	for i := 0; i < 6; i++ {
+		rate, hp, q = nextSamplingRate(rate, 0, hp, q)
+	}
+	if rate != 1 {
+		t.Fatalf("after 6 quiet: rate=%d, want 1", rate)
+	}
+}

@@ -210,12 +210,18 @@ struct cuda_graph_event {
 };
 
 /*
- * Runtime configuration — written by Go userspace, read by eBPF programs.
- * Stored in a BPF_MAP_TYPE_ARRAY with a single entry (key 0).
+ * ingero_config: runtime configuration read by all BPF probes.
+ * Stored in a single-entry BPF_MAP_TYPE_ARRAY map (config_map).
+ *
+ * ABI stability: fields may only be APPENDED. Existing fields and
+ * padding must not change (they are read by compiled BPF programs
+ * that may predate newer Go-side code).
  */
 struct ingero_config {
-	__u8 capture_stack;  /* 1 = capture userspace stack traces, 0 = skip */
-	__u8 _pad[7];
+	__u8  capture_stack;   /* 1 = capture userspace stack traces */
+	__u8  _pad1[3];
+	__u32 sampling_rate;   /* 0 or 1 = emit all events; N > 1 = emit 1 per N */
+	__u32 _pad2;           /* 12 bytes total (u32 alignment, no trailing pad) */
 };
 
 /*

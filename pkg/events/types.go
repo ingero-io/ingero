@@ -156,6 +156,30 @@ const (
 	HostPodRestart  HostOp = 10
 	HostPodEviction HostOp = 11
 	HostPodOOMKill  HostOp = 12
+
+	// Aggregated summary events (synthetic, emitted by the userspace
+	// drainAggregationMaps goroutine rather than the BPF ring buffer).
+	// Op codes 20+ to leave room for future eBPF-defined host ops.
+	//
+	// Argument packing conventions:
+	//
+	//   HostMmPageAllocSummary:
+	//     PID      = aggregated non-target PID
+	//     TID      = 0
+	//     Args[0]  = count of mm_page_alloc events in the drain window
+	//     Args[1]  = total bytes allocated across those events
+	//     Duration = 0 (unused)
+	//
+	//   HostSchedSwitchSummary:
+	//     PID      = next_pid (incoming task of each aggregated transition)
+	//     TID      = prev_pid (outgoing task — packed into TID since the
+	//                transition is keyed by (prev_pid << 32) | next_pid)
+	//     Args[0]  = count of sched_switch transitions in the drain window
+	//     Args[1]  = total off-CPU nanoseconds (may be 0 when the kernel
+	//                could not compute a duration for a transition)
+	//     Duration = 0 (unused — the aggregate off-cpu total lives in Args[1])
+	HostMmPageAllocSummary HostOp = 20
+	HostSchedSwitchSummary HostOp = 21
 )
 
 // String returns a human-readable name for the host operation.
@@ -181,6 +205,10 @@ func (op HostOp) String() string {
 		return "pod_eviction"
 	case HostPodOOMKill:
 		return "pod_oom_kill"
+	case HostMmPageAllocSummary:
+		return "mm_page_alloc_summary"
+	case HostSchedSwitchSummary:
+		return "sched_switch_summary"
 	default:
 		return fmt.Sprintf("host_op(%d)", op)
 	}
@@ -389,6 +417,8 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		"pod_restart":   HostPodRestart,
 		"pod_eviction":  HostPodEviction,
 		"pod_oom_kill":  HostPodOOMKill,
+		"mm_page_alloc_summary": HostMmPageAllocSummary,
+		"sched_switch_summary":  HostSchedSwitchSummary,
 	}
 	for k, v := range hostOps {
 		if lower == k {

@@ -2,36 +2,112 @@ package symtab
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// ProcMem provides read access to a target process's memory via /proc/[pid]/mem.
-// Requires CAP_SYS_PTRACE or root — same privilege level as eBPF.
+// ProcMem provides read access to a target process's memory.
+//
+// It has two read paths:
+//
+//   - /proc/[pid]/mem, opened at construction time. This is the preferred path,
+//     but the kernel enforces ptrace permission checks on every read. Under the
+//     default Ubuntu 24.04 configuration (kernel.yama.ptrace_scope=1), reads
+//     fail with EPERM unless the caller is the ptrace tracer of the target.
+//
+//   - process_vm_readv(2) — a syscall that copies memory across processes
+//     without requiring an actual ptrace attachment. It only requires
+//     CAP_SYS_PTRACE on the calling process. This works at ptrace_scope=0
+//     and =1, fails at =2 without CAP_SYS_PTRACE, and always fails at =3.
+//     Ingero runs as root, which implicitly grants CAP_SYS_PTRACE.
+//
+// When the /proc/[pid]/mem path returns EPERM/EACCES — either at open time or
+// on a read — ProcMem transparently falls back to process_vm_readv and remains
+// on that path for all subsequent reads.
 type ProcMem struct {
-	pid  uint32
-	file *os.File
+	pid        uint32
+	file       *os.File
+	useVmReadv bool
 }
 
-// OpenProcMem opens /proc/[pid]/mem for reading.
+// OpenProcMem opens /proc/[pid]/mem for reading. If the open fails with
+// EPERM (common on ptrace_scope=1 systems), it returns a ProcMem that uses
+// process_vm_readv for all reads instead of failing. Other open errors are
+// returned as-is so callers can distinguish e.g. ESRCH (process gone).
 func OpenProcMem(pid uint32) (*ProcMem, error) {
 	path := fmt.Sprintf("/proc/%d/mem", pid)
 	f, err := os.Open(path)
 	if err != nil {
+		if isPermErr(err) {
+			// Strict ptrace_scope — can't open /proc/pid/mem, but
+			// process_vm_readv may still work with CAP_SYS_PTRACE.
+			return &ProcMem{pid: pid, file: nil, useVmReadv: true}, nil
+		}
 		return nil, fmt.Errorf("opening %s: %w", path, err)
 	}
 	return &ProcMem{pid: pid, file: f}, nil
 }
 
-// Close releases the file handle.
+// Close releases the file handle if one was opened.
 func (m *ProcMem) Close() error {
+	if m.file == nil {
+		return nil
+	}
 	return m.file.Close()
 }
 
+// isPermErr reports whether err is a permission error (EPERM or EACCES),
+// unwrapping syscall.Errno values wrapped inside *os.PathError or fmt.Errorf.
+func isPermErr(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EPERM || errno == syscall.EACCES
+	}
+	return false
+}
+
+// readVmReadv reads from the target process using process_vm_readv(2).
+func (m *ProcMem) readVmReadv(buf []byte, addr uint64) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	localIov := []unix.Iovec{
+		{Base: &buf[0], Len: uint64(len(buf))},
+	}
+	remoteIov := []unix.RemoteIovec{
+		{Base: uintptr(addr), Len: len(buf)},
+	}
+	n, err := unix.ProcessVMReadv(int(m.pid), localIov, remoteIov, 0)
+	if err != nil {
+		return fmt.Errorf("process_vm_readv %d bytes at 0x%x from PID %d: %w", len(buf), addr, m.pid, err)
+	}
+	if n != len(buf) {
+		return fmt.Errorf("process_vm_readv short read: got %d bytes, wanted %d at 0x%x", n, len(buf), addr)
+	}
+	return nil
+}
+
 // ReadAt reads len(buf) bytes from the target process at the given virtual address.
+//
+// First tries /proc/[pid]/mem (if open). If that returns EPERM/EACCES, it
+// "sticks" to process_vm_readv for all subsequent reads on this ProcMem so we
+// don't keep paying the failed-syscall cost.
 func (m *ProcMem) ReadAt(buf []byte, addr uint64) error {
+	if m.useVmReadv || m.file == nil {
+		return m.readVmReadv(buf, addr)
+	}
 	n, err := m.file.ReadAt(buf, int64(addr))
 	if err != nil {
+		if isPermErr(err) {
+			// /proc/pid/mem now denies us (likely ptrace_scope=1). Flip to
+			// process_vm_readv for this and all future reads.
+			m.useVmReadv = true
+			return m.readVmReadv(buf, addr)
+		}
 		return fmt.Errorf("reading %d bytes at 0x%x from PID %d: %w", len(buf), addr, m.pid, err)
 	}
 	if n != len(buf) {

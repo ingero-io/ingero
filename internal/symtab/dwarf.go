@@ -79,8 +79,22 @@ func FindDebugFile(libPath string) (string, error) {
 	return "", nil
 }
 
-// findByBuildID reads .note.gnu.build-id and looks for
-// /usr/lib/debug/.build-id/XX/XXXXXXXX.debug.
+// ReadBuildID reads the .note.gnu.build-id section of an ELF file and
+// returns the build-id as a lowercase hex string (e.g., "a1b2c3d4...").
+// Returns "" if the section is missing or malformed.
+func ReadBuildID(libPath string) (string, error) {
+	f, err := elf.Open(libPath)
+	if err != nil {
+		return "", fmt.Errorf("opening ELF %s: %w", libPath, err)
+	}
+	defer f.Close()
+
+	return readBuildIDFromELF(f)
+}
+
+// readBuildIDFromELF parses .note.gnu.build-id from an already-opened ELF file
+// and returns the build-id as a lowercase hex string. Returns "" if the section
+// is missing or malformed.
 //
 // The .note.gnu.build-id section contains an ELF note with:
 //   - 4 bytes: name size (should be 4 for "GNU\0")
@@ -88,7 +102,7 @@ func FindDebugFile(libPath string) (string, error) {
 //   - 4 bytes: type (NT_GNU_BUILD_ID = 3)
 //   - name (padded to 4-byte alignment)
 //   - desc (the build ID bytes)
-func findByBuildID(f *elf.File) (string, error) {
+func readBuildIDFromELF(f *elf.File) (string, error) {
 	sect := f.Section(".note.gnu.build-id")
 	if sect == nil {
 		return "", nil
@@ -141,8 +155,21 @@ func findByBuildID(f *elf.File) (string, error) {
 		return "", nil
 	}
 
+	return hex.EncodeToString(buildID), nil
+}
+
+// findByBuildID reads .note.gnu.build-id and looks for
+// /usr/lib/debug/.build-id/XX/XXXXXXXX.debug.
+func findByBuildID(f *elf.File) (string, error) {
+	idHex, err := readBuildIDFromELF(f)
+	if err != nil {
+		return "", err
+	}
+	if idHex == "" || len(idHex) < 4 {
+		return "", nil
+	}
+
 	// Build path: /usr/lib/debug/.build-id/XX/YYYY.debug
-	idHex := hex.EncodeToString(buildID)
 	debugPath := filepath.Join("/usr/lib/debug/.build-id", idHex[:2], idHex[2:]+".debug")
 
 	if _, err := os.Stat(debugPath); err == nil {
