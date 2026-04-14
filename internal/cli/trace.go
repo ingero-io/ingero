@@ -761,6 +761,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 		if hostTracer != nil {
 			d += hostTracer.Dropped()
+			d += hostTracer.CriticalDropped()
 		}
 		if driverTracer != nil {
 			d += driverTracer.Dropped()
@@ -786,9 +787,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		for _, gt := range graphTracers {
 			graphD += gt.Dropped()
 		}
-		var hostD, driverD, ioD, tcpD, netD uint64
+		var hostD, hostCritD, driverD, ioD, tcpD, netD uint64
 		if hostTracer != nil {
 			hostD = hostTracer.Dropped()
+			hostCritD = hostTracer.CriticalDropped()
 		}
 		if driverTracer != nil {
 			driverD = driverTracer.Dropped()
@@ -802,8 +804,8 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		if netTracer != nil {
 			netD = netTracer.Dropped()
 		}
-		return fmt.Sprintf("cuda=%d driver=%d host=%d io=%d tcp=%d net=%d graph=%d",
-			cudaD, driverD, hostD, ioD, tcpD, netD, graphD)
+		return fmt.Sprintf("cuda=%d driver=%d host=%d host_crit=%d io=%d tcp=%d net=%d graph=%d",
+			cudaD, driverD, hostD, hostCritD, ioD, tcpD, netD, graphD)
 	}
 
 	// Dynamic PID tracking: when tracing all processes (no --pid), we add
@@ -1987,6 +1989,24 @@ func renderSystemLine(b *strings.Builder, lines *int, sys *stats.SystemSnapshot)
 	*lines++
 }
 
+// parseDetailField extracts the numeric value of a `name=N` field from a
+// whitespace-separated drop detail string (as produced by droppedDetailFn).
+// Returns 0 if the field is absent or unparseable — callers should treat 0
+// as "no event drops for this source".
+func parseDetailField(detail, name string) uint64 {
+	prefix := name + "="
+	for _, tok := range strings.Fields(detail) {
+		if strings.HasPrefix(tok, prefix) {
+			v, err := strconv.ParseUint(tok[len(prefix):], 10, 64)
+			if err != nil {
+				return 0
+			}
+			return v
+		}
+	}
+	return 0
+}
+
 func renderTable(snap *stats.Snapshot, dropped uint64, droppedDetail string, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
 	var b strings.Builder
 
@@ -2077,6 +2097,12 @@ func renderTable(snap *stats.Snapshot, dropped uint64, droppedDetail string, lin
 		totalEvts := snap.TotalEvents + dropped
 		if totalEvts > 0 && float64(dropped)/float64(totalEvts) > 0.05 {
 			dropLine += "  WARN: >5% of events dropped -- consider --ringbuf-size"
+		}
+		// Hard-failure WARN for any critical-event drop — OOM/exec/exit/fork
+		// deliveries are guaranteed. Parse host_crit=N out of the detail
+		// string (emitted by droppedDetailFn) and flag non-zero values.
+		if parseDetailField(droppedDetail, "host_crit") > 0 {
+			dropLine += "  WARN: CRITICAL events dropped -- this should never happen"
 		}
 		fmt.Fprintf(&b, "%s\033[K\n", dropLine)
 		lines++

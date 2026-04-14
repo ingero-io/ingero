@@ -308,3 +308,14 @@ func TestDrainMmAllocNilMap(t *testing.T) {
 	default:
 	}
 }
+
+// TestCriticalDroppedInitialZero verifies the CriticalDropped counter
+// starts at zero on a freshly constructed Tracer. Any non-zero value
+// here indicates a guaranteed-delivery failure for OOM / process
+// lifecycle events, so the zero-initial invariant is load-bearing.
+func TestCriticalDroppedInitialZero(t *testing.T) {
+	tr := &Tracer{}
+	if tr.CriticalDropped() != 0 {
+		t.Errorf("CriticalDropped() = %d, want 0", tr.CriticalDropped())
+	}
+}

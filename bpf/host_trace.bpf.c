@@ -21,6 +21,17 @@ struct {
 	__uint(max_entries, 1024 * 1024);
 } host_events SEC(".maps");
 
+/*
+ * critical_events: dedicated ring buffer for low-frequency, high-value
+ * events that must never be dropped — OOM kills, process exec/exit/fork.
+ * These events are NEVER sampled or aggregated. 256KB is sufficient
+ * headroom (combined event rate well under 100/sec on a busy host).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} critical_events SEC(".maps");
+
 // In-kernel PID filter. Only events involving these PIDs are emitted.
 // Populated by Go agent; 256 entries covers K8s nodes with many GPU pods.
 struct {
@@ -139,6 +150,43 @@ static __always_inline void emit_host_event(__u32 pid, __u32 tid,
 	// If bpf_probe_read_kernel below fails (very unlikely for tracepoint ctx
 	// fields, but defensive against future verifier-permitted variants), the
 	// comm field would otherwise leak whatever bytes were in the ringbuf slot.
+	__builtin_memset(&evt->hdr.comm, 0, sizeof(evt->hdr.comm));
+	if (comm_src)
+		bpf_probe_read_kernel(&evt->hdr.comm, sizeof(evt->hdr.comm), comm_src);
+	else
+		bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
+	evt->duration_ns = duration_ns;
+	evt->cpu = cpu;
+	evt->target_pid = target_pid;
+
+	bpf_ringbuf_submit(evt, 0);
+}
+
+// emit_critical_event mirrors emit_host_event but targets the dedicated
+// critical_events ring buffer. Used for OOM kills and process lifecycle
+// (exec/exit/fork) — events that must never be dropped due to high-frequency
+// traffic on the main host_events buffer. See critical_events map definition
+// for rationale.
+static __always_inline void emit_critical_event(__u32 pid, __u32 tid,
+						__u8 op, __u64 duration_ns,
+						__u32 cpu, __u32 target_pid,
+						const char *comm_src)
+{
+	struct host_event *evt;
+
+	evt = bpf_ringbuf_reserve(&critical_events, sizeof(*evt), 0);
+	if (!evt)
+		return;
+
+	evt->hdr.timestamp_ns = bpf_ktime_get_ns();
+	evt->hdr.pid = pid;
+	evt->hdr.tid = tid;
+	evt->hdr.source = EVENT_SRC_HOST;
+	evt->hdr.op = op;
+	evt->hdr._pad = 0;
+	evt->hdr._pad2 = 0;
+	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	// Defensive zero-init — bpf_ringbuf_reserve does not zero memory.
 	__builtin_memset(&evt->hdr.comm, 0, sizeof(evt->hdr.comm));
 	if (comm_src)
 		bpf_probe_read_kernel(&evt->hdr.comm, sizeof(evt->hdr.comm), comm_src);
@@ -307,9 +355,10 @@ int handle_oom_kill(struct trace_event_raw_mark_victim *ctx)
 
 	// OOM killer fires from the allocator's task context, which may or may
 	// not be the victim. Use current task comm — same fidelity caveat as PID.
-	emit_host_event(tgid, tid,
-			HOST_OP_OOM_KILL, 0,
-			bpf_get_smp_processor_id(), ctx->pid, NULL);
+	// Routed to critical_events: guaranteed delivery for this rare, high-value event.
+	emit_critical_event(tgid, tid,
+			    HOST_OP_OOM_KILL, 0,
+			    bpf_get_smp_processor_id(), ctx->pid, NULL);
 
 	return 0;
 }
@@ -326,9 +375,10 @@ int handle_process_exec(struct trace_event_raw_sched_process_exec *ctx)
 	if (!is_target(tgid, cgroup_id))
 		return 0;
 
-	emit_host_event(tgid, tid,
-			HOST_OP_PROCESS_EXEC, 0,
-			bpf_get_smp_processor_id(), 0, NULL);
+	// Routed to critical_events: process lifecycle must not be dropped.
+	emit_critical_event(tgid, tid,
+			    HOST_OP_PROCESS_EXEC, 0,
+			    bpf_get_smp_processor_id(), 0, NULL);
 
 	return 0;
 }
@@ -345,9 +395,10 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 	if (!is_target(tgid, cgroup_id))
 		return 0;
 
-	emit_host_event(tgid, tid,
-			HOST_OP_PROCESS_EXIT, 0,
-			bpf_get_smp_processor_id(), 0, NULL);
+	// Routed to critical_events: process lifecycle must not be dropped.
+	emit_critical_event(tgid, tid,
+			    HOST_OP_PROCESS_EXIT, 0,
+			    bpf_get_smp_processor_id(), 0, NULL);
 
 	return 0;
 }
@@ -368,9 +419,10 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 	__u32 child_pid = ctx->child_pid;
 
 	// Event PID = parent (current task), so current_comm is correct.
-	emit_host_event(tgid, tid,
-			HOST_OP_PROCESS_FORK, 0,
-			bpf_get_smp_processor_id(), child_pid, NULL);
+	// Routed to critical_events: process lifecycle must not be dropped.
+	emit_critical_event(tgid, tid,
+			    HOST_OP_PROCESS_FORK, 0,
+			    bpf_get_smp_processor_id(), child_pid, NULL);
 
 	return 0;
 }

@@ -801,6 +801,40 @@ Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-bas
 **Does it check for updates?**
 Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero checks GitHub Releases for newer versions (once per 24 hours, cached in `~/.ingero/update-check`). The check runs in the background and never delays your command. Set `INGERO_NO_UPDATE_NOTIFIER=1` to disable. Skipped for `query`, `mcp`, `version`, and dev builds.
 
+## Known Patterns
+
+Recurring GPU workload issues that Ingero detects automatically, with documented fixes.
+
+### CUDA Graph capture fails immediately (cuBLAS lazy initialization)
+
+**Symptom:** `cudaStreamBeginCapture` followed by cuBLAS or cuDNN calls fails immediately. Errors surface as `CUBLAS_STATUS_NOT_INITIALIZED`, a failed `cudaStreamEndCapture`, or an invalid graph handle. In traces, the capture region is abnormally short (duration < 1ms) and contains no kernel launches.
+
+**Cause:** cuBLAS and cuDNN lazily create their internal handles, memory pools, and workspace buffers on the first API call. Those initialization steps invoke CUDA runtime APIs (`cudaMalloc`, `cudaEventCreate`, and others) that are disallowed inside a stream capture region. When the first cuBLAS/cuDNN call happens under capture, the runtime rejects those disallowed calls and the capture aborts or produces an invalid graph.
+
+**Fix:** Execute 3+ warmup iterations of the work you intend to capture before calling `cudaStreamBeginCapture`. Warmup forces cuBLAS/cuDNN to complete lazy initialization outside the capture context.
+
+```python
+# BAD  -  capture aborts on first cuBLAS call
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = torch.matmul(a, b)
+
+# GOOD  -  warmup forces cuBLAS initialization outside capture
+s = torch.cuda.Stream()
+s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3):
+        y = torch.matmul(a, b)
+torch.cuda.current_stream().wait_stream(s)
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = torch.matmul(a, b)
+```
+
+Alternatively, use `torch.cuda.make_graphed_callables()`, which handles the warmup sequence automatically.
+
+**Automatic detection:** `ingero explain` surfaces this pattern as a `graph-capture-warmup` causal chain (MEDIUM severity). Run it after a trace when you suspect CUDA Graph capture issues.
+
 ## License
 
 **Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
