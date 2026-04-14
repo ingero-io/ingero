@@ -868,3 +868,60 @@ func TestPIDNameCacheNames(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// parseRingBufSize tests
+// ---------------------------------------------------------------------------
+
+func TestParseRingBufSize(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    uint32
+		wantErr bool
+	}{
+		{"", 0, false},                       // empty = no override
+		{"8m", 8 * 1024 * 1024, false},       // 8 MiB
+		{"32m", 32 * 1024 * 1024, false},     // 32 MiB
+		{"4k", 4096, false},                  // minimum valid
+		{"1g", 1 << 30, false},               // 1 GiB
+		{"8388608", 8 * 1024 * 1024, false},  // raw bytes (8 MiB)
+		{"10m", 0, true},                     // not power of 2
+		{"1k", 0, true},                      // too small (1024 < 4096)
+		{"0m", 0, true},                      // zero
+		{"5g", 0, true},                      // exceeds uint32
+		{"abc", 0, true},                     // invalid
+		{"0k", 0, true},                      // zero with suffix
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseRingBufSize(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseRingBufSize(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseRingBufSize(%q) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// libMismatchChecker tests
+// ---------------------------------------------------------------------------
+
+func TestLibMismatchChecker(t *testing.T) {
+	attached := map[string]bool{"/usr/lib/libcudart.so.12": true}
+	checker := newLibMismatchChecker(attached)
+
+	// First call for a PID — should check (we can't easily verify the log,
+	// just that it doesn't panic).
+	checker.Check(1234)
+
+	// Second call for same PID — should be a no-op (already checked).
+	checker.Check(1234)
+
+	// Nil checker should not panic.
+	var nilChecker *libMismatchChecker
+	nilChecker.Check(5678)
+}

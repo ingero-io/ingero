@@ -19,6 +19,7 @@ import (
 type Tracer struct {
 	libPath      string
 	stackEnabled bool
+	ringBufSize  uint32 // 0 = use compiled default
 	objs         driverTraceObjects
 	links        []link.Link
 	reader       *ringbuf.Reader
@@ -47,6 +48,14 @@ func WithStackCapture(enabled bool) Option {
 	}
 }
 
+// WithRingBufSize overrides the compiled-in ring buffer size (default 8MB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
+
 // New creates a new driver API tracer for the given libcuda.so path.
 func New(libcudaPath string, opts ...Option) *Tracer {
 	t := &Tracer{
@@ -61,7 +70,18 @@ func New(libcudaPath string, opts ...Option) *Tracer {
 
 // Attach loads the eBPF program and attaches uprobes to driver API functions.
 func (t *Tracer) Attach() error {
-	if err := loadDriverTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadDriverTrace()
+	if err != nil {
+		return fmt.Errorf("loading driver eBPF spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["driver_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading driver eBPF objects: %w", err)
 	}
 

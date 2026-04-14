@@ -2,6 +2,7 @@ package symtab
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 )
 
@@ -129,13 +130,6 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 		return nil, nil
 	}
 
-	offsets := GetPyOffsetsBest(info.LibPath, info.Minor)
-	if offsets == nil {
-		symDebugf("no offsets available for Python %s", info.Version)
-		w.cache[pid] = nil
-		return nil, nil
-	}
-
 	// Find _PyRuntime address.
 	runtimeAddr, err := findPyRuntimeAddr(pid, info)
 	if err != nil || runtimeAddr == 0 {
@@ -149,8 +143,38 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 	mem, err := OpenProcMem(pid)
 	if err != nil {
 		symDebugf("cannot open /proc/%d/mem: %v", pid, err)
+		slog.Warn("Python frame walking disabled — cannot read /proc/pid/mem",
+			"pid", pid, "error", err, "hint", "set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE")
 		w.cache[pid] = nil
 		return nil, err
+	}
+
+	// Try _Py_DebugOffsets first (CPython 3.12+ — no DWARF needed).
+	var offsets *PyOffsets
+	debugOffsets, debugErr := readDebugOffsets(mem, runtimeAddr, info.Minor)
+	if debugErr != nil {
+		symDebugf("readDebugOffsets failed for PID %d: %v", pid, debugErr)
+	}
+	if debugOffsets != nil {
+		symDebugf("using _Py_DebugOffsets from process memory for Python 3.%d", info.Minor)
+		offsets = debugOffsets
+	}
+
+	// Fall back to DWARF / hardcoded offsets.
+	if offsets == nil {
+		offsets = GetPyOffsetsBest(info.LibPath, info.Minor)
+	}
+
+	if offsets == nil {
+		symDebugf("no offsets available for Python %s", info.Version)
+		w.cache[pid] = nil
+		return nil, nil
+	}
+
+	// Warn once per process when using hardcoded fallback offsets (no DWARF, no _Py_DebugOffsets).
+	if offsets.Version == fmt.Sprintf("3.%d", info.Minor) {
+		slog.Warn("Python source attribution using fallback offsets — install python3-dbgsym for accurate frames",
+			"pid", pid, "python_version", fmt.Sprintf("3.%d", info.Minor))
 	}
 
 	state := &pyProcessState{

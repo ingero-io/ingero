@@ -19,6 +19,7 @@ import (
 // events to a Go channel.
 type Tracer struct {
 	libPath     string
+	ringBufSize uint32 // 0 = use compiled default
 	objs        cudaGraphTraceObjects
 	links       []link.Link
 	reader      *ringbuf.Reader
@@ -31,6 +32,14 @@ type Tracer struct {
 
 // Option configures a Tracer.
 type Option func(*Tracer)
+
+// WithRingBufSize overrides the compiled-in ring buffer size (default 4MB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
 
 // probeSpec defines a uprobe/uretprobe pair to attach.
 type probeSpec struct {
@@ -55,7 +64,18 @@ func New(libcudartPath string, opts ...Option) *Tracer {
 // All symbols are best-effort: if a symbol is not found in libcudart.so, it is
 // skipped with a warning (graceful degradation per NFR28).
 func (t *Tracer) Attach() error {
-	if err := loadCudaGraphTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadCudaGraphTrace()
+	if err != nil {
+		return fmt.Errorf("loading graph eBPF spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["graph_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading graph eBPF objects: %w", err)
 	}
 

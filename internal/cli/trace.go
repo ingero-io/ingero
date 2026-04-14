@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
+	"math/bits"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -61,6 +65,8 @@ var (
 	traceNoNet        bool          // Disable network socket tracing.
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 	traceNode         string        // Node identity for multi-node correlation.
+	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
+	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
 )
 
 var traceCmd = &cobra.Command{
@@ -100,8 +106,56 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
+	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
+	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
 
 	rootCmd.AddCommand(traceCmd)
+}
+
+// parseRingBufSize parses a human-readable size string (e.g., "32m", "16m",
+// "8388608") into a uint32 byte count. Validates that the result is a power
+// of 2 and at least 4096 (one page). Returns 0 if the input is empty.
+func parseRingBufSize(s string) (uint32, error) {
+	if s == "" {
+		return 0, nil
+	}
+
+	s = strings.TrimSpace(strings.ToLower(s))
+	var multiplier uint64 = 1
+	numStr := s
+
+	switch {
+	case strings.HasSuffix(s, "k"):
+		multiplier = 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "m"):
+		multiplier = 1024 * 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "g"):
+		multiplier = 1024 * 1024 * 1024
+		numStr = s[:len(s)-1]
+	}
+
+	n, err := strconv.ParseUint(numStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid ringbuf-size %q: %w", s, err)
+	}
+
+	total := n * multiplier
+	if total == 0 {
+		return 0, fmt.Errorf("ringbuf-size %q resolves to 0 bytes", s)
+	}
+	if total > 1<<32-1 {
+		return 0, fmt.Errorf("ringbuf-size %q exceeds uint32 max (4GB)", s)
+	}
+	if total < 4096 {
+		return 0, fmt.Errorf("ringbuf-size %q too small: minimum is 4096 (4k)", s)
+	}
+	if bits.OnesCount64(total) != 1 {
+		return 0, fmt.Errorf("ringbuf-size %q (%d bytes) is not a power of 2", s, total)
+	}
+
+	return uint32(total), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +163,15 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func traceRunE(cmd *cobra.Command, args []string) error {
+	// Parse --ringbuf-size early — fail fast on invalid input.
+	ringBufBytes, err := parseRingBufSize(traceRingBufSize)
+	if err != nil {
+		return err
+	}
+	if ringBufBytes > 0 {
+		debugf("ring buffer override applied to cuda/driver/host only (high-throughput probes): %d bytes", ringBufBytes)
+	}
+
 	// Resolve node identity early — fail fast if name contains colon.
 	nodeIdentity, err := ResolveNodeIdentity(traceNode)
 	if err != nil {
@@ -166,11 +229,16 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	//   --pid 123,456   → trace exactly those PIDs
 	//   --user bob      → trace all CUDA PIDs owned by bob
 	//   (default)       → trace all CUDA PIDs owned by SUDO_USER (invoking user)
-	libPath, targetPIDs, processNames, err := resolveTargets(tracePIDs)
+	libPaths, targetPIDs, processNames, err := resolveTargets(tracePIDs)
 	if err != nil {
 		return err
 	}
-	debugf("targets resolved: lib=%s pids=%v names=%v", libPath, targetPIDs, processNames)
+	if len(libPaths) == 0 {
+		return fmt.Errorf("no CUDA libraries found")
+	}
+	// Primary library path (first element) — used for display and backward compat.
+	libPath := libPaths[0]
+	debugf("targets resolved: libs=%v pids=%v names=%v", libPaths, targetPIDs, processNames)
 
 	// If --user not explicitly set and no --pid given, default to SUDO_USER
 	// so that "sudo ingero trace" traces the invoking user's processes, not root's.
@@ -223,36 +291,68 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Build PID filter for event loop (nil = accept all).
 	pidFilter := pidSetFromInts(targetPIDs)
 
-	// Step 2: Create CUDA tracer and attach eBPF uprobes.
+	// Step 2: Create CUDA tracer(s) and attach eBPF uprobes.
+	// When multiple libcudart.so copies are discovered (e.g., system + venv),
+	// create a tracer per library so probes fire regardless of which copy
+	// the workload loads.
 	var cudaOpts []cuda.Option
 	if traceStack {
 		cudaOpts = append(cudaOpts, cuda.WithStackCapture(true))
 	}
-	cudaTracer := cuda.New(libPath, cudaOpts...)
-	if err := cudaTracer.Attach(); err != nil {
-		return fmt.Errorf("attaching CUDA probes: %w", err)
+	if ringBufBytes > 0 {
+		cudaOpts = append(cudaOpts, cuda.WithRingBufSize(ringBufBytes))
 	}
-	defer cudaTracer.Close()
-	debugf("CUDA tracer: %d probes attached to %s", cudaTracer.ProbeCount(), libPath)
 
-	// Step 2b: Create CUDA Graph tracer (non-fatal — graceful degradation).
-	// Uses the same libcudart.so. If graph API symbols are absent, skips silently.
-	var graphTracer *cudagraph.Tracer
+	var cudaTracers []*cuda.Tracer
+	var graphTracers []*cudagraph.Tracer
 	graphProbeCount := 0
-	{
-		gt := cudagraph.New(libPath)
+
+	// Track all attached library paths (resolved) for runtime mismatch detection.
+	attachedLibs := make(map[string]bool)
+
+	for _, lp := range libPaths {
+		ct := cuda.New(lp, cudaOpts...)
+		if err := ct.Attach(); err != nil {
+			if len(libPaths) == 1 {
+				// Single library — hard failure (original behavior).
+				return fmt.Errorf("attaching CUDA probes: %w", err)
+			}
+			// Multiple libraries — log warning and continue with others.
+			fmt.Fprintf(os.Stderr, "  Warning: CUDA probes failed for %s: %v\n", lp, err)
+			debugf("CUDA tracer: attach failed for %s: %v", lp, err)
+			continue
+		}
+		cudaTracers = append(cudaTracers, ct)
+		attachedLibs[lp] = true
+		debugf("CUDA tracer: %d probes attached to %s", ct.ProbeCount(), lp)
+
+		// Step 2b: Create CUDA Graph tracer per library (non-fatal).
+		// ringbuf override not applied — graph is low-throughput; uses compiled default.
+		gt := cudagraph.New(lp)
 		if err := gt.Attach(); err != nil {
-			fmt.Fprintf(os.Stderr, "  graph probes: skipped (symbols not found)\n")
-			debugf("graph tracer: attach failed: %v", err)
+			debugf("graph tracer: attach failed for %s: %v", lp, err)
 		} else {
-			graphTracer = gt
-			graphProbeCount = gt.ProbeCount()
-			debugf("graph tracer: %d probes attached to %s", graphProbeCount, libPath)
+			graphTracers = append(graphTracers, gt)
+			graphProbeCount += gt.ProbeCount()
+			debugf("graph tracer: %d probes attached to %s", gt.ProbeCount(), lp)
 		}
 	}
-	if graphTracer != nil {
-		defer graphTracer.Close()
+	if len(cudaTracers) == 0 {
+		return fmt.Errorf("attaching CUDA probes: no libraries could be attached")
 	}
+	// Defers stack — all tracers close when traceRunE returns.
+	for _, ct := range cudaTracers {
+		defer ct.Close()
+	}
+	for _, gt := range graphTracers {
+		defer gt.Close()
+	}
+	if len(graphTracers) == 0 {
+		fmt.Fprintf(os.Stderr, "  graph probes: skipped (symbols not found)\n")
+	}
+
+	// Use first CUDA tracer as the "primary" for probe count display.
+	cudaTracer := cudaTracers[0]
 
 	// Step 3: Create host tracer (non-fatal — graceful degradation).
 	// Always attach host tracepoints. When no PIDs are targeted, the BPF
@@ -263,7 +363,11 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	{
 		// Seed with first PID (host.New takes one initial PID, 0 = none).
 		initialPID := singlePIDOrZero(targetPIDs)
-		ht := host.New(uint32(initialPID))
+		var hostOpts []host.Option
+		if ringBufBytes > 0 {
+			hostOpts = append(hostOpts, host.WithRingBufSize(ringBufBytes))
+		}
+		ht := host.New(uint32(initialPID), hostOpts...)
 		if err := ht.Attach(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: host tracepoints unavailable: %v\n", err)
 			fmt.Fprintf(os.Stderr, "  Continuing with CUDA-only mode.\n\n")
@@ -297,6 +401,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		if traceStack {
 			driverOpts = append(driverOpts, driver.WithStackCapture(true))
 		}
+		if ringBufBytes > 0 {
+			driverOpts = append(driverOpts, driver.WithRingBufSize(ringBufBytes))
+		}
 		dt := driver.New(libcudaPath, driverOpts...)
 		if err := dt.Attach(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: driver API tracing unavailable: %v\n", err)
@@ -314,6 +421,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3c: Create block I/O tracer (non-fatal).
+	// ringbuf override not applied — block I/O is low-throughput; uses compiled default.
 	var ioTracer *blockio.Tracer
 	ioProbeCount := 0
 	if !traceNoIO {
@@ -332,6 +440,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3d: Create TCP retransmit tracer (non-fatal).
+	// ringbuf override not applied — TCP is low-throughput; uses compiled default.
 	var tcpTracer *tcp.Tracer
 	tcpProbeCount := 0
 	if !traceNoTCP {
@@ -350,6 +459,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3e: Create network socket tracer (non-fatal).
+	// ringbuf override not applied — net is low-throughput; uses compiled default.
 	var netTracer *nettracer.Tracer
 	netProbeCount := 0
 	if !traceNoNet {
@@ -514,11 +624,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		HeartbeatInterval: traceHeartbeat,
 	}.NewSnapshotFilter()
 
+	// Sum CUDA probe counts across all tracers.
+	totalCUDAProbes := 0
+	for _, ct := range cudaTracers {
+		totalCUDAProbes += ct.ProbeCount()
+	}
+
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), graphProbeCount, hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
+	printTraceHeader(libPath, targetPIDs, processNames, totalCUDAProbes, graphProbeCount, hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
 
 	// Step 7: Launch tracers and merge event channels.
-	go cudaTracer.Run(ctx)
+	for _, ct := range cudaTracers {
+		go ct.Run(ctx)
+	}
 	if hostTracer != nil {
 		go hostTracer.Run(ctx)
 	}
@@ -528,9 +646,13 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// Launch new tracers — each feeds into the merged channel.
 	var extraChs [](<-chan events.Event)
-	if graphTracer != nil {
-		go graphTracer.Run(ctx)
-		extraChs = append(extraChs, graphTracer.Events())
+	// Additional CUDA tracers (beyond the primary) feed into extraChs.
+	for _, ct := range cudaTracers[1:] {
+		extraChs = append(extraChs, ct.Events())
+	}
+	for _, gt := range graphTracers {
+		go gt.Run(ctx)
+		extraChs = append(extraChs, gt.Events())
 	}
 	if ioTracer != nil {
 		go ioTracer.Run(ctx)
@@ -626,9 +748,15 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// droppedDetailFn captures tracer slices by reference. These slices are
+	// immutable after this point — do not append to cudaTracers/graphTracers.
+
 	// Combined dropped count from all tracers.
 	droppedFn := func() uint64 {
-		d := cudaTracer.Dropped()
+		var d uint64
+		for _, ct := range cudaTracers {
+			d += ct.Dropped()
+		}
 		if hostTracer != nil {
 			d += hostTracer.Dropped()
 		}
@@ -645,6 +773,35 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			d += netTracer.Dropped()
 		}
 		return d
+	}
+
+	// Per-tracer drop breakdown for display.
+	droppedDetailFn := func() string {
+		var cudaD, graphD uint64
+		for _, ct := range cudaTracers {
+			cudaD += ct.Dropped()
+		}
+		for _, gt := range graphTracers {
+			graphD += gt.Dropped()
+		}
+		var hostD, driverD, ioD, tcpD, netD uint64
+		if hostTracer != nil {
+			hostD = hostTracer.Dropped()
+		}
+		if driverTracer != nil {
+			driverD = driverTracer.Dropped()
+		}
+		if ioTracer != nil {
+			ioD = ioTracer.Dropped()
+		}
+		if tcpTracer != nil {
+			tcpD = tcpTracer.Dropped()
+		}
+		if netTracer != nil {
+			netD = netTracer.Dropped()
+		}
+		return fmt.Sprintf("cuda=%d driver=%d host=%d io=%d tcp=%d net=%d graph=%d",
+			cudaD, driverD, hostD, ioD, tcpD, netD, graphD)
 	}
 
 	// Dynamic PID tracking: when tracing all processes (no --pid), we add
@@ -686,13 +843,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Step 8: Build PID→name cache for JSON output enrichment.
 	procNames = newPIDNameCache(targetPIDs, processNames)
 
+	// Library mismatch checker: on first CUDA event per PID, verify the
+	// process's loaded libcudart.so matches one of our attached libraries.
+	// Warns once per PID if there's a mismatch (e.g., venv library vs system).
+	mismatchCheck := newLibMismatchChecker(attachedLibs)
+
 	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
+		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
+	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, trackPID)
 }
 
 
@@ -1030,21 +1192,32 @@ func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, host
 // Target resolution
 // ---------------------------------------------------------------------------
 
-// resolveTargets finds the libcudart.so path and target processes.
+// resolveTargets finds the libcudart.so path(s) and target processes.
 //
 // Resolution order:
-//  1. If --pid is specified: validate each PID in FindCUDAProcesses(), return lib from first
-//  2. If auto-detect: return ALL found CUDA processes (not just the first)
-//  3. Fallback: search filesystem for libcudart.so (attach to library,
-//     probes fire for ANY process that loads it)
+//  1. If --cuda-lib is set: use that path exclusively, skip all discovery
+//  2. If --pid is specified: validate each PID in FindCUDAProcesses(), return lib from first
+//  3. If auto-detect: return ALL found CUDA processes (not just the first)
+//  4. Fallback (no processes): call FindAllLibCUDART() to discover ALL copies
+//     of the library (system + venv). Probes fire for ANY process that loads it.
 //
-// Returns (libPath, pids, processNames, error). Empty pids means "all processes".
-func resolveTargets(pids []int) (string, []int, []string, error) {
+// Returns (libPaths, pids, processNames, error).
+// libPaths[0] is the "primary" library (used for header display, etc.).
+// Empty pids means "all processes".
+func resolveTargets(pids []int) ([]string, []int, []string, error) {
+	// --cuda-lib: explicit path, skip all discovery.
+	if traceCUDALib != "" {
+		if _, err := os.Stat(traceCUDALib); err != nil {
+			return nil, nil, nil, fmt.Errorf("--cuda-lib path not accessible: %w", err)
+		}
+		return []string{traceCUDALib}, nil, nil, nil
+	}
+
 	if len(pids) > 0 {
 		// User specified PID(s) — find their libcudart.so.
 		procs, err := discover.FindCUDAProcesses()
 		if err != nil {
-			return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
+			return nil, nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 		}
 
 		procMap := make(map[int]discover.CUDAProcess)
@@ -1058,7 +1231,7 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 		for _, pid := range pids {
 			p, ok := procMap[pid]
 			if !ok {
-				return "", nil, nil, fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
+				return nil, nil, nil, fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
 			}
 			if libPath == "" {
 				libPath = p.LibCUDAPath
@@ -1066,13 +1239,13 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 			resolvedPIDs = append(resolvedPIDs, p.PID)
 			names = append(names, p.Name)
 		}
-		return libPath, resolvedPIDs, names, nil
+		return []string{libPath}, resolvedPIDs, names, nil
 	}
 
 	// Auto-detect: find ALL CUDA processes.
 	procs, err := discover.FindCUDAProcesses()
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
+		return nil, nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 	}
 
 	if len(procs) > 0 {
@@ -1082,22 +1255,29 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 			resolvedPIDs = append(resolvedPIDs, p.PID)
 			names = append(names, p.Name)
 		}
-		return procs[0].LibCUDAPath, resolvedPIDs, names, nil
+		return []string{procs[0].LibCUDAPath}, resolvedPIDs, names, nil
 	}
 
-	// No running CUDA processes — attach to library on disk.
-	// Probes fire when any process later loads it.
-	libPath, err := discover.FindLibCUDART()
-	if err != nil {
-		return "", nil, nil, fmt.Errorf(
+	// No running CUDA processes — discover ALL copies of libcudart.so.
+	// Attach probes to every copy so that venv-bundled libraries are covered.
+	libPaths := discover.FindAllLibCUDART()
+	if len(libPaths) == 0 {
+		return nil, nil, nil, fmt.Errorf(
 			"no CUDA processes found and libcudart.so not found.\n"+
 				"  Start a GPU workload first, or install CUDA toolkit.\n"+
 				"  Run 'ingero check' for detailed diagnostics")
 	}
 
-	fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPath)
+	if len(libPaths) == 1 {
+		fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPaths[0])
+	} else {
+		fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %d libraries:\n", len(libPaths))
+		for _, p := range libPaths {
+			fmt.Fprintf(os.Stderr, "    %s\n", p)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "  Probes will fire when a CUDA workload starts.\n\n")
-	return libPath, nil, nil, nil
+	return libPaths, nil, nil, nil
 }
 
 // resolveProcessNames looks up names for a list of PIDs via FindCUDAProcesses.
@@ -1115,6 +1295,62 @@ func resolveProcessNames(pids []int) []string {
 		names[i] = procMap[pid]
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------------
+// Library mismatch checker
+// ---------------------------------------------------------------------------
+
+// libMismatchChecker detects when a CUDA process has loaded a libcudart.so
+// that doesn't match any of the libraries ingero attached probes to. This
+// happens when a venv bundles its own libcudart.so but ingero only probed the
+// system copy (or vice versa). Warns once per PID via slog.Warn.
+//
+// Safe for concurrent use — Check() is guarded by a mutex.
+type libMismatchChecker struct {
+	mu           sync.Mutex
+	attachedLibs map[string]bool // resolved paths of libraries with probes
+	checked      map[uint32]bool // PIDs already checked (warn-once)
+}
+
+func newLibMismatchChecker(attachedLibs map[string]bool) *libMismatchChecker {
+	return &libMismatchChecker{
+		attachedLibs: attachedLibs,
+		checked:      make(map[uint32]bool),
+	}
+}
+
+// Check reads /proc/<pid>/maps on first CUDA event for this PID and logs
+// a warning if the loaded library doesn't match any attached library.
+func (c *libMismatchChecker) Check(pid uint32) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.checked[pid] {
+		c.mu.Unlock()
+		return
+	}
+	c.checked[pid] = true
+	c.mu.Unlock()
+
+	loadedLib, err := discover.FindCUDAInMaps(int(pid))
+	if err != nil || loadedLib == "" {
+		return // process gone or no CUDA mapping — skip silently
+	}
+
+	// Check if the loaded library matches any attached library.
+	if c.attachedLibs[loadedLib] {
+		return // exact match
+	}
+
+	// Try resolved path comparison for symlink differences.
+	resolved, err := filepath.EvalSymlinks(loadedLib)
+	if err == nil && c.attachedLibs[resolved] {
+		return
+	}
+
+	slog.Warn("PID loaded libcudart.so not matching any attached library", "pid", pid, "loaded_lib", loadedLib)
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,7 +1422,7 @@ func (c *pidNameCache) Names() map[uint32]string {
 // runTableMode consumes events and refreshes a stats table every second.
 // corrPID is the correlator PID (single PID or 0 for aggregate).
 // pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, droppedDetailFn func() string, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, onFork ...func(uint32)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1263,7 +1499,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			if eventStore != nil && len(chains) > 0 {
 				eventStore.RecordChains(chainsToStored(chains))
 			}
-			renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+			renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 			return nil
 
 		case evt, ok := <-eventCh:
@@ -1283,7 +1519,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				if eventStore != nil && len(chains) > 0 {
 					eventStore.RecordChains(chainsToStored(chains))
 				}
-				renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 				return nil
 			}
 
@@ -1364,6 +1600,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			}
 			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver || evt.Source == events.SourceCUDAGraph) {
 				cudaPIDs[evt.PID] = true
+			}
+
+			// Runtime library mismatch check: on first CUDA event per PID,
+			// verify the process loaded a library we have probes on.
+			if mismatchCheck != nil && evt.Source == events.SourceCUDA {
+				mismatchCheck.Check(evt.PID)
 			}
 
 			// Resolve process name for non-host events (CUDA, Driver, IO, TCP, Net).
@@ -1491,7 +1733,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 						eventStore.ExpireChains(2 * time.Minute)
 					}
 				}
-				renderTable(snap, droppedFn(), &linesDrawn, false, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, false, corrs, chains)
 			}
 
 		case <-debugTickerCh:
@@ -1604,7 +1846,7 @@ func renderSystemLine(b *strings.Builder, lines *int, sys *stats.SystemSnapshot)
 	*lines++
 }
 
-func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
+func renderTable(snap *stats.Snapshot, dropped uint64, droppedDetail string, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
 	var b strings.Builder
 
 	// Move cursor up to overwrite previous output.
@@ -1687,6 +1929,18 @@ func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bo
 	fmt.Fprintf(&b, "%s\033[K\n", summary)
 	lines++
 
+	// Per-tracer drop breakdown (always shown when any drops occurred).
+	if dropped > 0 && droppedDetail != "" {
+		dropLine := fmt.Sprintf("  Events dropped: %s", droppedDetail)
+		// WARN if drops exceed 5% of total events.
+		totalEvts := snap.TotalEvents + dropped
+		if totalEvts > 0 && float64(dropped)/float64(totalEvts) > 0.05 {
+			dropLine += "  WARN: >5% of events dropped -- consider --ringbuf-size"
+		}
+		fmt.Fprintf(&b, "%s\033[K\n", dropLine)
+		lines++
+	}
+
 	// Spike patterns.
 	for _, op := range snap.Ops {
 		if op.SpikePattern != "" {
@@ -1756,7 +2010,7 @@ type jsonEvent struct {
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
 // pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, mismatchCheck *libMismatchChecker, onFork ...func(uint32)) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	// Periodic debug throughput counter (same as runTableMode).
@@ -1913,6 +2167,12 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			}
 			if cudaPIDs != nil && (evt.Source == events.SourceCUDA || evt.Source == events.SourceDriver || evt.Source == events.SourceCUDAGraph) {
 				cudaPIDs[evt.PID] = true
+			}
+
+			// Runtime library mismatch check: on first CUDA event per PID,
+			// verify the process loaded a library we have probes on.
+			if mismatchCheck != nil && evt.Source == events.SourceCUDA {
+				mismatchCheck.Check(evt.PID)
 			}
 
 			// Dynamic PID tracking: fork child → eBPF target_pids only.
