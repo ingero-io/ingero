@@ -6,10 +6,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/ingero-io/ingero/internal/procpath"
 )
 
 // harvestScript is a self-contained Python program that discovers CPython
@@ -267,14 +271,45 @@ type HarvestedOffsets struct {
 // Errors are returned for genuine failures (binary missing, subprocess
 // non-zero exit with stderr). Empty stdout returns (&HarvestedOffsets{}, nil)
 // so the caller can proceed with fallbacks.
-func HarvestOffsets(pythonBinary string) (*HarvestedOffsets, error) {
+//
+// pid is the target process whose Python interpreter to impersonate. When
+// ingero runs in a container (our /proc/self/ns/mnt differs from the
+// target's) and we have root, we chroot the subprocess into /proc/<pid>/root
+// so ld-linux finds the target's libpython + stdlib, not ingero's container
+// filesystem (which typically lacks Python entirely). Requires euid 0.
+// If pid <= 0, or we're not root, or the namespaces match, or the chroot
+// setup fails at any step, we fall through to a plain subprocess — the
+// same behavior as before this flag existed.
+//
+// LD_LIBRARY_PATH / LD_PRELOAD / LD_* are stripped from the child env when
+// chrooting, since the caller's ld-linux hints reference the caller's
+// namespace and won't be valid under the new root.
+func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, pythonBinary, "-c", harvestScript)
+	// If not running inside a chroot, the target-namespace path may not be
+	// openable from our own namespace. Try to translate — but only when we
+	// *won't* chroot below (in which case the child needs the target-
+	// namespace path directly).
+	effectiveBinary := pythonBinary
+	useChroot := shouldChrootForPID(pid)
+	if !useChroot {
+		effectiveBinary = procpath.ResolveContainerPath(pid, pythonBinary)
+	}
+
+	cmd := exec.CommandContext(ctx, effectiveBinary, "-c", harvestScript)
+	if useChroot {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Chroot: fmt.Sprintf("/proc/%d/root", pid),
+		}
+		cmd.Dir = "/" // chroot is applied after Dir; cwd must exist post-chroot
+		cmd.Env = filterLDEnv(os.Environ())
+	}
+
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("running harvester via %s: %w", pythonBinary, err)
+		return nil, fmt.Errorf("running harvester via %s: %w", effectiveBinary, err)
 	}
 
 	result := &HarvestedOffsets{}
@@ -396,4 +431,42 @@ func (h *HarvestedOffsets) Overlay(base *PyOffsets) *PyOffsets {
 	}
 	out.Version = out.Version + "+harvested"
 	return &out
+}
+
+// shouldChrootForPID reports whether the harvester subprocess should chroot
+// into /proc/<pid>/root to inherit the target's filesystem view. True only
+// when pid > 0, euid is 0 (chroot requires it), /proc/<pid>/root exists,
+// and the target's mount namespace is distinct from ingero's own (compared
+// via /proc/self/ns/mnt vs /proc/<pid>/ns/mnt readlinks). Any step failing
+// returns false so the plain-exec fallback takes over.
+func shouldChrootForPID(pid int) bool {
+	if pid <= 0 || os.Geteuid() != 0 {
+		return false
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root", pid)); err != nil {
+		return false
+	}
+	self, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		return false
+	}
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", pid))
+	if err != nil {
+		return false
+	}
+	return self != target
+}
+
+// filterLDEnv returns env minus LD_LIBRARY_PATH, LD_PRELOAD, and any other
+// LD_* variable — these reference the caller's namespace and will mislead
+// the child's ld-linux after a chroot into the target's root.
+func filterLDEnv(env []string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LD_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

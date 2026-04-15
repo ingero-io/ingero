@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/ingero-io/ingero/internal/procpath"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -196,10 +197,17 @@ func FindPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 // it can never find _PyRuntime. We use FindSymbolByName() which searches
 // all symbol types.
 func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
+	// When ingero runs in a container, info.LibPath (from /proc/PID/maps) is
+	// in the target's mount namespace. Resolve via /proc/<pid>/root/ so we
+	// can open the ELF from our own namespace. On bare metal / shared mounts
+	// this is a no-op. The /proc/PID/maps match loop below continues to use
+	// info.LibPath unchanged — it compares against target-namespace strings.
+	elfPath := procpath.ResolveContainerPath(int(pid), info.LibPath)
+
 	// Look up _PyRuntime by name — searches STT_FUNC, STT_OBJECT, STT_NOTYPE.
-	symValue, pie, baseVA, found := FindSymbolByName(info.LibPath, "_PyRuntime")
+	symValue, pie, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
 	if !found {
-		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", info.LibPath)
+		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
 	}
 
 	// Parse /proc/[pid]/maps to find the library's base address.

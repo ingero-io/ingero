@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/ingero-io/ingero/internal/procpath"
 )
 
 // CUDAProcess represents a running process that has loaded CUDA runtime.
@@ -77,7 +79,7 @@ func findCUDAInMaps(pid int) (string, error) {
 			// Extract the file path (last field on the line)
 			path := extractPathFromMapsLine(line)
 			if path != "" {
-				return resolveContainerPath(pid, path), nil
+				return procpath.ResolveContainerPath(pid, path), nil
 			}
 		}
 	}
@@ -427,27 +429,11 @@ func findLibInProcMaps(pid int, substr string) (string, error) {
 		if len(fields) >= 6 {
 			path := fields[len(fields)-1]
 			if strings.Contains(path, substr) {
-				return resolveContainerPath(pid, path), nil
+				return procpath.ResolveContainerPath(pid, path), nil
 			}
 		}
 	}
 	return "", scanner.Err()
-}
-
-// resolveContainerPath handles library path resolution when ingero runs in a
-// container (e.g., K8s DaemonSet). Paths from /proc/[pid]/maps refer to the
-// target process's mount namespace. If the path doesn't exist in our namespace
-// (container), resolve through /proc/[pid]/root/ which traverses the target's
-// filesystem. On bare metal this is a no-op (direct path always exists).
-func resolveContainerPath(pid int, path string) string {
-	if _, err := os.Stat(path); err == nil {
-		return path // Direct path works (bare metal or shared mount)
-	}
-	altPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
-	if _, err := os.Stat(altPath); err == nil {
-		return altPath
-	}
-	return path // Return original; let caller handle the error
 }
 
 // readProcFile reads a small /proc file and returns its trimmed content.
