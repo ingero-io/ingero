@@ -110,7 +110,7 @@ static const struct py_frame *_unused_py_frame __attribute__((unused));
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 16);
+	__uint(max_entries, 32);
 	__type(key, __u32);
 	__type(value, __u64);
 } py_debug_stats SEC(".maps");
@@ -230,10 +230,18 @@ static __always_inline __u64 find_thread_state(
 /*
  * walk_python_frames_312: CPython 3.12 frame walker.
  *
- * In 3.12, PyThreadState.current_frame points directly at the top
- * _PyInterpreterFrame. Each interpreter frame has:
- *   - .previous     (walk pointer, off_frame_back)
- *   - .executable   (PyCodeObject*, off_frame_code)
+ * In 3.12, PyThreadState.current_frame is a DIRECT _PyInterpreterFrame*
+ * (no cframe indirection — that was 3.11's design). Each frame has:
+ *   - .f_code     (PyCodeObject*, off_frame_code)
+ *   - .previous   (walk pointer, off_frame_back)
+ *
+ * At uprobe time inside a C extension call (e.g. cudaMalloc), CPython
+ * pushes a stack-allocated "entry frame stub" on top. The stub may have
+ * uninitialized garbage in the f_code slot (low bits of an unrelated
+ * value), so checking `code_ptr != 0` is too weak. We require code_ptr
+ * to be a userspace heap pointer (>= 0x100000 and below the canonical
+ * x86_64 user VA top) and walk .previous over stubs until we find a
+ * real Python frame.
  *
  * Preconditions:
  *   - result is non-NULL and already zeroed (depth=0, truncated=0).
@@ -256,28 +264,41 @@ static __always_inline int walk_python_frames_312(
 	    (const void *)(tstate + st->off_tstate_frame)) != 0)
 		return 0;
 
-	/* Walk frame chain (bounded). */
+	/* Walk frame chain (bounded). emit-count is bounded by PY_MAX_FRAMES;
+	 * traversal-count is bounded separately (we may skip stub frames). */
+	int emitted = 0;
 	#pragma unroll(16)
-	for (int i = 0; i < PY_MAX_FRAMES; i++) {
-		if (frame == 0)
+	for (int walk_iter = 0; walk_iter < 16; walk_iter++) {
+		if (frame == 0 || emitted >= PY_MAX_FRAMES)
 			break;
-		if (i == 0)
+		if (walk_iter == 0)
 			py_debug_inc(7);  /* frame_loop_first_iteration */
 
-		struct py_frame *out = &result->frames[i];
-		out->filename[0] = 0;
-		out->funcname[0] = 0;
-		out->firstlineno = 0;
-
-		/* frame->executable -> PyCodeObject */
+		/* frame->f_code -> PyCodeObject */
 		__u64 code_ptr = 0;
 		if (bpf_probe_read_user(&code_ptr, sizeof(code_ptr),
 		    (const void *)(frame + st->off_frame_code)) != 0)
 			break;
-		if (code_ptr == 0)
+
+		/* frame->previous (read before deciding so we can skip stubs). */
+		__u64 prev = 0;
+		if (bpf_probe_read_user(&prev, sizeof(prev),
+		    (const void *)(frame + st->off_frame_back)) != 0)
 			break;
 
-		/* code->co_filename, co_name (PyUnicodeObject pointers) */
+		/* Heap-range check: stubs (entry frames for C calls) live on the
+		 * C stack with garbage in f_code. Real PyCodeObjects are
+		 * heap-allocated, well above any static binary mapping. */
+		if (code_ptr <= 0x100000 || code_ptr >= 0x800000000000) {
+			frame = prev;
+			continue;
+		}
+
+		struct py_frame *out = &result->frames[emitted];
+		out->filename[0] = 0;
+		out->funcname[0] = 0;
+		out->firstlineno = 0;
+
 		__u64 fn_ptr = 0;
 		if (bpf_probe_read_user(&fn_ptr, sizeof(fn_ptr),
 		    (const void *)(code_ptr + st->off_code_filename)) == 0)
@@ -290,17 +311,11 @@ static __always_inline int walk_python_frames_312(
 			read_compact_ascii(out->funcname, sizeof(out->funcname),
 			                   nm_ptr, st);
 
-		/* code->co_firstlineno (int32) */
 		bpf_probe_read_user(&out->firstlineno, sizeof(out->firstlineno),
 		    (const void *)(code_ptr + st->off_code_firstlineno));
 
-		result->depth = i + 1;
-
-		/* Advance to previous frame. */
-		__u64 prev = 0;
-		if (bpf_probe_read_user(&prev, sizeof(prev),
-		    (const void *)(frame + st->off_frame_back)) != 0)
-			break;
+		emitted++;
+		result->depth = emitted;
 		frame = prev;
 	}
 
@@ -329,41 +344,104 @@ static __always_inline int walk_python_frames_311(
     const struct py_runtime_state *st,
     struct py_walk_result *result)
 {
+	py_debug_inc(10);  /* entered_311 */
 	__u64 tstate = find_thread_state(native_tid, st);
 	if (tstate == 0)
 		return 0;
+	py_debug_inc(11);  /* 311_thread_found */
 
 	/* tstate->cframe -> _PyCFrame* */
 	__u64 cframe_ptr = 0;
 	if (bpf_probe_read_user(&cframe_ptr, sizeof(cframe_ptr),
 	    (const void *)(tstate + st->off_tstate_frame)) != 0)
 		return 0;
+	py_debug_inc(12);  /* 311_cframe_read_ok */
 	if (cframe_ptr == 0)
 		return 0;
+	py_debug_inc(13);  /* 311_cframe_nonzero */
 
-	/* cframe->current_frame -> _PyInterpreterFrame* */
-	__u64 frame = 0;
-	if (bpf_probe_read_user(&frame, sizeof(frame),
+	/* cframe->current_frame -> _PyInterpreterFrame*
+	 *
+	 * At uprobe time inside a C extension (e.g. cudaMalloc), CPython has
+	 * pushed an "entry frame stub" on top. The stub typically lives at a
+	 * STATIC address (in libpython's .data section) and contains garbage
+	 * in the f_code slot — not zero, just not a valid heap pointer. So
+	 * "f_code != 0" is too weak a check. We require f_code to be a
+	 * userspace-heap pointer (>= 0x100000 and <= USERVA_TOP).
+	 *
+	 * Walk strategy: start at cframe.current_frame and follow the
+	 * interp_frame.previous chain (each stub points to the real frame
+	 * above it) up to 8 hops, accepting the first frame whose f_code is
+	 * heap-range. */
+	__u64 cand = 0;
+	if (bpf_probe_read_user(&cand, sizeof(cand),
 	    (const void *)(cframe_ptr + st->off_cframe_current_frame)) != 0)
 		return 0;
 
-	/* Walk frame chain (bounded). Layout identical to 3.12 from here. */
-	#pragma unroll(16)
-	for (int i = 0; i < PY_MAX_FRAMES; i++) {
-		if (frame == 0)
+	__u64 frame = 0;
+	#pragma unroll(8)
+	for (int hop = 0; hop < 8; hop++) {
+		if (cand == 0) break;
+		__u64 first_word = 0;
+		if (bpf_probe_read_user(&first_word, sizeof(first_word),
+		    (const void *)(cand + st->off_frame_code)) != 0) break;
+		/* Heap-range check: stubs (entry frames for C calls) live on the
+		 * C stack with garbage in the f_code slot. Real PyCodeObjects are
+		 * heap-allocated, well above any static binary mapping. */
+		if (first_word > 0x100000 && first_word < 0x800000000000) {
+			frame = cand;
 			break;
+		}
+		__u64 prev_frame = 0;
+		if (bpf_probe_read_user(&prev_frame, sizeof(prev_frame),
+		    (const void *)(cand + st->off_frame_back)) != 0) break;
+		cand = prev_frame;
+	}
+	py_debug_inc(14);  /* 311_interp_frame_read_ok */
+	if (frame != 0) py_debug_inc(15);  /* 311_frame_nonzero */
 
-		struct py_frame *out = &result->frames[i];
-		out->filename[0] = 0;
-		out->funcname[0] = 0;
-		out->firstlineno = 0;
+	/* Walk frame chain (bounded). Layout identical to 3.12 from here.
+	 *
+	 * IMPORTANT: CPython allocates "entry frame" stubs at the top of the
+	 * frame stack when transitioning between Python and C extension code
+	 * (e.g. inside a C extension called from Python). Entry frames have
+	 * f_code == NULL but a valid `previous` pointer linking back to the
+	 * nearest real Python frame. At uprobe time for a C function like
+	 * cudaMalloc, tstate->cframe->current_frame typically IS one of these
+	 * stubs — so on code_ptr == 0 we must FOLLOW the previous chain and
+	 * try again rather than breaking out. `i` only increments when we
+	 * actually emit a frame (so PY_MAX_FRAMES bounds emitted depth, not
+	 * traversal count). We bound traversal separately with a larger cap.
+	 */
+	int emitted = 0;
+	#pragma unroll(16)
+	for (int walk_iter = 0; walk_iter < 16; walk_iter++) {
+		if (frame == 0 || emitted >= PY_MAX_FRAMES)
+			break;
+		if (walk_iter == 0) py_debug_inc(7);  /* frame_loop_first_iteration */
 
 		__u64 code_ptr = 0;
 		if (bpf_probe_read_user(&code_ptr, sizeof(code_ptr),
 		    (const void *)(frame + st->off_frame_code)) != 0)
 			break;
-		if (code_ptr == 0)
+		if (walk_iter == 0) py_debug_inc(16);  /* 311_loop_code_read_ok */
+
+		__u64 prev = 0;
+		if (bpf_probe_read_user(&prev, sizeof(prev),
+		    (const void *)(frame + st->off_frame_back)) != 0)
 			break;
+
+		if (code_ptr == 0) {
+			/* Entry-frame stub — skip and try parent. */
+			frame = prev;
+			continue;
+		}
+		if (walk_iter == 0) py_debug_inc(17);  /* 311_loop_code_nonzero */
+
+		struct py_frame *out = &result->frames[emitted];
+		out->filename[0] = 0;
+		out->funcname[0] = 0;
+		out->firstlineno = 0;
 
 		__u64 fn_ptr = 0;
 		if (bpf_probe_read_user(&fn_ptr, sizeof(fn_ptr),
@@ -380,17 +458,14 @@ static __always_inline int walk_python_frames_311(
 		bpf_probe_read_user(&out->firstlineno, sizeof(out->firstlineno),
 		    (const void *)(code_ptr + st->off_code_firstlineno));
 
-		result->depth = i + 1;
-
-		__u64 prev = 0;
-		if (bpf_probe_read_user(&prev, sizeof(prev),
-		    (const void *)(frame + st->off_frame_back)) != 0)
-			break;
+		emitted++;
+		result->depth = emitted;
 		frame = prev;
 	}
 
 	if (frame != 0)
 		result->truncated = 1;
+	if (result->depth > 0) py_debug_inc(8);  /* depth_gt_zero (shared with _312) */
 
 	return 0;
 }
@@ -503,18 +578,32 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 	py_debug_inc(1);  /* state_lookup_ok */
 
 	/* Branch on python_minor. 0 = legacy client (pre-v2 struct), treat as 12
-	 * for backward compatibility — matches the assumption the original
-	 * 3.12-only walker made before multi-version support. */
+	 * for backward compatibility. */
 	__u8 minor = st->python_minor;
 	if (minor == 0)
 		minor = 12;
 
+	/* CPython layout note: both 3.11 and 3.12 use the cframe indirection
+	 * (tstate.cframe -> _PyCFrame.current_frame -> _PyInterpreterFrame).
+	 * CPython 3.13+ dropped the cframe and made current_frame direct.
+	 *
+	 * walker_311 handles the two-pointer-chase correctly; walker_312 was
+	 * previously (mis)configured for the direct layout and is kept for
+	 * 3.13+ use once we wire up a 3.13 dispatch path.
+	 *
+	 * Dispatch heuristic for 3.12+ uses off_cframe_current_frame: when
+	 * non-zero, use cframe indirection; when zero, assume direct access.
+	 * Userspace harvester sets this based on empirical runtime probing. */
 	switch (minor) {
 	case 10:
 		return walk_python_frames_310(pid, native_tid, st, result);
 	case 11:
 		return walk_python_frames_311(pid, native_tid, st, result);
 	case 12:
+		/* Real 3.12 has cframe indirection; 3.13 doesn't. Choose based
+		 * on whether the harvester discovered a non-zero cframe offset. */
+		if (st->off_cframe_current_frame > 0)
+			return walk_python_frames_311(pid, native_tid, st, result);
 		return walk_python_frames_312(pid, native_tid, st, result);
 	default:
 		/* Unsupported minor — return 0 frames; userspace walker fills in. */

@@ -967,6 +967,20 @@ func dumpPyDebugStats(m *ebpf.Map) {
 		"frame_loop_first_iteration",
 		"depth_gt_zero",
 		"read_first_native_tid",
+		"entered_311",
+		"311_thread_found",
+		"311_cframe_read_ok",
+		"311_cframe_nonzero",
+		"311_interp_frame_read_ok",
+		"311_frame_nonzero",
+		"311_loop_code_read_ok",
+		"311_loop_code_nonzero",
+		"_unused_18", "_unused_19", "_unused_20", "_unused_21",
+		"_unused_22", "_unused_23", "_unused_24",
+		"scratch_lookup_ok",
+		"have_py_set",
+		"entered_pyextended_branch",
+		"reserved_pyextended",
 	}
 	numCPU := runtime.NumCPU()
 	fmt.Fprintln(os.Stderr, "  py-walker debug counters:")
@@ -1666,6 +1680,16 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 	} else if harvested != nil {
 		offsets = harvested.Overlay(offsets)
 		debugf("py-walker: overlaid runtime-harvested offsets onto %s table for PID %d", offsets.Version, pid)
+	}
+
+	// CPython 3.12 ALWAYS uses tstate.current_frame directly (no cframe
+	// indirection). The harvester's empirical scan can falsely conclude
+	// indirection because parent_frame.previous points to its child, mimicking
+	// the cframe-current_frame relationship. Force direct access for 3.12 so
+	// the dispatcher routes to walker_312 (which validates code_ptr is a heap
+	// pointer and skips C-call entry-frame stubs).
+	if info.Minor == 12 {
+		offsets.CframeCurrentFrame = 0
 	}
 
 	// Overlay _Py_DebugOffsets if present (3.13+).

@@ -138,19 +138,23 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 		    bpf_map_lookup_elem(&py_scratch, &zero);
 		int have_py = 0;
 		if (py_result) {
+			py_debug_inc(25);  /* scratch_lookup_ok */
 			py_result->depth = 0;
 			py_result->truncated = 0;
 			if (walk_python_frames(pid, tid, py_result) == 0 &&
 			    py_result->depth > 0) {
 				have_py = 1;
+				py_debug_inc(26);  /* have_py_set */
 			}
 		}
 
 		if (have_py && py_result) {
+			py_debug_inc(27);  /* entered_pyextended_branch */
 			struct cuda_event_stack_py *pevt;
 			pevt = bpf_ringbuf_reserve(&events, sizeof(*pevt), 0);
 			if (!pevt)
 				goto emit_stack_only; /* fall through to stack-only */
+			py_debug_inc(28);  /* reserved_pyextended */
 
 			struct cuda_event_stack *sevt = &pevt->base;
 			sevt->hdr.timestamp_ns = entry->timestamp_ns;

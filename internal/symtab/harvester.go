@@ -39,6 +39,23 @@ code_addr = id(code)
 
 emit('PyMinor', sys.version_info.minor)
 
+# Safe-read helper — dereferencing arbitrary pointers from ctypes can
+# segfault (unmapped memory). /proc/self/mem returns EIO cleanly.
+_mem_fd = os.open('/proc/self/mem', os.O_RDONLY)
+_MAX_VADDR = 0x00007fffffffffff  # canonical x86_64 user VA top
+
+def safe_read(addr, n):
+    if addr < 0x1000 or addr > _MAX_VADDR:
+        return None
+    try:
+        b = os.pread(_mem_fd, n, addr)
+        return b if len(b) == n else None
+    except OSError:
+        return None
+
+def u64_at(buf, off):
+    return int.from_bytes(buf[off:off+8], 'little')
+
 # --- Find the interpreter frame (_PyInterpreterFrame) pointer and validate it.
 # A candidate C from PyFrameObject's bytes is a real interp frame iff reading
 # forward from C reveals code_addr (at C + FrameCode). That anchors us to the
@@ -47,28 +64,71 @@ interp_frame = 0
 frame_code_off = -1
 fr_buf = list((ctypes.c_uint64 * 32).from_address(frame_addr))
 for fr_val in fr_buf:
-    if fr_val < 0x1000: continue
-    try:
-        cand = (ctypes.c_uint64 * 25).from_address(fr_val)
-        for j, w in enumerate(cand):
-            if w == code_addr:
-                interp_frame = fr_val
-                frame_code_off = j * 8
-                break
-        if interp_frame: break
-    except (OSError, ValueError): continue
+    if fr_val < 0x1000 or fr_val > _MAX_VADDR: continue
+    data = safe_read(fr_val, 200)
+    if not data: continue
+    for j in range(25):
+        if u64_at(data, j*8) == code_addr:
+            interp_frame = fr_val
+            frame_code_off = j * 8
+            break
+    if interp_frame: break
 
 if frame_code_off >= 0: emit('FrameCode', frame_code_off)
 
-# --- TstateFrame: search widely in tstate for the validated interp_frame ptr.
-# tstate can be large (thousands of bytes); scan aggressively.
+# --- TstateFrame + OffCframeCurrentFrame discovery.
+#
+# CPython 3.12 actually stores the top _PyInterpreterFrame DIRECTLY in
+# tstate.current_frame (no cframe indirection). The legacy cframe field
+# still exists but is not what callers should walk through. CPython 3.11
+# does use _PyCFrame indirection (.cframe -> .current_frame).
+#
+# Heuristic order:
+#   1. Direct: scan tstate for a pointer P such that *P+0 looks like a
+#      PyCodeObject (i.e., P is itself an interp_frame whose f_code at
+#      offset 0 is the valid code pointer). The harvester process's
+#      sys._getframe() stack means the live current frame is the harvester
+#      script's own frame; its f_code IS code_addr. So *P+0 == code_addr
+#      is the test that picks the DIRECT current_frame field.
+#   2. Cframe indirection: P is a cframe, and *P+small_off contains
+#      interp_frame (used by 3.11).
+tstate_frame_off = -1
+cframe_cf_off = -1
+ts_wide = (ctypes.c_uint64 * 512).from_address(tstate)
 if interp_frame:
-    ts_wide = (ctypes.c_uint64 * 512).from_address(tstate)
+    # Strategy 1: P is direct interp_frame (P[0] == code_addr)
     for i in range(512):
         try:
-            if ts_wide[i] == interp_frame:
-                emit('TstateFrame', i * 8); break
-        except (IndexError): break
+            p = ts_wide[i]
+        except IndexError: break
+        if p < 0x1000 or p > _MAX_VADDR: continue
+        head = safe_read(p, 8)
+        if not head: continue
+        if u64_at(head, 0) == code_addr:
+            tstate_frame_off = i * 8
+            cframe_cf_off = 0  # direct, no indirection
+            break
+
+if tstate_frame_off < 0 and interp_frame:
+    # Strategy 2: cframe indirection (CPython 3.11)
+    for i in range(512):
+        try:
+            p = ts_wide[i]
+        except IndexError: break
+        if p < 0x1000 or p > _MAX_VADDR: continue
+        data = safe_read(p, 64)
+        if not data: continue
+        # Skip offset 0 — that's the "direct" case already tried.
+        for j in range(1, 8):
+            if u64_at(data, j*8) == interp_frame:
+                tstate_frame_off = i * 8
+                cframe_cf_off = j * 8
+                break
+        if tstate_frame_off >= 0: break
+
+if tstate_frame_off >= 0:
+    emit('TstateFrame', tstate_frame_off)
+    emit('OffCframeCurrentFrame', cframe_cf_off)
 
 # --- FrameBack via nested frame chain ---
 if interp_frame:
@@ -186,6 +246,7 @@ type HarvestedOffsets struct {
 	TstateNext              *uint64
 	InterpTstateHead        *uint64
 	TstateFrame             *uint64
+	OffCframeCurrentFrame   *uint64 // 0 = direct (3.13+); >0 = cframe indirection (3.11/3.12)
 	FrameBack               *uint64
 	FrameCode               *uint64
 	CodeFilename            *uint64
@@ -245,6 +306,10 @@ func HarvestOffsets(pythonBinary string) (*HarvestedOffsets, error) {
 			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 				result.TstateFrame = &n
 			}
+		case "OffCframeCurrentFrame":
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				result.OffCframeCurrentFrame = &n
+			}
 		case "FrameBack":
 			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 				result.FrameBack = &n
@@ -301,6 +366,9 @@ func (h *HarvestedOffsets) Overlay(base *PyOffsets) *PyOffsets {
 	}
 	if h.TstateFrame != nil {
 		out.TstateFrame = *h.TstateFrame
+	}
+	if h.OffCframeCurrentFrame != nil {
+		out.CframeCurrentFrame = *h.OffCframeCurrentFrame
 	}
 	if h.FrameBack != nil {
 		out.FrameBack = *h.FrameBack
