@@ -83,6 +83,32 @@ type PyOffsets struct {
 //	  code_object: size, filename, name, firstlineno, ...
 //	  unicode_object: size, length, state, ascii (data start offset)
 //
+// ReadDebugOffsetsFromPID opens /proc/<pid>/mem (or falls back to
+// process_vm_readv at YAMA ptrace_scope<=2) and extracts the
+// _Py_DebugOffsets struct from the running CPython 3.12+ process. This
+// returns the AUTHORITATIVE offset table — offsets from the exact binary
+// the workload is using, immune to distro-patch layout drift or
+// release-vs-debug-build ABI differences that can poison DWARF lookups
+// from sibling libraries.
+//
+// Returns (nil, nil) if the Python version is < 3.12 or the runtime
+// marker is not present (e.g., partial init). Returns an error only for
+// actual memory-access failures the caller may want to log.
+//
+// Safe to call for 3.10/3.11 — returns nil, nil unconditionally and the
+// caller should fall through to DWARF/hardcoded offsets.
+func ReadDebugOffsetsFromPID(pid uint32, runtimeAddr uint64, minor int) (*PyOffsets, error) {
+	if minor < 12 || runtimeAddr == 0 {
+		return nil, nil
+	}
+	mem, err := OpenProcMem(pid)
+	if err != nil {
+		return nil, fmt.Errorf("opening procmem for pid %d: %w", pid, err)
+	}
+	defer mem.Close()
+	return readDebugOffsets(mem, runtimeAddr, minor)
+}
+
 // Returns nil for minor < 12 (struct does not exist before 3.12).
 func readDebugOffsets(mem *ProcMem, runtimeAddr uint64, minor int) (*PyOffsets, error) {
 	if minor < 12 {

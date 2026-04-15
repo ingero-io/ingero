@@ -214,11 +214,25 @@ func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 	for i := range regions {
 		if regions[i].Path == info.LibPath {
 			// Calculate the runtime address in process memory.
-			// For PIE/shared libs: addr = region.Start - region.Offset + sym.Value - baseVA
-			addr := regions[i].Start - regions[i].Offset + symValue
-			if pie {
-				addr -= baseVA
-			}
+			//
+			// Formula: addr = region.Start - region.Offset + sym.Value - baseVA
+			//
+			// This works uniformly for both PIE/shared libraries (ET_DYN, baseVA
+			// typically 0) and non-PIE executables (ET_EXEC, baseVA = the
+			// linker's virtual base, e.g. 0x400000 for a standard x86_64 ELF).
+			//
+			// For non-PIE the symbol value is already an absolute VA equal to
+			// its in-process address (since the binary is loaded at its linked
+			// base). Subtracting baseVA cancels the region.Start contribution,
+			// yielding sym.Value directly. Without the subtract we'd compute
+			// region.Start + sym.Value = 2x the base, landing in unmapped
+			// memory between the binary's last segment and the heap.
+			//
+			// For PIE, baseVA is the prog.Vaddr-prog.Off of the first
+			// executable PT_LOAD, typically 0; region.Start holds the runtime
+			// load address, so the formula resolves to load_base + sym_offset.
+			addr := regions[i].Start - regions[i].Offset + symValue - baseVA
+			_ = pie // kept for future PIE-specific logic if needed
 			return addr, nil
 		}
 	}

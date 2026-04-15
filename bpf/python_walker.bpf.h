@@ -95,6 +95,32 @@ static const struct py_walk_result *_unused_py_walk_result __attribute__((unused
 static const struct py_frame *_unused_py_frame __attribute__((unused));
 
 /*
+ * py_debug_stats: per-CPU counters for diagnosing why the walker isn't
+ * emitting frames. Slots:
+ *   [0] entered_dispatcher          (walker called)
+ *   [1] state_lookup_ok             (per-PID state found in py_runtime_map)
+ *   [2] entered_312                 (3.12 variant entered)
+ *   [3] read_interp_ok              (first read of interpreters_head succeeded)
+ *   [4] read_threads_head_ok        (read of threads.head succeeded)
+ *   [5] thread_loop_iterations      (sum of iterations across all calls)
+ *   [6] thread_match_found          (find_thread_state returned non-zero)
+ *   [7] frame_loop_first_iteration  (entered the frame walk loop at least once)
+ *   [8] depth_gt_zero               (walker returned with depth > 0)
+ *   [9] read_first_native_tid       (read of first tstate's native_thread_id ok)
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 16);
+	__type(key, __u32);
+	__type(value, __u64);
+} py_debug_stats SEC(".maps");
+
+static __always_inline void py_debug_inc(__u32 slot) {
+	__u64 *c = bpf_map_lookup_elem(&py_debug_stats, &slot);
+	if (c) (*c)++;
+}
+
+/*
  * read_compact_ascii: reads a CPython compact-ASCII string into dst.
  * Returns 1 on success, 0 on any failure or non-compact string.
  *
@@ -162,6 +188,7 @@ static __always_inline __u64 find_thread_state(
 	if (bpf_probe_read_user(&interp, sizeof(interp),
 	    (const void *)(st->runtime_addr + st->off_runtime_interpreters_head)) != 0)
 		return 0;
+	py_debug_inc(3);  /* read_interp_ok */
 	if (interp == 0)
 		return 0;
 
@@ -170,20 +197,26 @@ static __always_inline __u64 find_thread_state(
 	if (bpf_probe_read_user(&tstate, sizeof(tstate),
 	    (const void *)(interp + st->off_tstate_head)) != 0)
 		return 0;
+	py_debug_inc(4);  /* read_threads_head_ok */
 
 	/* Walk thread list (bounded). */
 	#pragma unroll(8)
 	for (int i = 0; i < PY_MAX_THREADS; i++) {
 		if (tstate == 0)
 			break;
+		py_debug_inc(5);  /* thread_loop_iterations */
 
 		__u64 cur_tid = 0;
 		if (bpf_probe_read_user(&cur_tid, sizeof(cur_tid),
 		    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
 			break;
+		if (i == 0)
+			py_debug_inc(9);  /* read_first_native_tid */
 
-		if ((__u32)cur_tid == native_tid)
+		if ((__u32)cur_tid == native_tid) {
+			py_debug_inc(6);  /* thread_match_found */
 			return tstate;
+		}
 
 		__u64 next = 0;
 		if (bpf_probe_read_user(&next, sizeof(next),
@@ -212,6 +245,7 @@ static __always_inline int walk_python_frames_312(
     const struct py_runtime_state *st,
     struct py_walk_result *result)
 {
+	py_debug_inc(2);  /* entered_312 */
 	__u64 tstate = find_thread_state(native_tid, st);
 	if (tstate == 0)
 		return 0;  /* not an error — thread may not exist yet */
@@ -227,6 +261,8 @@ static __always_inline int walk_python_frames_312(
 	for (int i = 0; i < PY_MAX_FRAMES; i++) {
 		if (frame == 0)
 			break;
+		if (i == 0)
+			py_debug_inc(7);  /* frame_loop_first_iteration */
 
 		struct py_frame *out = &result->frames[i];
 		out->filename[0] = 0;
@@ -270,6 +306,9 @@ static __always_inline int walk_python_frames_312(
 
 	if (frame != 0)
 		result->truncated = 1;
+
+	if (result->depth > 0)
+		py_debug_inc(8);  /* depth_gt_zero (success) */
 
 	return 0;
 }
@@ -451,6 +490,7 @@ static __always_inline int walk_python_frames_310(
  */
 static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
                                                struct py_walk_result *result) {
+	py_debug_inc(0);  /* entered_dispatcher */
 	if (!result)
 		return -1;
 	result->depth = 0;
@@ -460,6 +500,7 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 	    bpf_map_lookup_elem(&py_runtime_map, &pid);
 	if (!st)
 		return -1;
+	py_debug_inc(1);  /* state_lookup_ok */
 
 	/* Branch on python_minor. 0 = legacy client (pre-v2 struct), treat as 12
 	 * for backward compatibility — matches the assumption the original

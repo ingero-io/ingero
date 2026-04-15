@@ -461,6 +461,13 @@ func (t *Tracer) PyRuntimeMap() *ebpf.Map {
 	return lookupMapField(&t.objs.cudaTraceMaps, "PyRuntimeMap")
 }
 
+// PyDebugStatsMap returns the per-CPU py_debug_stats counter map used to
+// diagnose why the in-kernel Python walker is (or isn't) emitting frames.
+// Returns nil when the map isn't present in the generated bindings.
+func (t *Tracer) PyDebugStatsMap() *ebpf.Map {
+	return lookupMapField(&t.objs.cudaTraceMaps, "PyDebugStats")
+}
+
 // ProbeCount returns the number of attached probes.
 func (t *Tracer) ProbeCount() int {
 	return len(t.links)

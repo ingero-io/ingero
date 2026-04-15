@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -932,10 +933,56 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
+	var loopErr error
 	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
+		loopErr = runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
+	} else {
+		loopErr = runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, droppedDetailFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, mismatchCheck, pyMap, trackPID)
+
+	// Debug: dump Python walker per-CPU counters when eBPF walker was active.
+	// The counters are incremented from python_walker.bpf.h to diagnose where
+	// the walker fails (thread match, frame chain, etc.) — see py_debug_stats
+	// slot definitions in the header.
+	if debugMode && tracePyWalker == "ebpf" && len(cudaTracers) > 0 {
+		if statsMap := cudaTracers[0].PyDebugStatsMap(); statsMap != nil {
+			dumpPyDebugStats(statsMap)
+		}
+	}
+	return loopErr
+}
+
+// dumpPyDebugStats reads the per-CPU py_debug_stats counters and logs them.
+// The map has 16 uint64 slots; slots we currently use are defined in
+// bpf/python_walker.bpf.h. We sum across all CPUs for each slot.
+func dumpPyDebugStats(m *ebpf.Map) {
+	labels := []string{
+		"entered_dispatcher",
+		"state_lookup_ok",
+		"entered_312",
+		"read_interp_ok",
+		"read_threads_head_ok",
+		"thread_loop_iterations",
+		"thread_match_found",
+		"frame_loop_first_iteration",
+		"depth_gt_zero",
+		"read_first_native_tid",
+	}
+	numCPU := runtime.NumCPU()
+	fmt.Fprintln(os.Stderr, "  py-walker debug counters:")
+	for i := 0; i < len(labels); i++ {
+		key := uint32(i)
+		perCPU := make([]uint64, numCPU)
+		if err := m.Lookup(&key, &perCPU); err != nil {
+			fmt.Fprintf(os.Stderr, "    [%d] %s: lookup err %v\n", i, labels[i], err)
+			continue
+		}
+		var sum uint64
+		for _, v := range perCPU {
+			sum += v
+		}
+		fmt.Fprintf(os.Stderr, "    [%d] %-28s %d\n", i, labels[i], sum)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,7 +1633,28 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 		return
 	}
 
-	offsets := symtab.GetPyOffsetsBest(info.LibPath, info.Minor)
+	// For CPython 3.12+, prefer reading _Py_DebugOffsets from the running
+	// process memory. This is the authoritative source — offsets from the
+	// exact binary the workload is using — and avoids the distro-patch trap
+	// where DWARF extracted from a sibling binary (e.g., libpython3.12d.so,
+	// Ubuntu's debug BUILD with different struct layouts than the release
+	// build) produces offsets that silently read from the wrong memory.
+	//
+	// Requires either kernel.yama.ptrace_scope<=2 (so /proc/pid/mem is
+	// readable, possibly via the process_vm_readv fallback), or root/
+	// CAP_SYS_PTRACE. Skipped silently on failure.
+	var offsets *symtab.PyOffsets
+	if info.Minor >= 12 {
+		if pyDebugOff, doErr := symtab.ReadDebugOffsetsFromPID(pid, runtimeAddr, info.Minor); doErr != nil {
+			debugf("py-walker: readDebugOffsets from PID %d failed, will fall back to DWARF/hardcoded: %v", pid, doErr)
+		} else if pyDebugOff != nil {
+			debugf("py-walker: using _Py_DebugOffsets from process memory for PID %d", pid)
+			offsets = pyDebugOff
+		}
+	}
+	if offsets == nil {
+		offsets = symtab.GetPyOffsetsBest(info.LibPath, info.Minor)
+	}
 	if offsets == nil {
 		debugf("py-walker: no offsets available for Python %s (PID %d)", info.Version, pid)
 		return

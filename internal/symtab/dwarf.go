@@ -35,11 +35,15 @@ func symDebugf(format string, args ...any) {
 //  1. Build ID: read .note.gnu.build-id → /usr/lib/debug/.build-id/XX/XXXX.debug
 //  2. Debuglink: read .gnu_debuglink → search dir/, dir/.debug/, /usr/lib/debug/dir/
 //  3. Inline: check if libPath itself has .debug_info (unstripped, e.g. conda builds)
-//  4. Debug build: try libpythonX.Yd.so (Ubuntu's -dbg package includes full DWARF).
-//     Since CPython 3.8, Py_DEBUG no longer implies Py_TRACE_REFS, so the debug
-//     build's struct layouts match the release build (no _PyObject_HEAD_EXTRA).
-//     This is the most reliable fallback on Ubuntu when -dbgsym packages aren't
-//     available from ddebs.ubuntu.com.
+//
+// NOT tried: the debug BUILD library (libpythonX.Yd.so). That's a separately
+// compiled Py_DEBUG binary, not debug info for the release build. Empirical
+// testing on Ubuntu 24.04 / CPython 3.12 shows struct offsets DO diverge
+// between debug and release builds (contrary to prior assumptions) — using
+// DWARF from libpython3.12d.so poisons the frame walker with layouts that
+// don't match the running release process. The correct install path is
+// python3.X-dbgsym (debug info matching the release build), which strategies
+// 1-3 pick up automatically.
 //
 // Returns "" with nil error if no debug info is found (caller should fall back).
 func FindDebugFile(libPath string) (string, error) {
@@ -67,15 +71,7 @@ func FindDebugFile(libPath string) (string, error) {
 		return libPath, nil
 	}
 
-	// Strategy 4: Try the debug build library (libpythonX.Yd.so).
-	// Ubuntu's libpython3.X-dbg package installs a debug build with full DWARF.
-	// Since CPython 3.8, Py_DEBUG no longer implies Py_TRACE_REFS, so struct
-	// layouts match the release build (verified on Ubuntu 22.04 with offsetof).
-	if path := findDebugBuildLib(libPath); path != "" {
-		return path, nil
-	}
-
-	symDebugf("no DWARF debug info found for %s (install libpython3.X-dbgsym or libpython3.X-dbg)", libPath)
+	symDebugf("no DWARF debug info found for %s (install python3.X-dbgsym for debug-info matching the running release build — DO NOT install python3.X-dbg, which is a DIFFERENT Py_DEBUG build with incompatible struct layouts)", libPath)
 	return "", nil
 }
 

@@ -8,7 +8,10 @@ import (
 )
 
 func TestPyRuntimeStateSize(t *testing.T) {
-	want := 36
+	// The C struct on x86_64 rounds up to 40 bytes due to u64 alignment
+	// (trailing u16 forces 4 pad bytes). The BPF map rejects 36-byte
+	// writes — MUST marshal 40.
+	want := 40
 	if pyRuntimeStateSize != want {
 		t.Errorf("pyRuntimeStateSize = %d, want %d", pyRuntimeStateSize, want)
 	}
@@ -89,8 +92,8 @@ func TestPyRuntimeStateMarshalRoundtrip_AllVersions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("MarshalBinary: %v", err)
 			}
-			if len(buf) != 36 {
-				t.Errorf("len=%d, want 36", len(buf))
+			if len(buf) != 40 {
+				t.Errorf("len=%d, want 40", len(buf))
 			}
 			if buf[32] != c.minor {
 				t.Errorf("byte[32] = %d, want %d", buf[32], c.minor)

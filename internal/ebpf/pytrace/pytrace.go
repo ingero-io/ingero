@@ -56,9 +56,22 @@ type PyRuntimeState struct {
 }
 
 // pyRuntimeStateSize is the marshaled size of PyRuntimeState in bytes.
-// This must match the C struct layout
-// (u64 + 12 * u16 + u8 + u8(pad) + u16 = 36 bytes).
-const pyRuntimeStateSize = 8 + 12*2 + 1 + 1 + 2
+// The C struct's natural size on x86_64 is 40 bytes — clang aligns to
+// the largest member (u64 = 8 bytes), so the trailing u16 forces 4 bytes
+// of structure tail padding to round 36 up to a multiple of 8.
+//
+// The BPF map's value size is fixed at compile time to sizeof(struct),
+// so the userspace write MUST be 40 bytes — a 36-byte write is rejected
+// by the kernel with "marshal value: []uint8 doesn't marshal to 40 bytes".
+//
+// Layout (40 bytes total):
+//   [0..8)   runtime_addr  u64
+//   [8..32)  12 × u16 offsets (interpreters_head ... unicode_data)
+//   [32]     python_minor  u8
+//   [33]     _pad3         u8
+//   [34..36) off_cframe_current_frame u16
+//   [36..40) trailing struct alignment pad (zero-filled)
+const pyRuntimeStateSize = 40
 
 // MarshalBinary serializes the struct to little-endian bytes for writing
 // to the BPF map. The map value is opaque bytes from the kernel's view —

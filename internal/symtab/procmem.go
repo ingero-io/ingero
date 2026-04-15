@@ -60,12 +60,24 @@ func (m *ProcMem) Close() error {
 	return m.file.Close()
 }
 
-// isPermErr reports whether err is a permission error (EPERM or EACCES),
-// unwrapping syscall.Errno values wrapped inside *os.PathError or fmt.Errorf.
+// isPermErr reports whether err is a permission-style error that warrants
+// falling back to process_vm_readv. Unwraps syscall.Errno values wrapped
+// inside *os.PathError or fmt.Errorf.
+//
+// Covers:
+//   - EPERM, EACCES: classic "not permitted" (e.g., ptrace_scope=2 without
+//     CAP_SYS_PTRACE).
+//   - EIO: YAMA returns EIO when /proc/pid/mem reads are blocked because the
+//     caller is not an authorized ptrace tracer. At kernel.yama.ptrace_scope=1
+//     (Ubuntu default), only a process's direct parent (or an attached tracer)
+//     can read its /proc/pid/mem — even as root. Any other reader gets EIO on
+//     seek/read, not EPERM. Triggering the process_vm_readv fallback on EIO
+//     recovers the common case of tracing a non-child process as root on
+//     Ubuntu.
 func isPermErr(err error) bool {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		return errno == syscall.EPERM || errno == syscall.EACCES
+		return errno == syscall.EPERM || errno == syscall.EACCES || errno == syscall.EIO
 	}
 	return false
 }
