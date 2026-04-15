@@ -636,6 +636,44 @@ For Python workloads (PyTorch, TensorFlow, etc.), Ingero extracts **CPython fram
 
 Supported Python versions: **3.10, 3.11, 3.12** (covers Ubuntu 22.04 default, conda default, and most production deployments). Version detection is automatic via `/proc/[pid]/maps`.
 
+#### Why you want a Python frame walker
+
+Native stack traces alone stop at `_PyEval_EvalFrameDefault` — the C function that runs the Python bytecode interpreter. Every frame above that in "what your code is actually doing" lives in interpreter state (`PyThreadState`, `_PyInterpreterFrame`, `PyCodeObject`), not in the C call stack. Without a walker, you see `_PyEval_EvalFrameDefault` repeated N times, which tells you nothing about which `.py` file triggered the slow `cuLaunchKernel`.
+
+A Python frame walker reads CPython's own data structures and reconstructs the source-level call chain (`train.py:train_step`, `model.py:forward`, ...). That's what lets you answer "which Python line launched this slow kernel?" instead of "something inside the interpreter launched it."
+
+Ingero ships **two walker implementations** for this:
+
+- **Userspace walker (default)** — runs in the Go process after an event arrives. Reads target process memory via `/proc/[pid]/mem` or `process_vm_readv`. Simple, flexible, handles the full CPython offset fallback chain (`_Py_DebugOffsets` → known-offsets DB → DWARF → hardcoded).
+- **In-kernel eBPF walker (opt-in)** — walks frames from inside the kernel probe via `bpf_probe_read_user` helpers. No `/proc/[pid]/mem` access needed. Required when `kernel.yama.ptrace_scope=3` (hardened systems), and useful when you want frame capture to happen synchronously with the CUDA event rather than asynchronously on event arrival.
+
+#### How to use it
+
+**Default (userspace walker):** Just pass `--stack` — frames appear automatically for supported Python versions.
+
+```bash
+sudo ingero trace --stack --duration 30s
+```
+
+You'll see `py_file` / `py_func` / `py_line` fields in JSON output, or `[Python] <file>:<line> in <func>()` entries in the table/debug view.
+
+**eBPF walker (opt-in):** Pass `--py-walker=ebpf` alongside `--stack`.
+
+```bash
+sudo ingero trace --stack --py-walker=ebpf --duration 30s
+```
+
+Use the eBPF walker when:
+- Your system has `kernel.yama.ptrace_scope=3` (the userspace walker can't read process memory there)
+- You want guaranteed synchronous frame capture at the exact moment of the CUDA event
+- You're running on a read-only/hardened host where `/proc/[pid]/mem` access is blocked
+
+Stick with the default (`--py-walker=auto`, which resolves to the userspace walker) when:
+- You're on a normal Linux host (ptrace_scope 0, 1, or 2) — the userspace walker is simpler and has full offset-fallback coverage including distro-patched CPython builds
+- You care about minimum per-event overhead — the eBPF walker adds BPF helper-call cost per emitted event
+
+**Troubleshooting missing frames:** Run `ingero check` — it now reports your `kernel.yama.ptrace_scope` value and tells you what to do if it's blocking the userspace walker. For CPython 3.12 you'll also benefit automatically from the self-describing `_Py_DebugOffsets` struct (no debug symbols needed); for 3.10/3.11 on patched distro builds, installing the matching `python3.X-dbgsym` package gives the userspace walker DWARF offsets to fall back on.
+
 ### JSON Output with `--stack`
 
 Real output from a PyTorch ResNet-50 training run on A100 SXM4  -  a cuBLAS matmul kernel launch captured via Driver API uprobes, with the full call chain from Python through cuBLAS to the GPU:
