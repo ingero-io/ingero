@@ -1633,31 +1633,47 @@ func tryPushPyRuntimeState(pid uint32, pyMap *ebpf.Map) {
 		return
 	}
 
-	// For CPython 3.12+, prefer reading _Py_DebugOffsets from the running
-	// process memory. This is the authoritative source — offsets from the
-	// exact binary the workload is using — and avoids the distro-patch trap
-	// where DWARF extracted from a sibling binary (e.g., libpython3.12d.so,
-	// Ubuntu's debug BUILD with different struct layouts than the release
-	// build) produces offsets that silently read from the wrong memory.
+	// Resolve struct offsets via a layered fallback chain (highest -> lowest
+	// confidence). All sources can fail silently on Ubuntu's distro-patched
+	// CPython 3.12 builds, so we combine the best signal from each:
 	//
-	// Requires either kernel.yama.ptrace_scope<=2 (so /proc/pid/mem is
-	// readable, possibly via the process_vm_readv fallback), or root/
-	// CAP_SYS_PTRACE. Skipped silently on failure.
+	//   1. _Py_DebugOffsets read from the running process memory (3.13+ only;
+	//      3.12 has no such struct — the field at _PyRuntime+0 is _initialized,
+	//      not a debug-offsets header).
+	//   2. Runtime ctypes harvester subprocess. Spawns the SAME python binary
+	//      with a tiny script that uses ctypes + known runtime values
+	//      (os.gettid, sys._getframe, id()) to scan struct memory and discover
+	//      field offsets empirically. Authoritative for the offsets it finds —
+	//      same binary as the workload, no debug symbols, no DWARF, immune to
+	//      distro patches. Partial coverage; fields it can't discover are
+	//      filled by the next source.
+	//   3. GetPyOffsetsBest fallback chain (build-id DB → DWARF → hardcoded).
+	//
+	// Each source overlays the previous: we start with hardcoded/DWARF as a
+	// base table, then overlay harvester values where present, then overlay
+	// _Py_DebugOffsets where present. The final table is what gets pushed to
+	// the BPF map.
 	var offsets *symtab.PyOffsets
-	if info.Minor >= 12 {
-		if pyDebugOff, doErr := symtab.ReadDebugOffsetsFromPID(pid, runtimeAddr, info.Minor); doErr != nil {
-			debugf("py-walker: readDebugOffsets from PID %d failed, will fall back to DWARF/hardcoded: %v", pid, doErr)
-		} else if pyDebugOff != nil {
-			debugf("py-walker: using _Py_DebugOffsets from process memory for PID %d", pid)
-			offsets = pyDebugOff
-		}
-	}
+	offsets = symtab.GetPyOffsetsBest(info.LibPath, info.Minor)
 	if offsets == nil {
-		offsets = symtab.GetPyOffsetsBest(info.LibPath, info.Minor)
-	}
-	if offsets == nil {
-		debugf("py-walker: no offsets available for Python %s (PID %d)", info.Version, pid)
+		debugf("py-walker: no fallback offsets available for Python %s (PID %d)", info.Version, pid)
 		return
+	}
+
+	// Overlay runtime harvester (most authoritative for the offsets it discovers).
+	if harvested, hErr := symtab.HarvestOffsets(info.LibPath); hErr != nil {
+		debugf("py-walker: harvester subprocess failed for PID %d (%s): %v — using fallback offsets", pid, info.LibPath, hErr)
+	} else if harvested != nil {
+		offsets = harvested.Overlay(offsets)
+		debugf("py-walker: overlaid runtime-harvested offsets onto %s table for PID %d", offsets.Version, pid)
+	}
+
+	// Overlay _Py_DebugOffsets if present (3.13+).
+	if info.Minor >= 13 {
+		if pyDebugOff, doErr := symtab.ReadDebugOffsetsFromPID(pid, runtimeAddr, info.Minor); doErr == nil && pyDebugOff != nil {
+			offsets = pyDebugOff
+			debugf("py-walker: using _Py_DebugOffsets from process memory for PID %d", pid)
+		}
 	}
 
 	state, err := pyRuntimeStateFromOffsets(runtimeAddr, offsets, info.Minor)
