@@ -100,11 +100,7 @@ func (r *Resolver) mergeBPFPythonFrames(evt *events.Event) {
 	}
 	pyFrames := make([]PyFrame, 0, len(evt.PythonFrames))
 	for _, f := range evt.PythonFrames {
-		pyFrames = append(pyFrames, PyFrame{
-			Filename: f.Filename,
-			Function: f.Function,
-			Line:     f.Line,
-		})
+		pyFrames = append(pyFrames, PyFrame(f))
 	}
 	r.mergePythonFrames(evt, pyFrames)
 }

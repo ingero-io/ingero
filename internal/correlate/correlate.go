@@ -1826,9 +1826,7 @@ func (e *Engine) checkGraphCaptureWarmup(pid uint32, graphWindow []events.Event)
 		case events.GraphBeginCapture:
 			beginTimes[evt.TID] = evt
 		case events.GraphEndCapture:
-			if _, ok := beginTimes[evt.TID]; ok {
-				delete(beginTimes, evt.TID)
-			}
+			delete(beginTimes, evt.TID)
 			if evt.RetCode != 0 && evt.Duration < minGraphCaptureDuration {
 				shortFails = append(shortFails, failedCapture{
 					pid:      evt.PID,
