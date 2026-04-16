@@ -5,13 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
+	"math/bits"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/spf13/cobra"
 
 	"github.com/ingero-io/ingero/internal/cgroup"
@@ -23,10 +29,12 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
 	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
+	"github.com/ingero-io/ingero/internal/ebpf/pytrace"
 	"github.com/ingero-io/ingero/internal/ebpf/tcp"
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/procpath"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/straggler"
 	"github.com/ingero-io/ingero/internal/k8s"
@@ -61,6 +69,10 @@ var (
 	traceNoNet        bool          // Disable network socket tracing.
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 	traceNode         string        // Node identity for multi-node correlation.
+	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
+	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
+	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
+	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
 )
 
 var traceCmd = &cobra.Command{
@@ -100,8 +112,71 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
+	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
+	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
+	traceCmd.Flags().Uint32Var(&traceSamplingRate, "sampling-rate", 0, "event sampling rate (0 = adaptive, 1 = emit all, N > 1 = emit 1 in N). Adaptive mode auto-increases rate under sustained drop pressure.")
+	traceCmd.Flags().StringVar(&tracePyWalker, "py-walker", "auto",
+		"Python frame walker: auto (userspace, default), ebpf (kernel-side, requires Python 3.12), userspace (force userspace)")
 
 	rootCmd.AddCommand(traceCmd)
+}
+
+// validatePyWalker returns nil if s is one of the supported --py-walker
+// values, or a descriptive error otherwise. Exported (package-private)
+// so the selection logic is unit-testable without invoking traceRunE.
+func validatePyWalker(s string) error {
+	switch s {
+	case "auto", "ebpf", "userspace":
+		return nil
+	default:
+		return fmt.Errorf("invalid --py-walker %q (must be auto, ebpf, or userspace)", s)
+	}
+}
+
+// parseRingBufSize parses a human-readable size string (e.g., "32m", "16m",
+// "8388608") into a uint32 byte count. Validates that the result is a power
+// of 2 and at least 4096 (one page). Returns 0 if the input is empty.
+func parseRingBufSize(s string) (uint32, error) {
+	if s == "" {
+		return 0, nil
+	}
+
+	s = strings.TrimSpace(strings.ToLower(s))
+	var multiplier uint64 = 1
+	numStr := s
+
+	switch {
+	case strings.HasSuffix(s, "k"):
+		multiplier = 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "m"):
+		multiplier = 1024 * 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "g"):
+		multiplier = 1024 * 1024 * 1024
+		numStr = s[:len(s)-1]
+	}
+
+	n, err := strconv.ParseUint(numStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid ringbuf-size %q: %w", s, err)
+	}
+
+	total := n * multiplier
+	if total == 0 {
+		return 0, fmt.Errorf("ringbuf-size %q resolves to 0 bytes", s)
+	}
+	if total > 1<<32-1 {
+		return 0, fmt.Errorf("ringbuf-size %q exceeds uint32 max (4GB)", s)
+	}
+	if total < 4096 {
+		return 0, fmt.Errorf("ringbuf-size %q too small: minimum is 4096 (4k)", s)
+	}
+	if bits.OnesCount64(total) != 1 {
+		return 0, fmt.Errorf("ringbuf-size %q (%d bytes) is not a power of 2", s, total)
+	}
+
+	return uint32(total), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +184,39 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func traceRunE(cmd *cobra.Command, args []string) error {
+	// Single-instance enforcement: refuse to start if another ingero trace
+	// is already running on this host. Prevents silent watchdog-pin
+	// overwrite (Bug 8) and doubles overhead from concurrent uprobes.
+	unlock, err := acquireTraceLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Parse --ringbuf-size early — fail fast on invalid input.
+	ringBufBytes, err := parseRingBufSize(traceRingBufSize)
+	if err != nil {
+		return err
+	}
+	if ringBufBytes > 0 {
+		debugf("ring buffer override applied to cuda/driver/host only (high-throughput probes): %d bytes", ringBufBytes)
+	}
+
+	// Validate --py-walker early — fail fast on invalid input.
+	if err := validatePyWalker(tracePyWalker); err != nil {
+		return err
+	}
+
+	// Warn on the known edge case: at ptrace_scope=3, system-wide
+	// (pid=-1) uprobes may not fire. Trace-all mode without --pid
+	// relies on those. See Bug 7 for the adversarial repro.
+	if tracePyWalker == "ebpf" && len(tracePIDs) == 0 {
+		if scope, err := discover.CheckPtraceScope(); err == nil && scope == 3 {
+			slog.Warn("ptrace_scope=3 + trace-all + --py-walker=ebpf may not emit cuda events",
+				"hint", "pass --pid X or lower kernel.yama.ptrace_scope")
+		}
+	}
+
 	// Resolve node identity early — fail fast if name contains colon.
 	nodeIdentity, err := ResolveNodeIdentity(traceNode)
 	if err != nil {
@@ -166,11 +274,16 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	//   --pid 123,456   → trace exactly those PIDs
 	//   --user bob      → trace all CUDA PIDs owned by bob
 	//   (default)       → trace all CUDA PIDs owned by SUDO_USER (invoking user)
-	libPath, targetPIDs, processNames, err := resolveTargets(tracePIDs)
+	libPaths, targetPIDs, processNames, err := resolveTargets(tracePIDs)
 	if err != nil {
 		return err
 	}
-	debugf("targets resolved: lib=%s pids=%v names=%v", libPath, targetPIDs, processNames)
+	if len(libPaths) == 0 {
+		return fmt.Errorf("no CUDA libraries found")
+	}
+	// Primary library path (first element) — used for display and backward compat.
+	libPath := libPaths[0]
+	debugf("targets resolved: libs=%v pids=%v names=%v", libPaths, targetPIDs, processNames)
 
 	// If --user not explicitly set and no --pid given, default to SUDO_USER
 	// so that "sudo ingero trace" traces the invoking user's processes, not root's.
@@ -223,35 +336,96 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Build PID filter for event loop (nil = accept all).
 	pidFilter := pidSetFromInts(targetPIDs)
 
-	// Step 2: Create CUDA tracer and attach eBPF uprobes.
+	// Step 2: Create CUDA tracer(s) and attach eBPF uprobes.
+	// When multiple libcudart.so copies are discovered (e.g., system + venv),
+	// create a tracer per library so probes fire regardless of which copy
+	// the workload loads.
 	var cudaOpts []cuda.Option
 	if traceStack {
 		cudaOpts = append(cudaOpts, cuda.WithStackCapture(true))
 	}
-	cudaTracer := cuda.New(libPath, cudaOpts...)
-	if err := cudaTracer.Attach(); err != nil {
-		return fmt.Errorf("attaching CUDA probes: %w", err)
+	if ringBufBytes > 0 {
+		cudaOpts = append(cudaOpts, cuda.WithRingBufSize(ringBufBytes))
 	}
-	defer cudaTracer.Close()
-	debugf("CUDA tracer: %d probes attached to %s", cudaTracer.ProbeCount(), libPath)
+	// PID-specific uprobe attach when tracing a single target. Reduces
+	// kernel-wide uprobe overhead and may work around ptrace_scope=3
+	// gates on system-wide perf_event_open (Bug 7).
+	if len(tracePIDs) == 1 && tracePIDs[0] > 0 {
+		cudaOpts = append(cudaOpts, cuda.WithUprobePID(tracePIDs[0]))
+	}
 
-	// Step 2b: Create CUDA Graph tracer (non-fatal — graceful degradation).
-	// Uses the same libcudart.so. If graph API symbols are absent, skips silently.
-	var graphTracer *cudagraph.Tracer
+	var cudaTracers []*cuda.Tracer
+	var graphTracers []*cudagraph.Tracer
 	graphProbeCount := 0
-	{
-		gt := cudagraph.New(libPath)
+
+	// Track all attached library paths (resolved) for runtime mismatch detection.
+	attachedLibs := make(map[string]bool)
+
+	for _, lp := range libPaths {
+		ct := cuda.New(lp, cudaOpts...)
+		if err := ct.Attach(); err != nil {
+			if len(libPaths) == 1 {
+				// Single library — hard failure (original behavior).
+				return fmt.Errorf("attaching CUDA probes: %w", err)
+			}
+			// Multiple libraries — log warning and continue with others.
+			fmt.Fprintf(os.Stderr, "  Warning: CUDA probes failed for %s: %v\n", lp, err)
+			debugf("CUDA tracer: attach failed for %s: %v", lp, err)
+			continue
+		}
+		cudaTracers = append(cudaTracers, ct)
+		attachedLibs[lp] = true
+		debugf("CUDA tracer: %d probes attached to %s", ct.ProbeCount(), lp)
+
+		// Step 2b: Create CUDA Graph tracer per library (non-fatal).
+		// ringbuf override not applied — graph is low-throughput; uses compiled default.
+		gt := cudagraph.New(lp)
 		if err := gt.Attach(); err != nil {
-			fmt.Fprintf(os.Stderr, "  graph probes: skipped (symbols not found)\n")
-			debugf("graph tracer: attach failed: %v", err)
+			debugf("graph tracer: attach failed for %s: %v", lp, err)
 		} else {
-			graphTracer = gt
-			graphProbeCount = gt.ProbeCount()
-			debugf("graph tracer: %d probes attached to %s", graphProbeCount, libPath)
+			graphTracers = append(graphTracers, gt)
+			graphProbeCount += gt.ProbeCount()
+			debugf("graph tracer: %d probes attached to %s", gt.ProbeCount(), lp)
 		}
 	}
-	if graphTracer != nil {
-		defer graphTracer.Close()
+	if len(cudaTracers) == 0 {
+		return fmt.Errorf("attaching CUDA probes: no libraries could be attached")
+	}
+	// Defers stack — all tracers close when traceRunE returns.
+	for _, ct := range cudaTracers {
+		defer ct.Close()
+	}
+	for _, gt := range graphTracers {
+		defer gt.Close()
+	}
+	if len(graphTracers) == 0 {
+		fmt.Fprintf(os.Stderr, "  graph probes: skipped (symbols not found)\n")
+	}
+
+	// Use first CUDA tracer as the "primary" for probe count display.
+	cudaTracer := cudaTracers[0]
+
+	// --py-walker=ebpf: obtain the py_runtime_map from EVERY cuda tracer.
+	// The map is part of cuda_trace.bpf.c via the included python_walker.bpf.h
+	// header. Each cuda tracer loads its own BPF objects (one per libcudart.so
+	// discovered), so each has its OWN per-instance py_runtime_map. Per-PID
+	// walker state must be written to ALL of them — the workload's cuda
+	// events are processed by whichever tracer is attached to the libcudart
+	// the workload loaded, and that tracer's BPF program only sees its own
+	// map. A nil map means bpf2go hasn't yet regenerated the bindings with
+	// the walker header — fail loudly so operators run `make generate`.
+	var pyMaps []*ebpf.Map
+	if tracePyWalker == "ebpf" {
+		for _, ct := range cudaTracers {
+			m := ct.PyRuntimeMap()
+			if m == nil {
+				return fmt.Errorf("--py-walker=ebpf requires py_runtime_map " +
+					"(run 'make generate' after the walker header was added to cuda_trace.bpf.c)")
+			}
+			pyMaps = append(pyMaps, m)
+		}
+		slog.Info("Python walker: using kernel-side eBPF walker (--py-walker=ebpf)",
+			"cuda_tracers", len(cudaTracers))
 	}
 
 	// Step 3: Create host tracer (non-fatal — graceful degradation).
@@ -263,7 +437,11 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	{
 		// Seed with first PID (host.New takes one initial PID, 0 = none).
 		initialPID := singlePIDOrZero(targetPIDs)
-		ht := host.New(uint32(initialPID))
+		var hostOpts []host.Option
+		if ringBufBytes > 0 {
+			hostOpts = append(hostOpts, host.WithRingBufSize(ringBufBytes))
+		}
+		ht := host.New(uint32(initialPID), hostOpts...)
 		if err := ht.Attach(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: host tracepoints unavailable: %v\n", err)
 			fmt.Fprintf(os.Stderr, "  Continuing with CUDA-only mode.\n\n")
@@ -297,6 +475,12 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		if traceStack {
 			driverOpts = append(driverOpts, driver.WithStackCapture(true))
 		}
+		if ringBufBytes > 0 {
+			driverOpts = append(driverOpts, driver.WithRingBufSize(ringBufBytes))
+		}
+		if len(tracePIDs) == 1 && tracePIDs[0] > 0 {
+			driverOpts = append(driverOpts, driver.WithUprobePID(tracePIDs[0]))
+		}
 		dt := driver.New(libcudaPath, driverOpts...)
 		if err := dt.Attach(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: driver API tracing unavailable: %v\n", err)
@@ -314,6 +498,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3c: Create block I/O tracer (non-fatal).
+	// ringbuf override not applied — block I/O is low-throughput; uses compiled default.
 	var ioTracer *blockio.Tracer
 	ioProbeCount := 0
 	if !traceNoIO {
@@ -332,6 +517,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3d: Create TCP retransmit tracer (non-fatal).
+	// ringbuf override not applied — TCP is low-throughput; uses compiled default.
 	var tcpTracer *tcp.Tracer
 	tcpProbeCount := 0
 	if !traceNoTCP {
@@ -350,6 +536,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 3e: Create network socket tracer (non-fatal).
+	// ringbuf override not applied — net is low-throughput; uses compiled default.
 	var netTracer *nettracer.Tracer
 	netProbeCount := 0
 	if !traceNoNet {
@@ -514,11 +701,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		HeartbeatInterval: traceHeartbeat,
 	}.NewSnapshotFilter()
 
+	// Sum CUDA probe counts across all tracers.
+	totalCUDAProbes := 0
+	for _, ct := range cudaTracers {
+		totalCUDAProbes += ct.ProbeCount()
+	}
+
 	// Step 6: Print header.
-	printTraceHeader(libPath, targetPIDs, processNames, cudaTracer.ProbeCount(), graphProbeCount, hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
+	printTraceHeader(libPath, targetPIDs, processNames, totalCUDAProbes, graphProbeCount, hostProbeCount, driverProbeCount, ioProbeCount, tcpProbeCount, netProbeCount, snapFilter)
 
 	// Step 7: Launch tracers and merge event channels.
-	go cudaTracer.Run(ctx)
+	for _, ct := range cudaTracers {
+		go ct.Run(ctx)
+	}
 	if hostTracer != nil {
 		go hostTracer.Run(ctx)
 	}
@@ -528,9 +723,13 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// Launch new tracers — each feeds into the merged channel.
 	var extraChs [](<-chan events.Event)
-	if graphTracer != nil {
-		go graphTracer.Run(ctx)
-		extraChs = append(extraChs, graphTracer.Events())
+	// Additional CUDA tracers (beyond the primary) feed into extraChs.
+	for _, ct := range cudaTracers[1:] {
+		extraChs = append(extraChs, ct.Events())
+	}
+	for _, gt := range graphTracers {
+		go gt.Run(ctx)
+		extraChs = append(extraChs, gt.Events())
 	}
 	if ioTracer != nil {
 		go ioTracer.Run(ctx)
@@ -626,11 +825,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// droppedDetailFn captures tracer slices by reference. These slices are
+	// immutable after this point — do not append to cudaTracers/graphTracers.
+
 	// Combined dropped count from all tracers.
 	droppedFn := func() uint64 {
-		d := cudaTracer.Dropped()
+		var d uint64
+		for _, ct := range cudaTracers {
+			d += ct.Dropped()
+		}
 		if hostTracer != nil {
 			d += hostTracer.Dropped()
+			d += hostTracer.CriticalDropped()
 		}
 		if driverTracer != nil {
 			d += driverTracer.Dropped()
@@ -645,6 +851,36 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			d += netTracer.Dropped()
 		}
 		return d
+	}
+
+	// Per-tracer drop breakdown for display.
+	droppedDetailFn := func() string {
+		var cudaD, graphD uint64
+		for _, ct := range cudaTracers {
+			cudaD += ct.Dropped()
+		}
+		for _, gt := range graphTracers {
+			graphD += gt.Dropped()
+		}
+		var hostD, hostCritD, driverD, ioD, tcpD, netD uint64
+		if hostTracer != nil {
+			hostD = hostTracer.Dropped()
+			hostCritD = hostTracer.CriticalDropped()
+		}
+		if driverTracer != nil {
+			driverD = driverTracer.Dropped()
+		}
+		if ioTracer != nil {
+			ioD = ioTracer.Dropped()
+		}
+		if tcpTracer != nil {
+			tcpD = tcpTracer.Dropped()
+		}
+		if netTracer != nil {
+			netD = netTracer.Dropped()
+		}
+		return fmt.Sprintf("cuda=%d driver=%d host=%d host_crit=%d io=%d tcp=%d net=%d graph=%d",
+			cudaD, driverD, hostD, hostCritD, ioD, tcpD, netD, graphD)
 	}
 
 	// Dynamic PID tracking: when tracing all processes (no --pid), we add
@@ -680,21 +916,372 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				netTracer.SetTargetPID(pid)
 				debugf("net tracer: dynamically added PID %d", pid)
 			}
+			// Seed py_runtime_map for dynamically-discovered PIDs. Without
+			// this, the eBPF walker's state push relies on HostProcessExec
+			// events — which the host tracer suppresses for PIDs not yet in
+			// target_pids, so post-trace-start workloads never get their
+			// state pushed. Dedup via pyPushedPIDs prevents duplicate
+			// harvester runs when HostProcessExec fires later for this PID.
+			tryPushPyRuntimeStateOnce(pid, pyMaps)
 		}
+	}
+
+	// Apply initial sampling rate (fixed or adaptive baseline).
+	// Rate 0 from the flag means "adaptive" — start at 1 (emit all) and
+	// let runAdaptiveSamplingMonitor adjust based on drop pressure.
+	initialRate := traceSamplingRate
+	if initialRate == 0 {
+		initialRate = 1
+	}
+	for _, ct := range cudaTracers {
+		if err := ct.SetSamplingRate(initialRate); err != nil {
+			debugf("setting cuda sampling rate: %v", err)
+		}
+	}
+	if driverTracer != nil {
+		if err := driverTracer.SetSamplingRate(initialRate); err != nil {
+			debugf("setting driver sampling rate: %v", err)
+		}
+	}
+	for _, gt := range graphTracers {
+		if err := gt.SetSamplingRate(initialRate); err != nil {
+			debugf("setting graph sampling rate: %v", err)
+		}
+	}
+
+	// Launch adaptive sampling monitor if --sampling-rate was not set (or was 0).
+	if traceSamplingRate == 0 {
+		go runAdaptiveSamplingMonitor(ctx, cudaTracers, driverTracer, graphTracers, droppedFn)
 	}
 
 	// Step 8: Build PID→name cache for JSON output enrichment.
 	procNames = newPIDNameCache(targetPIDs, processNames)
 
+	// Library mismatch checker: on first CUDA event per PID, verify the
+	// process's loaded libcudart.so matches one of our attached libraries.
+	// Warns once per PID if there's a mismatch (e.g., venv library vs system).
+	mismatchCheck := newLibMismatchChecker(attachedLibs)
+
+	// Seed py_runtime_map for already-running target Python processes.
+	// Three seed points feed into tryPushPyRuntimeStateOnce, which dedups
+	// per-PID via pyPushedPIDs:
+	//   1. Startup loop (here) — for PIDs known via --pid X.
+	//   2. trackPID closure (above) — fires on first non-host event for a
+	//      dynamically-discovered PID. Covers workloads that started AFTER
+	//      the trace and whose sched_process_exec was suppressed by the
+	//      host tracer's target_pids gate.
+	//   3. HostProcessExec handler in the event loop — re-pushes after an
+	//      exec (binary may have changed).
+	// HostProcessExit clears the dedup mark alongside pytrace.ClearPID.
+	if len(pyMaps) > 0 {
+		for _, pid := range targetPIDs {
+			if pid > 0 {
+				tryPushPyRuntimeStateOnce(uint32(pid), pyMaps)
+			}
+		}
+	}
+
 	// Step 9: Run the event loop.
 	// trackPID is passed as onFork — called for both fork children and
 	// newly-discovered CUDA process PIDs (dynamic host tracer enrollment).
-	if traceJSON {
-		return runJSONMode(ctx, merged, collector, pidFilter, eventStore, resolver, onSnapshot, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
+	var loopErr error
+	// Collect py_debug_stats maps for periodic reserve-failure warning
+	// (Bug 9) and end-of-run counter dump. Do this before the event loop
+	// so the periodic ticker can read counters during the trace, not just
+	// at the end.
+	var pyStatsMaps []*ebpf.Map
+	if tracePyWalker == "ebpf" {
+		for _, ct := range cudaTracers {
+			if m := ct.PyDebugStatsMap(); m != nil {
+				pyStatsMaps = append(pyStatsMaps, m)
+			}
+		}
 	}
-	return runTableMode(ctx, merged, collector, corrPID, pidFilter, droppedFn, onSnapshot, eventStore, corr, resolver, podCache, snapFilter, procNames, cudaPIDs, tracker, stragglerDetector, nodeIdentity, rankCache, trackPID)
+
+	loopCfg := &eventLoopConfig{
+		Collector:     collector,
+		PIDFilter:     pidFilter,
+		OnSnapshot:    onSnapshot,
+		EventStore:    eventStore,
+		Resolver:      resolver,
+		PodCache:      podCache,
+		SnapFilter:    snapFilter,
+		ProcNames:     procNames,
+		CUDAPIDs:      cudaPIDs,
+		MemTracker:    tracker,
+		StragglerDet:  stragglerDetector,
+		NodeIdentity:  nodeIdentity,
+		RankCache:     rankCache,
+		MismatchCheck: mismatchCheck,
+		PyMaps:        pyMaps,
+		PyStatsMaps:   pyStatsMaps,
+	}
+
+	if traceJSON {
+		loopErr = runJSONMode(ctx, merged, loopCfg, trackPID)
+	} else {
+		loopErr = runTableMode(ctx, merged, loopCfg, corrPID, droppedFn, droppedDetailFn, corr, trackPID)
+	}
+
+	// Debug: dump Python walker per-CPU counters when eBPF walker was active.
+	if debugMode && len(pyStatsMaps) > 0 {
+		dumpPyDebugStats(pyStatsMaps)
+	}
+	return loopErr
 }
 
+// dumpPyDebugStats reads the per-CPU py_debug_stats counters and logs them.
+// The map has 16 uint64 slots; slots we currently use are defined in
+// bpf/python_walker.bpf.h. We sum across all CPUs for each slot, then
+// aggregate across maps (each cuda tracer has its own stats map).
+func dumpPyDebugStats(maps []*ebpf.Map) {
+	labels := []string{
+		"entered_dispatcher",
+		"state_lookup_ok",
+		"entered_312",
+		"read_interp_ok",
+		"read_threads_head_ok",
+		"thread_loop_iterations",
+		"thread_match_found",
+		"frame_loop_first_iteration",
+		"depth_gt_zero",
+		"read_first_native_tid",
+		"entered_311",
+		"311_thread_found",
+		"311_cframe_read_ok",
+		"311_cframe_nonzero",
+		"311_interp_frame_read_ok",
+		"311_frame_nonzero",
+		"311_loop_code_read_ok",
+		"311_loop_code_nonzero",
+		"_unused_18", "_unused_19", "_unused_20", "_unused_21",
+		"_unused_22", "_unused_23", "_unused_24",
+		"scratch_lookup_ok",
+		"have_py_set",
+		"entered_pyextended_branch",
+		"reserved_pyextended",
+	}
+	numCPU := runtime.NumCPU()
+	fmt.Fprintf(os.Stderr, "  py-walker debug counters (aggregated across %d cuda tracer(s)):\n", len(maps))
+	for i := 0; i < len(labels); i++ {
+		key := uint32(i)
+		var sum uint64
+		for _, m := range maps {
+			perCPU := make([]uint64, numCPU)
+			if err := m.Lookup(&key, &perCPU); err != nil {
+				continue
+			}
+			for _, v := range perCPU {
+				sum += v
+			}
+		}
+		fmt.Fprintf(os.Stderr, "    [%d] %-28s %d\n", i, labels[i], sum)
+	}
+}
+
+// readPyDebugCounter sums a single py_debug_stats slot across all per-CPU
+// slices across all cuda tracer stats maps. Returns 0 on any read error.
+func readPyDebugCounter(statsMaps []*ebpf.Map, slot uint32) uint64 {
+	numCPU := runtime.NumCPU()
+	var sum uint64
+	for _, m := range statsMaps {
+		perCPU := make([]uint64, numCPU)
+		if err := m.Lookup(&slot, &perCPU); err != nil {
+			continue
+		}
+		for _, v := range perCPU {
+			sum += v
+		}
+	}
+	return sum
+}
+
+// checkPyReserveFailures reads the walker's reserve-attempt vs reserve-success
+// counters and emits a WARN if >5% of Python extended-record reservations
+// failed (indicating ringbuf pressure is silently dropping Python frames).
+// Throttled: only fires once per 5s. Must be called from the event-loop
+// ticker goroutine (not from BPF callbacks).
+func checkPyReserveFailures(statsMaps []*ebpf.Map, lastWarn *time.Time) {
+	if len(statsMaps) == 0 {
+		return
+	}
+	now := time.Now()
+	if now.Sub(*lastWarn) < 5*time.Second {
+		return
+	}
+	attempted := readPyDebugCounter(statsMaps, 27) // entered_pyextended_branch
+	succeeded := readPyDebugCounter(statsMaps, 28) // reserved_pyextended
+	if attempted == 0 {
+		return
+	}
+	// Counters are read non-atomically across per-CPU slices, so a CPU
+	// incrementing [28] between our two Lookup calls can yield
+	// succeeded > attempted. Clamp to avoid nonsense percentages.
+	if succeeded > attempted {
+		succeeded = attempted
+	}
+	failed := attempted - succeeded
+	failPct := float64(failed) / float64(attempted) * 100
+	if failPct > 5 {
+		slog.Warn("Python frame records dropped due to ringbuf pressure",
+			"reserved", succeeded, "attempted", attempted,
+			"failure_pct", fmt.Sprintf("%.0f%%", failPct),
+			"hint", "raise --ringbuf-size")
+		*lastWarn = now
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Single-instance lock
+// ---------------------------------------------------------------------------
+
+const watchdogPinPath = "/sys/fs/bpf/ingero_watchdog"
+
+// acquireTraceLock enforces single-instance per host. Returns an unlock
+// function that must be deferred. If another ingero trace is running,
+// returns a user-facing error. If a stale lock exists from a SIGKILL'd
+// ingero, cleans up orphaned BPF state and proceeds.
+func acquireTraceLock() (func(), error) {
+	lockPath := "/var/run/ingero-trace.lock"
+	if _, err := os.Stat("/var/run"); err != nil {
+		lockPath = "/tmp/ingero-trace.lock"
+	}
+
+	if data, err := os.ReadFile(lockPath); err == nil {
+		pidStr := strings.TrimSpace(string(data))
+		if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
+			comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			commStr := strings.TrimSpace(string(comm))
+			if commStr == "ingero" || strings.HasPrefix(commStr, "ingero") {
+				return nil, fmt.Errorf("another ingero trace is running (PID %d) — only one instance per host", pid)
+			}
+		}
+		slog.Info("cleaning up BPF state from previous ingero invocation",
+			"lock_path", lockPath,
+			"hint", "previous ingero was likely SIGKILL'd or crashed")
+		os.Remove(watchdogPinPath)
+	}
+
+	if err := os.WriteFile(lockPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		debugf("lock file write failed (non-fatal): %v", err)
+	}
+
+	return func() {
+		os.Remove(lockPath)
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive sampling monitor
+// ---------------------------------------------------------------------------
+
+// adaptiveSamplingWindowDropsThreshold is the per-5s-window drop count that
+// counts as "high pressure". At 5s windows, 1000 drops ≈ 200/sec sustained.
+const adaptiveSamplingWindowDropsThreshold = 1000
+
+// adaptiveSamplingMaxRate caps the sampling divisor. Beyond 1-in-100 the
+// loss of fidelity outweighs the throughput win for investigations.
+const adaptiveSamplingMaxRate uint32 = 100
+
+// nextSamplingRate returns the next sampling rate and updated pressure/quiet
+// counters given the current rate and window drop count. Extracted as a pure
+// function so the rate-selection logic is unit-testable without a goroutine.
+//
+// Strategy:
+//   - windowDrops > threshold for 2 consecutive windows (≥10s sustained):
+//     bump rate 1 → 10 → 100 (capped at adaptiveSamplingMaxRate).
+//   - windowDrops == 0 for 6 consecutive windows (≥30s quiet): reset to 1.
+//   - Otherwise: hold rate, reset both counters.
+//
+// Returns (newRate, newHighPressureCount, newQuietCount).
+func nextSamplingRate(currentRate uint32, windowDrops uint64, highPressureCount, quietCount int) (uint32, int, int) {
+	if windowDrops > adaptiveSamplingWindowDropsThreshold {
+		quietCount = 0
+		// Already at cap — no point tracking pressure we can't act on.
+		if currentRate >= adaptiveSamplingMaxRate {
+			return currentRate, highPressureCount, quietCount
+		}
+		highPressureCount++
+		if highPressureCount >= 2 {
+			newRate := currentRate * 10
+			if newRate < currentRate { // overflow guard
+				newRate = adaptiveSamplingMaxRate
+			}
+			if newRate > adaptiveSamplingMaxRate {
+				newRate = adaptiveSamplingMaxRate
+			}
+			return newRate, 0, 0
+		}
+		return currentRate, highPressureCount, quietCount
+	}
+	if windowDrops == 0 {
+		quietCount++
+		highPressureCount = 0
+		if quietCount >= 6 && currentRate > 1 {
+			return 1, 0, 0
+		}
+		return currentRate, highPressureCount, quietCount
+	}
+	// Mixed: some drops but below threshold. Hold rate, reset counters.
+	return currentRate, 0, 0
+}
+
+// runAdaptiveSamplingMonitor watches the drop rate and adjusts BPF sampling
+// to reduce pressure. Checks every 5 seconds; see nextSamplingRate for the
+// rate-change strategy.
+func runAdaptiveSamplingMonitor(ctx context.Context, cudaTracers []*cuda.Tracer, driverTracer *driver.Tracer, graphTracers []*cudagraph.Tracer, droppedFn func() uint64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var rate uint32 = 1
+	var highPressureCount, quietCount int
+	var lastDropCount uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentDrops := droppedFn()
+			windowDrops := currentDrops - lastDropCount
+			lastDropCount = currentDrops
+
+			newRate, hp, q := nextSamplingRate(rate, windowDrops, highPressureCount, quietCount)
+			highPressureCount = hp
+			quietCount = q
+			if newRate != rate {
+				applyRate(cudaTracers, driverTracer, graphTracers, newRate)
+				if newRate > rate {
+					slog.Info("adaptive sampling: increased rate due to sustained drops", "old_rate", rate, "new_rate", newRate, "window_drops", windowDrops)
+				} else {
+					slog.Info("adaptive sampling: reset to 1 (no drops for 30s)", "old_rate", rate)
+				}
+				rate = newRate
+			}
+		}
+	}
+}
+
+// applyRate writes the sampling rate to every attached tracer's BPF
+// config_map. Errors are logged via debugf (best-effort — tracers that
+// fail to update stay at the previous rate until the next attempt).
+func applyRate(cudaTracers []*cuda.Tracer, driverTracer *driver.Tracer, graphTracers []*cudagraph.Tracer, rate uint32) {
+	for _, ct := range cudaTracers {
+		if err := ct.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: cuda rate update failed: %v", err)
+		}
+	}
+	if driverTracer != nil {
+		if err := driverTracer.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: driver rate update failed: %v", err)
+		}
+	}
+	for _, gt := range graphTracers {
+		if err := gt.SetSamplingRate(rate); err != nil {
+			debugf("adaptive sampling: graph rate update failed: %v", err)
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Selective storage — store only investigation-valuable events, aggregate rest
@@ -1030,21 +1617,32 @@ func mergeAllEventChannels(ctx context.Context, cudaCh <-chan events.Event, host
 // Target resolution
 // ---------------------------------------------------------------------------
 
-// resolveTargets finds the libcudart.so path and target processes.
+// resolveTargets finds the libcudart.so path(s) and target processes.
 //
 // Resolution order:
-//  1. If --pid is specified: validate each PID in FindCUDAProcesses(), return lib from first
-//  2. If auto-detect: return ALL found CUDA processes (not just the first)
-//  3. Fallback: search filesystem for libcudart.so (attach to library,
-//     probes fire for ANY process that loads it)
+//  1. If --cuda-lib is set: use that path exclusively, skip all discovery
+//  2. If --pid is specified: validate each PID in FindCUDAProcesses(), return lib from first
+//  3. If auto-detect: return ALL found CUDA processes (not just the first)
+//  4. Fallback (no processes): call FindAllLibCUDART() to discover ALL copies
+//     of the library (system + venv). Probes fire for ANY process that loads it.
 //
-// Returns (libPath, pids, processNames, error). Empty pids means "all processes".
-func resolveTargets(pids []int) (string, []int, []string, error) {
+// Returns (libPaths, pids, processNames, error).
+// libPaths[0] is the "primary" library (used for header display, etc.).
+// Empty pids means "all processes".
+func resolveTargets(pids []int) ([]string, []int, []string, error) {
+	// --cuda-lib: explicit path, skip all discovery.
+	if traceCUDALib != "" {
+		if _, err := os.Stat(traceCUDALib); err != nil {
+			return nil, nil, nil, fmt.Errorf("--cuda-lib path not accessible: %w", err)
+		}
+		return []string{traceCUDALib}, nil, nil, nil
+	}
+
 	if len(pids) > 0 {
 		// User specified PID(s) — find their libcudart.so.
 		procs, err := discover.FindCUDAProcesses()
 		if err != nil {
-			return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
+			return nil, nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 		}
 
 		procMap := make(map[int]discover.CUDAProcess)
@@ -1058,7 +1656,7 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 		for _, pid := range pids {
 			p, ok := procMap[pid]
 			if !ok {
-				return "", nil, nil, fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
+				return nil, nil, nil, fmt.Errorf("PID %d not found or not using CUDA — is it running?", pid)
 			}
 			if libPath == "" {
 				libPath = p.LibCUDAPath
@@ -1066,13 +1664,13 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 			resolvedPIDs = append(resolvedPIDs, p.PID)
 			names = append(names, p.Name)
 		}
-		return libPath, resolvedPIDs, names, nil
+		return []string{libPath}, resolvedPIDs, names, nil
 	}
 
 	// Auto-detect: find ALL CUDA processes.
 	procs, err := discover.FindCUDAProcesses()
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
+		return nil, nil, nil, fmt.Errorf("scanning for CUDA processes: %w", err)
 	}
 
 	if len(procs) > 0 {
@@ -1082,22 +1680,29 @@ func resolveTargets(pids []int) (string, []int, []string, error) {
 			resolvedPIDs = append(resolvedPIDs, p.PID)
 			names = append(names, p.Name)
 		}
-		return procs[0].LibCUDAPath, resolvedPIDs, names, nil
+		return []string{procs[0].LibCUDAPath}, resolvedPIDs, names, nil
 	}
 
-	// No running CUDA processes — attach to library on disk.
-	// Probes fire when any process later loads it.
-	libPath, err := discover.FindLibCUDART()
-	if err != nil {
-		return "", nil, nil, fmt.Errorf(
+	// No running CUDA processes — discover ALL copies of libcudart.so.
+	// Attach probes to every copy so that venv-bundled libraries are covered.
+	libPaths := discover.FindAllLibCUDART()
+	if len(libPaths) == 0 {
+		return nil, nil, nil, fmt.Errorf(
 			"no CUDA processes found and libcudart.so not found.\n"+
 				"  Start a GPU workload first, or install CUDA toolkit.\n"+
 				"  Run 'ingero check' for detailed diagnostics")
 	}
 
-	fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPath)
+	if len(libPaths) == 1 {
+		fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %s\n", libPaths[0])
+	} else {
+		fmt.Fprintf(os.Stderr, "  No CUDA processes running — attaching to %d libraries:\n", len(libPaths))
+		for _, p := range libPaths {
+			fmt.Fprintf(os.Stderr, "    %s\n", p)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "  Probes will fire when a CUDA workload starts.\n\n")
-	return libPath, nil, nil, nil
+	return libPaths, nil, nil, nil
 }
 
 // resolveProcessNames looks up names for a list of PIDs via FindCUDAProcesses.
@@ -1115,6 +1720,340 @@ func resolveProcessNames(pids []int) []string {
 		names[i] = procMap[pid]
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------------
+// Library mismatch checker
+// ---------------------------------------------------------------------------
+
+// libMismatchChecker detects when a CUDA process has loaded a libcudart.so
+// that doesn't match any of the libraries ingero attached probes to. This
+// happens when a venv bundles its own libcudart.so but ingero only probed the
+// system copy (or vice versa). Warns once per PID via slog.Warn.
+//
+// Safe for concurrent use — Check() is guarded by a mutex.
+type libMismatchChecker struct {
+	mu           sync.Mutex
+	attachedLibs map[string]bool // resolved paths of libraries with probes
+	checked      map[uint32]bool // PIDs already checked (warn-once)
+}
+
+func newLibMismatchChecker(attachedLibs map[string]bool) *libMismatchChecker {
+	return &libMismatchChecker{
+		attachedLibs: attachedLibs,
+		checked:      make(map[uint32]bool),
+	}
+}
+
+// Check reads /proc/<pid>/maps on first CUDA event for this PID and logs
+// a warning if the loaded library doesn't match any attached library.
+func (c *libMismatchChecker) Check(pid uint32) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.checked[pid] {
+		c.mu.Unlock()
+		return
+	}
+	c.checked[pid] = true
+	c.mu.Unlock()
+
+	loadedLib, err := discover.FindCUDAInMaps(int(pid))
+	if err != nil || loadedLib == "" {
+		return // process gone or no CUDA mapping — skip silently
+	}
+
+	// Check if the loaded library matches any attached library.
+	if c.attachedLibs[loadedLib] {
+		return // exact match
+	}
+
+	// Try resolved path comparison for symlink differences.
+	resolved, err := filepath.EvalSymlinks(loadedLib)
+	if err == nil && c.attachedLibs[resolved] {
+		return
+	}
+
+	slog.Warn("PID loaded libcudart.so not matching any attached library", "pid", pid, "loaded_lib", loadedLib)
+}
+
+// ---------------------------------------------------------------------------
+// Python runtime state lifecycle (--py-walker=ebpf)
+// ---------------------------------------------------------------------------
+
+// tryPushPyRuntimeState detects whether the given PID is a CPython 3.10,
+// 3.11, or 3.12 process and, if so, pushes its _PyRuntime address and
+// struct offsets into the BPF py_runtime_map so the in-kernel walker can
+// unwind Python frames. The walker dispatches per-version based on the
+// PythonMinor field in the pushed state.
+//
+// Best-effort: any failure (not Python, unsupported version, libpython
+// missing, offset out of uint16 range, map write error) is logged at debug
+// level and returns nil — the trace continues without per-kernel frame
+// walking for this PID. Callers should not treat failures as fatal.
+//
+// pyMaps empty is a no-op — simplifies callers that conditionally enable the
+// ebpf walker without threading an "enabled" bool through every caller. The
+// state is written to EVERY map in the slice (one per cuda tracer instance).
+func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
+	if len(pyMaps) == 0 || pid == 0 {
+		return
+	}
+
+	info := symtab.DetectPython(pid)
+	if info == nil {
+		debugf("py-walker: PID %d not a Python process — skipping", pid)
+		return
+	}
+	// Previously this function returned early if minor != 12.
+	// Now we support 10, 11, and 12 via per-version dispatch in the
+	// BPF walker (see bpf/python_walker.bpf.h).
+	if info.Minor != 10 && info.Minor != 11 && info.Minor != 12 {
+		debugf("py-walker: PID %d is Python %s — python_minor %d not supported by BPF walker (only 3.10/3.11/3.12); userspace walker will handle", pid, info.Version, info.Minor)
+		return
+	}
+
+	runtimeAddr, err := symtab.FindPyRuntimeAddr(pid, info)
+	if err != nil || runtimeAddr == 0 {
+		debugf("py-walker: _PyRuntime not found for PID %d: %v", pid, err)
+		return
+	}
+
+	// Resolve struct offsets via a layered fallback chain (highest -> lowest
+	// confidence). All sources can fail silently on Ubuntu's distro-patched
+	// CPython 3.12 builds, so we combine the best signal from each:
+	//
+	//   1. _Py_DebugOffsets read from the running process memory (3.13+ only;
+	//      3.12 has no such struct — the field at _PyRuntime+0 is _initialized,
+	//      not a debug-offsets header).
+	//   2. Runtime ctypes harvester subprocess. Spawns the SAME python binary
+	//      with a tiny script that uses ctypes + known runtime values
+	//      (os.gettid, sys._getframe, id()) to scan struct memory and discover
+	//      field offsets empirically. Authoritative for the offsets it finds —
+	//      same binary as the workload, no debug symbols, no DWARF, immune to
+	//      distro patches. Partial coverage; fields it can't discover are
+	//      filled by the next source.
+	//   3. GetPyOffsetsBest fallback chain (build-id DB → DWARF → hardcoded).
+	//
+	// Each source overlays the previous: we start with hardcoded/DWARF as a
+	// base table, then overlay harvester values where present, then overlay
+	// _Py_DebugOffsets where present. The final table is what gets pushed to
+	// the BPF map.
+	// When ingero runs in a container, info.LibPath (from /proc/PID/maps) is
+	// in the target's mount namespace. GetPyOffsetsBest opens the ELF for
+	// build-id + DWARF reads, so it needs a path accessible from our own
+	// namespace. HarvestOffsets passes info.LibPath as-is and chroots into
+	// /proc/<pid>/root/ so the target-namespace path is correct there.
+	elfPath := procpath.ResolveContainerPath(int(pid), info.LibPath)
+
+	var offsets *symtab.PyOffsets
+	offsets = symtab.GetPyOffsetsBest(elfPath, info.Minor)
+	if offsets == nil {
+		debugf("py-walker: no fallback offsets available for Python %s (PID %d)", info.Version, pid)
+		return
+	}
+
+	// Overlay runtime harvester (most authoritative for the offsets it discovers).
+	if harvested, hErr := symtab.HarvestOffsets(info.LibPath, int(pid)); hErr != nil {
+		debugf("py-walker: harvester subprocess failed for PID %d (%s): %v — using fallback offsets", pid, info.LibPath, hErr)
+	} else if harvested != nil {
+		offsets = harvested.Overlay(offsets)
+		debugf("py-walker: overlaid runtime-harvested offsets onto %s table for PID %d", offsets.Version, pid)
+	}
+
+	// CPython 3.12 ALWAYS uses tstate.current_frame directly (no cframe
+	// indirection). The harvester's empirical scan can falsely conclude
+	// indirection because parent_frame.previous points to its child, mimicking
+	// the cframe-current_frame relationship. Force direct access for 3.12 so
+	// the dispatcher routes to walker_312 (which validates code_ptr is a heap
+	// pointer and skips C-call entry-frame stubs).
+	if info.Minor == 12 {
+		offsets.CframeCurrentFrame = 0
+	}
+
+	// Overlay _Py_DebugOffsets if present (3.13+).
+	if info.Minor >= 13 {
+		if pyDebugOff, doErr := symtab.ReadDebugOffsetsFromPID(pid, runtimeAddr, info.Minor); doErr == nil && pyDebugOff != nil {
+			offsets = pyDebugOff
+			debugf("py-walker: using _Py_DebugOffsets from process memory for PID %d", pid)
+		}
+	}
+
+	state, err := pyRuntimeStateFromOffsets(runtimeAddr, offsets, info.Minor)
+	if err != nil {
+		debugf("py-walker: converting offsets for PID %d: %v", pid, err)
+		return
+	}
+
+	// Broadcast to every cuda tracer's py_runtime_map. Each tracer's BPF
+	// program only reads from its own map; without broadcast, workload
+	// events going through tracer[N] (N>0) would see an empty map.
+	var firstErr error
+	for i, pyMap := range pyMaps {
+		if err := pytrace.SetPyRuntimeState(pyMap, pid, state); err != nil {
+			debugf("py-walker: writing py_runtime_map[%d] for PID %d: %v", i, pid, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if firstErr != nil {
+		return
+	}
+	// Mark this PID as having walker state (bool=true). The dedup map
+	// is keyed on PID; value distinguishes "has state" (true) from
+	// "tried but not Python / failed" (false). Fork inheritance uses
+	// this distinction — only inherit from a parent with true.
+	pyPushedPIDs.Store(pid, true)
+	if info.Minor != 12 {
+		// INFO-level log (once per PID) to surface multi-version support
+		// when a non-3.12 Python gets the BPF walker attached.
+		slog.Info("py-walker: pushed runtime state for non-3.12 Python process",
+			"pid", pid, "python_version", info.Version, "python_minor", info.Minor,
+			"runtime_addr", fmt.Sprintf("0x%x", runtimeAddr))
+	}
+	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d)", pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps))
+}
+
+// pyPushedPIDs is a per-PID dedup cache for the walker push pipeline.
+//   - Value bool=false: detection was attempted but the PID is not a
+//     supported Python process (or push failed). Future callers skip
+//     re-running the 150ms harvester for this PID.
+//   - Value bool=true: walker state was successfully written to at least
+//     one py_runtime_map. Fork inheritance copies state from this parent
+//     to its children.
+// Cleared on HostProcessExit and HostProcessExec (exec swaps the binary
+// so detection must re-run).
+var pyPushedPIDs sync.Map
+
+// tryPushPyRuntimeStateOnce wraps tryPushPyRuntimeState with per-PID dedup.
+// First call for a PID runs the full detect+harvest+push pipeline
+// (~150ms); repeat calls are a cheap map lookup and return.
+func tryPushPyRuntimeStateOnce(pid uint32, pyMaps []*ebpf.Map) {
+	if len(pyMaps) == 0 || pid == 0 {
+		return
+	}
+	// LoadOrStore marks the PID as "tried" (false). If it was already
+	// present (either true or false), we've attempted this PID before
+	// and skip. On success, tryPushPyRuntimeState upgrades the value
+	// to true via Store.
+	if _, loaded := pyPushedPIDs.LoadOrStore(pid, false); loaded {
+		return
+	}
+	tryPushPyRuntimeState(pid, pyMaps)
+}
+
+// handlePyLifecycle encapsulates the per-event py_runtime_map lifecycle
+// hooks shared between runTableMode and runJSONMode:
+//   - HostProcessFork: inherit parent's state into child (no harvester run)
+//   - HostProcessExec: clear dedup + re-push (binary may have changed)
+//   - HostProcessExit: clear dedup + delete map entry
+//
+// No-op when pyMaps is empty (walker disabled) or evt is not a host event.
+func handlePyLifecycle(evt events.Event, pyMaps []*ebpf.Map) {
+	if len(pyMaps) == 0 || evt.Source != events.SourceHost {
+		return
+	}
+	switch events.HostOp(evt.Op) {
+	case events.HostProcessFork:
+		childPID := uint32(evt.Args[1])
+		if childPID == 0 {
+			return
+		}
+		// Only inherit from parents that have actual walker state
+		// (bool=true). A parent with false is a non-Python process we
+		// already tried — inheriting from it would copy an empty entry
+		// AND poison the child's dedup so its own detection never runs.
+		v, ok := pyPushedPIDs.Load(evt.PID)
+		if !ok {
+			return
+		}
+		parentHasState, _ := v.(bool)
+		if !parentHasState {
+			return
+		}
+		for i, pyMap := range pyMaps {
+			if err := pytrace.CopyPID(pyMap, evt.PID, childPID); err != nil {
+				debugf("py-walker: CopyPID[%d] parent=%d child=%d: %v", i, evt.PID, childPID, err)
+			}
+		}
+		debugf("py-walker: fork-inherited state parent=%d child=%d (%d maps)", evt.PID, childPID, len(pyMaps))
+		pyPushedPIDs.Store(childPID, true)
+	case events.HostProcessExec:
+		clearPyPushedMark(evt.PID)
+		tryPushPyRuntimeStateOnce(evt.PID, pyMaps)
+	case events.HostProcessExit:
+		clearPyPushedMark(evt.PID)
+		for i, pyMap := range pyMaps {
+			if err := pytrace.ClearPID(pyMap, evt.PID); err != nil {
+				debugf("py-walker: ClearPID[%d](%d) failed: %v", i, evt.PID, err)
+			}
+		}
+	}
+}
+
+// clearPyPushedMark removes a PID from the dedup set. Call on process exit
+// (PID is gone) and on exec (the PID may now be running a different binary,
+// so the next push attempt should re-detect Python version + offsets).
+func clearPyPushedMark(pid uint32) {
+	pyPushedPIDs.Delete(pid)
+}
+
+// pyRuntimeStateFromOffsets converts a symtab.PyOffsets (uint64 fields —
+// CPython offsets are always small but typed wide) into the uint16 fields
+// required by the BPF py_runtime_state struct. Returns an error if any
+// offset exceeds uint16 — this would indicate a corrupt offset table or a
+// future CPython layout change that needs wider fields on the BPF side.
+//
+// `minor` is the CPython minor version (10, 11, or 12). It is stored in
+// the PythonMinor field so the BPF dispatcher can select the right
+// per-version walker variant.
+func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor int) (pytrace.PyRuntimeState, error) {
+	fields := []struct {
+		name string
+		val  uint64
+	}{
+		{"RuntimeInterpretersHead", o.RuntimeInterpretersHead},
+		{"InterpTstateHead", o.InterpTstateHead},
+		{"TstateNext", o.TstateNext},
+		{"TstateNativeThreadID", o.TstateNativeThreadID},
+		{"TstateFrame", o.TstateFrame},
+		{"FrameBack", o.FrameBack},
+		{"FrameCode", o.FrameCode},
+		{"CodeFilename", o.CodeFilename},
+		{"CodeName", o.CodeName},
+		{"CodeFirstLineNo", o.CodeFirstLineNo},
+		{"UnicodeState", o.UnicodeState},
+		{"UnicodeData", o.UnicodeData},
+	}
+	for _, f := range fields {
+		if f.val > 0xFFFF {
+			return pytrace.PyRuntimeState{}, fmt.Errorf("offset %s=%d exceeds uint16 range", f.name, f.val)
+		}
+	}
+	if o.CframeCurrentFrame > 0xFFFF {
+		return pytrace.PyRuntimeState{}, fmt.Errorf("offset CframeCurrentFrame=%d exceeds uint16 range", o.CframeCurrentFrame)
+	}
+	return pytrace.PyRuntimeState{
+		RuntimeAddr:                runtimeAddr,
+		OffRuntimeInterpretersHead: uint16(o.RuntimeInterpretersHead),
+		OffTstateHead:              uint16(o.InterpTstateHead),
+		OffTstateNext:              uint16(o.TstateNext),
+		OffTstateNativeTid:         uint16(o.TstateNativeThreadID),
+		OffTstateFrame:             uint16(o.TstateFrame),
+		OffFrameBack:               uint16(o.FrameBack),
+		OffFrameCode:               uint16(o.FrameCode),
+		OffCodeFilename:            uint16(o.CodeFilename),
+		OffCodeName:                uint16(o.CodeName),
+		OffCodeFirstLineNo:         uint16(o.CodeFirstLineNo),
+		OffUnicodeState:            uint16(o.UnicodeState),
+		OffUnicodeData:             uint16(o.UnicodeData),
+		PythonMinor:                uint8(minor),
+		// CframeCurrentFrame is populated only for 3.11 by
+		// symtab.GetPyOffsets; 0 for 3.10/3.12 by design.
+		OffCframeCurrentFrame: uint16(o.CframeCurrentFrame),
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,15 +2119,64 @@ func (c *pidNameCache) Names() map[uint32]string {
 }
 
 // ---------------------------------------------------------------------------
+// Event loop shared config
+// ---------------------------------------------------------------------------
+
+// eventLoopConfig bundles the ~16 dependencies shared between runTableMode
+// and runJSONMode. Reduces their signatures from 19–23 params each to ~4–8,
+// and makes it a one-line change to add another dependency. Callers fill
+// the struct once; callees alias fields to local names to keep existing
+// body code unchanged.
+type eventLoopConfig struct {
+	Collector     *stats.Collector
+	PIDFilter     map[uint32]bool
+	OnSnapshot    func(*stats.Snapshot)
+	EventStore    *store.Store
+	Resolver      *symtab.Resolver
+	PodCache      *k8s.PodCache
+	SnapFilter    *filter.SnapshotFilter
+	ProcNames     *pidNameCache
+	CUDAPIDs      map[uint32]bool
+	MemTracker    *memtrack.Tracker
+	StragglerDet  *straggler.Detector
+	NodeIdentity  string
+	RankCache     *discover.RankCache
+	MismatchCheck *libMismatchChecker
+	PyMaps        []*ebpf.Map
+	PyStatsMaps   []*ebpf.Map
+}
+
+// ---------------------------------------------------------------------------
 // Table mode — live-updating stats display
 // ---------------------------------------------------------------------------
 
 // runTableMode consumes events and refreshes a stats table every second.
-// corrPID is the correlator PID (single PID or 0 for aggregate).
-// pidFilter is the event-loop filter (nil = accept all).
-func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, corrPID uint32, pidFilter map[uint32]bool, droppedFn func() uint64, onSnapshot func(*stats.Snapshot), eventStore *store.Store, corr *correlate.Engine, resolver *symtab.Resolver, podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
+// cfg carries the ~16 shared dependencies; corrPID, droppedFn, droppedDetailFn,
+// and corr are table-mode-specific.
+func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoopConfig, corrPID uint32, droppedFn func() uint64, droppedDetailFn func() string, corr *correlate.Engine, onFork ...func(uint32)) error {
+	// Alias config fields to local names — keeps the (large) body unchanged
+	// from the pre-config-struct era. Go compiler elides these; no cost.
+	collector := cfg.Collector
+	pidFilter := cfg.PIDFilter
+	onSnapshot := cfg.OnSnapshot
+	eventStore := cfg.EventStore
+	resolver := cfg.Resolver
+	podCache := cfg.PodCache
+	snapFilter := cfg.SnapFilter
+	procNames := cfg.ProcNames
+	cudaPIDs := cfg.CUDAPIDs
+	memTracker := cfg.MemTracker
+	stragglerDet := cfg.StragglerDet
+	nodeIdentity := cfg.NodeIdentity
+	rankCache := cfg.RankCache
+	mismatchCheck := cfg.MismatchCheck
+	pyMaps := cfg.PyMaps
+	pyStatsMaps := cfg.PyStatsMaps
+
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	var lastPyWarn time.Time
 
 	// Track how many lines we printed for cursor-up overwriting.
 	linesDrawn := 0
@@ -1263,7 +2251,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 			if eventStore != nil && len(chains) > 0 {
 				eventStore.RecordChains(chainsToStored(chains))
 			}
-			renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+			renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 			return nil
 
 		case evt, ok := <-eventCh:
@@ -1283,7 +2271,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				if eventStore != nil && len(chains) > 0 {
 					eventStore.RecordChains(chainsToStored(chains))
 				}
-				renderTable(snap, droppedFn(), &linesDrawn, true, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 				return nil
 			}
 
@@ -1366,6 +2354,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				cudaPIDs[evt.PID] = true
 			}
 
+			// Runtime library mismatch check: on first CUDA event per PID,
+			// verify the process loaded a library we have probes on.
+			if mismatchCheck != nil && evt.Source == events.SourceCUDA {
+				mismatchCheck.Check(evt.PID)
+			}
+
 			// Resolve process name for non-host events (CUDA, Driver, IO, TCP, Net).
 			// Host events excluded — sched_switch fires for hundreds of irrelevant
 			// system PIDs that would pollute the cache.
@@ -1402,8 +2396,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 				}
 			}
 
+			// --py-walker=ebpf lifecycle: fork inherit, exec re-push, exit clear.
+			handlePyLifecycle(evt, pyMaps)
+
 		case <-ticker.C:
 			updateSysCtx()
+			checkPyReserveFailures(pyStatsMaps, &lastPyWarn)
 			// Record system snapshot for post-hoc causal chain replay.
 			if eventStore != nil {
 				sys := sysColl.Snapshot()
@@ -1491,7 +2489,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, collector *s
 						eventStore.ExpireChains(2 * time.Minute)
 					}
 				}
-				renderTable(snap, droppedFn(), &linesDrawn, false, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, false, corrs, chains)
 			}
 
 		case <-debugTickerCh:
@@ -1604,7 +2602,25 @@ func renderSystemLine(b *strings.Builder, lines *int, sys *stats.SystemSnapshot)
 	*lines++
 }
 
-func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
+// parseDetailField extracts the numeric value of a `name=N` field from a
+// whitespace-separated drop detail string (as produced by droppedDetailFn).
+// Returns 0 if the field is absent or unparseable — callers should treat 0
+// as "no event drops for this source".
+func parseDetailField(detail, name string) uint64 {
+	prefix := name + "="
+	for _, tok := range strings.Fields(detail) {
+		if strings.HasPrefix(tok, prefix) {
+			v, err := strconv.ParseUint(tok[len(prefix):], 10, 64)
+			if err != nil {
+				return 0
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+func renderTable(snap *stats.Snapshot, dropped uint64, droppedDetail string, linesDrawn *int, final bool, correlations []correlate.Correlation, chains ...[]correlate.CausalChain) {
 	var b strings.Builder
 
 	// Move cursor up to overwrite previous output.
@@ -1687,6 +2703,24 @@ func renderTable(snap *stats.Snapshot, dropped uint64, linesDrawn *int, final bo
 	fmt.Fprintf(&b, "%s\033[K\n", summary)
 	lines++
 
+	// Per-tracer drop breakdown (always shown when any drops occurred).
+	if dropped > 0 && droppedDetail != "" {
+		dropLine := fmt.Sprintf("  Events dropped: %s", droppedDetail)
+		// WARN if drops exceed 5% of total events.
+		totalEvts := snap.TotalEvents + dropped
+		if totalEvts > 0 && float64(dropped)/float64(totalEvts) > 0.05 {
+			dropLine += "  WARN: >5% of events dropped -- consider --ringbuf-size"
+		}
+		// Hard-failure WARN for any critical-event drop — OOM/exec/exit/fork
+		// deliveries are guaranteed. Parse host_crit=N out of the detail
+		// string (emitted by droppedDetailFn) and flag non-zero values.
+		if parseDetailField(droppedDetail, "host_crit") > 0 {
+			dropLine += "  WARN: CRITICAL events dropped -- this should never happen"
+		}
+		fmt.Fprintf(&b, "%s\033[K\n", dropLine)
+		lines++
+	}
+
 	// Spike patterns.
 	for _, op := range snap.Ops {
 		if op.SpikePattern != "" {
@@ -1755,9 +2789,30 @@ type jsonEvent struct {
 }
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
-// pidFilter is the event-loop filter (nil = accept all).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *stats.Collector, pidFilter map[uint32]bool, eventStore *store.Store, resolver *symtab.Resolver, onSnapshot func(*stats.Snapshot), podCache *k8s.PodCache, snapFilter *filter.SnapshotFilter, procNames *pidNameCache, cudaPIDs map[uint32]bool, memTracker *memtrack.Tracker, stragglerDet *straggler.Detector, nodeIdentity string, rankCache *discover.RankCache, onFork ...func(uint32)) error {
+// cfg carries the ~16 shared dependencies. JSON mode has no corrPID /
+// correlator / drop-detail reporter (that's a table-UI concern).
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoopConfig, onFork ...func(uint32)) error {
+	// Alias config fields to local names — see runTableMode comment.
+	collector := cfg.Collector
+	pidFilter := cfg.PIDFilter
+	onSnapshot := cfg.OnSnapshot
+	eventStore := cfg.EventStore
+	resolver := cfg.Resolver
+	podCache := cfg.PodCache
+	snapFilter := cfg.SnapFilter
+	procNames := cfg.ProcNames
+	cudaPIDs := cfg.CUDAPIDs
+	memTracker := cfg.MemTracker
+	stragglerDet := cfg.StragglerDet
+	nodeIdentity := cfg.NodeIdentity
+	rankCache := cfg.RankCache
+	mismatchCheck := cfg.MismatchCheck
+	pyMaps := cfg.PyMaps
+	pyStatsMaps := cfg.PyStatsMaps
+
 	enc := json.NewEncoder(os.Stdout)
+
+	var lastPyWarn time.Time
 
 	// Periodic debug throughput counter (same as runTableMode).
 	var debugEventCount uint64
@@ -1767,6 +2822,14 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 		dt := time.NewTicker(10 * time.Second)
 		defer dt.Stop()
 		debugTickerCh = dt.C
+	}
+
+	// Periodic Python-frame reserve-failure check (Bug 9).
+	var pyWarnTickerCh <-chan time.Time
+	if len(pyStatsMaps) > 0 {
+		pwt := time.NewTicker(5 * time.Second)
+		defer pwt.Stop()
+		pyWarnTickerCh = pwt.C
 	}
 
 	// Selective storage: aggregate map for events not individually stored.
@@ -1915,6 +2978,12 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 				cudaPIDs[evt.PID] = true
 			}
 
+			// Runtime library mismatch check: on first CUDA event per PID,
+			// verify the process loaded a library we have probes on.
+			if mismatchCheck != nil && evt.Source == events.SourceCUDA {
+				mismatchCheck.Check(evt.PID)
+			}
+
 			// Dynamic PID tracking: fork child → eBPF target_pids only.
 			// Do NOT inherit cudaPIDs — only actual CUDA/Driver events add PIDs.
 			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
@@ -1926,6 +2995,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 					procNames.Lookup(childPID)
 				}
 			}
+
+			// --py-walker=ebpf lifecycle: fork inherit, exec re-push, exit clear.
+			handlePyLifecycle(evt, pyMaps)
 
 			je := jsonEvent{
 				Timestamp:   evt.Timestamp.Format(time.RFC3339Nano),
@@ -1971,6 +3043,9 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, collector *st
 			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d",
 				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents)
 			debugEventCount = 0
+
+		case <-pyWarnTickerCh:
+			checkPyReserveFailures(pyStatsMaps, &lastPyWarn)
 		}
 	}
 }
@@ -2234,6 +3309,9 @@ func formatTraceFlags() string {
 	}
 	if traceMaxDB != "" && traceMaxDB != "0" {
 		flags = append(flags, "max-db="+traceMaxDB)
+	}
+	if tracePyWalker != "" && tracePyWalker != "auto" {
+		flags = append(flags, "py-walker="+tracePyWalker)
 	}
 	return strings.Join(flags, ",")
 }

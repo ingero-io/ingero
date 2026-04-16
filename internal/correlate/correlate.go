@@ -209,6 +209,17 @@ const DefaultGraphFreqWindow = 10 * time.Second
 // a launch is expected. If no launch occurs, "never launched" is flagged.
 const DefaultGraphNoLaunchTimeout = 30 * time.Second
 
+// DefaultGraphCaptureTimeout is the maximum duration to wait for a
+// cudaStreamEndCapture after a cudaStreamBeginCapture before flagging a
+// potential cuBLAS lazy-init failure. 5 seconds is generous — a normal
+// graph capture completes in milliseconds.
+const DefaultGraphCaptureTimeout = 5 * time.Second
+
+// minGraphCaptureDuration is the threshold below which a completed capture
+// is suspiciously short. Combined with a non-zero RetCode, this suggests
+// the capture failed immediately (e.g., due to cuBLAS lazy initialization).
+const minGraphCaptureDuration = 1 * time.Millisecond
+
 // Engine performs cross-layer correlation between host events and CUDA stats.
 type Engine struct {
 	mu         sync.RWMutex
@@ -436,6 +447,22 @@ func (e *Engine) SnapshotCorrelations(cudaOps []stats.OpStats, pid uint32) []Cor
 			}
 		case events.HostOOMKill:
 			oomCount++
+		case events.HostMmPageAllocSummary:
+			// Aggregated non-target mm_page_alloc events. Only counted
+			// when pid=0 (global view) — target PIDs still emit raw
+			// HostPageAlloc events counted above.
+			if pid == 0 {
+				pageAllocCount += int(evt.Args[0])
+				totalAllocBytes += evt.Args[1]
+			}
+		case events.HostSchedSwitchSummary:
+			// Aggregated non-target sched_switch transitions. Only
+			// counted when pid=0 — target PIDs still emit raw
+			// HostSchedSwitch events counted above.
+			if pid == 0 {
+				schedSwitchCount += int(evt.Args[0])
+				totalOffCPU += time.Duration(evt.Args[1])
+			}
 		}
 	}
 
@@ -564,6 +591,20 @@ func (e *Engine) SnapshotCausalChains(cudaOps []stats.OpStats, pid uint32) []Cau
 			podEvictionCount++
 		case events.HostPodOOMKill:
 			oomCount++ // K8s OOM kill treated same as kernel OOM
+		case events.HostMmPageAllocSummary:
+			// Aggregated non-target mm_page_alloc events — only
+			// contribute to the global view (pid=0). See
+			// SnapshotCorrelations for the same convention.
+			if pid == 0 {
+				pageAllocCount += int(evt.Args[0])
+				totalAllocBytes += evt.Args[1]
+			}
+		case events.HostSchedSwitchSummary:
+			// Aggregated non-target sched_switch transitions.
+			if pid == 0 {
+				schedSwitchCount += int(evt.Args[0])
+				totalOffCPU += time.Duration(evt.Args[1])
+			}
 		}
 	}
 
@@ -1464,6 +1505,9 @@ func (e *Engine) snapshotGraphChains(pid uint32, hostWindow, graphWindow []event
 	// Rule 4: Capture Never Launched.
 	chains = append(chains, e.checkGraphNeverLaunched(pid, graphWindow)...)
 
+	// Rule 5: Graph Capture Warmup Failure (cuBLAS lazy init).
+	chains = append(chains, e.checkGraphCaptureWarmup(pid, graphWindow)...)
+
 	return chains
 }
 
@@ -1730,6 +1774,116 @@ func (e *Engine) checkGraphNeverLaunched(pid uint32, graphWindow []events.Event)
 	}
 
 	return chains
+}
+
+// checkGraphCaptureWarmup detects CUDA Graph capture failures caused by
+// cuBLAS lazy initialization. Two patterns are flagged:
+//   - A BeginCapture has no matching EndCapture within DefaultGraphCaptureTimeout.
+//   - An EndCapture arrived but the capture was abnormally short (< 1ms) with
+//     a non-zero RetCode, suggesting the capture failed immediately.
+func (e *Engine) checkGraphCaptureWarmup(pid uint32, graphWindow []events.Event) []CausalChain {
+	now := time.Now()
+	if !e.latestTime.IsZero() {
+		now = e.latestTime
+	}
+
+	// Pattern A: in-flight captures that timed out (no EndCapture received).
+	var timedOut []struct {
+		pid    uint32
+		stream uint64
+		age    time.Duration
+	}
+	for capPID, state := range e.graphCaptures {
+		if pid != 0 && capPID != pid {
+			continue
+		}
+		age := now.Sub(state.beginTime)
+		if age >= DefaultGraphCaptureTimeout {
+			timedOut = append(timedOut, struct {
+				pid    uint32
+				stream uint64
+				age    time.Duration
+			}{capPID, state.stream, age})
+		}
+	}
+
+	// Pattern B: completed captures with abnormally short duration AND error.
+	type failedCapture struct {
+		pid      uint32
+		stream   uint64
+		duration time.Duration
+		retCode  int32
+	}
+	var shortFails []failedCapture
+	beginTimes := make(map[uint32]events.Event) // TID → begin event
+
+	for _, evt := range graphWindow {
+		if pid != 0 && evt.PID != pid {
+			continue
+		}
+		op := events.CUDAGraphOp(evt.Op)
+		switch op {
+		case events.GraphBeginCapture:
+			beginTimes[evt.TID] = evt
+		case events.GraphEndCapture:
+			delete(beginTimes, evt.TID)
+			if evt.RetCode != 0 && evt.Duration < minGraphCaptureDuration {
+				shortFails = append(shortFails, failedCapture{
+					pid:      evt.PID,
+					stream:   evt.StreamHandle,
+					duration: evt.Duration,
+					retCode:  evt.RetCode,
+				})
+			}
+		}
+	}
+
+	if len(timedOut) == 0 && len(shortFails) == 0 {
+		return nil
+	}
+
+	var timeline []ChainEvent
+
+	for _, to := range timedOut {
+		timeline = append(timeline, ChainEvent{
+			Layer:  "CUDA_GRAPH",
+			Op:     "graphBeginCapture",
+			Detail: fmt.Sprintf("PID %d: BeginCapture on stream 0x%x with no EndCapture after %v", to.pid, to.stream, to.age.Round(time.Second)),
+		})
+	}
+	for _, sf := range shortFails {
+		timeline = append(timeline, ChainEvent{
+			Layer:    "CUDA_GRAPH",
+			Op:       "graphEndCapture",
+			Detail:   fmt.Sprintf("PID %d: capture failed (retCode=%d, duration=%v) on stream 0x%x", sf.pid, sf.retCode, sf.duration.Round(time.Microsecond), sf.stream),
+			Duration: sf.duration,
+		})
+	}
+
+	timeline = append(timeline, ChainEvent{
+		Layer:  "CUDA",
+		Op:     "cuBLAS",
+		Detail: "cuBLAS defers handle creation until first use; if first use is during capture, disallowed operations abort the capture",
+	})
+
+	return []CausalChain{{
+		ID:       e.chainID("graph-capture-warmup"),
+		Severity: "MEDIUM",
+		Summary:  "CUDA Graph capture failure — possible cuBLAS lazy initialization",
+		RootCause: "cuBLAS defers handle creation until first use. If first use occurs during graph capture, the capture fails because handle creation triggers disallowed operations.",
+		Timeline:  timeline,
+		Explanation: "CUDA Graph capture failure — possible cuBLAS lazy initialization. " +
+			"Add 3+ warmup iterations before cudaStreamBeginCapture to ensure cuBLAS handles are initialized. " +
+			"cuBLAS (and cuDNN) lazily create internal handles, memory pools, and kernel plans on first invocation. " +
+			"These initialization steps call CUDA APIs (e.g., cudaMalloc, cudaEventCreate) that are disallowed during stream capture, " +
+			"causing the capture to fail or produce an invalid graph.",
+		Recommendations: []string{
+			"Add 3+ warmup iterations before cudaStreamBeginCapture to ensure cuBLAS handles are initialized",
+			"Call cublasCreate() and run a dummy GEMM before the first graph capture",
+			"For PyTorch: use torch.cuda.make_graphed_callables() which handles warmup automatically",
+			"Set CUBLAS_WORKSPACE_CONFIG=:4096:8 to pre-allocate cuBLAS workspaces",
+		},
+	}}
 }
 
 // dedup removes duplicate strings from a slice while preserving order.

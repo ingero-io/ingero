@@ -89,7 +89,10 @@ struct entry_state {
  *   offset 12: tid           (u32)
  *   offset 16: source        (u8)
  *   offset 17: op            (u8)
- *   offset 18: _pad          (u16)
+ *   offset 18: _pad          (u16) — repurposed as per-event flag bits;
+ *                                    see INGERO_EVENT_FLAG_* below. Older
+ *                                    probes that never set flag bits
+ *                                    leave this at 0 (unchanged ABI).
  *   offset 20: _pad2         (u32) — explicit; replaces implicit compiler padding
  *   offset 24: cgroup_id     (u64) — bpf_get_current_cgroup_id() for K8s container scoping
  *   offset 32: comm          (char[16]) — bpf_get_current_comm() for PID-reuse-resilient process identity
@@ -105,11 +108,18 @@ struct ingero_event_hdr {
 	__u32 tid;
 	__u8  source;       /* EVENT_SRC_* */
 	__u8  op;           /* operation type */
-	__u16 _pad;
+	__u16 _pad;         /* flag bits — see INGERO_EVENT_FLAG_* (most probes leave 0) */
 	__u32 _pad2;        /* explicit alignment padding (was implicit in v0.6) */
 	__u64 cgroup_id;    /* cgroup v2 inode ID; 0 or 1 = no meaningful cgroup */
 	char  comm[16];     /* process name from bpf_get_current_comm() — TASK_COMM_LEN */
 };
+
+/*
+ * Per-event flag bits stored in ingero_event_hdr._pad.
+ * ABI-backwards-compatible: older probes that never set this field leave
+ * it 0, which means "no flags" — callers can safely AND-test any bit.
+ */
+#define INGERO_EVENT_FLAG_PY_FRAMES 0x0001u  /* event payload has trailing py_walk_result */
 
 /* CUDA runtime event (80 bytes, was 64 in v0.9, 56 in v0.6) */
 struct cuda_event {
@@ -210,12 +220,18 @@ struct cuda_graph_event {
 };
 
 /*
- * Runtime configuration — written by Go userspace, read by eBPF programs.
- * Stored in a BPF_MAP_TYPE_ARRAY with a single entry (key 0).
+ * ingero_config: runtime configuration read by all BPF probes.
+ * Stored in a single-entry BPF_MAP_TYPE_ARRAY map (config_map).
+ *
+ * ABI stability: fields may only be APPENDED. Existing fields and
+ * padding must not change (they are read by compiled BPF programs
+ * that may predate newer Go-side code).
  */
 struct ingero_config {
-	__u8 capture_stack;  /* 1 = capture userspace stack traces, 0 = skip */
-	__u8 _pad[7];
+	__u8  capture_stack;   /* 1 = capture userspace stack traces */
+	__u8  _pad1[3];
+	__u32 sampling_rate;   /* 0 or 1 = emit all events; N > 1 = emit 1 per N */
+	__u32 _pad2;           /* 12 bytes total (u32 alignment, no trailing pad) */
 };
 
 /*
@@ -246,6 +262,88 @@ struct cuda_event_stack {
 	__u64 stack_ips[MAX_STACK_DEPTH];  /* 512: raw instruction pointers */
 };
 /* Total: 48 + 8+8+8+4+4 + 2+6+512 = 600 bytes (was 584 in v0.9, 576 in v0.6) */
+
+/*
+ * py_runtime_state: per-PID Python runtime configuration pushed from
+ * userspace into py_runtime_map. The eBPF Python frame walker reads
+ * this to know where _PyRuntime lives and what the offset table is.
+ *
+ * All offsets are byte offsets within their respective CPython structs.
+ * Supports CPython 3.10, 3.11, and 3.12 via python_minor dispatch in
+ * the walker.
+ *
+ * Layout: 8 (runtime_addr) + 12*2 (legacy uint16 offsets) + 1 (python_minor)
+ *       + 1 (pad) + 2 (off_cframe_current_frame) = 36 bytes total.
+ * ABI-stable append-only: the v1 layout was 32 bytes (3.12-only). v2
+ * appends python_minor + pad + off_cframe_current_frame (4 extra bytes).
+ * Older 32-byte writes (legacy 3.12-only clients) leave the appended
+ * fields zero, which the walker interprets as python_minor==0 => assume
+ * 3.12 to preserve backward compatibility.
+ */
+struct py_runtime_state {
+	__u64 runtime_addr;                  /* address of _PyRuntime in target process */
+	__u16 off_runtime_interpreters_head; /* _PyRuntime.interpreters.head offset */
+	__u16 off_tstate_head;               /* PyInterpreterState.threads.head offset */
+	__u16 off_tstate_next;               /* PyThreadState.next offset */
+	__u16 off_tstate_native_tid;         /* PyThreadState.native_thread_id offset */
+	__u16 off_tstate_frame;              /* PyThreadState.current_frame (3.12) or .frame (3.10) or .cframe (3.11) offset */
+	__u16 off_frame_back;                /* _PyInterpreterFrame.previous (3.11/12) or PyFrameObject.f_back (3.10) */
+	__u16 off_frame_code;                /* _PyInterpreterFrame.executable (3.11/12) or PyFrameObject.f_code (3.10) */
+	__u16 off_code_filename;             /* PyCodeObject.co_filename offset */
+	__u16 off_code_name;                 /* PyCodeObject.co_name offset */
+	__u16 off_code_firstlineno;          /* PyCodeObject.co_firstlineno offset */
+	__u16 off_unicode_state;             /* PyASCIIObject.state offset */
+	__u16 off_unicode_data;              /* PyASCIIObject.data inline offset */
+	/* v2 fields — appended for multi-version support. Older 32-byte
+	 * writes (3.12-only clients) leave these zero, which the walker
+	 * interprets as "assume 3.12" to preserve backward compatibility. */
+	__u8  python_minor;                  /* 10, 11, or 12; 0 = legacy caller, treat as 12 */
+	__u8  _pad3;
+	__u16 off_cframe_current_frame;      /* _PyCFrame.current_frame offset (3.11 only; 0 for others) */
+};
+
+/* Single Python frame extracted by the BPF walker. */
+struct py_frame {
+	char filename[128];
+	char funcname[128];
+	__s32 firstlineno;
+	__u32 _pad;  /* keep 8-byte aligned, total 264 bytes */
+};
+
+#define PY_MAX_FRAMES 16
+
+/*
+ * py_walk_result: result returned by walk_python_frames(). Embedded in
+ * extended cuda event when py walker is active.
+ */
+struct py_walk_result {
+	__u8 depth;            /* number of valid frames in frames[] */
+	__u8 truncated;        /* 1 if walk hit PY_MAX_FRAMES limit */
+	__u8 _pad[6];          /* align to 8 */
+	struct py_frame frames[PY_MAX_FRAMES];
+};
+
+/*
+ * Extended CUDA event with userspace stack AND Python frames.
+ *
+ * When the eBPF Python walker is active AND a frame walk returned
+ * non-empty results, emit_event() in cuda_trace.bpf.c reserves this
+ * variant instead of cuda_event_stack. The ringbuf record length and
+ * the INGERO_EVENT_FLAG_PY_FRAMES bit in hdr._pad let the Go parser
+ * dispatch:
+ *    80   bytes → cuda_event            (no stack, no python)
+ *   600   bytes → cuda_event_stack      (stack only)
+ *   4832  bytes → cuda_event_stack_py   (stack + python; flag bit set)
+ *
+ * py_walk_result is currently 4232 bytes (2 + 6 pad + 16 * 264), so
+ * the total wire size is 4832 bytes. Well within BPF ringbuf limits
+ * and well over the 512-byte BPF stack limit (allocated via ringbuf
+ * reserve, never on the stack).
+ */
+struct cuda_event_stack_py {
+	struct cuda_event_stack base;    /* 600 bytes */
+	struct py_walk_result   py;      /* 4232 bytes */
+};
 
 /*
  * target_cgroups — in-kernel cgroup filter map (defined in host_trace.bpf.c).

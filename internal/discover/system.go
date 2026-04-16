@@ -433,6 +433,78 @@ func PythonVersion() string {
 	return s
 }
 
+// CheckPtraceScope reads /proc/sys/kernel/yama/ptrace_scope and returns the integer level (0-3).
+//
+// Levels:
+//
+//	0 — classic ptrace: any process can PTRACE_ATTACH to any other (as long as uid matches)
+//	1 — restricted: only direct parent can ptrace children (Ubuntu default)
+//	2 — admin only: requires CAP_SYS_PTRACE
+//	3 — no ptrace: completely disabled
+//
+// For reading /proc/pid/mem (needed for Python frame walking), level 0 or CAP_SYS_PTRACE is required.
+func CheckPtraceScope() (level int, err error) {
+	data, err := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope")
+	if err != nil {
+		return -1, fmt.Errorf("reading ptrace_scope: %w", err)
+	}
+
+	s := strings.TrimSpace(string(data))
+	level, err = strconv.Atoi(s)
+	if err != nil {
+		return -1, fmt.Errorf("parsing ptrace_scope %q: %w", s, err)
+	}
+	return level, nil
+}
+
+// CheckPtraceScopeResult returns a CheckResult for the ptrace_scope setting.
+func CheckPtraceScopeResult() CheckResult {
+	level, err := CheckPtraceScope()
+	if err != nil {
+		// On systems without Yama LSM (some containers, minimal kernels),
+		// /proc/sys/kernel/yama/ptrace_scope doesn't exist — not a blocker.
+		return CheckResult{
+			Name:     "ptrace_scope",
+			OK:       true,
+			Optional: true,
+			Detail:   "Yama LSM not present (ptrace unrestricted)",
+		}
+	}
+
+	value := strconv.Itoa(level)
+	switch level {
+	case 0:
+		return CheckResult{
+			Name:   "ptrace_scope",
+			OK:     true,
+			Value:  value,
+			Detail: "classic ptrace — /proc/pid/mem readable for Python frames",
+		}
+	case 1:
+		return CheckResult{
+			Name:     "ptrace_scope",
+			OK:       true,
+			Optional: true,
+			Value:    value,
+			Detail:   "restricted (Ubuntu default) — Python frame walking needs CAP_SYS_PTRACE or root",
+		}
+	case 2:
+		return CheckResult{
+			Name:   "ptrace_scope",
+			OK:     false,
+			Value:  value,
+			Detail: "admin-only — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+		}
+	default: // 3 or unknown
+		return CheckResult{
+			Name:   "ptrace_scope",
+			OK:     false,
+			Value:  value,
+			Detail: "ptrace disabled — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+		}
+	}
+}
+
 // RunAllChecks executes all system readiness checks and returns them in order.
 func RunAllChecks() []CheckResult {
 	checks := []func() CheckResult{
@@ -443,6 +515,7 @@ func RunAllChecks() []CheckResult {
 		CheckCUDALibrary,
 		CheckLibCUDA,
 		CheckCUDAProcesses,
+		CheckPtraceScopeResult,
 	}
 
 	results := make([]CheckResult, 0, len(checks))

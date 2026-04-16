@@ -15,9 +15,14 @@ probes:
     enabled: true
     # Path to libcudart.so (auto-detected if empty)
     library_path: ""
+    # ringbuf_size: 8388608  # 8MB default, must be power of 2
   driver:
     enabled: true
     # CUDA Driver API uprobes on libcuda.so (auto-detected)
+    # ringbuf_size: 8388608  # 8MB default, must be power of 2
+  cudagraph:
+    enabled: true
+    # ringbuf_size: 4194304  # 4MB default, must be power of 2
   host:
     enabled: true
     # Tracepoints: sched_switch, sched_wakeup, mm_page_alloc, oom_kill
@@ -25,6 +30,16 @@ probes:
       - sched_switch
       - sched_wakeup
       - mm_page_alloc
+    # ringbuf_size: 1048576  # 1MB default, must be power of 2
+  blockio:
+    enabled: true
+    # ringbuf_size: 1048576  # 1MB default, must be power of 2
+  net:
+    enabled: true
+    # ringbuf_size: 524288   # 512KB default, must be power of 2
+  tcp:
+    enabled: true
+    # ringbuf_size: 262144   # 256KB default, must be power of 2
 
 # Storage
 store:

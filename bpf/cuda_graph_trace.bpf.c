@@ -31,6 +31,46 @@ struct {
 	__type(value, struct graph_entry_state);
 } graph_entry_map SEC(".maps");
 
+// Runtime configuration map — Go writes config, eBPF reads it.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ingero_config);
+} graph_config_map SEC(".maps");
+
+/*
+ * graph_sample_counter: per-CPU event counter for adaptive sampling.
+ * Incremented on every event; events are skipped when counter % rate != 0.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} graph_sample_counter SEC(".maps");
+
+// ---- Helper: sampling gate ----
+
+/*
+ * graph_should_sample: returns true if the current event should be emitted
+ * under the configured sampling_rate. Rate 0 or 1 = always emit.
+ * Rate N > 1 = emit 1 in every N events (per-CPU).
+ */
+static __always_inline int graph_should_sample(void) {
+	__u32 key = 0;
+	struct ingero_config *cfg = bpf_map_lookup_elem(&graph_config_map, &key);
+	if (!cfg || cfg->sampling_rate <= 1) {
+		return 1;
+	}
+	__u64 *counter = bpf_map_lookup_elem(&graph_sample_counter, &key);
+	if (!counter) {
+		return 1;  /* safe default — emit on lookup failure */
+	}
+	__u64 c = __sync_fetch_and_add(counter, 1);
+	return (c % cfg->sampling_rate) == 0;
+}
+
 // ---- Helper: save graph entry state ----
 
 static __always_inline void graph_save_entry(__u32 tid, __u8 op,
@@ -56,6 +96,10 @@ static __always_inline void graph_emit_event(__u32 pid, __u32 tid,
 					     __u64 graph_handle,
 					     __u64 exec_handle)
 {
+	/* Adaptive sampling: skip this event when rate > 1 and counter % rate != 0. */
+	if (!graph_should_sample())
+		return;
+
 	struct cuda_graph_event *evt;
 	evt = bpf_ringbuf_reserve(&graph_events, sizeof(*evt), 0);
 	if (!evt)
@@ -212,5 +256,6 @@ int uretprobe_graph_launch(struct pt_regs *ctx)
 
 // Force BTF type emission for bpf2go code generation.
 const struct cuda_graph_event *_unused_cuda_graph_event_force_btf __attribute__((unused));
+const struct ingero_config *_unused_graph_config_force_btf __attribute__((unused));
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

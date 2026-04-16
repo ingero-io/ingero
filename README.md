@@ -20,6 +20,8 @@
 
 **Version: 0.9.1**
 
+**Post-v0.9.1 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
+
 **The only GPU observability tool your AI assistant can talk to.**
 
 *"What caused the GPU stall?" → "`forward()` at `train.py:142`  -  cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
@@ -339,7 +341,21 @@ sudo ingero trace --deadband 5 --heartbeat 30s  # deadband + force report every 
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP
 sudo ingero trace --node gpu-node-07      # tag events with node identity (for multi-node)
+sudo ingero trace --cuda-lib /opt/venv/lib/python3.11/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12
+                                           # explicit libcudart path (skips auto-discovery)
+sudo ingero trace --ringbuf-size 32m       # override high-throughput ring buffer size (power of 2, min 4096)
+sudo ingero trace --sampling-rate 0        # adaptive sampling (default: 1 = emit all; N>1 = 1-in-N)
+sudo ingero trace --py-walker ebpf         # in-kernel CPython walker (works at ptrace_scope=3)
 ```
+
+**Flag reference (post-v0.9.1 additions):**
+
+- `--cuda-lib PATH` — Explicit path to `libcudart.so`. Skips auto-discovery. Useful for venv workloads where multiple `libcudart` copies exist.
+- `--ringbuf-size SIZE` — Override ring buffer size for high-throughput probes (cuda, driver, host). Accepts `k`/`m`/`g` suffix. Must be a power of 2, minimum 4096. Default: compiled sizes (8MB cuda/driver, 1MB host).
+- `--sampling-rate N` — Event sampling rate. `0` = adaptive (auto-adjusts under sustained drops). `1` = emit all events (default behavior). `N > 1` = emit 1 in every N events. Applies to cuda/driver/graph probes only; host probes are never sampled.
+- `--py-walker {auto,ebpf,userspace}` — Python frame walker selection. `auto` (default) uses the userspace walker. `ebpf` uses the in-kernel CPython walker (supports 3.10, 3.11, 3.12 — no `/proc/pid/mem` required, works at `ptrace_scope=3`). `userspace` forces the classic walker.
+
+`ingero check` now reports the current `kernel.yama.ptrace_scope` value with actionable hints when it blocks Python source attribution (see Troubleshooting).
 
 **Only `trace` needs sudo**  -  it attaches eBPF probes to the kernel. All other commands (`check`, `explain`, `query`, `mcp`, `demo`) run unprivileged. When you run `sudo ingero trace`, the database is written to your home directory (not `/root/`) and chown'd to your user, so non-sudo commands can read it.
 
@@ -620,6 +636,44 @@ For Python workloads (PyTorch, TensorFlow, etc.), Ingero extracts **CPython fram
 
 Supported Python versions: **3.10, 3.11, 3.12** (covers Ubuntu 22.04 default, conda default, and most production deployments). Version detection is automatic via `/proc/[pid]/maps`.
 
+#### Why you want a Python frame walker
+
+Native stack traces alone stop at `_PyEval_EvalFrameDefault` — the C function that runs the Python bytecode interpreter. Every frame above that in "what your code is actually doing" lives in interpreter state (`PyThreadState`, `_PyInterpreterFrame`, `PyCodeObject`), not in the C call stack. Without a walker, you see `_PyEval_EvalFrameDefault` repeated N times, which tells you nothing about which `.py` file triggered the slow `cuLaunchKernel`.
+
+A Python frame walker reads CPython's own data structures and reconstructs the source-level call chain (`train.py:train_step`, `model.py:forward`, ...). That's what lets you answer "which Python line launched this slow kernel?" instead of "something inside the interpreter launched it."
+
+Ingero ships **two walker implementations** for this:
+
+- **Userspace walker (default)** — runs in the Go process after an event arrives. Reads target process memory via `/proc/[pid]/mem` or `process_vm_readv`. Simple, flexible, handles the full CPython offset fallback chain (`_Py_DebugOffsets` → known-offsets DB → DWARF → hardcoded).
+- **In-kernel eBPF walker (opt-in)** — walks frames from inside the kernel probe via `bpf_probe_read_user` helpers. No `/proc/[pid]/mem` access needed. Required when `kernel.yama.ptrace_scope=3` (hardened systems), and useful when you want frame capture to happen synchronously with the CUDA event rather than asynchronously on event arrival.
+
+#### How to use it
+
+**Default (userspace walker):** Just pass `--stack` — frames appear automatically for supported Python versions.
+
+```bash
+sudo ingero trace --stack --duration 30s
+```
+
+You'll see `py_file` / `py_func` / `py_line` fields in JSON output, or `[Python] <file>:<line> in <func>()` entries in the table/debug view.
+
+**eBPF walker (opt-in):** Pass `--py-walker=ebpf` alongside `--stack`.
+
+```bash
+sudo ingero trace --stack --py-walker=ebpf --duration 30s
+```
+
+Use the eBPF walker when:
+- Your system has `kernel.yama.ptrace_scope=3` (the userspace walker can't read process memory there)
+- You want guaranteed synchronous frame capture at the exact moment of the CUDA event
+- You're running on a read-only/hardened host where `/proc/[pid]/mem` access is blocked
+
+Stick with the default (`--py-walker=auto`, which resolves to the userspace walker) when:
+- You're on a normal Linux host (ptrace_scope 0, 1, or 2) — the userspace walker is simpler and has full offset-fallback coverage including distro-patched CPython builds
+- You care about minimum per-event overhead — the eBPF walker adds BPF helper-call cost per emitted event
+
+**Troubleshooting missing frames:** Run `ingero check` — it now reports your `kernel.yama.ptrace_scope` value and tells you what to do if it's blocking the userspace walker. For CPython 3.12 you'll also benefit automatically from the self-describing `_Py_DebugOffsets` struct (no debug symbols needed); for 3.10/3.11 on patched distro builds, installing the matching `python3.X-dbgsym` package gives the userspace walker DWARF offsets to fall back on.
+
 ### JSON Output with `--stack`
 
 Real output from a PyTorch ResNet-50 training run on A100 SXM4  -  a cuBLAS matmul kernel launch captured via Driver API uprobes, with the full call chain from Python through cuBLAS to the GPU:
@@ -800,6 +854,116 @@ Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-bas
 
 **Does it check for updates?**
 Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero checks GitHub Releases for newer versions (once per 24 hours, cached in `~/.ingero/update-check`). The check runs in the background and never delays your command. Set `INGERO_NO_UPDATE_NOTIFIER=1` to disable. Skipped for `query`, `mcp`, `version`, and dev builds.
+
+## Known Issues
+
+- **Multiprocess CUDA via `fork()`.** NVIDIA's CUDA driver doesn't support `fork()` after the parent has initialized a CUDA context — children can't use CUDA. The eBPF walker inherits the parent's walker state to the child synchronously on fork, but a child that can't call CUDA won't trigger the walker regardless. For multiprocess CUDA workloads, use `torch.multiprocessing.set_start_method('spawn')` (or Ray/torchrun spawn equivalents); fresh spawn-style processes initialize their own CUDA context and get full walker coverage through the normal dynamic-PID path.
+
+- **Ubuntu 24.04 + distro-patched CPython 3.12 on the userspace walker.** Ubuntu's patched CPython has struct offsets that differ from upstream, and Ubuntu 24.04 doesn't ship `python3.12-dbgsym` in the main archive. The userspace walker falls back to hardcoded upstream offsets and produces garbage frame data. The **eBPF walker sidesteps this via its runtime offset harvester** — use `--py-walker=ebpf` on Ubuntu 24.04 until dbgsym becomes readily available. (Installing `python3.12-dbgsym` from `ddebs.ubuntu.com` also resolves the userspace-walker path.)
+
+- **Trace-all mode at `kernel.yama.ptrace_scope=3`.** The eBPF walker works at ptrace_scope=3 with an explicit `--pid X` target (PID-specific uprobe attach). Without `--pid` (trace-all / dynamic-discovery mode), cuda/driver uprobes may not fire — a startup warning is logged. Workarounds: pass `--pid X` or lower `kernel.yama.ptrace_scope` to `1` (the Ubuntu default).
+
+### Walker roadmap — userspace walker deprecation
+
+The in-kernel eBPF walker (`--py-walker=ebpf`) is now the strategic path forward. It has runtime offset harvesting for patched distro builds (including Ubuntu 24.04 CPython 3.12), multi-library libcudart coverage, per-CUDA-tracer state broadcast, fork-inheritance for multiprocess workloads, and runs at any `ptrace_scope` value with `--pid`.
+
+The **userspace walker — the current default — will be deprecated in an upcoming release.** Once the remaining items above are either fixed or accepted as narrow trade-offs, the eBPF walker will be promoted to the `auto` default. If you're setting up new deployments, prefer `--py-walker=ebpf` today. The `userspace` mode will remain available (via `--py-walker=userspace`) after the default flips, until the deprecation window closes.
+
+## Known Patterns
+
+Recurring GPU workload issues that Ingero detects automatically, with documented fixes.
+
+### CUDA Graph capture fails immediately (cuBLAS lazy initialization)
+
+**Symptom:** `cudaStreamBeginCapture` followed by cuBLAS or cuDNN calls fails immediately. Errors surface as `CUBLAS_STATUS_NOT_INITIALIZED`, a failed `cudaStreamEndCapture`, or an invalid graph handle. In traces, the capture region is abnormally short (duration < 1ms) and contains no kernel launches.
+
+**Cause:** cuBLAS and cuDNN lazily create their internal handles, memory pools, and workspace buffers on the first API call. Those initialization steps invoke CUDA runtime APIs (`cudaMalloc`, `cudaEventCreate`, and others) that are disallowed inside a stream capture region. When the first cuBLAS/cuDNN call happens under capture, the runtime rejects those disallowed calls and the capture aborts or produces an invalid graph.
+
+**Fix:** Execute 3+ warmup iterations of the work you intend to capture before calling `cudaStreamBeginCapture`. Warmup forces cuBLAS/cuDNN to complete lazy initialization outside the capture context.
+
+```python
+# BAD  -  capture aborts on first cuBLAS call
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = torch.matmul(a, b)
+
+# GOOD  -  warmup forces cuBLAS initialization outside capture
+s = torch.cuda.Stream()
+s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3):
+        y = torch.matmul(a, b)
+torch.cuda.current_stream().wait_stream(s)
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = torch.matmul(a, b)
+```
+
+Alternatively, use `torch.cuda.make_graphed_callables()`, which handles the warmup sequence automatically.
+
+**Automatic detection:** `ingero explain` surfaces this pattern as a `graph-capture-warmup` causal chain (MEDIUM severity). Run it after a trace when you suspect CUDA Graph capture issues.
+
+### Python source frames are missing
+
+**Symptom:** Native frames appear in stack traces, but the Python file, function, and line fields are empty. The trace shows `[Native]` frames only; no `[Python]` frames interleave with the CPython eval loop.
+
+**Causes:**
+- `kernel.yama.ptrace_scope >= 1` blocks `/proc/[pid]/mem` access, which the userspace walker relies on.
+- Distro-patched CPython whose struct offsets differ from upstream.
+- CPython version older than 3.10 or newer than the supported set (3.10, 3.11, 3.12).
+
+**Fix:**
+
+1. Check `ingero check` for the `ptrace_scope` advisory. At level 0 or 1 the userspace walker works when ingero runs as root or with `CAP_SYS_PTRACE` (the `process_vm_readv` fallback handles level 1 automatically).
+2. For hardened systems at `ptrace_scope=2` or `=3`, pass `--py-walker=ebpf` to route frame walking into the kernel via eBPF. The in-kernel walker reads CPython frame state directly from the task's user memory and bypasses the `/proc/[pid]/mem` dependency entirely.
+3. For distro builds whose offsets differ from upstream, installing `python3-dbgsym` lets ingero use DWARF offsets. CPython 3.12 additionally uses the self-describing `_Py_DebugOffsets` struct when present — no debug symbols needed.
+
+### High event drop rates under load
+
+**Symptom:** Table UI footer shows `Events dropped: cuda=N driver=N ...` with nonzero counts, or a `>5% of events dropped` WARN line. Per-tracer drop counters are visible in the trace output whenever drops occur.
+
+**Cause:** Ring buffer or userspace channel saturating under sustained event rates (typically above ~5M events/sec). The driver/runtime ring buffers fill faster than the userspace reader drains them.
+
+**Fix options (in order of preference):**
+
+1. Let adaptive sampling kick in: `--sampling-rate 0`. The adaptive path escalates the sampling rate under sustained drops and resets when the event stream is quiet. No manual tuning required.
+2. Increase ring buffer size for the high-throughput probes: `--ringbuf-size 32m` (or larger, must be a power of 2). The flag applies to cuda/driver/host ring buffers; low-throughput probes keep their compiled defaults.
+3. For sustained extreme rates, fix sampling: `--sampling-rate 10` emits one in every ten events.
+
+Critical events (OOM kills, process exec/exit/fork) flow through a dedicated smaller ring buffer and are never subject to sampling or aggregation. They remain visible even under heavy drop conditions on the main event stream.
+
+## Troubleshooting
+
+Symptom-to-fix entries for common operational questions. The Known Patterns section above has the full context; these are the tighter cheat-sheet versions.
+
+**Q: My venv workload isn't being traced.**
+Multi-library discovery is automatic. Ingero now locates every copy of `libcudart.so` (system install plus venv/conda copies shipped by `nvidia-cuda-runtime` pip packages) and attaches probes to all of them. Confirm with `--debug`: you should see `INFO discover: found libcudart.so path=...` lines for each copy. Force a specific library with `--cuda-lib /path/to/libcudart.so` if auto-discovery picks the wrong one.
+
+**Q: Python source frames don't appear in my stack traces.**
+See the Known Patterns entry above for full context. Quick checks: `ingero check | grep ptrace_scope`, ensure you're running as root or with `CAP_SYS_PTRACE`, and try `--py-walker=ebpf` for hardened systems. CPython 3.12 gets the best experience via the self-describing `_Py_DebugOffsets` struct — no debug symbols needed.
+
+**Q: Events are being dropped.**
+See Known Patterns for the full mitigation list. Start by letting adaptive sampling handle it (`--sampling-rate 0`, which is the recommended default for variable workloads). Tune `--ringbuf-size` only if the adaptive path isn't enough. OOM, process exec/exit, and fork events are guaranteed delivery regardless of drop rates on the main stream.
+
+**Q: How do I reduce ingero's overhead?**
+Default overhead target is `<2%` above the workload's baseline (NFR3). If you're seeing more:
+
+- Disable low-value probes: `--no-io --no-tcp --no-net` turns off block I/O, TCP retransmit, and network socket tracers. CUDA and host remain.
+- Skip stack capture: omit `--stack` (or pass `--stack=false`) if you don't need userspace stack traces; it's the most expensive per-event cost.
+- Use sampling: `--sampling-rate 10` on very high event workloads. For occasional-overhead-spike workloads, adaptive (`--sampling-rate 0`, default) is usually sufficient.
+- Keep the userspace walker (default `--py-walker=auto`) unless you need the eBPF path — the eBPF walker adds helper-call cost per event.
+
+### Advanced Configuration
+
+Reference material for power users. The defaults are tuned for typical training and inference workloads; only tweak these if you have a specific reason.
+
+**Ring buffer sizing.** Default sizes reflect expected event rates (8MB for cuda/driver, 1MB for host, smaller for tcp/net/block-io). Increase the high-throughput probe buffers if your workload exceeds ~1-5M events/sec sustained. The `--ringbuf-size` flag applies to the high-throughput probes only; low-throughput probes keep their compiled defaults.
+
+**Sampling rate semantics.** `0` = adaptive (the recommended default for variable workloads). `1` = emit every event (deterministic, useful for reproducibility testing). `N > 1` = per-CPU event counter; every Nth event is emitted. Does **not** apply to host probes (`sched_switch`, `mm_page_alloc`, OOM, exec/exit/fork are never sampled).
+
+**Python walker choice.** `auto` (default) runs the userspace walker; it supports 3.10/3.11/3.12 and handles `ptrace_scope` up to level 2 via a `process_vm_readv` fallback. `ebpf` runs the in-kernel walker; also supports 3.10/3.11/3.12 and additionally works at `ptrace_scope=3`. `userspace` forces the userspace walker (disables any automatic promotion).
+
+**Critical events reliability.** OOM, process exec, exit, and fork events flow through a dedicated 256KB ring buffer independent of the main 8MB/1MB buffers. They are never sampled, never aggregated, and the userspace reader blocks rather than drops — critical signals (needed for fork-inheritance, OOM correlation, orchestrator remediation) are guaranteed delivery.
 
 ## License
 

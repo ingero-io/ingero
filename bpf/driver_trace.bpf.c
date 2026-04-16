@@ -42,7 +42,36 @@ struct {
 	__type(value, struct entry_state);
 } driver_entry_map SEC(".maps");
 
+/*
+ * driver_sample_counter: per-CPU event counter for adaptive sampling.
+ * Incremented on every event; events are skipped when counter % rate != 0.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} driver_sample_counter SEC(".maps");
+
 // ---- Helpers ----
+
+/*
+ * driver_should_sample: returns true if the current event should be emitted
+ * under the configured sampling_rate. Rate 0 or 1 = always emit.
+ * Rate N > 1 = emit 1 in every N events (per-CPU).
+ */
+static __always_inline int driver_should_sample(struct ingero_config *cfg) {
+	if (!cfg || cfg->sampling_rate <= 1) {
+		return 1;
+	}
+	__u32 zero = 0;
+	__u64 *counter = bpf_map_lookup_elem(&driver_sample_counter, &zero);
+	if (!counter) {
+		return 1;  /* safe default — emit on lookup failure */
+	}
+	__u64 c = __sync_fetch_and_add(counter, 1);
+	return (c % cfg->sampling_rate) == 0;
+}
 
 static __always_inline void driver_save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg1)
 {
@@ -65,6 +94,11 @@ static __always_inline void driver_emit_event(struct pt_regs *ctx,
 	// Check if stack capture is enabled.
 	__u32 key = 0;
 	struct ingero_config *cfg = bpf_map_lookup_elem(&driver_config_map, &key);
+
+	/* Adaptive sampling: skip this event when rate > 1 and counter % rate != 0. */
+	if (!driver_should_sample(cfg))
+		return;
+
 	if (cfg && cfg->capture_stack) {
 		struct cuda_event_stack *sevt;
 		sevt = bpf_ringbuf_reserve(&driver_events, sizeof(*sevt), 0);

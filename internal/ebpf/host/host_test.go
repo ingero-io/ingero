@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -253,5 +254,68 @@ func TestParseEventTooShort(t *testing.T) {
 	_, err := parseEvent([]byte{1, 2, 3})
 	if err == nil {
 		t.Fatal("parseEvent() should fail on short buffer")
+	}
+}
+
+// TestDrainAggregationMapsRespectCtx verifies that the aggregation drain
+// loop exits promptly when its context is cancelled, without needing the
+// ticker to fire. No real BPF maps are involved — this is a control-flow
+// test only. Actual map read paths (drainMmAlloc, drainSchedSwitch) are
+// guarded by nil-map checks so they no-op under test conditions.
+func TestDrainAggregationMapsRespectCtx(t *testing.T) {
+	tr := &Tracer{
+		eventCh: make(chan events.Event, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		tr.drainAggregationMaps(ctx)
+		close(done)
+	}()
+
+	// Cancel before the first tick (1s). The goroutine must observe
+	// ctx.Done() and exit promptly via the select in the loop.
+	cancel()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainAggregationMaps did not exit after ctx cancel within 2s")
+	}
+}
+
+// TestDrainMmAllocNilMap ensures drainMmAlloc is a no-op when the
+// aggregation map is not available (e.g. pre-regeneration bindings or
+// tests where objects have not been loaded). It must not panic, emit
+// events, or increment dropped counters.
+func TestDrainMmAllocNilMap(t *testing.T) {
+	tr := &Tracer{
+		eventCh: make(chan events.Event, 1),
+	}
+	before := tr.dropped.Load()
+	tr.drainMmAlloc(context.Background())
+	tr.drainSchedSwitch(context.Background())
+	after := tr.dropped.Load()
+	if before != after {
+		t.Errorf("dropped changed on nil-map drain: before=%d after=%d", before, after)
+	}
+	select {
+	case evt := <-tr.eventCh:
+		t.Errorf("unexpected event emitted on nil-map drain: %+v", evt)
+	default:
+	}
+}
+
+// TestCriticalDroppedInitialZero verifies the CriticalDropped counter
+// starts at zero on a freshly constructed Tracer. Any non-zero value
+// here indicates a guaranteed-delivery failure for OOM / process
+// lifecycle events, so the zero-initial invariant is load-bearing.
+func TestCriticalDroppedInitialZero(t *testing.T) {
+	tr := &Tracer{}
+	if tr.CriticalDropped() != 0 {
+		t.Errorf("CriticalDropped() = %d, want 0", tr.CriticalDropped())
 	}
 }

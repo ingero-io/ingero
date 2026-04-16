@@ -2,23 +2,18 @@ package symtab
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
+
+	"github.com/ingero-io/ingero/internal/procpath"
+	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// PyFrame represents a single Python frame in the call stack.
-type PyFrame struct {
-	Filename string // e.g., "train.py"
-	Function string // e.g., "forward"
-	Line     int    // e.g., 47
-}
-
-// String returns a human-readable representation: "train.py:47 in forward()"
-func (f PyFrame) String() string {
-	if f.Line > 0 {
-		return fmt.Sprintf("%s:%d in %s()", f.Filename, f.Line, f.Function)
-	}
-	return fmt.Sprintf("%s in %s()", f.Filename, f.Function)
-}
+// PyFrame is re-exported from pkg/events so callers that used to import
+// it from this package continue to compile unchanged. The canonical
+// definition lives in events — both this userspace walker and the eBPF
+// walker's userspace parser produce values of that shape.
+type PyFrame = events.PyFrame
 
 // maxPyFrameDepth limits how deep we walk the Python frame chain.
 const maxPyFrameDepth = 64
@@ -129,13 +124,6 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 		return nil, nil
 	}
 
-	offsets := GetPyOffsetsBest(info.LibPath, info.Minor)
-	if offsets == nil {
-		symDebugf("no offsets available for Python %s", info.Version)
-		w.cache[pid] = nil
-		return nil, nil
-	}
-
 	// Find _PyRuntime address.
 	runtimeAddr, err := findPyRuntimeAddr(pid, info)
 	if err != nil || runtimeAddr == 0 {
@@ -149,8 +137,38 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 	mem, err := OpenProcMem(pid)
 	if err != nil {
 		symDebugf("cannot open /proc/%d/mem: %v", pid, err)
+		slog.Warn("Python frame walking disabled — cannot read /proc/pid/mem",
+			"pid", pid, "error", err, "hint", "set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE")
 		w.cache[pid] = nil
 		return nil, err
+	}
+
+	// Try _Py_DebugOffsets first (CPython 3.12+ — no DWARF needed).
+	var offsets *PyOffsets
+	debugOffsets, debugErr := readDebugOffsets(mem, runtimeAddr, info.Minor)
+	if debugErr != nil {
+		symDebugf("readDebugOffsets failed for PID %d: %v", pid, debugErr)
+	}
+	if debugOffsets != nil {
+		symDebugf("using _Py_DebugOffsets from process memory for Python 3.%d", info.Minor)
+		offsets = debugOffsets
+	}
+
+	// Fall back to DWARF / hardcoded offsets.
+	if offsets == nil {
+		offsets = GetPyOffsetsBest(info.LibPath, info.Minor)
+	}
+
+	if offsets == nil {
+		symDebugf("no offsets available for Python %s", info.Version)
+		w.cache[pid] = nil
+		return nil, nil
+	}
+
+	// Warn once per process when using hardcoded fallback offsets (no DWARF, no _Py_DebugOffsets).
+	if offsets.Version == fmt.Sprintf("3.%d", info.Minor) {
+		slog.Warn("Python source attribution using fallback offsets — install python3-dbgsym for accurate frames",
+			"pid", pid, "python_version", fmt.Sprintf("3.%d", info.Minor))
 	}
 
 	state := &pyProcessState{
@@ -163,6 +181,15 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 	return state, nil
 }
 
+// FindPyRuntimeAddr is the exported wrapper for findPyRuntimeAddr, used by
+// external packages (notably internal/cli for the --py-walker=ebpf lifecycle
+// hook, which must push the _PyRuntime address into a BPF map on process
+// exec). Semantics identical to findPyRuntimeAddr — kept as a thin alias so
+// internal callers continue to use the lower-case name.
+func FindPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
+	return findPyRuntimeAddr(pid, info)
+}
+
 // findPyRuntimeAddr locates the _PyRuntime symbol in the process's memory.
 //
 // _PyRuntime is a global data object (STT_OBJECT in ELF), not a function.
@@ -170,10 +197,17 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 // it can never find _PyRuntime. We use FindSymbolByName() which searches
 // all symbol types.
 func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
+	// When ingero runs in a container, info.LibPath (from /proc/PID/maps) is
+	// in the target's mount namespace. Resolve via /proc/<pid>/root/ so we
+	// can open the ELF from our own namespace. On bare metal / shared mounts
+	// this is a no-op. The /proc/PID/maps match loop below continues to use
+	// info.LibPath unchanged — it compares against target-namespace strings.
+	elfPath := procpath.ResolveContainerPath(int(pid), info.LibPath)
+
 	// Look up _PyRuntime by name — searches STT_FUNC, STT_OBJECT, STT_NOTYPE.
-	symValue, pie, baseVA, found := FindSymbolByName(info.LibPath, "_PyRuntime")
+	symValue, pie, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
 	if !found {
-		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", info.LibPath)
+		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
 	}
 
 	// Parse /proc/[pid]/maps to find the library's base address.
@@ -188,11 +222,25 @@ func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 	for i := range regions {
 		if regions[i].Path == info.LibPath {
 			// Calculate the runtime address in process memory.
-			// For PIE/shared libs: addr = region.Start - region.Offset + sym.Value - baseVA
-			addr := regions[i].Start - regions[i].Offset + symValue
-			if pie {
-				addr -= baseVA
-			}
+			//
+			// Formula: addr = region.Start - region.Offset + sym.Value - baseVA
+			//
+			// This works uniformly for both PIE/shared libraries (ET_DYN, baseVA
+			// typically 0) and non-PIE executables (ET_EXEC, baseVA = the
+			// linker's virtual base, e.g. 0x400000 for a standard x86_64 ELF).
+			//
+			// For non-PIE the symbol value is already an absolute VA equal to
+			// its in-process address (since the binary is loaded at its linked
+			// base). Subtracting baseVA cancels the region.Start contribution,
+			// yielding sym.Value directly. Without the subtract we'd compute
+			// region.Start + sym.Value = 2x the base, landing in unmapped
+			// memory between the binary's last segment and the heap.
+			//
+			// For PIE, baseVA is the prog.Vaddr-prog.Off of the first
+			// executable PT_LOAD, typically 0; region.Start holds the runtime
+			// load address, so the formula resolves to load_base + sym_offset.
+			addr := regions[i].Start - regions[i].Offset + symValue - baseVA
+			_ = pie // kept for future PIE-specific logic if needed
 			return addr, nil
 		}
 	}

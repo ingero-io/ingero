@@ -17,6 +17,7 @@ import (
 
 // Tracer attaches to block I/O tracepoints and emits events.
 type Tracer struct {
+	ringBufSize uint32 // 0 = use compiled default
 	objs        ioTraceObjects
 	links       []link.Link
 	reader      *ringbuf.Reader
@@ -27,11 +28,26 @@ type Tracer struct {
 	closed      atomic.Bool
 }
 
+// Option configures a Tracer.
+type Option func(*Tracer)
+
+// WithRingBufSize overrides the compiled-in ring buffer size (default 1MB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
+
 // New creates a block I/O tracer. Call Attach() to start.
-func New() *Tracer {
-	return &Tracer{
+func New(opts ...Option) *Tracer {
+	t := &Tracer{
 		eventCh: make(chan events.Event, 4096),
 	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // Attach loads the eBPF programs, attaches tracepoints, and creates the ring
@@ -51,7 +67,18 @@ func (t *Tracer) Attach() error {
 		}
 	}()
 
-	if err := loadIoTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadIoTrace()
+	if err != nil {
+		return fmt.Errorf("loading I/O trace spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["io_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading I/O trace objects: %w", err)
 	}
 
@@ -73,7 +100,6 @@ func (t *Tracer) Attach() error {
 		t.links = append(t.links, tp)
 	}
 
-	var err error
 	t.reader, err = ringbuf.NewReader(t.objs.IoEvents)
 	if err != nil {
 		return fmt.Errorf("creating I/O ring buffer reader: %w", err)

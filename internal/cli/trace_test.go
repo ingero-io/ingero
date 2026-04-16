@@ -868,3 +868,185 @@ func TestPIDNameCacheNames(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// parseRingBufSize tests
+// ---------------------------------------------------------------------------
+
+func TestParseRingBufSize(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    uint32
+		wantErr bool
+	}{
+		{"", 0, false},                       // empty = no override
+		{"8m", 8 * 1024 * 1024, false},       // 8 MiB
+		{"32m", 32 * 1024 * 1024, false},     // 32 MiB
+		{"4k", 4096, false},                  // minimum valid
+		{"1g", 1 << 30, false},               // 1 GiB
+		{"8388608", 8 * 1024 * 1024, false},  // raw bytes (8 MiB)
+		{"10m", 0, true},                     // not power of 2
+		{"1k", 0, true},                      // too small (1024 < 4096)
+		{"0m", 0, true},                      // zero
+		{"5g", 0, true},                      // exceeds uint32
+		{"abc", 0, true},                     // invalid
+		{"0k", 0, true},                      // zero with suffix
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseRingBufSize(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseRingBufSize(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseRingBufSize(%q) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// libMismatchChecker tests
+// ---------------------------------------------------------------------------
+
+func TestLibMismatchChecker(t *testing.T) {
+	attached := map[string]bool{"/usr/lib/libcudart.so.12": true}
+	checker := newLibMismatchChecker(attached)
+
+	// First call for a PID — should check (we can't easily verify the log,
+	// just that it doesn't panic).
+	checker.Check(1234)
+
+	// Second call for same PID — should be a no-op (already checked).
+	checker.Check(1234)
+
+	// Nil checker should not panic.
+	var nilChecker *libMismatchChecker
+	nilChecker.Check(5678)
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive sampling rate progression tests
+// ---------------------------------------------------------------------------
+
+// TestAdaptiveSamplingRateProgression verifies the rate progression logic
+// (1 → 10 → 100, capped) and the quiet-period reset (→ 1).
+func TestAdaptiveSamplingRateProgression(t *testing.T) {
+	tests := []struct {
+		name                  string
+		currentRate           uint32
+		windowDrops           uint64
+		highPressureCount     int
+		quietCount            int
+		wantRate              uint32
+		wantHighPressureCount int
+		wantQuietCount        int
+	}{
+		// First high-pressure window: bump pressure counter, don't yet change rate.
+		{"first_high_pressure", 1, 5000, 0, 0, 1, 1, 0},
+		// Second high-pressure window at rate 1: bump to 10, reset counters.
+		{"second_high_pressure_rate1", 1, 5000, 1, 0, 10, 0, 0},
+		// Second high-pressure window at rate 10: bump to 100.
+		{"second_high_pressure_rate10", 10, 5000, 1, 0, 100, 0, 0},
+		// Second high-pressure window at rate 100: stay capped at 100.
+		{"capped_at_100", 100, 5000, 1, 0, 100, 1, 0},
+		// Drops below threshold but >0: hold, reset counters.
+		{"mild_drops_hold", 10, 500, 1, 0, 10, 0, 0},
+		// First quiet window while elevated: bump quiet counter.
+		{"first_quiet_at_rate10", 10, 0, 0, 0, 10, 0, 1},
+		// Quiet for 6 consecutive windows: reset to 1.
+		{"quiet_reset", 10, 0, 0, 5, 1, 0, 0},
+		// Quiet for <6 windows: keep rate.
+		{"quiet_not_yet", 10, 0, 0, 4, 10, 0, 5},
+		// Quiet at rate 1: stay at 1 regardless of quietCount.
+		{"quiet_at_rate1", 1, 0, 0, 10, 1, 0, 11},
+		// High pressure resets the quiet counter.
+		{"high_pressure_resets_quiet", 10, 5000, 0, 4, 10, 1, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRate, gotHP, gotQ := nextSamplingRate(tt.currentRate, tt.windowDrops, tt.highPressureCount, tt.quietCount)
+			if gotRate != tt.wantRate {
+				t.Errorf("rate: got %d, want %d", gotRate, tt.wantRate)
+			}
+			if gotHP != tt.wantHighPressureCount {
+				t.Errorf("highPressureCount: got %d, want %d", gotHP, tt.wantHighPressureCount)
+			}
+			if gotQ != tt.wantQuietCount {
+				t.Errorf("quietCount: got %d, want %d", gotQ, tt.wantQuietCount)
+			}
+		})
+	}
+}
+
+// TestAdaptiveSamplingFullProgression simulates the full rate progression
+// across multiple ticks to verify end-to-end behavior: sustained drops
+// escalate 1 → 10 → 100, then a quiet period resets to 1.
+func TestAdaptiveSamplingFullProgression(t *testing.T) {
+	var rate uint32 = 1
+	var hp, q int
+
+	// Two consecutive high-pressure windows: 1 → 10.
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 1 {
+		t.Fatalf("after 1 high-pressure: rate=%d, want 1", rate)
+	}
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 10 {
+		t.Fatalf("after 2 high-pressure: rate=%d, want 10", rate)
+	}
+
+	// Two more: 10 → 100.
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	rate, hp, q = nextSamplingRate(rate, 5000, hp, q)
+	if rate != 100 {
+		t.Fatalf("after 4 high-pressure: rate=%d, want 100", rate)
+	}
+
+	// 6 quiet windows: reset to 1.
+	for i := 0; i < 6; i++ {
+		rate, hp, q = nextSamplingRate(rate, 0, hp, q)
+	}
+	if rate != 1 {
+		t.Fatalf("after 6 quiet: rate=%d, want 1", rate)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --py-walker flag validation
+// ---------------------------------------------------------------------------
+
+// TestParsePyWalkerFlag covers every accepted value plus representative
+// invalid inputs. Validation happens early in traceRunE and must fail
+// fast on anything outside the closed enum.
+func TestParsePyWalkerFlag(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantErr bool
+	}{
+		{"auto", false},
+		{"ebpf", false},
+		{"userspace", false},
+		{"invalid", true},
+		{"", true},
+		{"EBPF", true},       // case-sensitive by design
+		{"auto ", true},      // no trimming
+		{"ebpf,userspace", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			err := validatePyWalker(tt.input)
+			gotErr := err != nil
+			if gotErr != tt.wantErr {
+				t.Errorf("validatePyWalker(%q) err=%v, wantErr=%v", tt.input, err, tt.wantErr)
+			}
+			// Error messages should reference the offending value so users
+			// can correct their invocation.
+			if gotErr && !strings.Contains(err.Error(), "py-walker") {
+				t.Errorf("validatePyWalker(%q) error %q should mention --py-walker", tt.input, err.Error())
+			}
+		})
+	}
+}
