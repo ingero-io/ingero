@@ -118,6 +118,31 @@ func SetPyRuntimeState(m *ebpf.Map, pid uint32, state PyRuntimeState) error {
 	return nil
 }
 
+// CopyPID reads the PyRuntimeState blob for src and writes it under dst.
+// Intended for fork inheritance: a forked child has the same Python binary
+// and offsets as its parent, so we can skip the ~150ms detect+harvest
+// pipeline and copy the parent's entry directly.
+//
+// Returns nil if src has no entry (parent wasn't a Python process or state
+// wasn't pushed yet). Returns any non-ErrKeyNotExist error from either the
+// read or write step. A nil map is a no-op.
+func CopyPID(m *ebpf.Map, src, dst uint32) error {
+	if m == nil {
+		return nil
+	}
+	var buf [pyRuntimeStateSize]byte
+	if err := m.Lookup(src, &buf); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading py_runtime_map for pid %d: %w", src, err)
+	}
+	if err := m.Put(dst, buf[:]); err != nil {
+		return fmt.Errorf("writing py_runtime_map for pid %d (copied from %d): %w", dst, src, err)
+	}
+	return nil
+}
+
 // ClearPID removes per-PID state from the supplied BPF map. Call on
 // process_exit to keep the map bounded as PIDs recycle.
 //

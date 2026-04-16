@@ -21,6 +21,7 @@ type Tracer struct {
 	libPath      string
 	stackEnabled bool
 	ringBufSize  uint32 // 0 = use compiled default
+	uprobePID    int    // >0 = PID-specific uprobe attach
 	objs         driverTraceObjects
 	links        []link.Link
 	reader       *ringbuf.Reader
@@ -46,6 +47,13 @@ type Option func(*Tracer)
 func WithStackCapture(enabled bool) Option {
 	return func(t *Tracer) {
 		t.stackEnabled = enabled
+	}
+}
+
+// WithUprobePID restricts uprobes to a single target PID.
+func WithUprobePID(pid int) Option {
+	return func(t *Tracer) {
+		t.uprobePID = pid
 	}
 }
 
@@ -119,16 +127,21 @@ func (t *Tracer) Attach() error {
 		{[]string{"cuMemAllocManaged", "cuMemAllocManaged_v2"}, t.objs.UprobeCuMemAllocManaged, t.objs.UretprobeCuMemAllocManaged},
 	}
 
+	var uprobeOpts *link.UprobeOptions
+	if t.uprobePID > 0 {
+		uprobeOpts = &link.UprobeOptions{PID: t.uprobePID}
+	}
+
 	for _, spec := range specs {
 		attached := false
 		for _, sym := range spec.symbols {
-			up, err := exe.Uprobe(sym, spec.uprobe, nil)
+			up, err := exe.Uprobe(sym, spec.uprobe, uprobeOpts)
 			if err != nil {
 				continue
 			}
 			t.links = append(t.links, up)
 
-			uret, err := exe.Uretprobe(sym, spec.uretprobe, nil)
+			uret, err := exe.Uretprobe(sym, spec.uretprobe, uprobeOpts)
 			if err != nil {
 				up.Close()
 				t.links = t.links[:len(t.links)-1]
