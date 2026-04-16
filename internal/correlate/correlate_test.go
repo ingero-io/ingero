@@ -2094,3 +2094,139 @@ func TestGraphCorrelationPIDIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestGraphCaptureWarmupTimedOut(t *testing.T) {
+	eng := New(WithMaxAge(0)) // no pruning
+
+	pid := uint32(1234)
+
+	// Record a BeginCapture but no EndCapture.
+	beginEvt := makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0)
+	beginEvt.Timestamp = time.Now().Add(-10 * time.Second) // 10s ago
+	eng.RecordEvent(beginEvt)
+
+	// Advance clock so the engine sees the capture as stale.
+	eng.AdvanceClock(time.Now())
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+
+	found := false
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-warmup" {
+			found = true
+			if ch.Severity != "MEDIUM" {
+				t.Errorf("severity = %q, want MEDIUM", ch.Severity)
+			}
+			if !strings.Contains(ch.RootCause, "cuBLAS") {
+				t.Errorf("RootCause should mention cuBLAS, got: %s", ch.RootCause)
+			}
+			if !strings.Contains(ch.Summary, "cuBLAS lazy initialization") {
+				t.Errorf("Summary should mention cuBLAS lazy initialization, got: %s", ch.Summary)
+			}
+			if len(ch.Recommendations) == 0 {
+				t.Error("expected recommendations, got none")
+			}
+			// Check that recommendations mention warmup.
+			hasWarmup := false
+			for _, rec := range ch.Recommendations {
+				if strings.Contains(rec, "warmup") {
+					hasWarmup = true
+					break
+				}
+			}
+			if !hasWarmup {
+				t.Errorf("recommendations should mention warmup, got: %v", ch.Recommendations)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected graph-capture-warmup chain for timed-out capture, got none")
+	}
+}
+
+func TestGraphCaptureWarmupShortFail(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+
+	// Record a capture that completed very quickly with an error.
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0))
+	// EndCapture: duration < 1ms, retCode != 0 → cuBLAS lazy init failure.
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, pid, 500*time.Microsecond, 0xABCD, 0xBEEF, 0, 0, 1))
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+
+	found := false
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-warmup" {
+			found = true
+			if ch.Severity != "MEDIUM" {
+				t.Errorf("severity = %q, want MEDIUM", ch.Severity)
+			}
+			if !strings.Contains(ch.RootCause, "cuBLAS") {
+				t.Errorf("RootCause should mention cuBLAS, got: %s", ch.RootCause)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected graph-capture-warmup chain for short failed capture, got none")
+	}
+}
+
+func TestGraphCaptureWarmupNotTriggeredOnSuccess(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+
+	// Record a successful capture with normal duration.
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0))
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, pid, 5*time.Millisecond, 0xABCD, 0xBEEF, 0, 0, 0))
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-warmup" {
+			t.Error("should not produce graph-capture-warmup chain when capture succeeds normally")
+		}
+	}
+}
+
+func TestGraphCaptureWarmupNotTriggeredOnShortSuccess(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	pid := uint32(1234)
+
+	// Record a short capture that succeeded (retCode=0) — not a failure.
+	eng.RecordEvent(makeGraphEvt(events.GraphBeginCapture, pid, 0, 0xABCD, 0, 0, 0, 0))
+	eng.RecordEvent(makeGraphEvt(events.GraphEndCapture, pid, 500*time.Microsecond, 0xABCD, 0xBEEF, 0, 0, 0))
+
+	cudaOps := []stats.OpStats{}
+	chains := eng.SnapshotCausalChains(cudaOps, pid)
+
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-warmup" {
+			t.Error("should not produce graph-capture-warmup when capture is short but successful (retCode=0)")
+		}
+	}
+}
+
+func TestGraphCaptureWarmupPIDIsolation(t *testing.T) {
+	eng := New(WithMaxAge(0))
+
+	// PID 1234 has a timed-out capture.
+	beginEvt := makeGraphEvt(events.GraphBeginCapture, 1234, 0, 0xABCD, 0, 0, 0, 0)
+	beginEvt.Timestamp = time.Now().Add(-10 * time.Second)
+	eng.RecordEvent(beginEvt)
+	eng.AdvanceClock(time.Now())
+
+	// Query for PID 5678 — should see no warmup chain.
+	chains := eng.SnapshotCausalChains([]stats.OpStats{}, 5678)
+	for _, ch := range chains {
+		if ch.ID == "graph-capture-warmup" {
+			t.Error("PID 5678 should not see graph-capture-warmup chain from PID 1234")
+		}
+	}
+}

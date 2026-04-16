@@ -382,3 +382,65 @@ func TestResolveOp_Unknown(t *testing.T) {
 	}
 }
 
+// TestCommToString covers every branch of the [16]int8 → string converter:
+// empty, NUL-terminated short, full 16 bytes with no terminator, mid-string
+// NUL truncation (POSIX semantics), and high-bit non-ASCII bytes.
+func TestCommToString(t *testing.T) {
+	tests := []struct {
+		name string
+		in   [16]int8
+		want string
+	}{
+		{
+			name: "empty (all NUL)",
+			in:   [16]int8{},
+			want: "",
+		},
+		{
+			name: "short NUL-terminated",
+			in:   [16]int8{'p', 'y', 't', 'h', 'o', 'n', '3'},
+			want: "python3",
+		},
+		{
+			name: "single char",
+			in:   [16]int8{'a'},
+			want: "a",
+		},
+		{
+			name: "full 16 bytes no NUL terminator",
+			in: [16]int8{
+				'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+				'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+			},
+			want: "abcdefghijklmnop",
+		},
+		{
+			name: "exactly 15 chars + NUL",
+			in: [16]int8{
+				'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+				'i', 'j', 'k', 'l', 'm', 'n', 'o', 0,
+			},
+			want: "abcdefghijklmno",
+		},
+		{
+			name: "mid-string NUL truncates (POSIX)",
+			in:   [16]int8{'a', 'b', 0, 'c', 'd'},
+			want: "ab",
+		},
+		{
+			name: "high-bit non-ASCII bytes preserved as raw bytes",
+			// 0xFF = -1 as int8; verifies the byte() cast handles signedness.
+			in:   [16]int8{'a', -1, 'b'},
+			want: "a\xffb",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CommToString(tc.in)
+			if got != tc.want {
+				t.Errorf("CommToString = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+

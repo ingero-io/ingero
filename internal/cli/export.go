@@ -179,7 +179,7 @@ func loadFromFleet(ctx context.Context, nodes []string) ([]events.Event, []store
 	}
 	cutoff := time.Now().Add(-since).UnixNano()
 
-	sql := fmt.Sprintf("SELECT timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, node, rank, local_rank, world_size FROM events WHERE timestamp > %d ORDER BY timestamp", cutoff)
+	sql := fmt.Sprintf("SELECT timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, node, rank, local_rank, world_size, comm FROM events WHERE timestamp > %d ORDER BY timestamp", cutoff)
 	qResult, err := client.QuerySQL(ctx, sql)
 	if err != nil {
 		if qResult != nil {
@@ -226,8 +226,11 @@ func loadFromFleet(ctx context.Context, nodes []string) ([]events.Event, []store
 }
 
 // fleetRowToEvent converts a fleet query row to an Event.
-// Column order: node, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, node, rank, local_rank, world_size
-// (first column is "node" prepended by fleet client)
+//
+// The fleet client prepends its own "node" column at row[0], so SQL columns
+// start at index 1. We look up each SQL column by name from `cols` rather
+// than by position so peers running different schema versions (or returning
+// columns in a different order) can't silently corrupt the parse.
 func fleetRowToEvent(row []any, cols []string) *events.Event {
 	if len(row) < 11 {
 		return nil
@@ -254,24 +257,33 @@ func fleetRowToEvent(row []any, cols []string) *events.Event {
 		return ""
 	}
 
-	// row[0] is the fleet-prepended "node" column (address).
-	// row[1..] are the SQL columns.
-	idx := 1 // skip fleet node column
-	evt := events.Event{
-		Timestamp: time.Unix(0, toInt64(row[idx])),   // timestamp
-		PID:       uint32(toInt64(row[idx+1])),         // pid
-		TID:       uint32(toInt64(row[idx+2])),         // tid
-		Source:    events.Source(toInt64(row[idx+3])),   // source
-		Op:        uint8(toInt64(row[idx+4])),           // op
-		Duration:  time.Duration(toInt64(row[idx+5])),   // duration (nanos)
-		GPUID:     uint32(toInt64(row[idx+6])),         // gpu_id
-		Args:      [2]uint64{uint64(toInt64(row[idx+7])), uint64(toInt64(row[idx+8]))},
-		RetCode:   int32(toInt64(row[idx+9])),          // ret_code
+	// Build a column-name → index map from `cols`. The fleet client does not
+	// prepend the synthetic "node" column to `cols`, so cols[0] is the first
+	// SQL column. Map values are indices into `row` (offset by +1 to skip
+	// row[0] which holds the fleet-prepended node address).
+	colIdx := make(map[string]int, len(cols))
+	for i, name := range cols {
+		colIdx[name] = i + 1
+	}
+	get := func(name string) any {
+		if i, ok := colIdx[name]; ok && i < len(row) {
+			return row[i]
+		}
+		return nil
 	}
 
-	// Node and rank columns.
-	if len(row) > idx+10 {
-		evt.Node = toString(row[idx+10])
+	evt := events.Event{
+		Timestamp: time.Unix(0, toInt64(get("timestamp"))),
+		PID:       uint32(toInt64(get("pid"))),
+		TID:       uint32(toInt64(get("tid"))),
+		Source:    events.Source(toInt64(get("source"))),
+		Op:        uint8(toInt64(get("op"))),
+		Duration:  time.Duration(toInt64(get("duration"))),
+		GPUID:     uint32(toInt64(get("gpu_id"))),
+		Args:      [2]uint64{uint64(toInt64(get("arg0"))), uint64(toInt64(get("arg1")))},
+		RetCode:   int32(toInt64(get("ret_code"))),
+		Node:      toString(get("node")),
+		Comm:      toString(get("comm")), // v0.10: empty for older peers
 	}
 	if evt.Node == "" {
 		evt.Node = toString(row[0]) // fallback to fleet address

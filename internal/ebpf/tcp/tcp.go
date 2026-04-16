@@ -15,6 +15,7 @@ import (
 
 // Tracer attaches to TCP tracepoints and emits retransmit events.
 type Tracer struct {
+	ringBufSize uint32 // 0 = use compiled default
 	objs        tcpTraceObjects
 	links       []link.Link
 	reader      *ringbuf.Reader
@@ -25,11 +26,26 @@ type Tracer struct {
 	closed      atomic.Bool
 }
 
+// Option configures a Tracer.
+type Option func(*Tracer)
+
+// WithRingBufSize overrides the compiled-in ring buffer size (default 256KB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
+
 // New creates a TCP tracer. Call Attach() to start.
-func New() *Tracer {
-	return &Tracer{
+func New(opts ...Option) *Tracer {
+	t := &Tracer{
 		eventCh: make(chan events.Event, 4096),
 	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // Attach loads the eBPF program, attaches the BTF tracepoint, and creates the
@@ -50,7 +66,18 @@ func (t *Tracer) Attach() error {
 		}
 	}()
 
-	if err := loadTcpTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadTcpTrace()
+	if err != nil {
+		return fmt.Errorf("loading TCP trace spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["tcp_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading TCP trace objects: %w", err)
 	}
 
@@ -126,6 +153,7 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 		Timestamp: events.KtimeToWallClock(e.Hdr.TimestampNs),
 		PID:       e.Hdr.Pid,
 		TID:       e.Hdr.Tid,
+		Comm:      events.CommToString(e.Hdr.Comm),
 		Source:    events.SourceTCP,
 		Op:        e.Hdr.Op,
 		Args: [2]uint64{

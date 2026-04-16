@@ -90,9 +90,15 @@ func isClosedError(err error) bool {
 
 // typedMessage wraps MemoryState with a type discriminator for the UDS protocol.
 // The "type" field enables the orchestrator to dispatch by message type.
+//
+// v0.10: comm carries the kernel-captured process name. Older orchestrator
+// builds silently ignore unknown JSON fields (Rust serde default behavior,
+// verified — no #[serde(deny_unknown_fields)] in ingero-ee/orchestrator/src/),
+// so adding comm is non-breaking on the wire.
 type typedMessage struct {
 	Type           string  `json:"type"`
 	PID            uint32  `json:"pid"`
+	Comm           string  `json:"comm,omitempty"`
 	GPUID          uint32  `json:"gpu_id"`
 	AllocatedBytes uint64  `json:"allocated_bytes"`
 	TotalVRAM      uint64  `json:"total_vram"`
@@ -118,6 +124,7 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 	msg := typedMessage{
 		Type:           "memory",
 		PID:            ms.PID,
+		Comm:           ms.Comm,
 		GPUID:          ms.GPUID,
 		AllocatedBytes: ms.AllocatedBytes,
 		TotalVRAM:      ms.TotalVRAM,
@@ -144,9 +151,11 @@ func (s *Server) Send(ms memtrack.MemoryState) {
 }
 
 // straggleMessage wraps StraggleState with a type discriminator for the UDS protocol.
+// v0.10: comm carries kernel-captured process name (forward-compatible — see typedMessage).
 type straggleMessage struct {
 	Type              string   `json:"type"`
 	PID               uint32   `json:"pid"`
+	Comm              string   `json:"comm,omitempty"`
 	ThroughputDropPct float64  `json:"throughput_drop_pct"`
 	SchedSwitchCount  uint32   `json:"sched_switch_count"`
 	PreemptingPIDs    []uint32 `json:"preempting_pids"`
@@ -168,6 +177,7 @@ func (s *Server) SendStraggle(ss straggler.StraggleState) error {
 	msg := straggleMessage{
 		Type:              "straggle",
 		PID:               ss.PID,
+		Comm:              ss.Comm,
 		ThroughputDropPct: ss.ThroughputDropPct,
 		SchedSwitchCount:  ss.SchedSwitchCount,
 		PreemptingPIDs:    ss.PreemptingPIDs,

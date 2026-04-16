@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -9,12 +10,13 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// Compile-time size assertion: ensures bpf2go-generated struct matches 48 bytes.
-var _ [48 - unsafe.Sizeof(hostTraceHostEvent{})]byte
+// Compile-time size assertion: ensures bpf2go-generated struct matches 64 bytes
+// (v0.10: 48-byte header with cgroup_id+comm + 16 bytes payload).
+var _ [64 - unsafe.Sizeof(hostTraceHostEvent{})]byte
 
 // buildHostEventBytes constructs a raw byte buffer matching the C struct host_event layout:
 //
-//	struct ingero_event_hdr {   // 32 bytes (v0.7)
+//	struct ingero_event_hdr {   // 48 bytes (v0.10)
 //	    __u64 timestamp_ns;     // offset 0
 //	    __u32 pid;              // offset 8
 //	    __u32 tid;              // offset 12
@@ -23,16 +25,19 @@ var _ [48 - unsafe.Sizeof(hostTraceHostEvent{})]byte
 //	    __u16 _pad;             // offset 18
 //	    __u32 _pad2;            // offset 20
 //	    __u64 cgroup_id;        // offset 24
+//	    char  comm[16];         // offset 32 (v0.10 PID hardening)
 //	};
 //	struct host_event {
-//	    struct ingero_event_hdr hdr;  // offset 0-31
-//	    __u64 duration_ns;           // offset 32
-//	    __u32 cpu;                   // offset 40
-//	    __u32 target_pid;            // offset 44
-//	};                               // total: 48 bytes
+//	    struct ingero_event_hdr hdr;  // offset 0-47
+//	    __u64 duration_ns;           // offset 48
+//	    __u32 cpu;                   // offset 56
+//	    __u32 target_pid;            // offset 60
+//	};                               // total: 64 bytes
+//
+// comm is NUL-padded into the 16-byte slot (truncated to 15 chars + NUL if too long).
 func buildHostEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
-	durationNs uint64, cpu, targetPID uint32, cgroupID uint64) []byte {
-	buf := make([]byte, 48)
+	durationNs uint64, cpu, targetPID uint32, cgroupID uint64, comm string) []byte {
+	buf := make([]byte, 64)
 	binary.LittleEndian.PutUint64(buf[0:8], tsNs)
 	binary.LittleEndian.PutUint32(buf[8:12], pid)
 	binary.LittleEndian.PutUint32(buf[12:16], tid)
@@ -41,9 +46,14 @@ func buildHostEventBytes(tsNs uint64, pid, tid uint32, source, op uint8,
 	// buf[18:20] = _pad (zeros)
 	// buf[20:24] = _pad2 (zeros)
 	binary.LittleEndian.PutUint64(buf[24:32], cgroupID)
-	binary.LittleEndian.PutUint64(buf[32:40], durationNs)
-	binary.LittleEndian.PutUint32(buf[40:44], cpu)
-	binary.LittleEndian.PutUint32(buf[44:48], targetPID)
+	commBytes := []byte(comm)
+	if len(commBytes) > 15 {
+		commBytes = commBytes[:15]
+	}
+	copy(buf[32:48], commBytes)
+	binary.LittleEndian.PutUint64(buf[48:56], durationNs)
+	binary.LittleEndian.PutUint32(buf[56:60], cpu)
+	binary.LittleEndian.PutUint32(buf[60:64], targetPID)
 	return buf
 }
 
@@ -54,6 +64,7 @@ func TestParseEventSchedSwitch(t *testing.T) {
 		2,       // cpu
 		1234,    // target_pid
 		77,      // cgroup_id
+		"python3", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -82,6 +93,9 @@ func TestParseEventSchedSwitch(t *testing.T) {
 	if evt.CGroupID != 77 {
 		t.Errorf("CGroupID = %d, want 77", evt.CGroupID)
 	}
+	if evt.Comm != "python3" {
+		t.Errorf("Comm = %q, want %q", evt.Comm, "python3")
+	}
 	if evt.Timestamp != events.KtimeToWallClock(tsNs) {
 		t.Errorf("Timestamp = %v, want %v", evt.Timestamp, events.KtimeToWallClock(tsNs))
 	}
@@ -94,6 +108,7 @@ func TestParseEventPageAlloc(t *testing.T) {
 		0,          // cpu
 		0,          // target_pid
 		0,          // cgroup_id
+		"",         // comm — exercises empty-comm tolerance
 	)
 
 	evt, err := parseEvent(raw)
@@ -111,6 +126,9 @@ func TestParseEventPageAlloc(t *testing.T) {
 	if evt.Args[0] != allocBytes {
 		t.Errorf("Args[0] (alloc_bytes) = %d, want %d", evt.Args[0], allocBytes)
 	}
+	if evt.Comm != "" {
+		t.Errorf("Comm = %q, want empty string", evt.Comm)
+	}
 }
 
 func TestParseEventOOMKill(t *testing.T) {
@@ -119,6 +137,7 @@ func TestParseEventOOMKill(t *testing.T) {
 		3,    // cpu
 		9999, // victim PID
 		0,    // cgroup_id
+		"oom_killer", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -140,6 +159,7 @@ func TestParseEventSchedWakeup(t *testing.T) {
 		1,    // cpu
 		5678, // wakee PID
 		0,    // cgroup_id
+		"waker", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -166,6 +186,7 @@ func TestParseEventPodRestart(t *testing.T) {
 		0,    // cpu
 		8888, // target_pid = the pod's main container PID
 		500,  // cgroup_id
+		"",   // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -189,6 +210,7 @@ func TestParseEventPodEviction(t *testing.T) {
 		0, 0,
 		7777, // evicted pod's PID
 		600,
+		"", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -209,6 +231,7 @@ func TestParseEventPodOOMKill(t *testing.T) {
 		0, 0,
 		6666, // OOM-killed pod's PID
 		700,
+		"", // comm
 	)
 
 	evt, err := parseEvent(raw)
@@ -231,5 +254,68 @@ func TestParseEventTooShort(t *testing.T) {
 	_, err := parseEvent([]byte{1, 2, 3})
 	if err == nil {
 		t.Fatal("parseEvent() should fail on short buffer")
+	}
+}
+
+// TestDrainAggregationMapsRespectCtx verifies that the aggregation drain
+// loop exits promptly when its context is cancelled, without needing the
+// ticker to fire. No real BPF maps are involved — this is a control-flow
+// test only. Actual map read paths (drainMmAlloc, drainSchedSwitch) are
+// guarded by nil-map checks so they no-op under test conditions.
+func TestDrainAggregationMapsRespectCtx(t *testing.T) {
+	tr := &Tracer{
+		eventCh: make(chan events.Event, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		tr.drainAggregationMaps(ctx)
+		close(done)
+	}()
+
+	// Cancel before the first tick (1s). The goroutine must observe
+	// ctx.Done() and exit promptly via the select in the loop.
+	cancel()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainAggregationMaps did not exit after ctx cancel within 2s")
+	}
+}
+
+// TestDrainMmAllocNilMap ensures drainMmAlloc is a no-op when the
+// aggregation map is not available (e.g. pre-regeneration bindings or
+// tests where objects have not been loaded). It must not panic, emit
+// events, or increment dropped counters.
+func TestDrainMmAllocNilMap(t *testing.T) {
+	tr := &Tracer{
+		eventCh: make(chan events.Event, 1),
+	}
+	before := tr.dropped.Load()
+	tr.drainMmAlloc(context.Background())
+	tr.drainSchedSwitch(context.Background())
+	after := tr.dropped.Load()
+	if before != after {
+		t.Errorf("dropped changed on nil-map drain: before=%d after=%d", before, after)
+	}
+	select {
+	case evt := <-tr.eventCh:
+		t.Errorf("unexpected event emitted on nil-map drain: %+v", evt)
+	default:
+	}
+}
+
+// TestCriticalDroppedInitialZero verifies the CriticalDropped counter
+// starts at zero on a freshly constructed Tracer. Any non-zero value
+// here indicates a guaranteed-delivery failure for OOM / process
+// lifecycle events, so the zero-initial invariant is load-bearing.
+func TestCriticalDroppedInitialZero(t *testing.T) {
+	tr := &Tracer{}
+	if tr.CriticalDropped() != 0 {
+		t.Errorf("CriticalDropped() = %d, want 0", tr.CriticalDropped())
 	}
 }

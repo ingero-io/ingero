@@ -445,6 +445,7 @@ func (s *Server) handleGraphEvents(w http.ResponseWriter, r *http.Request) {
 	type graphEventResp struct {
 		Timestamp    string `json:"timestamp"`
 		PID          uint32 `json:"pid"`
+		Comm         string `json:"comm,omitempty"` // v0.10: process name from kernel-side bpf_get_current_comm()
 		Op           string `json:"op"`
 		DurationUS   int64  `json:"duration_us"`
 		StreamHandle string `json:"stream_handle,omitempty"`
@@ -459,6 +460,7 @@ func (s *Server) handleGraphEvents(w http.ResponseWriter, r *http.Request) {
 		entry := graphEventResp{
 			Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
 			PID:        evt.PID,
+			Comm:       evt.Comm,
 			Op:         events.CUDAGraphOp(evt.Op).String(),
 			DurationUS: int64(evt.Duration / time.Microsecond),
 			RetCode:    evt.RetCode,

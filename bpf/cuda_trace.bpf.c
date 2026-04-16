@@ -7,11 +7,19 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "common.bpf.h"
+/*
+ * python_walker.bpf.h defines py_runtime_map and py_scratch as SEC(".maps")
+ * globals, plus the static-inline walk_python_frames(). This is the sole
+ * compilation unit that instantiates those maps — internal/ebpf/pytrace
+ * accesses them via cudaTraceObjects.PyRuntimeMap (same .o, same kernel
+ * map). See python_walker.bpf.h header comment for the rationale.
+ */
+#include "python_walker.bpf.h"
 
 // Ring buffer for sending events to userspace.
-// 8MB: with --stack, events are 584 bytes (v0.7); at 49K events/sec
-// ~14,300 stack events fit (~292ms buffer). Without --stack (64 bytes),
-// ~131,000 events fit (~2.7s buffer). Increased from 2MB after H100
+// 8MB: with --stack, events are 600 bytes (v0.10, +16 for hdr.comm); at 49K events/sec
+// ~13,900 stack events fit (~284ms buffer). Without --stack (80 bytes),
+// ~104,800 events fit (~2.1s buffer). Increased from 2MB after H100
 // testing showed 3.5% stack coverage at high event rates.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -55,7 +63,36 @@ struct {
 	__type(value, __u64);  // allocation size in bytes
 } alloc_sizes SEC(".maps");
 
+/*
+ * sample_counter: per-CPU event counter for adaptive sampling.
+ * Incremented on every event; events are skipped when counter % rate != 0.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} sample_counter SEC(".maps");
+
 // ---- Helper functions ----
+
+/*
+ * should_sample: returns true if the current event should be emitted
+ * under the configured sampling_rate. Rate 0 or 1 = always emit.
+ * Rate N > 1 = emit 1 in every N events (per-CPU).
+ */
+static __always_inline int should_sample(struct ingero_config *cfg) {
+	if (!cfg || cfg->sampling_rate <= 1) {
+		return 1;
+	}
+	__u32 zero = 0;
+	__u64 *counter = bpf_map_lookup_elem(&sample_counter, &zero);
+	if (!counter) {
+		return 1;  /* safe default — emit on lookup failure */
+	}
+	__u64 c = __sync_fetch_and_add(counter, 1);
+	return (c % cfg->sampling_rate) == 0;
+}
 
 static __always_inline void save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg1)
 {
@@ -69,8 +106,8 @@ static __always_inline void save_entry(__u32 tid, __u8 op, __u64 arg0, __u64 arg
 }
 
 // emit_event pushes a completed event to the ring buffer.
-// When config.capture_stack is set, emits cuda_event_stack (584 bytes)
-// with bpf_get_stack(BPF_F_USER_STACK); otherwise emits cuda_event (64 bytes).
+// When config.capture_stack is set, emits cuda_event_stack (600 bytes)
+// with bpf_get_stack(BPF_F_USER_STACK); otherwise emits cuda_event (80 bytes).
 // Go parser distinguishes by record length.
 static __always_inline void emit_event(struct pt_regs *ctx,
 				       __u32 pid, __u32 tid,
@@ -81,7 +118,85 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 
 	__u32 key = 0;
 	struct ingero_config *cfg = bpf_map_lookup_elem(&config_map, &key);
+
+	/* Adaptive sampling: skip this event when rate > 1 and counter % rate != 0. */
+	if (!should_sample(cfg))
+		return;
+
 	if (cfg && cfg->capture_stack) {
+		/*
+		 * Try to walk Python frames first into per-CPU scratch. If the
+		 * walker reports a non-empty result, we reserve the extended
+		 * (stack + python) ringbuf record so userspace gets both in a
+		 * single event. Otherwise we fall back to the plain stack
+		 * record. walk_python_frames() is cheap (~200ns) when the pid
+		 * is not registered in py_runtime_map — it just misses the
+		 * hash lookup and returns -1.
+		 */
+		__u32 zero = 0;
+		struct py_walk_result *py_result =
+		    bpf_map_lookup_elem(&py_scratch, &zero);
+		int have_py = 0;
+		if (py_result) {
+			py_debug_inc(25);  /* scratch_lookup_ok */
+			py_result->depth = 0;
+			py_result->truncated = 0;
+			if (walk_python_frames(pid, tid, py_result) == 0 &&
+			    py_result->depth > 0) {
+				have_py = 1;
+				py_debug_inc(26);  /* have_py_set */
+			}
+		}
+
+		if (have_py && py_result) {
+			py_debug_inc(27);  /* entered_pyextended_branch */
+			struct cuda_event_stack_py *pevt;
+			pevt = bpf_ringbuf_reserve(&events, sizeof(*pevt), 0);
+			if (!pevt)
+				goto emit_stack_only; /* fall through to stack-only */
+			py_debug_inc(28);  /* reserved_pyextended */
+
+			struct cuda_event_stack *sevt = &pevt->base;
+			sevt->hdr.timestamp_ns = entry->timestamp_ns;
+			sevt->hdr.pid = pid;
+			sevt->hdr.tid = tid;
+			sevt->hdr.source = EVENT_SRC_CUDA;
+			sevt->hdr.op = entry->op;
+			sevt->hdr._pad = INGERO_EVENT_FLAG_PY_FRAMES;
+			sevt->hdr._pad2 = 0;
+			sevt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+			bpf_get_current_comm(&sevt->hdr.comm, sizeof(sevt->hdr.comm));
+			sevt->duration_ns = now - entry->timestamp_ns;
+			sevt->arg0 = entry->arg0;
+			sevt->arg1 = entry->arg1;
+			sevt->return_code = return_code;
+			sevt->gpu_id = 0;
+
+			long stack_bytes = bpf_get_stack(ctx, sevt->stack_ips,
+							 sizeof(sevt->stack_ips),
+							 BPF_F_USER_STACK);
+			if (stack_bytes > 0)
+				sevt->stack_depth = (__u16)(stack_bytes / 8);
+			else
+				sevt->stack_depth = 0;
+
+			sevt->_stack_pad[0] = 0;
+			sevt->_stack_pad[1] = 0;
+			sevt->_stack_pad[2] = 0;
+
+			/* Copy py_walk_result out of the per-CPU scratch slot
+			 * into the reserved ringbuf record. clang's BPF backend
+			 * rejects __builtin_memcpy for sizes >> 128 bytes, so we
+			 * use bpf_probe_read_kernel which handles arbitrary sizes
+			 * as a single verifier-safe helper call. */
+			bpf_probe_read_kernel(&pevt->py, sizeof(struct py_walk_result),
+			                      py_result);
+
+			bpf_ringbuf_submit(pevt, 0);
+			return;
+		}
+
+emit_stack_only:;
 		struct cuda_event_stack *sevt;
 		sevt = bpf_ringbuf_reserve(&events, sizeof(*sevt), 0);
 		if (!sevt)
@@ -95,6 +210,7 @@ static __always_inline void emit_event(struct pt_regs *ctx,
 		sevt->hdr._pad = 0;
 		sevt->hdr._pad2 = 0;
 		sevt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+		bpf_get_current_comm(&sevt->hdr.comm, sizeof(sevt->hdr.comm));
 		sevt->duration_ns = now - entry->timestamp_ns;
 		sevt->arg0 = entry->arg0;
 		sevt->arg1 = entry->arg1;
@@ -131,6 +247,7 @@ fallback:;
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 	evt->duration_ns = now - entry->timestamp_ns;
 	evt->arg0 = entry->arg0;
 	evt->arg1 = entry->arg1;
@@ -437,6 +554,10 @@ int uretprobe_cuda_malloc_managed(struct pt_regs *ctx)
 // Force BTF type emission for bpf2go code generation.
 const struct cuda_event *_unused_cuda_event_force_btf __attribute__((unused));
 const struct cuda_event_stack *_unused_cuda_event_stack_force_btf __attribute__((unused));
+const struct cuda_event_stack_py *_unused_cuda_event_stack_py_force_btf __attribute__((unused));
 const struct ingero_config *_unused_config_force_btf __attribute__((unused));
+const struct py_runtime_state *_unused_py_runtime_state_force_btf __attribute__((unused));
+const struct py_walk_result *_unused_py_walk_result_force_btf __attribute__((unused));
+const struct py_frame *_unused_py_frame_force_btf __attribute__((unused));
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

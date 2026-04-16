@@ -10,6 +10,31 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// CommToString converts a fixed-size [16]int8 byte buffer (as produced by
+// bpf2go for `char comm[16]`) into a Go string, trimming at the first NUL.
+// Empty input or all-NUL input returns "" — callers must tolerate empty comm
+// (BPF helpers can return zero bytes in softirq/edge contexts).
+func CommToString(comm [16]int8) string {
+	for i, c := range comm {
+		if c == 0 {
+			if i == 0 {
+				return ""
+			}
+			b := make([]byte, i)
+			for j := 0; j < i; j++ {
+				b[j] = byte(comm[j])
+			}
+			return string(b)
+		}
+	}
+	// No NUL found — full 16 bytes are valid (rare; comm is usually NUL-padded).
+	b := make([]byte, 16)
+	for j := 0; j < 16; j++ {
+		b[j] = byte(comm[j])
+	}
+	return string(b)
+}
+
 // ktimeOffset is the difference between wall-clock time and CLOCK_MONOTONIC.
 // bpf_ktime_get_ns() uses CLOCK_MONOTONIC, so to convert to wall-clock time
 // we add this offset: wall = ktime + ktimeOffset.
@@ -131,6 +156,30 @@ const (
 	HostPodRestart  HostOp = 10
 	HostPodEviction HostOp = 11
 	HostPodOOMKill  HostOp = 12
+
+	// Aggregated summary events (synthetic, emitted by the userspace
+	// drainAggregationMaps goroutine rather than the BPF ring buffer).
+	// Op codes 20+ to leave room for future eBPF-defined host ops.
+	//
+	// Argument packing conventions:
+	//
+	//   HostMmPageAllocSummary:
+	//     PID      = aggregated non-target PID
+	//     TID      = 0
+	//     Args[0]  = count of mm_page_alloc events in the drain window
+	//     Args[1]  = total bytes allocated across those events
+	//     Duration = 0 (unused)
+	//
+	//   HostSchedSwitchSummary:
+	//     PID      = next_pid (incoming task of each aggregated transition)
+	//     TID      = prev_pid (outgoing task — packed into TID since the
+	//                transition is keyed by (prev_pid << 32) | next_pid)
+	//     Args[0]  = count of sched_switch transitions in the drain window
+	//     Args[1]  = total off-CPU nanoseconds (may be 0 when the kernel
+	//                could not compute a duration for a transition)
+	//     Duration = 0 (unused — the aggregate off-cpu total lives in Args[1])
+	HostMmPageAllocSummary HostOp = 20
+	HostSchedSwitchSummary HostOp = 21
 )
 
 // String returns a human-readable name for the host operation.
@@ -156,6 +205,10 @@ func (op HostOp) String() string {
 		return "pod_eviction"
 	case HostPodOOMKill:
 		return "pod_oom_kill"
+	case HostMmPageAllocSummary:
+		return "mm_page_alloc_summary"
+	case HostSchedSwitchSummary:
+		return "sched_switch_summary"
 	default:
 		return fmt.Sprintf("host_op(%d)", op)
 	}
@@ -364,6 +417,8 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		"pod_restart":   HostPodRestart,
 		"pod_eviction":  HostPodEviction,
 		"pod_oom_kill":  HostPodOOMKill,
+		"mm_page_alloc_summary": HostMmPageAllocSummary,
+		"sched_switch_summary":  HostSchedSwitchSummary,
 	}
 	for k, v := range hostOps {
 		if lower == k {
@@ -434,12 +489,37 @@ type StackFrame struct {
 	PyLine     int    `json:"py_line,omitempty"` // Python source line (Phase C)
 }
 
+// PyFrame represents a single Python source frame in the call stack.
+//
+// Produced by either the userspace CPython walker (internal/symtab) or
+// the in-kernel eBPF walker (bpf/python_walker.bpf.h → parseEvent). The
+// events package owns the type so symtab, ebpf, and resolver layers can
+// pass frames around without an import cycle.
+//
+// Line holds PyCodeObject.co_firstlineno — the first line of the function
+// definition, not the currently executing line. Precise current-line
+// resolution requires decoding co_linetable and is a future enhancement.
+type PyFrame struct {
+	Filename string `json:"filename,omitempty"` // e.g., "train.py"
+	Function string `json:"function,omitempty"` // e.g., "forward"
+	Line     int    `json:"line,omitempty"`     // e.g., 47 (co_firstlineno)
+}
+
+// String returns a human-readable representation: "train.py:47 in forward()".
+func (f PyFrame) String() string {
+	if f.Line > 0 {
+		return fmt.Sprintf("%s:%d in %s()", f.Filename, f.Line, f.Function)
+	}
+	return fmt.Sprintf("%s in %s()", f.Filename, f.Function)
+}
+
 // Event is the common envelope for all traced events.
 // Single struct with Source discriminator — simplifies channel, stats, and storage.
 type Event struct {
 	Timestamp time.Time     // when the operation completed (kernel monotonic clock)
 	PID       uint32        // process ID (tgid in kernel terms)
 	TID       uint32        // thread ID (pid in kernel terms — yes, confusing)
+	Comm      string        // process name from bpf_get_current_comm() (≤TASK_COMM_LEN=16, may be empty)
 	Source    Source        // which eBPF layer: cuda, nvidia, host
 	Op        uint8         // operation type (cast to CUDAOp, etc. based on Source)
 	Duration  time.Duration // how long the operation took (entry→return)
@@ -453,6 +533,13 @@ type Event struct {
 	RetCode   int32         // CUDA return code (0 = success)
 	Stack     []StackFrame  // userspace stack trace (nil when --stack not enabled)
 	CGroupID  uint64        // cgroup v2 inode ID (0 or 1 = no meaningful cgroup)
+
+	// PythonFrames is populated by the event parser when the in-kernel
+	// Python frame walker (--py-walker=ebpf) captured frames for this
+	// event. Nil when the BPF walker is disabled or produced no frames.
+	// The resolver uses this slice in preference to invoking the
+	// userspace walker.
+	PythonFrames []PyFrame `json:"python_frames,omitempty"`
 
 	// CUDA Graph fields (only populated for SourceCUDAGraph events):
 	StreamHandle uint64 // stream for BeginCapture/EndCapture/Launch

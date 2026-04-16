@@ -260,10 +260,11 @@ func runSyntheticScenario(ctx context.Context, s *synth.Scenario, loop bool) err
 	traceVerbose = demoVerbose
 
 	var err error
+	demoCfg := &eventLoopConfig{Collector: collector}
 	if demoJSON {
-		err = runJSONMode(ctx, ch, collector, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", nil)
+		err = runJSONMode(ctx, ch, demoCfg)
 	} else {
-		err = runTableMode(ctx, ch, collector, 0, nil, noDrops, nil, nil, correlator, nil, nil, nil, nil, nil, nil, nil, "", nil)
+		err = runTableMode(ctx, ch, demoCfg, 0, noDrops, nil, correlator)
 	}
 
 	if !demoJSON {
@@ -493,10 +494,16 @@ func runGPUScenario(ctx context.Context, s *synth.Scenario) error {
 	if targetPID > 0 {
 		demoPIDFilter = map[uint32]bool{uint32(targetPID): true}
 	}
+	workloadCfg := &eventLoopConfig{
+		Collector: collector,
+		PIDFilter: demoPIDFilter,
+		Resolver:  resolver,
+		CUDAPIDs:  demoPIDFilter,
+	}
 	if demoJSON {
-		runJSONMode(workloadCtx, merged, collector, demoPIDFilter, nil, resolver, nil, nil, nil, nil, demoPIDFilter, nil, nil, "", nil, trackPID)
+		runJSONMode(workloadCtx, merged, workloadCfg, trackPID)
 	} else {
-		runTableMode(workloadCtx, merged, collector, uint32(targetPID), demoPIDFilter, droppedFn, nil, nil, corr, resolver, nil, nil, nil, demoPIDFilter, nil, nil, "", nil, trackPID)
+		runTableMode(workloadCtx, merged, workloadCfg, uint32(targetPID), droppedFn, nil, corr, trackPID)
 	}
 
 	// Print insight after the table.

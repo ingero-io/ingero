@@ -221,6 +221,7 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 	// Determine source columns based on schema version.
 	hasRank, _ := hasColumn(src, "events", "rank")
 	hasCgroup, _ := hasColumn(src, "events", "cgroup_id")
+	hasComm, _ := hasColumn(src, "events", "comm")
 
 	// Build SELECT for source.
 	srcCols := "id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash"
@@ -232,6 +233,9 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 	}
 	if hasRank {
 		srcCols += ", rank, local_rank, world_size"
+	}
+	if hasComm {
+		srcCols += ", comm"
 	}
 
 	rows, err := src.Query("SELECT " + srcCols + " FROM events")
@@ -245,9 +249,11 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 		return 0, err
 	}
 
+	// Destination always has comm column (initialized with current schema), so
+	// we always pass it — empty string for legacy source rows.
 	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO events
-		(id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size, comm)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return 0, err
@@ -266,6 +272,7 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 			cgroupID                        int64
 			node                            string
 			rank, localRank, worldSize      sql.NullInt64
+			comm                            string
 		)
 
 		// Scan based on available columns.
@@ -278,6 +285,9 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 		}
 		if hasRank {
 			scanArgs = append(scanArgs, &rank, &localRank, &worldSize)
+		}
+		if hasComm {
+			scanArgs = append(scanArgs, &comm)
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -312,7 +322,7 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 			worldSizeVal = worldSize.Int64
 		}
 
-		stmt.Exec(idStr, timestamp, pid, tid, source, op, duration, gpuID, arg0, arg1, retCode, stackHash, cgroupID, node, rankVal, localRankVal, worldSizeVal)
+		stmt.Exec(idStr, timestamp, pid, tid, source, op, duration, gpuID, arg0, arg1, retCode, stackHash, cgroupID, node, rankVal, localRankVal, worldSizeVal, comm)
 		count++
 
 		if count%500 == 0 {
@@ -324,8 +334,8 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 			}
 			stmt.Close()
 			stmt, txErr = tx.Prepare(`INSERT OR IGNORE INTO events
-				(id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				(id, timestamp, pid, tid, source, op, duration, gpu_id, arg0, arg1, ret_code, stack_hash, cgroup_id, node, rank, local_rank, world_size, comm)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if txErr != nil {
 				tx.Rollback()
 				return count, fmt.Errorf("prepare statement at row %d: %w", count, txErr)

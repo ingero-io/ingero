@@ -12,8 +12,14 @@ import (
 
 // MemoryState represents the current VRAM allocation state for a single PID on a single GPU.
 // JSON field names are the cross-language contract with external consumers (see docs/remediation-protocol.md).
+//
+// v0.10: Comm carries the kernel-captured process name from bpf_get_current_comm()
+// for human-readable orchestrator logs and PID-reuse detection. May be empty when
+// the BPF probe could not capture comm (softirq context, edge cases) or when the
+// emitting helper does not have a current event (test fixtures).
 type MemoryState struct {
 	PID            uint32  `json:"pid"`
+	Comm           string  `json:"comm,omitempty"`
 	GPUID          uint32  `json:"gpu_id"`
 	AllocatedBytes uint64  `json:"allocated_bytes"`
 	TotalVRAM      uint64  `json:"total_vram"`
@@ -33,8 +39,12 @@ type pidGpuKey struct {
 }
 
 // PIDGPUState tracks the running allocation balance for a single PID on a single GPU.
+// v0.10: caches the most recently observed non-empty comm for the PID so MemoryState
+// emissions carry process identity even from event paths that don't supply comm
+// (RecordMalloc/RecordFree test helpers, etc.).
 type PIDGPUState struct {
 	allocatedBytes uint64
+	comm           string
 }
 
 // Tracker maintains per-PID per-GPU VRAM allocation balances from cudaMalloc/cudaFree events.
@@ -113,6 +123,12 @@ func (t *Tracker) ProcessEvent(evt events.Event) {
 		t.pids[key] = state
 	}
 
+	// Cache the most recent non-empty comm for this PID+GPU. Empty comm
+	// (BPF edge case) does not overwrite a previously valid value.
+	if evt.Comm != "" {
+		state.comm = evt.Comm
+	}
+
 	if isAlloc {
 		state.allocatedBytes += lastAllocSize
 	}
@@ -188,6 +204,7 @@ func (t *Tracker) buildState(key pidGpuKey, lastAllocSize uint64, timestampNs in
 	}
 	return MemoryState{
 		PID:            key.pid,
+		Comm:           state.comm, // v0.10: cached from most recent event with non-empty comm
 		GPUID:          key.gpuID,
 		AllocatedBytes: state.allocatedBytes,
 		TotalVRAM:      totalVRAM,

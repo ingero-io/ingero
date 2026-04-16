@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -19,6 +20,8 @@ import (
 type Tracer struct {
 	libPath      string
 	stackEnabled bool
+	ringBufSize  uint32 // 0 = use compiled default
+	uprobePID    int    // >0 = PID-specific uprobe attach
 	objs         driverTraceObjects
 	links        []link.Link
 	reader       *ringbuf.Reader
@@ -47,6 +50,21 @@ func WithStackCapture(enabled bool) Option {
 	}
 }
 
+// WithUprobePID restricts uprobes to a single target PID.
+func WithUprobePID(pid int) Option {
+	return func(t *Tracer) {
+		t.uprobePID = pid
+	}
+}
+
+// WithRingBufSize overrides the compiled-in ring buffer size (default 8MB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
+
 // New creates a new driver API tracer for the given libcuda.so path.
 func New(libcudaPath string, opts ...Option) *Tracer {
 	t := &Tracer{
@@ -61,7 +79,18 @@ func New(libcudaPath string, opts ...Option) *Tracer {
 
 // Attach loads the eBPF program and attaches uprobes to driver API functions.
 func (t *Tracer) Attach() error {
-	if err := loadDriverTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadDriverTrace()
+	if err != nil {
+		return fmt.Errorf("loading driver eBPF spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["driver_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading driver eBPF objects: %w", err)
 	}
 
@@ -98,16 +127,21 @@ func (t *Tracer) Attach() error {
 		{[]string{"cuMemAllocManaged", "cuMemAllocManaged_v2"}, t.objs.UprobeCuMemAllocManaged, t.objs.UretprobeCuMemAllocManaged},
 	}
 
+	var uprobeOpts *link.UprobeOptions
+	if t.uprobePID > 0 {
+		uprobeOpts = &link.UprobeOptions{PID: t.uprobePID}
+	}
+
 	for _, spec := range specs {
 		attached := false
 		for _, sym := range spec.symbols {
-			up, err := exe.Uprobe(sym, spec.uprobe, nil)
+			up, err := exe.Uprobe(sym, spec.uprobe, uprobeOpts)
 			if err != nil {
 				continue
 			}
 			t.links = append(t.links, up)
 
-			uret, err := exe.Uretprobe(sym, spec.uretprobe, nil)
+			uret, err := exe.Uretprobe(sym, spec.uretprobe, uprobeOpts)
 			if err != nil {
 				up.Close()
 				t.links = t.links[:len(t.links)-1]
@@ -128,8 +162,12 @@ func (t *Tracer) Attach() error {
 	}
 
 	// Enable stack capture in the eBPF config map if requested.
+	// ingero_config is 12 bytes on x86_64 (u32 alignment, no trailing
+	// pad). Always write the full struct so sampling_rate is zeroed to
+	// "emit all" by default until SetSamplingRate() overrides it.
 	if t.stackEnabled && t.objs.DriverConfigMap != nil {
-		cfg := [8]byte{1}
+		var cfg [12]byte
+		cfg[0] = 1 // capture_stack = 1; sampling_rate (offset 4) stays 0.
 		if err := t.objs.DriverConfigMap.Put(uint32(0), cfg[:]); err != nil {
 			return fmt.Errorf("enabling driver stack capture: %w", err)
 		}
@@ -189,7 +227,7 @@ func (t *Tracer) Run(ctx context.Context) {
 var stackEventSize = int(unsafe.Sizeof(driverTraceCudaEvent{})) + 8 + 512
 
 // parseEvent converts raw bytes from the ring buffer into a typed Event.
-// Handles both base events (64 bytes) and stack events (584 bytes).
+// Handles both base events (80 bytes, v0.10) and stack events (600 bytes, v0.10).
 func parseEvent(raw []byte) (events.Event, error) {
 	baseSize := int(unsafe.Sizeof(driverTraceCudaEvent{}))
 	if len(raw) < baseSize {
@@ -202,6 +240,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		Timestamp: events.KtimeToWallClock(ce.Hdr.TimestampNs),
 		PID:       ce.Hdr.Pid,
 		TID:       ce.Hdr.Tid,
+		Comm:      events.CommToString(ce.Hdr.Comm),
 		Source:    events.Source(ce.Hdr.Source),
 		Op:        ce.Hdr.Op,
 		Duration:  time.Duration(ce.DurationNs),
@@ -211,7 +250,7 @@ func parseEvent(raw []byte) (events.Event, error) {
 		CGroupID:  ce.Hdr.CgroupId,
 	}
 
-	// Check for stack event (584 bytes).
+	// Check for stack event (600 bytes, v0.10).
 	if len(raw) >= stackEventSize {
 		evt.Stack = events.ParseStackIPs(raw, baseSize)
 	}
@@ -241,6 +280,28 @@ func (t *Tracer) Close() error {
 		errs = append(errs, fmt.Errorf("closing driver eBPF objects: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// SetSamplingRate updates the BPF sampling rate for this tracer.
+// Rate 0 or 1 = emit all events. Rate N > 1 = emit 1 in N events
+// (per-CPU, so actual ratio varies slightly).
+//
+// Must be called after Attach(). Thread-safe.
+func (t *Tracer) SetSamplingRate(rate uint32) error {
+	if t.objs.DriverConfigMap == nil {
+		return fmt.Errorf("config map not initialized — call Attach first")
+	}
+	// Build the full 12-byte ingero_config struct (u32 alignment, no trailing pad).
+	var cfg [12]byte
+	if t.stackEnabled {
+		cfg[0] = 1
+	}
+	// sampling_rate at offset 4 (little-endian uint32)
+	binary.LittleEndian.PutUint32(cfg[4:8], rate)
+	if err := t.objs.DriverConfigMap.Put(uint32(0), cfg[:]); err != nil {
+		return fmt.Errorf("updating driver sampling rate: %w", err)
+	}
+	return nil
 }
 
 // LibPath returns the path to the libcuda.so being traced.

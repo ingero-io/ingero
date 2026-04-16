@@ -17,6 +17,7 @@ import (
 
 // Tracer attaches to network socket syscall tracepoints and emits events.
 type Tracer struct {
+	ringBufSize uint32 // 0 = use compiled default
 	objs        netTraceObjects
 	links       []link.Link
 	reader      *ringbuf.Reader
@@ -27,11 +28,26 @@ type Tracer struct {
 	closed      atomic.Bool
 }
 
+// Option configures a Tracer.
+type Option func(*Tracer)
+
+// WithRingBufSize overrides the compiled-in ring buffer size (default 512KB).
+// The value must be a power of 2 and at least 4096 (one page).
+func WithRingBufSize(bytes uint32) Option {
+	return func(t *Tracer) {
+		t.ringBufSize = bytes
+	}
+}
+
 // New creates a network socket tracer. Call Attach() to start.
-func New() *Tracer {
-	return &Tracer{
+func New(opts ...Option) *Tracer {
+	t := &Tracer{
 		eventCh: make(chan events.Event, 4096),
 	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // Attach loads the eBPF programs, attaches syscall tracepoints, and creates the
@@ -51,7 +67,18 @@ func (t *Tracer) Attach() error {
 		}
 	}()
 
-	if err := loadNetTraceObjects(&t.objs, nil); err != nil {
+	spec, err := loadNetTrace()
+	if err != nil {
+		return fmt.Errorf("loading net trace spec: %w", err)
+	}
+
+	if t.ringBufSize > 0 {
+		if eventsMap, ok := spec.Maps["net_events"]; ok {
+			eventsMap.MaxEntries = t.ringBufSize
+		}
+	}
+
+	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading net trace objects: %w", err)
 	}
 
@@ -75,7 +102,6 @@ func (t *Tracer) Attach() error {
 		t.links = append(t.links, tp)
 	}
 
-	var err error
 	t.reader, err = ringbuf.NewReader(t.objs.NetEvents)
 	if err != nil {
 		return fmt.Errorf("creating net ring buffer reader: %w", err)
@@ -149,6 +175,7 @@ func (t *Tracer) parseEvent(raw []byte) (events.Event, bool) {
 		Timestamp: events.KtimeToWallClock(e.Hdr.TimestampNs),
 		PID:       e.Hdr.Pid,
 		TID:       e.Hdr.Tid,
+		Comm:      events.CommToString(e.Hdr.Comm),
 		Source:    events.SourceNet,
 		Op:        e.Hdr.Op,
 		Duration:  time.Duration(e.DurationNs),

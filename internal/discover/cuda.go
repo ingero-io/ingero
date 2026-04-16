@@ -5,12 +5,15 @@ package discover
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/ingero-io/ingero/internal/procpath"
 )
 
 // CUDAProcess represents a running process that has loaded CUDA runtime.
@@ -76,7 +79,7 @@ func findCUDAInMaps(pid int) (string, error) {
 			// Extract the file path (last field on the line)
 			path := extractPathFromMapsLine(line)
 			if path != "" {
-				return resolveContainerPath(pid, path), nil
+				return procpath.ResolveContainerPath(pid, path), nil
 			}
 		}
 	}
@@ -137,6 +140,91 @@ func FindLibCUDART() (string, error) {
 	}
 
 	return "", fmt.Errorf("libcudart.so not found in standard paths or Python packages")
+}
+
+// FindCUDAInMaps reads /proc/<pid>/maps for a libcudart.so mapping.
+// Exported wrapper around findCUDAInMaps for use by other packages.
+func FindCUDAInMaps(pid int) (string, error) {
+	return findCUDAInMaps(pid)
+}
+
+// FindAllLibCUDART collects ALL unique libcudart.so paths from every discovery
+// method. Unlike FindLibCUDART (which stops at the first match), this function
+// ensures probes attach to every copy of the library — critical when Python
+// venvs bundle their own libcudart.so alongside a system-installed copy.
+//
+// Discovery sources (all attempted, errors silently skipped):
+//   - Standard filesystem paths (cudaSearchPaths)
+//   - Python venvs (findLibCUDARTInVenvs)
+//   - Python packages (findLibCUDARTViaPython)
+//   - Host filesystem (findLibOnHost)
+//   - Running processes (FindCUDAProcesses — unique LibCUDAPath values)
+//
+// Results are deduplicated by resolved absolute path.
+func FindAllLibCUDART() []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	add := func(path string) {
+		if path == "" {
+			return
+		}
+		// Resolve to canonical path for dedup. If EvalSymlinks fails
+		// (e.g., /proc/1/root paths), use the original path.
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			resolved = path
+		}
+		abs, err := filepath.Abs(resolved)
+		if err != nil {
+			abs = resolved
+		}
+		if seen[abs] {
+			return
+		}
+		seen[abs] = true
+		result = append(result, path)
+		slog.Info("discover: found libcudart.so", "path", path)
+	}
+
+	// 1. Standard filesystem paths.
+	for _, dir := range cudaSearchPaths {
+		matches, err := filepath.Glob(filepath.Join(dir, "libcudart.so*"))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			resolved, err := filepath.EvalSymlinks(m)
+			if err != nil {
+				resolved = m
+			}
+			add(resolved)
+		}
+	}
+
+	// 2. Python venvs.
+	if path, err := findLibCUDARTInVenvs(); err == nil {
+		add(path)
+	}
+
+	// 3. Python packages.
+	if path, err := findLibCUDARTViaPython(); err == nil {
+		add(path)
+	}
+
+	// 4. Host filesystem (/proc/1/root/).
+	if path, err := findLibOnHost(cudaSearchPaths, "libcudart.so*"); err == nil {
+		add(path)
+	}
+
+	// 5. Running processes — extract unique LibCUDAPath values.
+	if procs, err := FindCUDAProcesses(); err == nil {
+		for _, p := range procs {
+			add(p.LibCUDAPath)
+		}
+	}
+
+	return result
 }
 
 // findLibCUDARTInVenvs searches common Python venv site-packages directories
@@ -341,27 +429,11 @@ func findLibInProcMaps(pid int, substr string) (string, error) {
 		if len(fields) >= 6 {
 			path := fields[len(fields)-1]
 			if strings.Contains(path, substr) {
-				return resolveContainerPath(pid, path), nil
+				return procpath.ResolveContainerPath(pid, path), nil
 			}
 		}
 	}
 	return "", scanner.Err()
-}
-
-// resolveContainerPath handles library path resolution when ingero runs in a
-// container (e.g., K8s DaemonSet). Paths from /proc/[pid]/maps refer to the
-// target process's mount namespace. If the path doesn't exist in our namespace
-// (container), resolve through /proc/[pid]/root/ which traverses the target's
-// filesystem. On bare metal this is a no-op (direct path always exists).
-func resolveContainerPath(pid int, path string) string {
-	if _, err := os.Stat(path); err == nil {
-		return path // Direct path works (bare metal or shared mount)
-	}
-	altPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
-	if _, err := os.Stat(altPath); err == nil {
-		return altPath
-	}
-	return path // Return original; let caller handle the error
 }
 
 // readProcFile reads a small /proc file and returns its trimmed content.
