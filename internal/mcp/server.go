@@ -339,7 +339,7 @@ func (s *Server) registerTools() {
 			text := formatAggregateStats(ops, tsc, opDescs)
 			return &gomcp.CallToolResult{
 				Content: []gomcp.Content{
-					&gomcp.TextContent{Text: text},
+					&gomcp.TextContent{Text: TelemetryPreamble() + text},
 				},
 			}, nil, nil
 		}
@@ -373,7 +373,7 @@ func (s *Server) registerTools() {
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
+				&gomcp.TextContent{Text: TelemetryPreamble() + text},
 			},
 		}, nil, nil
 	})
@@ -437,7 +437,7 @@ func (s *Server) registerTools() {
 				text := formatStoredChains(stored, tsc)
 				return &gomcp.CallToolResult{
 					Content: []gomcp.Content{
-						&gomcp.TextContent{Text: text},
+						&gomcp.TextContent{Text: TelemetryPreamble() + text},
 					},
 				}, nil, nil
 			}
@@ -518,7 +518,7 @@ func (s *Server) registerTools() {
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
+				&gomcp.TextContent{Text: TelemetryPreamble() + text},
 			},
 		}, nil, nil
 	})
@@ -686,6 +686,23 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			}, nil, nil
 		}
 
+		// Sanitize every string-typed cell before exposing it to the
+		// agent. SQLite returns columns as `any`; a row cell is typically
+		// int64, float64, string, []byte, or nil. Strings and byte-slice
+		// are the only attacker-controlled shapes (e.g., kernel names
+		// retrieved from stack_traces.frames or events.comm).
+		for i, row := range rows {
+			for j, cell := range row {
+				switch v := cell.(type) {
+				case string:
+					row[j] = SanitizeTelemetryTruncate(v, MaxFrameLen)
+				case []byte:
+					row[j] = SanitizeTelemetryTruncate(string(v), MaxFrameLen)
+				}
+			}
+			rows[i] = row
+		}
+
 		// Build JSON response: columns array + data array-of-arrays.
 		// Array-of-arrays avoids duplicate column name clobbering (e.g.,
 		// SELECT a.id, b.id) and is more compact than per-row key maps.
@@ -709,9 +726,25 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 			data, _ = json.MarshalIndent(output, "", "  ")
 		}
 
+		// Response size cap: even with per-cell sanitization, a large
+		// result set is a prompt-injection multiplier. 1 MB is a
+		// reasonable ceiling for a single tool response — queries needing
+		// more data should filter or paginate.
+		const maxRunSQLResponseBytes = 1 << 20
+		if len(data) > maxRunSQLResponseBytes {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{
+					&gomcp.TextContent{Text: fmt.Sprintf(
+						"SQL response too large (%d bytes, max %d). Add LIMIT or narrow the query.",
+						len(data), maxRunSQLResponseBytes)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: string(data)},
+				&gomcp.TextContent{Text: TelemetryPreamble() + string(data)},
 			},
 		}, nil, nil
 	})
@@ -861,23 +894,37 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 				SumArg0: sumArg0,
 			}
 			if procNames != nil {
-				sr.Processes = *procNames
+				// GROUP_CONCAT returns a comma-separated string; sanitize
+				// each name individually so one adversarial comm doesn't
+				// swallow legitimate others.
+				sr.Processes = sanitizeCSV(*procNames)
 			}
 			// Prefer resolved frames; fall back to raw IPs for old DBs.
+			// Parse, sanitize each frame, re-emit.
 			if framesJSON != "" {
-				var frames json.RawMessage
-				if json.Unmarshal([]byte(framesJSON), &frames) == nil {
-					sr.Frames = frames
+				var rawFrames []string
+				if json.Unmarshal([]byte(framesJSON), &rawFrames) == nil {
+					sanitized := make([]string, len(rawFrames))
+					for i, f := range rawFrames {
+						sanitized[i] = SanitizeTelemetryTruncate(f, MaxFrameLen)
+					}
+					sr.Frames = sanitized
 				}
 			}
 			if sr.Frames == nil && ipsJSON != "" {
-				var ips json.RawMessage
+				// Raw IPs are hex strings — not attacker-influenced, but
+				// wrap for consistency so the model learns one convention.
+				var ips []string
 				if json.Unmarshal([]byte(ipsJSON), &ips) == nil {
-					sr.Frames = ips
+					sanitized := make([]string, len(ips))
+					for i, ip := range ips {
+						sanitized[i] = SanitizeTelemetryTruncate(ip, MaxFrameLen)
+					}
+					sr.Frames = sanitized
 				}
 			}
 			if sr.Frames == nil {
-				sr.Frames = json.RawMessage("[]")
+				sr.Frames = []string{}
 			}
 			stacks = append(stacks, sr)
 		}
@@ -922,7 +969,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: string(data)},
+				&gomcp.TextContent{Text: TelemetryPreamble() + string(data)},
 			},
 		}, nil, nil
 	})
@@ -987,7 +1034,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
+				&gomcp.TextContent{Text: TelemetryPreamble() + text},
 			},
 		}, nil, nil
 	})
@@ -1058,7 +1105,7 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 
 		return &gomcp.CallToolResult{
 			Content: []gomcp.Content{
-				&gomcp.TextContent{Text: text},
+				&gomcp.TextContent{Text: TelemetryPreamble() + text},
 			},
 		}, nil, nil
 	})
@@ -1421,14 +1468,14 @@ func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 				tl = append(tl, TSCMap(true,
 					"timestamp", evt.Timestamp.Format("15:04:05"),
 					"layer", evt.Layer,
-					"detail", evt.Detail,
+					"detail", SanitizeTelemetryTruncate(evt.Detail, MaxFrameLen),
 				))
 			}
 			m := TSCMap(true,
 				"severity", ch.Severity,
-				"summary", ch.Summary,
-				"root_cause", ch.RootCause,
-				"recommendations", ch.Recommendations,
+				"summary", SanitizeTelemetryTruncate(ch.Summary, MaxFrameLen),
+				"root_cause", SanitizeTelemetryTruncate(ch.RootCause, MaxFrameLen),
+				"recommendations", sanitizeStringSlice(ch.Recommendations, MaxFrameLen),
 			)
 			m["tl"] = tl
 			out = append(out, m)
@@ -1439,13 +1486,13 @@ func formatCausalChains(chains []correlate.CausalChain, tsc bool) string {
 
 	result := fmt.Sprintf("%d causal chain(s) found:\n\n", len(chains))
 	for _, ch := range chains {
-		result += fmt.Sprintf("[%s] %s\n", ch.Severity, ch.Summary)
-		result += fmt.Sprintf("  Root cause: %s\n", ch.RootCause)
+		result += fmt.Sprintf("[%s] %s\n", ch.Severity, SanitizeTelemetryTruncate(ch.Summary, MaxFrameLen))
+		result += fmt.Sprintf("  Root cause: %s\n", SanitizeTelemetryTruncate(ch.RootCause, MaxFrameLen))
 		for _, evt := range ch.Timeline {
-			result += fmt.Sprintf("  [%s] %s\n", evt.Layer, evt.Detail)
+			result += fmt.Sprintf("  [%s] %s\n", evt.Layer, SanitizeTelemetryTruncate(evt.Detail, MaxFrameLen))
 		}
 		if len(ch.Recommendations) > 0 {
-			result += "  Fix: " + fmt.Sprintf("%v", ch.Recommendations) + "\n"
+			result += "  Fix: " + fmt.Sprintf("%v", sanitizeStringSlice(ch.Recommendations, MaxFrameLen)) + "\n"
 		}
 		result += "\n"
 	}
@@ -1464,14 +1511,14 @@ func formatStoredChains(chains []store.StoredChain, tsc bool) string {
 			for _, te := range ch.Timeline {
 				tl = append(tl, TSCMap(true,
 					"layer", te.Layer,
-					"detail", te.Detail,
+					"detail", SanitizeTelemetryTruncate(te.Detail, MaxFrameLen),
 				))
 			}
 			m := TSCMap(true,
 				"severity", ch.Severity,
-				"summary", ch.Summary,
-				"root_cause", ch.RootCause,
-				"recommendations", ch.Recommendations,
+				"summary", SanitizeTelemetryTruncate(ch.Summary, MaxFrameLen),
+				"root_cause", SanitizeTelemetryTruncate(ch.RootCause, MaxFrameLen),
+				"recommendations", sanitizeStringSlice(ch.Recommendations, MaxFrameLen),
 			)
 			m["tl"] = tl
 			out = append(out, m)
@@ -1482,17 +1529,31 @@ func formatStoredChains(chains []store.StoredChain, tsc bool) string {
 
 	result := fmt.Sprintf("%d stored causal chain(s) found:\n\n", len(chains))
 	for _, ch := range chains {
-		result += fmt.Sprintf("[%s] %s\n", ch.Severity, ch.Summary)
-		result += fmt.Sprintf("  Root cause: %s\n", ch.RootCause)
+		result += fmt.Sprintf("[%s] %s\n", ch.Severity, SanitizeTelemetryTruncate(ch.Summary, MaxFrameLen))
+		result += fmt.Sprintf("  Root cause: %s\n", SanitizeTelemetryTruncate(ch.RootCause, MaxFrameLen))
 		for _, te := range ch.Timeline {
-			result += fmt.Sprintf("  [%s] %s\n", te.Layer, te.Detail)
+			result += fmt.Sprintf("  [%s] %s\n", te.Layer, SanitizeTelemetryTruncate(te.Detail, MaxFrameLen))
 		}
 		if len(ch.Recommendations) > 0 {
-			result += "  Fix: " + fmt.Sprintf("%v", ch.Recommendations) + "\n"
+			result += "  Fix: " + fmt.Sprintf("%v", sanitizeStringSlice(ch.Recommendations, MaxFrameLen)) + "\n"
 		}
 		result += "\n"
 	}
 	return result + mcpAnalysisContext
+}
+
+// sanitizeStringSlice returns a new slice with SanitizeTelemetryTruncate
+// applied to each element. Used for fields that ship as JSON arrays
+// (e.g., Recommendations).
+func sanitizeStringSlice(in []string, maxLen int) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = SanitizeTelemetryTruncate(s, maxLen)
+	}
+	return out
 }
 
 func formatCheckResults(checks []discover.CheckResult) string {
@@ -1699,7 +1760,7 @@ func formatGraphLifecycle(evts []events.Event, pid uint32, tsc bool) string {
 	var b strings.Builder
 	comm := ""
 	if len(evts) > 0 {
-		comm = evts[0].Comm
+		comm = SanitizeTelemetry(evts[0].Comm)
 	}
 	fmt.Fprintf(&b, "CUDA Graph Lifecycle — PID %d (%s) (%d events)\n\n", pid, comm, len(evts))
 
@@ -1800,7 +1861,7 @@ func formatGraphFrequency(evts []events.Event, pid uint32, windowSec int, tsc bo
 	var b strings.Builder
 	comm := ""
 	if len(evts) > 0 {
-		comm = evts[0].Comm
+		comm = SanitizeTelemetry(evts[0].Comm)
 	}
 	fmt.Fprintf(&b, "CUDA Graph Frequency — PID %d (%s)\n\n", pid, comm)
 	fmt.Fprintf(&b, "Pool size: %d distinct graph executable(s)\n", len(execMap))
