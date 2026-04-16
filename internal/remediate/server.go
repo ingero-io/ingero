@@ -202,6 +202,97 @@ func (s *Server) SendStraggle(ss straggler.StraggleState) error {
 	return nil
 }
 
+// fleetStragglerStateMessage is the UDS envelope for agent-side Fleet
+// classifications (Story 3.4). Distinct from `straggle` (the local
+// cross-layer detector) — this one is peer-relative via Fleet threshold.
+type fleetStragglerStateMessage struct {
+	Type           string    `json:"type"`
+	NodeID         string    `json:"node_id"`
+	ClusterID      string    `json:"cluster_id"`
+	Score          float64   `json:"score"`
+	Threshold      float64   `json:"threshold"`
+	DetectionMode  string    `json:"detection_mode"`
+	DominantSignal string    `json:"dominant_signal"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+// fleetStragglerResolvedMessage marks the straggler->healthy transition.
+type fleetStragglerResolvedMessage struct {
+	Type      string    `json:"type"`
+	NodeID    string    `json:"node_id"`
+	ClusterID string    `json:"cluster_id"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// SendFleetStragglerState writes a peer-relative straggler notification
+// to the UDS consumer. Non-blocking: drops silently if no consumer is
+// connected or the write exceeds 50ms. Wire format follows the existing
+// typed-message convention ("type" field first for cheap discrimination
+// on the consumer side).
+func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detectionMode, dominantSignal string, score, threshold float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		atomic.AddUint64(&s.dropped, 1)
+		return nil
+	}
+
+	msg := fleetStragglerStateMessage{
+		Type:           "straggler_state",
+		NodeID:         nodeID,
+		ClusterID:      clusterID,
+		Score:          score,
+		Threshold:      threshold,
+		DetectionMode:  detectionMode,
+		DominantSignal: dominantSignal,
+		Timestamp:      ts,
+	}
+	return s.writeLocked(msg)
+}
+
+// SendFleetStragglerResolved writes a straggler->healthy edge
+// notification. Same non-blocking semantics as SendFleetStragglerState.
+func (s *Server) SendFleetStragglerResolved(ts time.Time, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		atomic.AddUint64(&s.dropped, 1)
+		return nil
+	}
+
+	msg := fleetStragglerResolvedMessage{
+		Type:      "straggler_resolved",
+		NodeID:    nodeID,
+		ClusterID: clusterID,
+		Timestamp: ts,
+	}
+	return s.writeLocked(msg)
+}
+
+// writeLocked marshals msg and writes it to the current connection.
+// Caller must hold s.mu. Drops the connection on write failure to match
+// the existing Send/SendStraggle pattern.
+func (s *Server) writeLocked(msg any) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("WARN: remediate: fleet_straggler_marshal_failed error=%v", err)
+		return nil
+	}
+	data = append(data, '\n')
+
+	s.conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	_, err = s.conn.Write(data)
+	if err != nil {
+		atomic.AddUint64(&s.dropped, 1)
+		log.Printf("WARN: remediate: fleet_straggler_write_failed error=%v dropped=%d", err, atomic.LoadUint64(&s.dropped))
+		s.conn.Close()
+		s.conn = nil
+	}
+	return nil
+}
+
 // Close stops the server, closes any active connection, and removes the socket file.
 // Safe to call even if Start() was never called or failed.
 func (s *Server) Close() error {

@@ -66,6 +66,10 @@ type EmitterConfig struct {
 	// zero WorldSize suppresses both attributes.
 	WorldSize int `yaml:"world_size"`
 	NodeRank  int `yaml:"node_rank"`
+	// ThresholdCache, if non-nil, is updated with the `X-Ingero-Threshold`
+	// and `X-Ingero-Quorum-Met` response headers on every push (success
+	// or failure). Nil leaves response-header handling disabled.
+	ThresholdCache *ThresholdCache `yaml:"-"`
 }
 
 // TLSConfig carries filesystem paths for mTLS materials.
@@ -144,6 +148,12 @@ type Emitter interface {
 	// metrics. Returns nil on 2xx, a wrapped error otherwise. Does not
 	// block or panic; callers must still respect ctx cancellation.
 	Push(ctx context.Context, now time.Time, score Score, state State, detectionMode string, degradation bool) error
+	// EmitStragglerEvent pushes a single `ingero.node.straggler_event`
+	// metric with value=1 (isStraggler=true) or value=0 (recovery edge,
+	// isStraggler=false). Attributes on the data point carry threshold,
+	// score, and dominant_signal for drill-down. Used for edge-triggered
+	// notifications alongside the regular Push cadence.
+	EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error
 	// FleetReachable returns false after FailureThreshold consecutive Push
 	// failures; resets to true on the first successful Push.
 	FleetReachable() bool
@@ -263,7 +273,9 @@ func (e *httpEmitter) Push(ctx context.Context, now time.Time, score Score, stat
 }
 
 // doPush performs a single HTTP attempt. Returns (statusErr, netErr) —
-// exactly one is non-nil on failure, both nil on 2xx.
+// exactly one is non-nil on failure, both nil on 2xx. On any response
+// received from the server (including non-2xx), the threshold cache is
+// updated from response headers if configured.
 func (e *httpEmitter) doPush(ctx context.Context, body []byte) (statusErr error, netErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url, bytes.NewReader(body))
 	if err != nil {
@@ -281,6 +293,13 @@ func (e *httpEmitter) doPush(ctx context.Context, body []byte) (statusErr error,
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
+	// Threshold piggyback: parse headers from any response the server
+	// returned (2xx or error). A non-2xx may still carry fresh threshold
+	// values via middleware.
+	if e.cfg.ThresholdCache != nil {
+		e.cfg.ThresholdCache.ParseAndSetHTTPHeaders(resp.Header, time.Now())
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("emitter: push rejected: %d %s", resp.StatusCode, resp.Status), nil
 	}
@@ -293,6 +312,54 @@ func (e *httpEmitter) jitter(base time.Duration) time.Duration {
 	// Jitter ±20% around base.
 	pct := e.rng.Float64()*0.4 - 0.2
 	return base + time.Duration(float64(base)*pct)
+}
+
+// EmitStragglerEvent implements the Emitter interface.
+func (e *httpEmitter) EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error {
+	payload := e.buildStragglerEventPayload(ev, isStraggler)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("emitter: marshal straggler: %w", err)
+	}
+	statusErr, netErr := e.doPush(ctx, body)
+	if statusErr == nil && netErr == nil {
+		return nil
+	}
+	// Straggler events don't participate in FleetReachable accounting —
+	// they ride on a best-effort channel separate from the main push
+	// cadence (which IS what owns reachability semantics).
+	if statusErr != nil {
+		return statusErr
+	}
+	return fmt.Errorf("emitter: straggler push: %w", netErr)
+}
+
+func (e *httpEmitter) buildStragglerEventPayload(ev StragglerEvent, isStraggler bool) otlpPayload {
+	timeNano := fmt.Sprintf("%d", ev.Timestamp.UnixNano())
+	var value int64
+	if isStraggler {
+		value = 1
+	}
+	attrs := []otlpKV{
+		{Key: contract.AttrDetectionMode, Value: otlpStr(string(ev.DetectionMode))},
+		{Key: contract.AttrThreshold, Value: otlpDbl(ev.Threshold)},
+		{Key: contract.AttrScore, Value: otlpDbl(ev.Score)},
+		{Key: contract.AttrDominantSignal, Value: otlpStr(ev.DominantSignal)},
+	}
+	return otlpPayload{
+		ResourceMetrics: []otlpResourceMetricsBlock{{
+			Resource: otlpResourceBlock{
+				Attributes: []otlpKV{
+					{Key: contract.AttrNodeID, Value: otlpStr(ev.NodeID)},
+					{Key: contract.AttrClusterID, Value: otlpStr(ev.ClusterID)},
+				},
+			},
+			ScopeMetrics: []otlpScopeMetricsBlock{{
+				Scope:   otlpScopeBlock{Name: "ingero.health", Version: "0.10.0"},
+				Metrics: []otlpMetric{intGauge(contract.MetricStragglerEvent, timeNano, value, attrs)},
+			}},
+		}},
+	}
 }
 
 func (e *httpEmitter) FleetReachable() bool {
@@ -516,6 +583,7 @@ type otlpVal struct {
 
 func otlpStr(s string) otlpVal { return otlpVal{StringValue: &s} }
 func otlpInt(i int64) otlpVal  { return otlpVal{IntValue: &i} }
+func otlpDbl(f float64) otlpVal { return otlpVal{DoubleValue: &f} }
 
 func dblGauge(name, timeNano string, v float64, attrs []otlpKV) otlpMetric {
 	return otlpMetric{

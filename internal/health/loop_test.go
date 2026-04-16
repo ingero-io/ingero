@@ -41,20 +41,26 @@ func (f *fakeCollector) Collect(ctx context.Context, now time.Time) (RawObservat
 
 // fakeEmitter records each Push call for assertion.
 type fakeEmitter struct {
-	mu       sync.Mutex
-	calls    []emitCall
-	err      error
-	reachable bool
-	pushes   int64
-	errors   int64
+	mu             sync.Mutex
+	calls          []emitCall
+	stragglerCalls []stragglerCall
+	err            error
+	reachable      bool
+	pushes         int64
+	errors         int64
 }
 
 type emitCall struct {
-	score         Score
-	state         State
-	mode          string
-	degradation   bool
-	now           time.Time
+	score       Score
+	state       State
+	mode        string
+	degradation bool
+	now         time.Time
+}
+
+type stragglerCall struct {
+	ev          StragglerEvent
+	isStraggler bool
 }
 
 func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
@@ -66,6 +72,13 @@ func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, stat
 		return f.err
 	}
 	f.pushes++
+	return nil
+}
+
+func (f *fakeEmitter) EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stragglerCalls = append(f.stragglerCalls, stragglerCall{ev, isStraggler})
 	return nil
 }
 
@@ -296,6 +309,262 @@ func TestLoop_EmitterError_Tolerated(t *testing.T) {
 	}
 }
 
+// Fake ModeEvaluator for loop integration tests.
+type fakeMode struct {
+	mode      DetectionMode
+	threshold float64
+	ok        bool
+}
+
+func (f *fakeMode) Evaluate(now time.Time) (DetectionMode, float64, bool) {
+	return f.mode, f.threshold, f.ok
+}
+func (f *fakeMode) CurrentMode() DetectionMode { return f.mode }
+
+// Fake StragglerSink for loop integration tests.
+type fakeSink struct {
+	mu        sync.Mutex
+	states    []StragglerEvent
+	resolved  []struct{ node, cluster string }
+	stateErr  error
+}
+
+func (f *fakeSink) SendStragglerState(ev StragglerEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states = append(f.states, ev)
+	return f.stateErr
+}
+func (f *fakeSink) SendStragglerResolved(nodeID, clusterID string, ts time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolved = append(f.resolved, struct{ node, cluster string }{nodeID, clusterID})
+	return nil
+}
+
+// Story 3.3 integration: ModeEvaluator controls the mode passed to Push.
+func TestLoop_ModeEvaluatorDrivesPushMode(t *testing.T) {
+	col := &fakeCollector{
+		obs:      []RawObservation{{Throughput: 100, Compute: 0.9, Memory: 0.9, CPU: 0.9}},
+		launches: []int{10},
+	}
+	em := &fakeEmitter{reachable: true}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 2, WarmupSamples: 0, StaleReadFailures: 3},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeFleet, threshold: 0.85, ok: true}
+
+	l, err := NewLoop(LoopConfig{
+		Baseliner:     bl,
+		StateMachine:  sm,
+		Emitter:       em,
+		Collector:     col,
+		ModeEvaluator: mode,
+		ScoreConfig:   DefaultConfig(),
+		PushInterval:  10 * time.Millisecond,
+		DetectionMode: "ignored-static-fallback",
+		Log:           discardLogger(),
+		Clock:         func() time.Time { return testTS },
+	})
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+	l.TickOnce(context.Background())
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.calls) != 1 {
+		t.Fatalf("want 1 push, got %d", len(em.calls))
+	}
+	if em.calls[0].mode != "fleet" {
+		t.Fatalf("mode = %q, want fleet (from ModeEvaluator, not static)", em.calls[0].mode)
+	}
+}
+
+// Story 3.4 integration: classifier fires straggler emission (OTLP + sink)
+// while score < threshold; recovery emits exactly once on the edge.
+func TestLoop_ClassifierStragglerAndRecovery(t *testing.T) {
+	col := &fakeCollector{}
+	em := &fakeEmitter{reachable: true}
+	sink := &fakeSink{}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 0, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeFleet, threshold: 0.80, ok: true}
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+
+	// Feed three ticks: two straggler, one recovery.
+	col.mu.Lock()
+	col.obs = []RawObservation{
+		{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5},   // low score -> straggler
+		{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5},   // still straggler
+		{Throughput: 100, Compute: 0.95, Memory: 0.95, CPU: 0.95}, // recovered
+	}
+	col.launches = []int{10, 10, 10}
+	col.mu.Unlock()
+
+	l, err := NewLoop(LoopConfig{
+		Baseliner:     bl,
+		StateMachine:  sm,
+		Emitter:       em,
+		Collector:     col,
+		ModeEvaluator: mode,
+		Classifier:    clf,
+		StragglerSink: sink,
+		NodeID:        "gpu-node-42",
+		ClusterID:     "prod",
+		ScoreConfig:   DefaultConfig(),
+		PushInterval:  10 * time.Millisecond,
+		Log:           discardLogger(),
+		Clock:         func() time.Time { return testTS },
+	})
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	l.TickOnce(context.Background()) // ACTIVE (warmup=0), straggler
+	l.TickOnce(context.Background()) // ACTIVE, still straggler
+	l.TickOnce(context.Background()) // recovery
+
+	em.mu.Lock()
+	sCalls := append([]stragglerCall{}, em.stragglerCalls...)
+	em.mu.Unlock()
+	sink.mu.Lock()
+	states := append([]StragglerEvent{}, sink.states...)
+	resolved := append([]struct{ node, cluster string }{}, sink.resolved...)
+	sink.mu.Unlock()
+
+	// Two straggler emissions (tick 1 = edge, tick 2 = while straggler),
+	// plus one recovery emission (tick 3 edge) = 3 total events.
+	if len(sCalls) != 3 {
+		t.Fatalf("straggler emit calls = %d, want 3 (2 straggler + 1 recovery)", len(sCalls))
+	}
+	if !sCalls[0].isStraggler || !sCalls[1].isStraggler {
+		t.Fatalf("first two calls should be isStraggler=true: %+v", sCalls[:2])
+	}
+	if sCalls[2].isStraggler {
+		t.Fatalf("third call should be recovery (isStraggler=false): %+v", sCalls[2])
+	}
+
+	// Sink: two state messages (stragger ticks), one resolved.
+	if len(states) != 2 {
+		t.Fatalf("sink states = %d, want 2", len(states))
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("sink resolved = %d, want 1", len(resolved))
+	}
+	if resolved[0].node != "gpu-node-42" || resolved[0].cluster != "prod" {
+		t.Fatalf("resolved identifiers wrong: %+v", resolved[0])
+	}
+}
+
+// Classifier stays silent when state machine is not ACTIVE.
+func TestLoop_ClassifierSkippedWhenNotActive(t *testing.T) {
+	col := &fakeCollector{
+		obs:      []RawObservation{{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5}},
+		launches: []int{10},
+	}
+	em := &fakeEmitter{reachable: true}
+	sink := &fakeSink{}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	// warmup=5 so the state machine stays CALIBRATING after one tick.
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 5, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeFleet, threshold: 0.80, ok: true}
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+
+	l, _ := NewLoop(LoopConfig{
+		Baseliner:     bl,
+		StateMachine:  sm,
+		Emitter:       em,
+		Collector:     col,
+		ModeEvaluator: mode,
+		Classifier:    clf,
+		StragglerSink: sink,
+		NodeID:        "node-0",
+		ClusterID:     "prod",
+		ScoreConfig:   DefaultConfig(),
+		PushInterval:  10 * time.Millisecond,
+		Log:           discardLogger(),
+		Clock:         func() time.Time { return testTS },
+	})
+	l.TickOnce(context.Background())
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.stragglerCalls) != 0 {
+		t.Fatal("classifier should be skipped while CALIBRATING")
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.states) != 0 {
+		t.Fatal("sink should be untouched while CALIBRATING")
+	}
+}
+
+// Classifier stays silent when mode == none (threshold not meaningful).
+func TestLoop_ClassifierSkippedWhenModeNone(t *testing.T) {
+	col := &fakeCollector{
+		obs:      []RawObservation{{Throughput: 100, Compute: 0.9, Memory: 0.9, CPU: 0.9}},
+		launches: []int{10},
+	}
+	em := &fakeEmitter{reachable: true}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 0, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeNone, threshold: 0, ok: false}
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+
+	l, _ := NewLoop(LoopConfig{
+		Baseliner:     bl,
+		StateMachine:  sm,
+		Emitter:       em,
+		Collector:     col,
+		ModeEvaluator: mode,
+		Classifier:    clf,
+		NodeID:        "node-0",
+		ClusterID:     "prod",
+		ScoreConfig:   DefaultConfig(),
+		PushInterval:  10 * time.Millisecond,
+		Log:           discardLogger(),
+		Clock:         func() time.Time { return testTS },
+	})
+	l.TickOnce(context.Background())
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.stragglerCalls) != 0 {
+		t.Fatalf("classifier should be skipped when mode=none, got %d calls", len(em.stragglerCalls))
+	}
+}
+
+// NewLoop rejects Classifier without NodeID or ClusterID.
+func TestNewLoop_ClassifierRequiresIdentity(t *testing.T) {
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(DefaultStateConfig(), discardLogger())
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+	_, err := NewLoop(LoopConfig{
+		Baseliner:    bl,
+		StateMachine: sm,
+		Emitter:      &fakeEmitter{reachable: true},
+		Collector:    &fakeCollector{},
+		Classifier:   clf,
+		ScoreConfig:  DefaultConfig(),
+		PushInterval: time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected error when Classifier is set without NodeID/ClusterID")
+	}
+}
+
 // Run() ticks at least once before ctx cancel, and the Emitter is
 // actually invoked. The earlier version of this test only verified
 // ctx.Canceled, which would pass even with zero ticks.
@@ -396,8 +665,11 @@ type benchEmitter struct{}
 func (benchEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
 	return nil
 }
-func (benchEmitter) FleetReachable() bool    { return true }
-func (benchEmitter) Stats() (int64, int64)   { return 0, 0 }
+func (benchEmitter) EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error {
+	return nil
+}
+func (benchEmitter) FleetReachable() bool  { return true }
+func (benchEmitter) Stats() (int64, int64) { return 0, 0 }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

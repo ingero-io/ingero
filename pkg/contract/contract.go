@@ -24,6 +24,17 @@ const (
 	MetricDegradationWarning = "ingero.node.degradation_warning"
 	MetricDetectionMode      = "ingero.agent.detection_mode"
 	MetricFleetReachable     = "ingero.agent.fleet_reachable"
+	// MetricStragglerEvent is emitted by the agent when its self-
+	// classification flips to straggler (value = 1) or recovers from
+	// straggler (value = 0, once on the edge). See Story 3.4.
+	MetricStragglerEvent = "ingero.node.straggler_event"
+)
+
+// OTLP straggler-event data-point attribute keys (Story 3.4).
+const (
+	AttrThreshold      = "threshold"
+	AttrScore          = "score"
+	AttrDominantSignal = "dominant_signal"
 )
 
 // OTLP resource attribute keys (stable per agent, identify the source).

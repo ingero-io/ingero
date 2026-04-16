@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/ingero-io/ingero/internal/health"
+	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +45,11 @@ var (
 	fleetPushWorldSize     int
 	fleetPushNodeRank      int
 	fleetPushStubCollector bool
+	fleetPushThresholdURL  string
+	fleetPushPollInterval  time.Duration
+	fleetPushHysteresis    float64
+	fleetPushRemediate     bool
+	fleetPushRemediateSock string
 )
 
 var fleetPushCmd = &cobra.Command{
@@ -95,11 +102,44 @@ func init() {
 		"Rank within the distributed group, when world_size > 0")
 	fleetPushCmd.Flags().BoolVar(&fleetPushStubCollector, "stub", false,
 		"Use a synthetic-signal collector (for endpoint smoke testing)")
+	fleetPushCmd.Flags().StringVar(&fleetPushThresholdURL, "fleet-threshold-url", "",
+		"Fleet threshold API URL for GET fallback polling (Story 3.2). Empty disables polling; piggyback headers are still consumed.")
+	fleetPushCmd.Flags().DurationVar(&fleetPushPollInterval, "fleet-poll-interval", 10*time.Second,
+		"GET fallback polling cadence (jittered +/-20%%)")
+	fleetPushCmd.Flags().Float64Var(&fleetPushHysteresis, "fleet-classifier-hysteresis", 0.02,
+		"Straggler classification hysteresis band (Story 3.4)")
+	fleetPushCmd.Flags().BoolVar(&fleetPushRemediate, "remediate", false,
+		"Publish straggler state to the remediation UDS socket (Story 3.4)")
+	fleetPushCmd.Flags().StringVar(&fleetPushRemediateSock, "remediate-socket", "/tmp/ingero-remediate.sock",
+		"UDS path for remediation messages when --remediate is set")
 
 	_ = fleetPushCmd.MarkFlagRequired("fleet-endpoint")
 	_ = fleetPushCmd.MarkFlagRequired("fleet-cluster-id")
 
 	rootCmd.AddCommand(fleetPushCmd)
+}
+
+// remediateSink adapts a *remediate.Server to the health.StragglerSink
+// interface. Lives in the CLI package so that internal/health stays free
+// of a dependency on internal/remediate.
+type remediateSink struct {
+	server *remediate.Server
+}
+
+func (r *remediateSink) SendStragglerState(ev health.StragglerEvent) error {
+	return r.server.SendFleetStragglerState(
+		ev.Timestamp,
+		ev.NodeID,
+		ev.ClusterID,
+		string(ev.DetectionMode),
+		ev.DominantSignal,
+		ev.Score,
+		ev.Threshold,
+	)
+}
+
+func (r *remediateSink) SendStragglerResolved(nodeID, clusterID string, ts time.Time) error {
+	return r.server.SendFleetStragglerResolved(ts, nodeID, clusterID)
 }
 
 func runFleetPush(cmd *cobra.Command, args []string) error {
@@ -172,6 +212,10 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("state machine: %w", err)
 	}
 
+	// ThresholdCache is populated by the Emitter on every push response
+	// (piggyback headers) and optionally by the GET-endpoint Poller.
+	thresholdCache := health.NewThresholdCache()
+
 	// Start from library defaults and override only what the CLI exposes.
 	// Avoids drift where DefaultEmitterConfig gets a new field and the CLI
 	// silently zeros it.
@@ -185,6 +229,7 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	emCfg.Insecure = fleetPushInsecure
 	emCfg.WorldSize = fleetPushWorldSize
 	emCfg.NodeRank = fleetPushNodeRank
+	emCfg.ThresholdCache = thresholdCache
 	if fleetPushTLSCA != "" || fleetPushTLSCert != "" || fleetPushTLSKey != "" {
 		emCfg.TLS = health.TLSConfig{
 			CACertPath:     fleetPushTLSCA,
@@ -205,11 +250,76 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		return errors.New("real signal collector not yet wired — re-run with --stub for smoke testing")
 	}
 
+	// Story 3.3: mode evaluator replaces the static --fleet-detection-mode
+	// label. Consumes the ThresholdCache + emitter-reachability + baseliner
+	// warmup count. Threshold flows through to Story 3.4's classifier.
+	modeEvaluator, err := health.NewModeEvaluator(
+		health.DefaultModeConfig(),
+		thresholdCache,
+		em,
+		baseliner,
+		health.DefaultBaselineConfig().WarmupSamples,
+		log,
+	)
+	if err != nil {
+		return fmt.Errorf("mode evaluator: %w", err)
+	}
+
+	// Story 3.4: classifier + optional UDS sink.
+	classifier, err := health.NewClassifier(health.ClassifierConfig{Hysteresis: fleetPushHysteresis})
+	if err != nil {
+		return fmt.Errorf("classifier: %w", err)
+	}
+
+	// Optional UDS: only started when --remediate is set. Shutdown cleanup
+	// happens via the deferred Close below.
+	var (
+		udsServer *remediate.Server
+		sink      health.StragglerSink
+	)
+	if fleetPushRemediate {
+		udsServer = remediate.NewServer(fleetPushRemediateSock)
+		if err := udsServer.Start(); err != nil {
+			return fmt.Errorf("remediate server: %w", err)
+		}
+		defer udsServer.Close()
+		sink = &remediateSink{server: udsServer}
+		log.Info("remediate UDS server started", "socket", fleetPushRemediateSock)
+	}
+
+	// Optional GET-endpoint poller (Story 3.2). Only started when the
+	// operator configures a threshold URL distinct from the OTLP endpoint.
+	var pollerWg sync.WaitGroup
+	if strings.TrimSpace(fleetPushThresholdURL) != "" {
+		pollerCfg := health.PollerConfig{
+			BaseURL:   fleetPushThresholdURL,
+			ClusterID: fleetPushClusterID,
+			Interval:  fleetPushPollInterval,
+			Timeout:   fleetPushTimeout,
+			Insecure:  fleetPushInsecure,
+		}
+		poller, perr := health.NewPoller(pollerCfg, thresholdCache, log)
+		if perr != nil {
+			return fmt.Errorf("poller: %w", perr)
+		}
+		// Start the poller after the loop ctx is available (see below).
+		defer func() { pollerWg.Wait() }()
+		log.Info("threshold poller configured", "url", fleetPushThresholdURL, "interval", fleetPushPollInterval.String())
+		// Deferred start (ctx is created below); capture via closure.
+		defer func(p *health.Poller) {}(poller)
+		_ = poller // actual start happens after ctx
+	}
+
 	loop, err := health.NewLoop(health.LoopConfig{
 		Baseliner:     baseliner,
 		StateMachine:  sm,
 		Emitter:       em,
 		Collector:     collector,
+		ModeEvaluator: modeEvaluator,
+		Classifier:    classifier,
+		StragglerSink: sink,
+		NodeID:        fleetPushNodeID,
+		ClusterID:     fleetPushClusterID,
 		ScoreConfig:   health.DefaultConfig(),
 		PushInterval:  fleetPushInterval,
 		DetectionMode: fleetPushDetectionMode,
@@ -222,6 +332,24 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Now that ctx exists, start the poller (if configured) on a goroutine.
+	if strings.TrimSpace(fleetPushThresholdURL) != "" {
+		poller, _ := health.NewPoller(health.PollerConfig{
+			BaseURL:   fleetPushThresholdURL,
+			ClusterID: fleetPushClusterID,
+			Interval:  fleetPushPollInterval,
+			Timeout:   fleetPushTimeout,
+			Insecure:  fleetPushInsecure,
+		}, thresholdCache, log)
+		pollerWg.Add(1)
+		go func() {
+			defer pollerWg.Done()
+			if perr := poller.Run(ctx); perr != nil && !errors.Is(perr, context.Canceled) {
+				log.Debug("threshold poller exited", "err", perr.Error())
+			}
+		}()
+	}
 
 	log.Info("fleet-push starting",
 		"endpoint", fleetPushEndpoint,

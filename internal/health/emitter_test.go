@@ -472,6 +472,72 @@ func TestPush_RespectsContextCancel(t *testing.T) {
 	}
 }
 
+// Piggyback headers on the push response flow into the ThresholdCache.
+func TestPush_PiggybackHeadersFlowToCache(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.HeaderThreshold, "0.83")
+		w.Header().Set(contract.HeaderQuorumMet, "true")
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cache := NewThresholdCache()
+	cfg := baseEmitterCfg(srv.URL)
+	cfg.ThresholdCache = cache
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+
+	snap, ok := cache.Get()
+	if !ok {
+		t.Fatal("cache empty after piggyback")
+	}
+	if snap.Value != 0.83 || !snap.QuorumMet {
+		t.Fatalf("cache = %+v, want 0.83/true", snap)
+	}
+	if !cache.PiggybackAvailable() {
+		t.Fatal("piggyback should be available")
+	}
+}
+
+// Piggyback parsing happens on non-2xx responses too — Fleet middleware
+// may attach headers even on error responses.
+func TestPush_PiggybackHeadersOnErrorResponse(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.HeaderThreshold, "0.77")
+		w.Header().Set(contract.HeaderQuorumMet, "true")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cache := NewThresholdCache()
+	cfg := baseEmitterCfg(srv.URL)
+	cfg.ThresholdCache = cache
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+
+	snap, ok := cache.Get()
+	if !ok || snap.Value != 0.77 {
+		t.Fatalf("cache should carry headers from error response: snap=%+v ok=%v", snap, ok)
+	}
+}
+
+// No headers on response => piggyback marked unavailable.
+func TestPush_NoHeadersFlagsPiggybackUnavailable(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cache := NewThresholdCache()
+	cfg := baseEmitterCfg(rs.server.URL)
+	cfg.ThresholdCache = cache
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	if cache.PiggybackAvailable() {
+		t.Fatal("piggyback should be unavailable when headers absent")
+	}
+}
+
 // Headers from EmitterConfig are attached.
 func TestPush_CustomHeaders(t *testing.T) {
 	var captured http.Header
