@@ -54,6 +54,48 @@ mcp:
   # Transport: stdio or http
   transport: stdio
 
+# Health score (Fleet integration). Score is computed only when fleet.endpoint
+# is set; weights and floor tune the score formula.
+health:
+  # Signal weights. Must sum to 1.0.
+  weights:
+    throughput: 0.40
+    compute: 0.25
+    memory: 0.20
+    cpu: 0.15
+  # Smooth floor penalty: if the minimum signal drops below degradation_zone,
+  # a penalty multiplier ramps linearly from 1.0 down to 0.5 as the minimum
+  # approaches penalty_floor. At or below penalty_floor the penalty caps at 0.5.
+  floor:
+    degradation_zone: 0.35
+    penalty_floor: 0.25
+  # Per-signal baselines: fast EMA adapts to current workload, hard floor
+  # detects slow long-term degradation. A degradation warning fires when any
+  # signal's fast EMA divided by its hard-floor EMA falls below warning_ratio
+  # and the baseliner has seen at least warmup_samples observations.
+  baseline:
+    fast_alpha: 0.1
+    floor_alpha: 0.001
+    warning_ratio: 0.5
+    warmup_samples: 30
+  # Lifecycle state machine: CALIBRATING -> ACTIVE -> IDLE <-> CALIBRATING,
+  # with STALE as a recovery-via-CALIBRATING state for event-read failures.
+  state:
+    # Consecutive zero-launch intervals before ACTIVE -> IDLE.
+    idle_intervals: 3
+    # Observations required in CALIBRATING before transitioning to ACTIVE.
+    # Should match baseline.warmup_samples.
+    warmup_samples: 30
+    # Consecutive event-read failures before any -> STALE.
+    stale_read_failures: 3
+  # Baseline persistence across agent restarts. Graceful shutdown writes the
+  # baseline to path; on startup, if the file is newer than stale_age the
+  # agent restores it and enters ACTIVE directly — avoiding a rolling-update
+  # calibration storm.
+  persistence:
+    path: /var/lib/ingero/health-baseline.json
+    stale_age: 10m
+
 # OTLP export (optional, disabled by default)
 otlp:
   enabled: false
@@ -67,9 +109,34 @@ prometheus:
   enabled: false
   listen: ":9090"
 
-# Fleet configuration for multi-node queries
+# Fleet configuration.
+#
+# Two modes share this block:
+#   - Multi-node queries (v0.9.1+): nodes[] for fan-out SQL/explain/export.
+#   - Health-score push (v0.10+, Fleet integration): endpoint + cluster_id
+#     push agent health scores to a central Fleet collector.
+# CLI flags --nodes / --fleet-endpoint override the corresponding fields.
 fleet:
-  # Node addresses for fan-out queries (host:port)
-  # Used by: ingero query --nodes, ingero explain --nodes
-  # CLI --nodes flag overrides this list
+  # Multi-node queries.
   nodes: []
+
+  # Health-score push (Fleet integration). Leaving endpoint empty disables
+  # the push loop — agent behaves exactly as in v0.9.x.
+  endpoint: ""
+  cluster_id: ""
+  # Workload label on every push: training | inference | unknown
+  workload_type: unknown
+  push_interval: 10s
+  timeout: 5s
+  # Use HTTP instead of HTTPS when endpoint is bare host:port.
+  insecure: false
+  # Consecutive push failures before ingero.agent.fleet_reachable flips to 0.
+  failure_threshold: 3
+  # mTLS material (all three required together for Fleet to be authenticated).
+  tls:
+    ca_cert: ""
+    client_cert: ""
+    client_key: ""
+  # Optional distributed-training labels. 0 = not distributed.
+  world_size: 0
+  node_rank: 0
