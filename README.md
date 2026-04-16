@@ -18,9 +18,9 @@
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
 [mcpservers.org](https://mcpservers.org)
 
-**Version: 0.9.1**
+**Version: 0.9.2**
 
-**Post-v0.9.1 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
+**v0.9.2 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
 
 **The only GPU observability tool your AI assistant can talk to.**
 
