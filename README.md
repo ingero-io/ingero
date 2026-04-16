@@ -855,6 +855,20 @@ Locally in `~/.ingero/ingero.db` (SQLite). Nothing leaves your machine. Size-bas
 **Does it check for updates?**
 Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero checks GitHub Releases for newer versions (once per 24 hours, cached in `~/.ingero/update-check`). The check runs in the background and never delays your command. Set `INGERO_NO_UPDATE_NOTIFIER=1` to disable. Skipped for `query`, `mcp`, `version`, and dev builds.
 
+## Known Issues
+
+- **Multiprocess CUDA via `fork()`.** NVIDIA's CUDA driver doesn't support `fork()` after the parent has initialized a CUDA context — children can't use CUDA. The eBPF walker inherits the parent's walker state to the child synchronously on fork, but a child that can't call CUDA won't trigger the walker regardless. For multiprocess CUDA workloads, use `torch.multiprocessing.set_start_method('spawn')` (or Ray/torchrun spawn equivalents); fresh spawn-style processes initialize their own CUDA context and get full walker coverage through the normal dynamic-PID path.
+
+- **Ubuntu 24.04 + distro-patched CPython 3.12 on the userspace walker.** Ubuntu's patched CPython has struct offsets that differ from upstream, and Ubuntu 24.04 doesn't ship `python3.12-dbgsym` in the main archive. The userspace walker falls back to hardcoded upstream offsets and produces garbage frame data. The **eBPF walker sidesteps this via its runtime offset harvester** — use `--py-walker=ebpf` on Ubuntu 24.04 until dbgsym becomes readily available. (Installing `python3.12-dbgsym` from `ddebs.ubuntu.com` also resolves the userspace-walker path.)
+
+- **Trace-all mode at `kernel.yama.ptrace_scope=3`.** The eBPF walker works at ptrace_scope=3 with an explicit `--pid X` target (PID-specific uprobe attach). Without `--pid` (trace-all / dynamic-discovery mode), cuda/driver uprobes may not fire — a startup warning is logged. Workarounds: pass `--pid X` or lower `kernel.yama.ptrace_scope` to `1` (the Ubuntu default).
+
+### Walker roadmap — userspace walker deprecation
+
+The in-kernel eBPF walker (`--py-walker=ebpf`) is now the strategic path forward. It has runtime offset harvesting for patched distro builds (including Ubuntu 24.04 CPython 3.12), multi-library libcudart coverage, per-CUDA-tracer state broadcast, fork-inheritance for multiprocess workloads, and runs at any `ptrace_scope` value with `--pid`.
+
+The **userspace walker — the current default — will be deprecated in an upcoming release.** Once the remaining items above are either fixed or accepted as narrow trade-offs, the eBPF walker will be promoted to the `auto` default. If you're setting up new deployments, prefer `--py-walker=ebpf` today. The `userspace` mode will remain available (via `--py-walker=userspace`) after the default flips, until the deprecation window closes.
+
 ## Known Patterns
 
 Recurring GPU workload issues that Ingero detects automatically, with documented fixes.
@@ -949,7 +963,7 @@ Reference material for power users. The defaults are tuned for typical training 
 
 **Python walker choice.** `auto` (default) runs the userspace walker; it supports 3.10/3.11/3.12 and handles `ptrace_scope` up to level 2 via a `process_vm_readv` fallback. `ebpf` runs the in-kernel walker; also supports 3.10/3.11/3.12 and additionally works at `ptrace_scope=3`. `userspace` forces the userspace walker (disables any automatic promotion).
 
-**Critical events reliability.** OOM, process exec, exit, and fork events flow through a dedicated 256KB ring buffer independent of the main 8MB/1MB buffers. They are never sampled, never aggregated, and a hard WARN fires if any are ever dropped (should not happen under normal operation — the buffer is sized for orders of magnitude above the realistic peak rate of these event types).
+**Critical events reliability.** OOM, process exec, exit, and fork events flow through a dedicated 256KB ring buffer independent of the main 8MB/1MB buffers. They are never sampled, never aggregated, and the userspace reader blocks rather than drops — critical signals (needed for fork-inheritance, OOM correlation, orchestrator remediation) are guaranteed delivery.
 
 ## License
 

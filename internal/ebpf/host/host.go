@@ -89,7 +89,7 @@ type Tracer struct {
 	criticalReader  *ringbuf.Reader       // reader for critical_events buffer
 	eventCh         chan events.Event     // output channel for parsed events
 	dropped         atomic.Uint64         // events dropped due to full channel
-	criticalDropped atomic.Uint64         // drops from critical buffer (should always be 0)
+	criticalDropped atomic.Uint64         // always 0 — runCriticalReader blocks instead of dropping
 	readErrors      atomic.Uint64         // ring buffer read errors
 	parseErrors     atomic.Uint64         // event parse failures
 	closed          atomic.Bool           // prevents double-close
@@ -323,9 +323,17 @@ func (t *Tracer) Run(ctx context.Context) {
 }
 
 // runCriticalReader reads events from the critical_events ring buffer
-// and sends them to eventCh. Mirrors the main reader loop but tracks
-// drops separately via criticalDropped — any drop here is a failure
-// mode because critical events are guaranteed delivery.
+// and sends them to eventCh. Unlike the normal-path reader, this send
+// BLOCKS when eventCh is full rather than dropping. Critical events
+// (OOM, process exec/fork/exit) are guaranteed delivery — dropping them
+// silently breaks downstream correlation (the walker's fork-inheritance
+// path, orchestrator remediation, OOM causal chains, etc.).
+//
+// The only exit condition is ctx.Done() — if the consumer wedges
+// permanently, we'll block here indefinitely, but a wedged eventCh
+// already means the trace is broken. This is strictly safer than
+// dropping critical signals on transient bursts (e.g., fork storms
+// from torch.multiprocessing, rapid subprocess spawning, etc.).
 func (t *Tracer) runCriticalReader(ctx context.Context) {
 	for {
 		record, err := t.criticalReader.Read()
@@ -345,10 +353,6 @@ func (t *Tracer) runCriticalReader(ctx context.Context) {
 		case t.eventCh <- evt:
 		case <-ctx.Done():
 			return
-		default:
-			t.criticalDropped.Add(1)
-			slog.Warn("critical event dropped — event channel full",
-				"source", "host_critical", "pid", evt.PID)
 		}
 	}
 }

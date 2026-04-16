@@ -1901,6 +1901,11 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 	if firstErr != nil {
 		return
 	}
+	// Mark this PID as having walker state (bool=true). The dedup map
+	// is keyed on PID; value distinguishes "has state" (true) from
+	// "tried but not Python / failed" (false). Fork inheritance uses
+	// this distinction — only inherit from a parent with true.
+	pyPushedPIDs.Store(pid, true)
 	if info.Minor != 12 {
 		// INFO-level log (once per PID) to surface multi-version support
 		// when a non-3.12 Python gets the BPF walker attached.
@@ -1911,11 +1916,15 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d)", pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps))
 }
 
-// pyPushedPIDs dedups tryPushPyRuntimeStateOnce calls across the three
-// seed points (startup, trackPID on first CUDA event, HostProcessExec).
-// Value type is struct{}; presence means "we've already tried this PID
-// on this ingero invocation". Cleared on HostProcessExit and HostProcessExec
-// (exec may swap the binary — re-detect).
+// pyPushedPIDs is a per-PID dedup cache for the walker push pipeline.
+//   - Value bool=false: detection was attempted but the PID is not a
+//     supported Python process (or push failed). Future callers skip
+//     re-running the 150ms harvester for this PID.
+//   - Value bool=true: walker state was successfully written to at least
+//     one py_runtime_map. Fork inheritance copies state from this parent
+//     to its children.
+// Cleared on HostProcessExit and HostProcessExec (exec swaps the binary
+// so detection must re-run).
 var pyPushedPIDs sync.Map
 
 // tryPushPyRuntimeStateOnce wraps tryPushPyRuntimeState with per-PID dedup.
@@ -1925,7 +1934,11 @@ func tryPushPyRuntimeStateOnce(pid uint32, pyMaps []*ebpf.Map) {
 	if len(pyMaps) == 0 || pid == 0 {
 		return
 	}
-	if _, loaded := pyPushedPIDs.LoadOrStore(pid, struct{}{}); loaded {
+	// LoadOrStore marks the PID as "tried" (false). If it was already
+	// present (either true or false), we've attempted this PID before
+	// and skip. On success, tryPushPyRuntimeState upgrades the value
+	// to true via Store.
+	if _, loaded := pyPushedPIDs.LoadOrStore(pid, false); loaded {
 		return
 	}
 	tryPushPyRuntimeState(pid, pyMaps)
@@ -1948,10 +1961,16 @@ func handlePyLifecycle(evt events.Event, pyMaps []*ebpf.Map) {
 		if childPID == 0 {
 			return
 		}
-		// Only mark the child pushed if the parent had state — otherwise
-		// a non-Python parent forking a Python child would poison the
-		// dedup and skip the harvester.
-		if _, parentHadState := pyPushedPIDs.Load(evt.PID); !parentHadState {
+		// Only inherit from parents that have actual walker state
+		// (bool=true). A parent with false is a non-Python process we
+		// already tried — inheriting from it would copy an empty entry
+		// AND poison the child's dedup so its own detection never runs.
+		v, ok := pyPushedPIDs.Load(evt.PID)
+		if !ok {
+			return
+		}
+		parentHasState, _ := v.(bool)
+		if !parentHasState {
 			return
 		}
 		for i, pyMap := range pyMaps {
@@ -1959,7 +1978,8 @@ func handlePyLifecycle(evt events.Event, pyMaps []*ebpf.Map) {
 				debugf("py-walker: CopyPID[%d] parent=%d child=%d: %v", i, evt.PID, childPID, err)
 			}
 		}
-		pyPushedPIDs.Store(childPID, struct{}{})
+		debugf("py-walker: fork-inherited state parent=%d child=%d (%d maps)", evt.PID, childPID, len(pyMaps))
+		pyPushedPIDs.Store(childPID, true)
 	case events.HostProcessExec:
 		clearPyPushedMark(evt.PID)
 		tryPushPyRuntimeStateOnce(evt.PID, pyMaps)

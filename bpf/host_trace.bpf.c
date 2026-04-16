@@ -408,17 +408,23 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 SEC("tp/sched/sched_process_fork")
 int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
-	__u32 parent_pid = ctx->parent_pid;
-
-	if (!is_target_pid(parent_pid))
-		return 0;
-
+	// ctx->parent_pid is the kernel PID of the TASK that called fork,
+	// which in a multi-threaded process is a worker thread (TID), NOT
+	// the tgid that target_pids is keyed on. Filter on the CURRENT
+	// task's tgid instead — that's the user-space PID of the process
+	// that owns the thread. Fixes dropped fork events for torch and
+	// any other multithreaded Python / DDP / Ray workloads (Bug 11).
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	if (!is_target_pid(tgid))
+		return 0;
+
 	__u32 tid = (__u32)pid_tgid;
 	__u32 child_pid = ctx->child_pid;
 
-	// Event PID = parent (current task), so current_comm is correct.
+	// Event PID = parent tgid (user-space PID), so userspace sees the
+	// process identity that matches target_pids.
 	// Routed to critical_events: process lifecycle must not be dropped.
 	emit_critical_event(tgid, tid,
 			    HOST_OP_PROCESS_FORK, 0,
