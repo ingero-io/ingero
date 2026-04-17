@@ -13,6 +13,10 @@ import (
 // (v0.10: 48-byte header with cgroup_id+comm + 32 bytes payload).
 var _ [80 - unsafe.Sizeof(driverTraceCudaEvent{})]byte
 
+// Compile-time size assertion: ingero_config must be 12 bytes. See the
+// equivalent assertion in internal/ebpf/cuda/cuda_test.go for rationale.
+var _ [12 - unsafe.Sizeof(driverTraceIngeroConfig{})]byte
+
 // buildDriverEventBytes constructs a raw byte buffer matching the C struct cuda_event layout
 // (reused for driver events with source=EVENT_SRC_DRIVER). Same 80-byte v0.10 layout as CUDA events.
 // comm is NUL-padded into the 16-byte slot (truncated to 15 chars + NUL if too long).

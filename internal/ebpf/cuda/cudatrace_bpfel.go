@@ -53,7 +53,44 @@ type cudaTraceEntryState struct {
 type cudaTraceIngeroConfig struct {
 	_            structs.HostLayout
 	CaptureStack uint8
-	Pad          [7]uint8
+	Pad1         [3]uint8
+	SamplingRate uint32
+	Pad2         uint32
+}
+
+type cudaTracePyRuntimeState struct {
+	_                          structs.HostLayout
+	RuntimeAddr                uint64
+	OffRuntimeInterpretersHead uint16
+	OffTstateHead              uint16
+	OffTstateNext              uint16
+	OffTstateNativeTid         uint16
+	OffTstateFrame             uint16
+	OffFrameBack               uint16
+	OffFrameCode               uint16
+	OffCodeFilename            uint16
+	OffCodeName                uint16
+	OffCodeFirstlineno         uint16
+	OffUnicodeState            uint16
+	OffUnicodeData             uint16
+	PythonMinor                uint8
+	Pad3                       uint8
+	OffCframeCurrentFrame      uint16
+	_                          [4]byte
+}
+
+type cudaTracePyWalkResult struct {
+	_         structs.HostLayout
+	Depth     uint8
+	Truncated uint8
+	Pad       [6]uint8
+	Frames    [16]struct {
+		_           structs.HostLayout
+		Filename    [128]int8
+		Funcname    [128]int8
+		Firstlineno int32
+		Pad         uint32
+	}
 }
 
 // loadCudaTrace returns the embedded CollectionSpec for cudaTrace.
@@ -125,15 +162,23 @@ type cudaTraceMapSpecs struct {
 	EntryMap       *ebpf.MapSpec `ebpf:"entry_map"`
 	Events         *ebpf.MapSpec `ebpf:"events"`
 	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	PyDebugStats   *ebpf.MapSpec `ebpf:"py_debug_stats"`
+	PyRuntimeMap   *ebpf.MapSpec `ebpf:"py_runtime_map"`
+	PyScratch      *ebpf.MapSpec `ebpf:"py_scratch"`
+	SampleCounter  *ebpf.MapSpec `ebpf:"sample_counter"`
 }
 
 // cudaTraceVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaTraceVariableSpecs struct {
-	UnusedConfigForceBtf         *ebpf.VariableSpec `ebpf:"_unused_config_force_btf"`
-	UnusedCudaEventForceBtf      *ebpf.VariableSpec `ebpf:"_unused_cuda_event_force_btf"`
-	UnusedCudaEventStackForceBtf *ebpf.VariableSpec `ebpf:"_unused_cuda_event_stack_force_btf"`
+	UnusedConfigForceBtf           *ebpf.VariableSpec `ebpf:"_unused_config_force_btf"`
+	UnusedCudaEventForceBtf        *ebpf.VariableSpec `ebpf:"_unused_cuda_event_force_btf"`
+	UnusedCudaEventStackForceBtf   *ebpf.VariableSpec `ebpf:"_unused_cuda_event_stack_force_btf"`
+	UnusedCudaEventStackPyForceBtf *ebpf.VariableSpec `ebpf:"_unused_cuda_event_stack_py_force_btf"`
+	UnusedPyFrameForceBtf          *ebpf.VariableSpec `ebpf:"_unused_py_frame_force_btf"`
+	UnusedPyRuntimeStateForceBtf   *ebpf.VariableSpec `ebpf:"_unused_py_runtime_state_force_btf"`
+	UnusedPyWalkResultForceBtf     *ebpf.VariableSpec `ebpf:"_unused_py_walk_result_force_btf"`
 }
 
 // cudaTraceObjects contains all objects after they have been loaded into the kernel.
@@ -161,6 +206,10 @@ type cudaTraceMaps struct {
 	EntryMap       *ebpf.Map `ebpf:"entry_map"`
 	Events         *ebpf.Map `ebpf:"events"`
 	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	PyDebugStats   *ebpf.Map `ebpf:"py_debug_stats"`
+	PyRuntimeMap   *ebpf.Map `ebpf:"py_runtime_map"`
+	PyScratch      *ebpf.Map `ebpf:"py_scratch"`
+	SampleCounter  *ebpf.Map `ebpf:"sample_counter"`
 }
 
 func (m *cudaTraceMaps) Close() error {
@@ -170,6 +219,10 @@ func (m *cudaTraceMaps) Close() error {
 		m.EntryMap,
 		m.Events,
 		m.IngeroWatchdog,
+		m.PyDebugStats,
+		m.PyRuntimeMap,
+		m.PyScratch,
+		m.SampleCounter,
 	)
 }
 
@@ -177,9 +230,13 @@ func (m *cudaTraceMaps) Close() error {
 //
 // It can be passed to loadCudaTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaTraceVariables struct {
-	UnusedConfigForceBtf         *ebpf.Variable `ebpf:"_unused_config_force_btf"`
-	UnusedCudaEventForceBtf      *ebpf.Variable `ebpf:"_unused_cuda_event_force_btf"`
-	UnusedCudaEventStackForceBtf *ebpf.Variable `ebpf:"_unused_cuda_event_stack_force_btf"`
+	UnusedConfigForceBtf           *ebpf.Variable `ebpf:"_unused_config_force_btf"`
+	UnusedCudaEventForceBtf        *ebpf.Variable `ebpf:"_unused_cuda_event_force_btf"`
+	UnusedCudaEventStackForceBtf   *ebpf.Variable `ebpf:"_unused_cuda_event_stack_force_btf"`
+	UnusedCudaEventStackPyForceBtf *ebpf.Variable `ebpf:"_unused_cuda_event_stack_py_force_btf"`
+	UnusedPyFrameForceBtf          *ebpf.Variable `ebpf:"_unused_py_frame_force_btf"`
+	UnusedPyRuntimeStateForceBtf   *ebpf.Variable `ebpf:"_unused_py_runtime_state_force_btf"`
+	UnusedPyWalkResultForceBtf     *ebpf.Variable `ebpf:"_unused_py_walk_result_force_btf"`
 }
 
 // cudaTracePrograms contains all programs after they have been loaded into the kernel.

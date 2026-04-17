@@ -21,6 +21,17 @@ fleetPush:
   pushInterval: 5s
   insecure: true       # set false when using mTLS
   stub: false          # true = synthetic signals (smoke testing)
+  # When stub=false (production default), fleet-push reads real signals from
+  # the SQLite DB populated by a sibling `ingero trace --record` process. Both
+  # containers must share a volume. The recommended deployment is a sidecar
+  # pod with two containers (mode=trace + mode=fleet-push) sharing an
+  # emptyDir at /var/lib/ingero, OR two DaemonSets (mode=trace first, then
+  # mode=fleet-push) both mounting the same hostPath.
+  signalDbPath: ""     # defaults to store.DefaultDBPath() if empty
+  signalWindow: 60s    # rolling window; event_aggregates are minute-bucketed
+  signalNumGPUs: 0     # 0 = autodetect (falls back to 1)
+  warmupSamples: 30    # samples before first non-calibrating push
+                       # warmup time = warmupSamples * pushInterval (default 30*5s = 150s)
   extraArgs: []
 
 resources:

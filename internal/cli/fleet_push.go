@@ -15,6 +15,7 @@ import (
 
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/remediate"
+	"github.com/ingero-io/ingero/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -50,6 +51,10 @@ var (
 	fleetPushHysteresis    float64
 	fleetPushRemediate     bool
 	fleetPushRemediateSock string
+	fleetPushSignalDBPath  string
+	fleetPushSignalWindow  time.Duration
+	fleetPushSignalNumGPUs int
+	fleetPushWarmupSamples int
 )
 
 var fleetPushCmd = &cobra.Command{
@@ -62,9 +67,15 @@ This is the Epic 2 integration entry point. Without --fleet-endpoint the
 agent behaves exactly as before — nothing about the default 'trace',
 'explain', or 'query' workflows is changed.
 
-Real signal collection from CUDA/CPU sources lands in a later story. For
-now, pass --stub to drive the push loop with synthetic constant signals
-(useful for smoke-testing a Fleet endpoint).`,
+Signal sources:
+  * --stub: synthetic constant signals for endpoint smoke-testing.
+  * Default (no --stub): reads rolling aggregates from the SQLite DB populated
+    by a sibling 'ingero trace --record' process. Point --signal-db-path at
+    the same DB both sides share (Helm chart defaults to a hostPath volume).
+
+Warmup: the agent observes --warmup-samples × --fleet-push-interval before
+it emits non-calibrating scores. With defaults that is 30 × 5s = 150 s.
+Tune --warmup-samples lower for dev smoke tests or higher for noisy workloads.`,
 	RunE: runFleetPush,
 }
 
@@ -112,6 +123,14 @@ func init() {
 		"Publish straggler state to the remediation UDS socket (Story 3.4)")
 	fleetPushCmd.Flags().StringVar(&fleetPushRemediateSock, "remediate-socket", "/tmp/ingero-remediate.sock",
 		"UDS path for remediation messages when --remediate is set")
+	fleetPushCmd.Flags().StringVar(&fleetPushSignalDBPath, "signal-db-path", store.DefaultDBPath(),
+		"Path to the SQLite DB written by a sibling 'ingero trace --record' process (ignored when --stub)")
+	fleetPushCmd.Flags().DurationVar(&fleetPushSignalWindow, "signal-window", 60*time.Second,
+		"Rolling window for throughput/compute derivation. event_aggregates has minute buckets, so shorter windows still read full-minute data.")
+	fleetPushCmd.Flags().IntVar(&fleetPushSignalNumGPUs, "signal-num-gpus", 0,
+		"GPU count for normalizing compute signal. 0 = autodetect (defaults to 1).")
+	fleetPushCmd.Flags().IntVar(&fleetPushWarmupSamples, "warmup-samples", health.DefaultBaselineConfig().WarmupSamples,
+		"Samples observed before first non-calibrating push (warmup = samples × push-interval). Default 30 × 5s = 150s.")
 
 	_ = fleetPushCmd.MarkFlagRequired("fleet-endpoint")
 	_ = fleetPushCmd.MarkFlagRequired("fleet-cluster-id")
@@ -177,7 +196,11 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 
 	log := slog.Default()
 
-	baseliner, err := health.NewBaseliner(health.DefaultBaselineConfig(), log)
+	baseCfg := health.DefaultBaselineConfig()
+	if fleetPushWarmupSamples > 0 {
+		baseCfg.WarmupSamples = fleetPushWarmupSamples
+	}
+	baseliner, err := health.NewBaseliner(baseCfg, log)
 	if err != nil {
 		return fmt.Errorf("baseliner: %w", err)
 	}
@@ -202,11 +225,15 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		log.Info("baseline not restored", "status", status.String())
 	}
 
+	stCfg := health.DefaultStateConfig()
+	if fleetPushWarmupSamples > 0 {
+		stCfg.WarmupSamples = fleetPushWarmupSamples
+	}
 	var sm health.StateMachine
 	if restored {
-		sm, err = health.NewStateMachineFromRestore(health.DefaultStateConfig(), log)
+		sm, err = health.NewStateMachineFromRestore(stCfg, log)
 	} else {
-		sm, err = health.NewStateMachine(health.DefaultStateConfig(), log)
+		sm, err = health.NewStateMachine(stCfg, log)
 	}
 	if err != nil {
 		return fmt.Errorf("state machine: %w", err)
@@ -247,7 +274,18 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	case fleetPushStubCollector:
 		collector = &stubCollector{}
 	default:
-		return errors.New("real signal collector not yet wired — re-run with --stub for smoke testing")
+		collector, err = health.NewSQLiteCollector(health.SQLiteCollectorConfig{
+			DBPath:  fleetPushSignalDBPath,
+			Window:  fleetPushSignalWindow,
+			NumGPUs: fleetPushSignalNumGPUs,
+			Log:     log,
+		})
+		if err != nil {
+			return fmt.Errorf("signal collector: %w\n(hint: run 'ingero trace --record' in a sibling pod/process to populate this DB, or pass --stub for smoke testing)", err)
+		}
+		if closer, ok := collector.(interface{ Close() error }); ok {
+			defer closer.Close()
+		}
 	}
 
 	// Story 3.3: mode evaluator replaces the static --fleet-detection-mode
@@ -258,7 +296,7 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		thresholdCache,
 		em,
 		baseliner,
-		health.DefaultBaselineConfig().WarmupSamples,
+		baseCfg.WarmupSamples,
 		log,
 	)
 	if err != nil {
@@ -365,7 +403,7 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	// warm (>= WarmupSamples) — a cold snapshot would be restored by the
 	// next boot and fool the state machine into starting in ACTIVE with
 	// garbage baselines.
-	baselineWarmupMin := health.DefaultBaselineConfig().WarmupSamples
+	baselineWarmupMin := baseCfg.WarmupSamples
 	if baseliner.SampleCount() < baselineWarmupMin {
 		log.Info("baseline not saved: below warmup threshold",
 			"sample_count", baseliner.SampleCount(), "warmup_min", baselineWarmupMin)

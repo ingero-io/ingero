@@ -58,6 +58,22 @@ spec:
             - "--fleet-threshold-url"
             - {{ .Values.fleetPush.thresholdUrl | quote }}
             {{- end }}
+            {{- if .Values.fleetPush.signalDbPath }}
+            - "--signal-db-path"
+            - {{ .Values.fleetPush.signalDbPath | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.signalWindow }}
+            - "--signal-window"
+            - {{ .Values.fleetPush.signalWindow | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.signalNumGPUs }}
+            - "--signal-num-gpus"
+            - {{ .Values.fleetPush.signalNumGPUs | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.warmupSamples }}
+            - "--warmup-samples"
+            - {{ .Values.fleetPush.warmupSamples | quote }}
+            {{- end }}
             {{- range .Values.fleetPush.extraArgs }}
             - {{ . | quote }}
             {{- end }}

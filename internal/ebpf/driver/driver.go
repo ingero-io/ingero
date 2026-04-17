@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -161,14 +160,12 @@ func (t *Tracer) Attach() error {
 		return fmt.Errorf("no driver API symbols found in %s", t.libPath)
 	}
 
-	// Enable stack capture in the eBPF config map if requested.
-	// ingero_config is 12 bytes on x86_64 (u32 alignment, no trailing
-	// pad). Always write the full struct so sampling_rate is zeroed to
-	// "emit all" by default until SetSamplingRate() overrides it.
+	// Enable stack capture in the eBPF config map if requested. The Put
+	// marshals the struct via cilium/ebpf's BTF-aware encoder, keeping
+	// field layout in sync with bpf2go regeneration.
 	if t.stackEnabled && t.objs.DriverConfigMap != nil {
-		var cfg [12]byte
-		cfg[0] = 1 // capture_stack = 1; sampling_rate (offset 4) stays 0.
-		if err := t.objs.DriverConfigMap.Put(uint32(0), cfg[:]); err != nil {
+		cfg := driverTraceIngeroConfig{CaptureStack: 1}
+		if err := t.objs.DriverConfigMap.Put(uint32(0), &cfg); err != nil {
 			return fmt.Errorf("enabling driver stack capture: %w", err)
 		}
 	}
@@ -291,14 +288,11 @@ func (t *Tracer) SetSamplingRate(rate uint32) error {
 	if t.objs.DriverConfigMap == nil {
 		return fmt.Errorf("config map not initialized — call Attach first")
 	}
-	// Build the full 12-byte ingero_config struct (u32 alignment, no trailing pad).
-	var cfg [12]byte
+	cfg := driverTraceIngeroConfig{SamplingRate: rate}
 	if t.stackEnabled {
-		cfg[0] = 1
+		cfg.CaptureStack = 1
 	}
-	// sampling_rate at offset 4 (little-endian uint32)
-	binary.LittleEndian.PutUint32(cfg[4:8], rate)
-	if err := t.objs.DriverConfigMap.Put(uint32(0), cfg[:]); err != nil {
+	if err := t.objs.DriverConfigMap.Put(uint32(0), &cfg); err != nil {
 		return fmt.Errorf("updating driver sampling rate: %w", err)
 	}
 	return nil

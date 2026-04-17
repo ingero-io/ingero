@@ -2,11 +2,9 @@ package cudagraph
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
-	"reflect"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -23,11 +21,6 @@ type Tracer struct {
 	libPath     string
 	ringBufSize uint32 // 0 = use compiled default
 	objs        cudaGraphTraceObjects
-	// configMap is resolved from the loaded collection — nil if the
-	// current BPF object predates graph_config_map (pre `make generate`).
-	// Populated in Attach() so SetSamplingRate works both with the current
-	// bindings and with future bpf2go-regenerated bindings.
-	configMap   *ebpf.Map
 	links       []link.Link
 	reader      *ringbuf.Reader
 	eventCh     chan events.Event
@@ -85,10 +78,6 @@ func (t *Tracer) Attach() error {
 	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("loading graph eBPF objects: %w", err)
 	}
-
-	// Wire configMap for sampling when the regenerated bindings expose it.
-	// Pre-regeneration this stays nil and SetSamplingRate is a graceful no-op.
-	t.configMap = t.resolveConfigMap()
 
 	var closeFn func()
 	closeFn = func() {
@@ -215,49 +204,18 @@ func (t *Tracer) Dropped() uint64 {
 	return t.dropped.Load()
 }
 
-// resolveConfigMap returns the graph_config_map from t.objs by reflection,
-// traversing the embedded cudaGraphTraceMaps struct. Returns nil when the
-// field is absent from the current bpf2go-generated bindings (pre `make
-// generate` regeneration after the B3-4 BPF changes). Using reflection
-// lets the Go-side wiring ship ahead of the regenerated bindings without
-// breaking the build — once bpf2go emits `GraphConfigMap *ebpf.Map`, this
-// picks it up automatically.
-func (t *Tracer) resolveConfigMap() *ebpf.Map {
-	v := reflect.ValueOf(&t.objs).Elem()
-	f := v.FieldByName("GraphConfigMap")
-	if !f.IsValid() || f.IsZero() {
-		return nil
-	}
-	m, ok := f.Interface().(*ebpf.Map)
-	if !ok {
-		return nil
-	}
-	return m
-}
-
 // SetSamplingRate updates the BPF sampling rate for this tracer.
 // Rate 0 or 1 = emit all events. Rate N > 1 = emit 1 in N events
 // (per-CPU, so actual ratio varies slightly).
 //
-// Must be called after Attach(). Thread-safe.
-//
-// The graph tracer's config map is resolved dynamically from the loaded
-// spec — the bpf2go-generated typed bindings are regenerated on Linux via
-// `make generate` after a BPF C change. Until regeneration, this returns
-// without error (sampling simply stays at the BPF default of "emit all").
+// Must be called after Attach(). Thread-safe. The graph tracer has no
+// stack-capture option; CaptureStack stays 0.
 func (t *Tracer) SetSamplingRate(rate uint32) error {
-	if t.configMap == nil {
-		// Config map not present in current BPF object — graceful no-op.
-		// After `make generate` runs on Linux, loadCudaGraphTrace will
-		// return a spec containing graph_config_map and this will wire up.
-		return nil
+	if t.objs.GraphConfigMap == nil {
+		return fmt.Errorf("graph config map not initialized — call Attach first")
 	}
-	// Build the full 12-byte ingero_config struct (u32 alignment, no trailing pad).
-	// Graph tracer has no stack-capture option; capture_stack stays 0.
-	var cfg [12]byte
-	// sampling_rate at offset 4 (little-endian uint32)
-	binary.LittleEndian.PutUint32(cfg[4:8], rate)
-	if err := t.configMap.Put(uint32(0), cfg[:]); err != nil {
+	cfg := cudaGraphTraceIngeroConfig{SamplingRate: rate}
+	if err := t.objs.GraphConfigMap.Put(uint32(0), &cfg); err != nil {
 		return fmt.Errorf("updating graph sampling rate: %w", err)
 	}
 	return nil

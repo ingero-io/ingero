@@ -15,6 +15,16 @@ import (
 // misparsing of ring buffer events.
 var _ [80 - unsafe.Sizeof(cudaTraceCudaEvent{})]byte
 
+// Compile-time size assertion: ingero_config is the value type of config_map.
+// If the C struct is appended (e.g., new sampling knob) without regenerating
+// the BPF objects via `make generate`, the kernel-side map's value_size stays
+// at the old size while this Go struct grows, producing the runtime error:
+//
+//	marshal value: []uint8 doesn't marshal to N bytes
+//
+// on the first ConfigMap.Put(). This assertion catches the drift at compile time.
+var _ [12 - unsafe.Sizeof(cudaTraceIngeroConfig{})]byte
+
 // buildCUDAEventBytes constructs a raw byte buffer matching the C struct cuda_event layout:
 //
 //	struct ingero_event_hdr {   // 48 bytes (v0.10)

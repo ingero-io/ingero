@@ -14,6 +14,10 @@ import (
 // misparsing of ring buffer events.
 var _ [88 - unsafe.Sizeof(cudaGraphTraceCudaGraphEvent{})]byte
 
+// Compile-time size assertion: ingero_config must be 12 bytes. See the
+// equivalent assertion in internal/ebpf/cuda/cuda_test.go for rationale.
+var _ [12 - unsafe.Sizeof(cudaGraphTraceIngeroConfig{})]byte
+
 // buildGraphEventBytes constructs a raw 88-byte cuda_graph_event for testing
 // (v0.10: header grew from 32 to 48 bytes for comm[16]).
 func buildGraphEventBytes(source uint8, op uint8, durationNs uint64,

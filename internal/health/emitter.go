@@ -203,21 +203,23 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 		return nil, fmt.Errorf("emitter.endpoint: %w", err)
 	}
 
-	client := &http.Client{Timeout: cfg.Timeout}
+	// Build a Transport that re-resolves DNS periodically so agents
+	// rebalance across Fleet replicas behind a headless Service. The
+	// default http.DefaultTransport pool sticks to whatever IP the first
+	// dial resolved; with 5s push intervals and 30s idle timeout, most
+	// pushes redial, which picks up new A/AAAA records.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.IdleConnTimeout = 30 * time.Second
+	tr.MaxIdleConnsPerHost = 1
+	client := &http.Client{Timeout: cfg.Timeout, Transport: tr}
 	if cfg.TLS.CACertPath != "" {
 		tlsCfg, tlsErr := loadTLSConfig(cfg.TLS)
 		if tlsErr != nil {
 			return nil, fmt.Errorf("emitter.tls: %w", tlsErr)
 		}
-		// Clone DefaultTransport's timeouts so a black-holed TLS handshake
-		// doesn't eat the whole http.Client.Timeout budget.
-		tr, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			tr = &http.Transport{}
-		}
-		trClone := tr.Clone()
-		trClone.TLSClientConfig = tlsCfg
-		client.Transport = trClone
+		trTLS := tr.Clone()
+		trTLS.TLSClientConfig = tlsCfg
+		client.Transport = trTLS
 	}
 
 	return &httpEmitter{

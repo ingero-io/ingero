@@ -842,6 +842,43 @@ func New(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// NewReadOnly opens an existing SQLite database in read-only mode. The DB
+// file must already exist and have been initialized by a writer (typically
+// an `ingero trace --record` process). Schema migrations, session creation,
+// and lookup-table seeding are skipped because the WAL is another process's.
+//
+// Used by `ingero fleet-push` to read rolling aggregates without fighting
+// the writer for locks.
+func NewReadOnly(dbPath string) (*Store, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("opening read-only db %s: %w", dbPath, err)
+	}
+	// ?mode=ro opens without write permission. ?_journal_mode=WAL is implicit
+	// but we set _query_only for extra safety and to avoid any PRAGMA writes.
+	dsn := "file:" + dbPath + "?mode=ro&_query_only=1"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening read-only db: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("pinging read-only db: %w", err)
+	}
+	// Honor the writer's WAL so concurrent reads don't block the writer.
+	db.Exec("PRAGMA busy_timeout = 2000")
+
+	s := &Store{
+		db:         db,
+		dbPath:     dbPath,
+		insertCh:   nil, // no writes
+		snapshotCh: nil,
+		runDone:    make(chan struct{}),
+		stackCache: nil,
+	}
+	close(s.runDone) // Run() is never called on read-only stores.
+	return s, nil
+}
+
 // WaitDone blocks until Run() has finished its final flush and returned.
 // Call this after ctx cancellation but before StopSession/Close to ensure
 // all pending batch writes are committed. Safe to call if Run() was never

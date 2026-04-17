@@ -32,6 +32,20 @@ type hostTraceHostEvent struct {
 	TargetPid  uint32
 }
 
+type hostTraceMmAllocStats struct {
+	_          structs.HostLayout
+	Count      uint64
+	TotalBytes uint64
+	LastTs     uint64
+}
+
+type hostTraceSchedSwitchStats struct {
+	_             structs.HostLayout
+	Count         uint64
+	TotalOffCpuNs uint64
+	LastTs        uint64
+}
+
 // loadHostTrace returns the embedded CollectionSpec for hostTrace.
 func loadHostTrace() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_HostTraceBytes)
@@ -87,9 +101,12 @@ type hostTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type hostTraceMapSpecs struct {
+	CriticalEvents *ebpf.MapSpec `ebpf:"critical_events"`
 	HostEvents     *ebpf.MapSpec `ebpf:"host_events"`
 	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	MmAllocAgg     *ebpf.MapSpec `ebpf:"mm_alloc_agg"`
 	SchedOffMap    *ebpf.MapSpec `ebpf:"sched_off_map"`
+	SchedSwitchAgg *ebpf.MapSpec `ebpf:"sched_switch_agg"`
 	TargetCgroups  *ebpf.MapSpec `ebpf:"target_cgroups"`
 	TargetPids     *ebpf.MapSpec `ebpf:"target_pids"`
 }
@@ -98,7 +115,9 @@ type hostTraceMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type hostTraceVariableSpecs struct {
-	UnusedHostEventForceBtf *ebpf.VariableSpec `ebpf:"_unused_host_event_force_btf"`
+	UnusedHostEventForceBtf        *ebpf.VariableSpec `ebpf:"_unused_host_event_force_btf"`
+	UnusedMmAllocStatsForceBtf     *ebpf.VariableSpec `ebpf:"_unused_mm_alloc_stats_force_btf"`
+	UnusedSchedSwitchStatsForceBtf *ebpf.VariableSpec `ebpf:"_unused_sched_switch_stats_force_btf"`
 }
 
 // hostTraceObjects contains all objects after they have been loaded into the kernel.
@@ -121,18 +140,24 @@ func (o *hostTraceObjects) Close() error {
 //
 // It can be passed to loadHostTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type hostTraceMaps struct {
+	CriticalEvents *ebpf.Map `ebpf:"critical_events"`
 	HostEvents     *ebpf.Map `ebpf:"host_events"`
 	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	MmAllocAgg     *ebpf.Map `ebpf:"mm_alloc_agg"`
 	SchedOffMap    *ebpf.Map `ebpf:"sched_off_map"`
+	SchedSwitchAgg *ebpf.Map `ebpf:"sched_switch_agg"`
 	TargetCgroups  *ebpf.Map `ebpf:"target_cgroups"`
 	TargetPids     *ebpf.Map `ebpf:"target_pids"`
 }
 
 func (m *hostTraceMaps) Close() error {
 	return _HostTraceClose(
+		m.CriticalEvents,
 		m.HostEvents,
 		m.IngeroWatchdog,
+		m.MmAllocAgg,
 		m.SchedOffMap,
+		m.SchedSwitchAgg,
 		m.TargetCgroups,
 		m.TargetPids,
 	)
@@ -142,7 +167,9 @@ func (m *hostTraceMaps) Close() error {
 //
 // It can be passed to loadHostTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type hostTraceVariables struct {
-	UnusedHostEventForceBtf *ebpf.Variable `ebpf:"_unused_host_event_force_btf"`
+	UnusedHostEventForceBtf        *ebpf.Variable `ebpf:"_unused_host_event_force_btf"`
+	UnusedMmAllocStatsForceBtf     *ebpf.Variable `ebpf:"_unused_mm_alloc_stats_force_btf"`
+	UnusedSchedSwitchStatsForceBtf *ebpf.Variable `ebpf:"_unused_sched_switch_stats_force_btf"`
 }
 
 // hostTracePrograms contains all programs after they have been loaded into the kernel.

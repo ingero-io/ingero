@@ -112,8 +112,14 @@ func NewPoller(cfg PollerConfig, cache *ThresholdCache, log *slog.Logger) (*Poll
 		return nil, fmt.Errorf("poller.base_url: %w", err)
 	}
 
+	// Rotate DNS periodically so polling rebalances across Fleet replicas
+	// behind a headless Service. Same rationale as emitter.go.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.IdleConnTimeout = 30 * time.Second
+	tr.MaxIdleConnsPerHost = 1
 	client := &http.Client{
-		Timeout: cfg.Timeout,
+		Timeout:   cfg.Timeout,
+		Transport: tr,
 		// Deny redirects outright — Fleet is a single well-known host;
 		// a 3xx to a different origin would (a) leak the mTLS client
 		// cert to an unexpected server, (b) potentially apply the
@@ -123,13 +129,9 @@ func NewPoller(cfg PollerConfig, cache *ThresholdCache, log *slog.Logger) (*Poll
 		},
 	}
 	if cfg.TLSConfig != nil {
-		tr, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			tr = &http.Transport{}
-		}
-		trClone := tr.Clone()
-		trClone.TLSClientConfig = cfg.TLSConfig
-		client.Transport = trClone
+		trTLS := tr.Clone()
+		trTLS.TLSClientConfig = cfg.TLSConfig
+		client.Transport = trTLS
 	}
 
 	if cfg.FallbackBackoff == 0 {
