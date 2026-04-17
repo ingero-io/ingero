@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -164,7 +165,7 @@ func TestBuildURL(t *testing.T) {
 		{"[::1]:4318", true, "http://[::1]:4318/v1/metrics"},
 	}
 	for _, c := range cases {
-		got, err := buildURL(c.endpoint, c.insecure)
+		got, err := buildURL(c.endpoint, c.insecure, "")
 		if err != nil {
 			t.Errorf("buildURL(%q, %v) unexpected error: %v", c.endpoint, c.insecure, err)
 			continue
@@ -172,6 +173,25 @@ func TestBuildURL(t *testing.T) {
 		if got != c.want {
 			t.Errorf("buildURL(%q, %v) = %q, want %q", c.endpoint, c.insecure, got, c.want)
 		}
+	}
+}
+
+func TestBuildURL_ClusterIDQueryParam(t *testing.T) {
+	got, err := buildURL("fleet:4318", false, "prod-cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://fleet:4318/v1/metrics?cluster_id=prod-cluster"
+	if got != want {
+		t.Errorf("buildURL with clusterID = %q, want %q", got, want)
+	}
+	// Empty cluster_id should not add query param.
+	got2, err := buildURL("fleet:4318", false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got2, "cluster_id") {
+		t.Errorf("empty clusterID should not add query param: %q", got2)
 	}
 }
 
@@ -183,7 +203,7 @@ func TestBuildURL_Errors(t *testing.T) {
 		"://invalid",       // malformed
 	}
 	for _, c := range cases {
-		if _, err := buildURL(c, false); err == nil {
+		if _, err := buildURL(c, false, ""); err == nil {
 			t.Errorf("buildURL(%q) expected error, got nil", c)
 		}
 	}

@@ -198,7 +198,7 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 		log = slog.Default()
 	}
 
-	endpointURL, err := buildURL(cfg.Endpoint, cfg.Insecure)
+	endpointURL, err := buildURL(cfg.Endpoint, cfg.Insecure, cfg.ClusterID)
 	if err != nil {
 		return nil, fmt.Errorf("emitter.endpoint: %w", err)
 	}
@@ -465,7 +465,7 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 //   - IPv6 host forms [::1]:4318
 //
 // Returns an error on malformed URL or unsupported scheme.
-func buildURL(endpoint string, insecure bool) (string, error) {
+func buildURL(endpoint string, insecure bool, clusterID string) (string, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return "", errors.New("empty endpoint")
@@ -505,6 +505,15 @@ func buildURL(endpoint string, insecure bool) (string, error) {
 		p += "/v1/metrics"
 	}
 	u.Path = p
+
+	// Append cluster_id as a query parameter so the Fleet middleware can
+	// identify the cluster at the HTTP layer (before parsing the OTLP
+	// payload) and inject piggyback threshold headers into the response.
+	if clusterID != "" {
+		q := u.Query()
+		q.Set(contract.ParamClusterID, clusterID)
+		u.RawQuery = q.Encode()
+	}
 
 	return u.String(), nil
 }
