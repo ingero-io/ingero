@@ -213,7 +213,7 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 	tr.MaxIdleConnsPerHost = 1
 	client := &http.Client{Timeout: cfg.Timeout, Transport: tr}
 	if cfg.TLS.CACertPath != "" {
-		tlsCfg, tlsErr := loadTLSConfig(cfg.TLS)
+		tlsCfg, tlsErr := LoadTLSConfig(cfg.TLS)
 		if tlsErr != nil {
 			return nil, fmt.Errorf("emitter.tls: %w", tlsErr)
 		}
@@ -520,10 +520,12 @@ func buildURL(endpoint string, insecure bool, clusterID string) (string, error) 
 	return u.String(), nil
 }
 
-// loadTLSConfig reads mTLS material from disk. tls.LoadX509KeyPair already
-// verifies that the private key matches the client certificate, so a
-// mismatched pair fails at config time rather than at first handshake.
-func loadTLSConfig(t TLSConfig) (*tls.Config, error) {
+// LoadTLSConfig reads mTLS material from disk and returns a *tls.Config
+// usable for both the emitter's OTLP push client and the threshold-API GET
+// poller. tls.LoadX509KeyPair already verifies that the private key matches
+// the client certificate, so a mismatched pair fails at config time rather
+// than at first handshake.
+func LoadTLSConfig(t TLSConfig) (*tls.Config, error) {
 	caPEM, err := os.ReadFile(t.CACertPath)
 	if err != nil {
 		return nil, fmt.Errorf("read ca_cert: %w", err)

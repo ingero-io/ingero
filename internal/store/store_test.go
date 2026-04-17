@@ -856,6 +856,53 @@ func TestAggregatesPrunedBySize(t *testing.T) {
 	}
 }
 
+// TestRecordAndQueryAggregates5s exercises the 5-second aggregate table:
+// writer (RecordAggregates5s), reader (QueryAggregatePerOp5s), and the
+// opportunistic retention that drops rows older than
+// FiveSecondAggregateRetention on write. The minute table must be
+// unaffected by the 5s writer.
+func TestRecordAndQueryAggregates5s(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	recent := now.Truncate(5 * time.Second).UnixNano()
+	stale := now.Add(-2 * FiveSecondAggregateRetention).Truncate(5 * time.Second).UnixNano()
+
+	// First write seeds a stale row. Retention sweep fires on every call,
+	// so by the time this function returns the stale row must be gone.
+	s.RecordAggregates5s([]Aggregate{
+		{Bucket: stale, Source: 1, Op: 3, PID: 0, Count: 999, Stored: 0, SumDur: 1},
+	})
+	// Second write seeds a recent row.
+	s.RecordAggregates5s([]Aggregate{
+		{Bucket: recent, Source: 1, Op: 3, PID: 0, Count: 42, Stored: 0, SumDur: 100, MinDur: 10, MaxDur: 50},
+	})
+
+	got, err := s.QueryAggregatePerOp5s(QueryParams{Since: 5 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryAggregatePerOp5s: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 (stale row should be pruned)", len(got))
+	}
+	if got[0].Count != 42 {
+		t.Errorf("Count=%d, want 42", got[0].Count)
+	}
+
+	// Minute table must remain empty — 5s writer should not touch it.
+	totals, err := s.QueryAggregateTotals(QueryParams{Since: 10 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryAggregateTotals: %v", err)
+	}
+	if totals.TotalEvents != 0 {
+		t.Errorf("minute table polluted by 5s writer: TotalEvents=%d", totals.TotalEvents)
+	}
+}
+
 // makeStack creates a test stack trace with the given instruction pointers.
 func makeStack(ips ...uint64) []events.StackFrame {
 	frames := make([]events.StackFrame, len(ips))

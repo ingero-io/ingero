@@ -34,6 +34,26 @@ fleetPush:
                        # warmup time = warmupSamples * pushInterval (default 30*5s = 150s)
   extraArgs: []
 
+  # Optional reference sidecar that consumes the UDS remediation event stream
+  # produced by the agent and exposes Prometheus metrics (event counters,
+  # active-straggler gauges, connected gauge). Only evaluated when
+  # mode=fleet-push. The sidecar and the agent share an emptyDir at /tmp so
+  # both containers see the same socket file.
+  remediation:
+    sinkEnabled: false
+    sinkImage:
+      repository: ghcr.io/ingero-io/straggler-sink
+      tag: ""                    # defaults to .Values.image.tag when empty
+      pullPolicy: IfNotPresent
+    sinkListenPort: 9090
+    sinkResources:
+      requests:
+        cpu: 20m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
 resources:
   requests:
     memory: 256Mi

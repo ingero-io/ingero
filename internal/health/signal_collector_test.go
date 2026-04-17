@@ -190,13 +190,15 @@ type aggRow struct {
 	maxDur int64
 }
 
-// seedTestDB creates a SQLite file with the subset of schema that
-// QueryAggregatePerOp reads (event_aggregates), inserts the given rows,
-// and returns the path. The file is cleaned up when the test ends.
+// seedTestDB creates a SQLite file with the subset of schema that the
+// collector queries (event_aggregates and event_aggregates_5s). Each input
+// row is inserted into BOTH tables with its bucket re-truncated to the
+// correct granularity, so tests that use any Window value see consistent
+// aggregates. The file is cleaned up when the test ends.
 //
 // NOTE: this deliberately does NOT use store.New() because that runs the
 // full schema migrations (including CREATE TABLE events) which take ~300ms
-// and aren't needed here. We only need event_aggregates.
+// and aren't needed here.
 func seedTestDB(t *testing.T, rows []aggRow) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -206,23 +208,33 @@ func seedTestDB(t *testing.T, rows []aggRow) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE event_aggregates (
-		bucket INTEGER NOT NULL,
-		source INTEGER NOT NULL,
-		op INTEGER NOT NULL,
-		count INTEGER NOT NULL DEFAULT 0,
-		sum_dur INTEGER NOT NULL DEFAULT 0,
-		min_dur INTEGER NOT NULL DEFAULT 0,
-		max_dur INTEGER NOT NULL DEFAULT 0,
-		sum_arg0 INTEGER NOT NULL DEFAULT 0,
-		PRIMARY KEY (bucket, source, op)
-	)`); err != nil {
-		t.Fatal(err)
+	for _, table := range []string{"event_aggregates", "event_aggregates_5s"} {
+		if _, err := db.Exec(`CREATE TABLE ` + table + ` (
+			bucket INTEGER NOT NULL,
+			source INTEGER NOT NULL,
+			op INTEGER NOT NULL,
+			count INTEGER NOT NULL DEFAULT 0,
+			sum_dur INTEGER NOT NULL DEFAULT 0,
+			min_dur INTEGER NOT NULL DEFAULT 0,
+			max_dur INTEGER NOT NULL DEFAULT 0,
+			sum_arg0 INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket, source, op)
+		)`); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, r := range rows {
+		minuteBucket := r.bucket.Truncate(time.Minute).UnixNano()
+		fiveSecBucket := r.bucket.Truncate(5 * time.Second).UnixNano()
 		if _, err := db.Exec(
 			"INSERT INTO event_aggregates (bucket, source, op, count, sum_dur, min_dur, max_dur) VALUES (?, ?, ?, ?, ?, ?, ?)",
-			r.bucket.UnixNano(), r.source, r.op, r.count, r.sumDur, r.minDur, r.maxDur,
+			minuteBucket, r.source, r.op, r.count, r.sumDur, r.minDur, r.maxDur,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(
+			"INSERT INTO event_aggregates_5s (bucket, source, op, count, sum_dur, min_dur, max_dur) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			fiveSecBucket, r.source, r.op, r.count, r.sumDur, r.minDur, r.maxDur,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -233,5 +245,97 @@ func seedTestDB(t *testing.T, rows []aggRow) string {
 	// Ensure file is flushed before NewReadOnly opens it.
 	_ = os.Chtimes(path, time.Now(), time.Now())
 	return path
+}
+
+// TestSQLiteCollector_WindowSelectsTable asserts that Collect reads from
+// event_aggregates_5s when Window <= 60s and from event_aggregates when
+// Window > 60s. Seeds each table with DIFFERENT counts so the throughput
+// unambiguously identifies which table was queried.
+func TestSQLiteCollector_WindowSelectsTable(t *testing.T) {
+	now := time.Now()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.db")
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"event_aggregates", "event_aggregates_5s"} {
+		if _, err := db.Exec(`CREATE TABLE ` + table + ` (
+			bucket INTEGER NOT NULL,
+			source INTEGER NOT NULL,
+			op INTEGER NOT NULL,
+			count INTEGER NOT NULL DEFAULT 0,
+			sum_dur INTEGER NOT NULL DEFAULT 0,
+			min_dur INTEGER NOT NULL DEFAULT 0,
+			max_dur INTEGER NOT NULL DEFAULT 0,
+			sum_arg0 INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket, source, op)
+		)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Distinct counts: 1m table gets 100, 5s table gets 600.
+	minuteBucket := now.Truncate(time.Minute).UnixNano()
+	fiveSecBucket := now.Truncate(5 * time.Second).UnixNano()
+	src := uint8(events.SourceCUDA)
+	op := uint8(events.CUDALaunchKernel)
+	if _, err := db.Exec(
+		"INSERT INTO event_aggregates (bucket, source, op, count) VALUES (?, ?, ?, 100)",
+		minuteBucket, src, op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		"INSERT INTO event_aggregates_5s (bucket, source, op, count) VALUES (?, ?, ?, 600)",
+		fiveSecBucket, src, op); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(path, time.Now(), time.Now())
+
+	// Window = 30s: sub-minute, should read 5s table -> 600 / 30 = 20.
+	col5, err := NewSQLiteCollector(SQLiteCollectorConfig{
+		DBPath: path,
+		Window: 30 * time.Second,
+		Log:    discardLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer col5.(io.Closer).Close()
+	obs5, launches5, err := col5.Collect(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs5.Throughput != 20 {
+		t.Errorf("window=30s: throughput=%v, want 20 (from 5s table)", obs5.Throughput)
+	}
+	if launches5 != 600 {
+		t.Errorf("window=30s: launches=%d, want 600", launches5)
+	}
+
+	// Window = 120s: long, should read 1m table -> 100 / 120 ≈ 0.833.
+	col1m, err := NewSQLiteCollector(SQLiteCollectorConfig{
+		DBPath: path,
+		Window: 120 * time.Second,
+		Log:    discardLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer col1m.(io.Closer).Close()
+	obs1m, launches1m, err := col1m.Collect(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantThroughput := 100.0 / 120.0
+	if obs1m.Throughput < wantThroughput-0.001 || obs1m.Throughput > wantThroughput+0.001 {
+		t.Errorf("window=120s: throughput=%v, want ~%v (from 1m table)", obs1m.Throughput, wantThroughput)
+	}
+	if launches1m != 100 {
+		t.Errorf("window=120s: launches=%d, want 100", launches1m)
+	}
 }
 

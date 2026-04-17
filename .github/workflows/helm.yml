@@ -1,0 +1,101 @@
+name: Helm
+
+on:
+  push:
+    branches: [main, fleet]
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    branches: [main, fleet]
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint ./deploy/helm/ingero
+
+  render-trace-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Render default (mode=trace)
+        run: |
+          helm template test ./deploy/helm/ingero > /tmp/trace.yaml
+          grep -q 'ingero trace' /tmp/trace.yaml || \
+            (echo "trace mode render missing trace command" && exit 1)
+
+  render-fleet-push-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Render mode=fleet-push
+        run: |
+          helm template test ./deploy/helm/ingero \
+            --set mode=fleet-push \
+            --set fleetPush.endpoint=http://fleet:4318 \
+            --set fleetPush.clusterID=ci-test \
+            --set fleetPush.stub=true \
+            > /tmp/fleet-push.yaml
+          grep -q 'fleet-push' /tmp/fleet-push.yaml || \
+            (echo "fleet-push mode render missing fleet-push command" && exit 1)
+      - name: Render mode=fleet-push + straggler-sink sidecar
+        run: |
+          helm template test ./deploy/helm/ingero \
+            --set mode=fleet-push \
+            --set fleetPush.endpoint=http://fleet:4318 \
+            --set fleetPush.clusterID=ci-test \
+            --set fleetPush.stub=true \
+            --set fleetPush.remediation.sinkEnabled=true \
+            > /tmp/fleet-push-sidecar.yaml
+          grep -q 'straggler-sink' /tmp/fleet-push-sidecar.yaml || \
+            (echo "sidecar missing from render" && exit 1)
+          grep -q 'remediate-sock' /tmp/fleet-push-sidecar.yaml || \
+            (echo "shared emptyDir volume missing" && exit 1)
+
+  install-fleet-push-stub-on-kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ingero-ci
+          wait: 120s
+      - name: helm install (fleet-push stub mode, no Fleet)
+        run: |
+          # mode=fleet-push with stub=true exercises the chart without
+          # needing eBPF (trace mode requires privileged + BTF which kind
+          # does not reliably provide). The pod will push to a non-existent
+          # Fleet endpoint and degrade to local-baseline; we only assert
+          # that the chart installs and the pod starts.
+          helm install ingero-ci ./deploy/helm/ingero \
+            --namespace ingero \
+            --create-namespace \
+            --set mode=fleet-push \
+            --set fleetPush.endpoint=http://127.0.0.1:4318 \
+            --set fleetPush.clusterID=ci-test \
+            --set fleetPush.stub=true \
+            --set fleetPush.insecure=true \
+            --set nodeSelector=null \
+            --set image.tag=fleet
+      - name: Verify DaemonSet rolled out
+        run: |
+          # Pod may never become Ready without a real Fleet — that's fine.
+          # We check the DaemonSet has at least one scheduled pod with the
+          # right arg list (proves the chart rendered and applied cleanly).
+          kubectl -n ingero rollout status daemonset/ingero-ci --timeout=60s \
+            || kubectl -n ingero describe daemonset ingero-ci
+          kubectl -n ingero get pods -o yaml | grep -q 'fleet-push'
+      - name: helm uninstall
+        if: always()
+        run: helm uninstall ingero-ci --namespace ingero || true

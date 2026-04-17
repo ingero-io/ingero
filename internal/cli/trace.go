@@ -1438,19 +1438,48 @@ func truncateMinute(t time.Time) int64 {
 	return t.Truncate(time.Minute).UnixNano()
 }
 
-// flushAggregates converts the in-memory aggregate map into store.Aggregate
-// slice and writes them to SQLite. Only flushes buckets older than the current
-// minute (completed buckets).
-func flushAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store, now time.Time) {
-	if eventStore == nil || len(aggs) == 0 {
+// truncateFiveSeconds truncates a time to the start of its 5-second bucket
+// as unix nanos. Used for the event_aggregates_5s table that backs the
+// health signal collector's sub-minute derivation windows.
+func truncateFiveSeconds(t time.Time) int64 {
+	return t.Truncate(5 * time.Second).UnixNano()
+}
+
+// flushAggregates converts the in-memory aggregate maps into store.Aggregate
+// slices and writes them to SQLite. Only flushes buckets older than the
+// current bucket for each granularity (completed buckets).
+//
+// Two tables, two cadences:
+//   - event_aggregates (1 min) keeps deep history, pruned by size.
+//   - event_aggregates_5s (5 s) feeds the sub-minute health signal window,
+//     retained for FiveSecondAggregateRetention.
+func flushAggregates(aggs map[aggKey]*aggValue, aggs5s map[aggKey]*aggValue, eventStore *store.Store, now time.Time) {
+	if eventStore == nil {
 		return
 	}
 
-	currentBucket := truncateMinute(now)
-	var batch []store.Aggregate
+	if len(aggs) > 0 {
+		currentBucket := truncateMinute(now)
+		batch := drainCompleted(aggs, currentBucket)
+		if len(batch) > 0 {
+			eventStore.RecordAggregates(batch)
+		}
+	}
+	if len(aggs5s) > 0 {
+		currentBucket5s := truncateFiveSeconds(now)
+		batch := drainCompleted(aggs5s, currentBucket5s)
+		if len(batch) > 0 {
+			eventStore.RecordAggregates5s(batch)
+		}
+	}
+}
 
+// drainCompleted pulls out every entry whose Bucket is strictly less than
+// currentBucket, returning them as a store.Aggregate batch and removing them
+// from the source map.
+func drainCompleted(aggs map[aggKey]*aggValue, currentBucket int64) []store.Aggregate {
+	var batch []store.Aggregate
 	for k, v := range aggs {
-		// Only flush completed minute-buckets (not the current one).
 		if k.Bucket >= currentBucket {
 			continue
 		}
@@ -1468,36 +1497,38 @@ func flushAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store, now tim
 		})
 		delete(aggs, k)
 	}
-
-	if len(batch) > 0 {
-		eventStore.RecordAggregates(batch)
-	}
+	return batch
 }
 
-// flushAllAggregates flushes ALL aggregate buckets (including current minute).
-// Called at shutdown to ensure no data is lost.
-func flushAllAggregates(aggs map[aggKey]*aggValue, eventStore *store.Store) {
-	if eventStore == nil || len(aggs) == 0 {
+// flushAllAggregates flushes ALL buckets from both maps (including in-flight
+// ones). Called at shutdown to ensure no data is lost.
+func flushAllAggregates(aggs map[aggKey]*aggValue, aggs5s map[aggKey]*aggValue, eventStore *store.Store) {
+	if eventStore == nil {
 		return
 	}
 
-	batch := make([]store.Aggregate, 0, len(aggs))
-	for k, v := range aggs {
-		batch = append(batch, store.Aggregate{
-			Bucket:  k.Bucket,
-			Source:  k.Source,
-			Op:      k.Op,
-			PID:     k.PID,
-			Count:   v.Count,
-			Stored:  v.Stored,
-			SumDur:  v.SumDur,
-			MinDur:  v.MinDur,
-			MaxDur:  v.MaxDur,
-			SumArg0: v.SumArg0,
-		})
+	if len(aggs) > 0 {
+		batch := make([]store.Aggregate, 0, len(aggs))
+		for k, v := range aggs {
+			batch = append(batch, store.Aggregate{
+				Bucket: k.Bucket, Source: k.Source, Op: k.Op, PID: k.PID,
+				Count: v.Count, Stored: v.Stored, SumDur: v.SumDur,
+				MinDur: v.MinDur, MaxDur: v.MaxDur, SumArg0: v.SumArg0,
+			})
+		}
+		eventStore.RecordAggregates(batch)
 	}
-
-	eventStore.RecordAggregates(batch)
+	if len(aggs5s) > 0 {
+		batch := make([]store.Aggregate, 0, len(aggs5s))
+		for k, v := range aggs5s {
+			batch = append(batch, store.Aggregate{
+				Bucket: k.Bucket, Source: k.Source, Op: k.Op, PID: k.PID,
+				Count: v.Count, Stored: v.Stored, SumDur: v.SumDur,
+				MinDur: v.MinDur, MaxDur: v.MaxDur, SumArg0: v.SumArg0,
+			})
+		}
+		eventStore.RecordAggregates5s(batch)
+	}
 }
 
 // isArgBytes returns true if arg0 for this (source, op) represents a byte count
@@ -1527,44 +1558,43 @@ func isArgBytes(source events.Source, op uint8) bool {
 	return false
 }
 
-// recordAggregate updates the in-memory aggregate for an event.
-// Called for every event regardless of whether it's individually stored.
-// The 'stored' flag indicates whether the event was also written to the events table.
-func recordAggregate(aggs map[aggKey]*aggValue, evt events.Event, stored bool) {
-	key := aggKey{
-		Bucket: truncateMinute(evt.Timestamp),
-		Source: uint8(evt.Source),
-		Op:     evt.Op,
-		PID:    evt.PID,
-	}
-
+// recordAggregate updates the in-memory aggregates for an event, writing
+// both the 1-minute map (aggs) and the 5-second map (aggs5s) in parallel.
+// The 'stored' flag indicates whether the event was also written to the
+// events table.
+func recordAggregate(aggs map[aggKey]*aggValue, aggs5s map[aggKey]*aggValue, evt events.Event, stored bool) {
 	durNanos := int64(evt.Duration)
+	src := uint8(evt.Source)
+	arg0Bytes := isArgBytes(evt.Source, evt.Op)
 
-	v, ok := aggs[key]
-	if !ok {
-		v = &aggValue{
-			MinDur: durNanos,
-			MaxDur: durNanos,
+	updateOne := func(m map[aggKey]*aggValue, bucket int64) {
+		key := aggKey{Bucket: bucket, Source: src, Op: evt.Op, PID: evt.PID}
+		v, ok := m[key]
+		if !ok {
+			v = &aggValue{MinDur: durNanos, MaxDur: durNanos}
+			m[key] = v
 		}
-		aggs[key] = v
+		v.Count++
+		v.SumDur += durNanos
+		if durNanos < v.MinDur {
+			v.MinDur = durNanos
+		}
+		if durNanos > v.MaxDur {
+			v.MaxDur = durNanos
+		}
+		// Only accumulate arg0 for byte-count ops (malloc size, memcpy
+		// count, page alloc bytes). Skip pointer-valued ops to avoid
+		// int64 overflow.
+		if arg0Bytes {
+			v.SumArg0 += int64(evt.Args[0])
+		}
+		if stored {
+			v.Stored++
+		}
 	}
 
-	v.Count++
-	v.SumDur += durNanos
-	if durNanos < v.MinDur {
-		v.MinDur = durNanos
-	}
-	if durNanos > v.MaxDur {
-		v.MaxDur = durNanos
-	}
-	// Only accumulate arg0 for byte-count ops (malloc size, memcpy count,
-	// page alloc bytes). Skip pointer-valued ops to avoid int64 overflow.
-	if isArgBytes(evt.Source, evt.Op) {
-		v.SumArg0 += int64(evt.Args[0])
-	}
-	if stored {
-		v.Stored++
-	}
+	updateOne(aggs, truncateMinute(evt.Timestamp))
+	updateOne(aggs5s, truncateFiveSeconds(evt.Timestamp))
 }
 
 // mergeAllEventChannels creates a single channel that receives events from
@@ -2191,9 +2221,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 		debugTickerCh = dt.C
 	}
 
-	// Selective storage: aggregate map for events not individually stored.
+	// Selective storage: aggregate maps for events not individually stored.
+	// Two granularities: 1-minute (deep history) and 5-second (sub-minute
+	// health signal window).
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
+	aggs5s := make(map[aggKey]*aggValue)
 	var aggFlushCount int // inline flush counter (see flushEveryN)
 
 	// Stack sampling: per-stack event counter to limit DB redundancy.
@@ -2227,7 +2260,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 		select {
 		case <-ctx.Done():
 			// Flush remaining aggregates at shutdown.
-			flushAllAggregates(aggs, eventStore)
+			flushAllAggregates(aggs, aggs5s, eventStore)
 			if eventStore != nil {
 				totalEvents := collector.Snapshot().TotalEvents
 				if totalEvents > 0 {
@@ -2256,7 +2289,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 
 		case evt, ok := <-eventCh:
 			if !ok {
-				flushAllAggregates(aggs, eventStore)
+				flushAllAggregates(aggs, aggs5s, eventStore)
 				updateSysCtx()
 				snap := collector.Snapshot()
 				attachSysSnapshot(snap, sysColl)
@@ -2337,10 +2370,10 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 						stackSamples[events.HashStackSymbols(evt.Stack)]++
 					}
 				}
-				recordAggregate(aggs, evt, stored)
+				recordAggregate(aggs, aggs5s, evt, stored)
 				aggFlushCount++
 				if aggFlushCount%flushEveryN == 0 {
-					flushAggregates(aggs, eventStore, time.Now())
+					flushAggregates(aggs, aggs5s, eventStore, time.Now())
 				}
 			}
 
@@ -2447,7 +2480,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			}
 
 			// Flush completed minute-buckets to SQLite.
-			flushAggregates(aggs, eventStore, time.Now())
+			flushAggregates(aggs, aggs5s, eventStore, time.Now())
 
 			// Flush per-cgroup scheduling stats for noisy neighbor detection.
 			if eventStore != nil && corr != nil {
@@ -2832,9 +2865,12 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 		pyWarnTickerCh = pwt.C
 	}
 
-	// Selective storage: aggregate map for events not individually stored.
+	// Selective storage: aggregate maps for events not individually stored.
+	// Two granularities: 1-minute (deep history) and 5-second (sub-minute
+	// health signal window).
 	sessionStart := time.Now()
 	aggs := make(map[aggKey]*aggValue)
+	aggs5s := make(map[aggKey]*aggValue)
 	var aggFlushCount int // inline flush counter (see flushEveryN)
 
 	// Stack sampling: per-stack event counter (same as table mode).
@@ -2859,7 +2895,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 	for {
 		select {
 		case <-ctx.Done():
-			flushAllAggregates(aggs, eventStore)
+			flushAllAggregates(aggs, aggs5s, eventStore)
 			if eventStore != nil {
 				totalEvents := collector.Snapshot().TotalEvents
 				if totalEvents > 0 {
@@ -2891,11 +2927,11 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 				}
 			}
 			// Flush completed minute-buckets to SQLite.
-			flushAggregates(aggs, eventStore, time.Now())
+			flushAggregates(aggs, aggs5s, eventStore, time.Now())
 
 		case evt, ok := <-eventCh:
 			if !ok {
-				flushAllAggregates(aggs, eventStore)
+				flushAllAggregates(aggs, aggs5s, eventStore)
 				if eventStore != nil {
 					totalEvents := collector.Snapshot().TotalEvents
 					if totalEvents > 0 {
@@ -2961,10 +2997,10 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 						stackSamples[events.HashStackSymbols(evt.Stack)]++
 					}
 				}
-				recordAggregate(aggs, evt, stored)
+				recordAggregate(aggs, aggs5s, evt, stored)
 				aggFlushCount++
 				if aggFlushCount%flushEveryN == 0 {
-					flushAggregates(aggs, eventStore, time.Now())
+					flushAggregates(aggs, aggs5s, eventStore, time.Now())
 				}
 			}
 

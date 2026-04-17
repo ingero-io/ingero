@@ -373,13 +373,29 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 
 	// Now that ctx exists, start the poller (if configured) on a goroutine.
 	if strings.TrimSpace(fleetPushThresholdURL) != "" {
-		poller, _ := health.NewPoller(health.PollerConfig{
+		pollerCfg := health.PollerConfig{
 			BaseURL:   fleetPushThresholdURL,
 			ClusterID: fleetPushClusterID,
 			Interval:  fleetPushPollInterval,
 			Timeout:   fleetPushTimeout,
 			Insecure:  fleetPushInsecure,
-		}, thresholdCache, log)
+		}
+		// Reuse the same mTLS material as the emitter so the GET poller
+		// survives the same handshake that the push path does. Without
+		// this, HTTPS threshold URLs fail with x509 errors despite
+		// --fleet-tls-* flags being set.
+		if fleetPushTLSCA != "" || fleetPushTLSCert != "" || fleetPushTLSKey != "" {
+			tlsCfg, terr := health.LoadTLSConfig(health.TLSConfig{
+				CACertPath:     fleetPushTLSCA,
+				ClientCertPath: fleetPushTLSCert,
+				ClientKeyPath:  fleetPushTLSKey,
+			})
+			if terr != nil {
+				return fmt.Errorf("poller tls: %w", terr)
+			}
+			pollerCfg.TLSConfig = tlsCfg
+		}
+		poller, _ := health.NewPoller(pollerCfg, thresholdCache, log)
 		pollerWg.Add(1)
 		go func() {
 			defer pollerWg.Done()

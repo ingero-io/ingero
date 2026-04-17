@@ -101,8 +101,50 @@ spec:
               readOnly: true
             - name: data
               mountPath: {{ dir .Values.trace.dbPath }}
+            {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+            - name: remediate-sock
+              mountPath: /tmp
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+        - name: straggler-sink
+          image: "{{ .Values.fleetPush.remediation.sinkImage.repository }}:{{ .Values.fleetPush.remediation.sinkImage.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.fleetPush.remediation.sinkImage.pullPolicy }}
+          # Least privilege: the sink only reads the shared UDS and serves
+          # /metrics. It does not need any host resources that the main
+          # privileged container has access to.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          args:
+            - "--socket-path"
+            - "/tmp/ingero-remediate.sock"
+            - "--listen"
+            - ":{{ .Values.fleetPush.remediation.sinkListenPort }}"
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.fleetPush.remediation.sinkListenPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - name: remediate-sock
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.fleetPush.remediation.sinkResources | nindent 12 }}
+        {{- end }}
       volumes:
         - name: proc
           hostPath:
@@ -117,3 +159,8 @@ spec:
           hostPath:
             path: {{ dir .Values.trace.dbPath }}
             type: DirectoryOrCreate
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+        - name: remediate-sock
+          emptyDir:
+            medium: Memory
+        {{- end }}

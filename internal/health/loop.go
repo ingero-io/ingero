@@ -250,6 +250,22 @@ func (l *Loop) classifyAndEmit(ctx context.Context, now time.Time, score Score, 
 		return
 	}
 
+	// Log the edge transition at Info so operators (and e2e scripts) can
+	// observe it in the agent log without enabling Debug. Non-edge
+	// straggler ticks are left for the OTLP / UDS channels.
+	if changed {
+		state := "HEALTHY"
+		if isStraggler {
+			state = "STRAGGLER"
+		}
+		l.log.Info("straggler_state transition",
+			"straggler_state", state,
+			"score", score.Value,
+			"threshold", threshold,
+			"mode", mode,
+		)
+	}
+
 	ev := StragglerEvent{
 		NodeID:         l.cfg.NodeID,
 		ClusterID:      l.cfg.ClusterID,

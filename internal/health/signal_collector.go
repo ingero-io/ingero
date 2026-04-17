@@ -19,8 +19,9 @@ type SQLiteCollectorConfig struct {
 	// Required.
 	DBPath string
 	// Window is the rolling window used to compute throughput and compute
-	// signals. Defaults to 60s. The minute-granularity of event_aggregates
-	// means values shorter than 60s produce the same numerator as 60s.
+	// signals. Defaults to 60s. When Window <= 60s, reads come from the
+	// 5-second aggregate table (event_aggregates_5s), giving sub-minute
+	// reactivity. Longer windows read the 1-minute table.
 	Window time.Duration
 	// NumGPUs is the number of GPUs on this host, used to normalize the
 	// compute signal. 0 means autodetect (falls back to 1).
@@ -29,15 +30,27 @@ type SQLiteCollectorConfig struct {
 	Log *slog.Logger
 }
 
+// subMinuteThreshold is the window cutoff at which the collector prefers
+// the 5-second aggregate table over the 1-minute table. At exactly 60s both
+// tables return equivalent numerators; the 5s table wins because its buckets
+// are flushed every 5s, eliminating the up-to-60s latency of the 1m table.
+const subMinuteThreshold = 60 * time.Second
+
 // sqliteCollector reads the last Window seconds of event_aggregates from
 // the trace SQLite DB and derives the four health signals plus a
 // kernel-launch count for state-machine idle detection.
 type sqliteCollector struct {
 	store   *store.Store
 	sys     *sysinfo.Collector
+	gpuMem  *gpuMemReader
 	window  time.Duration
 	numGPUs int
 	log     *slog.Logger
+
+	// gpuMemOK tracks the state of the last gpu memory read so that
+	// transitions (OK->err, err->OK) are logged exactly once per change.
+	// Accessed only from Collect, which runs in a single goroutine.
+	gpuMemOK bool
 }
 
 // NewSQLiteCollector constructs a Collector backed by a SQLite DB and
@@ -60,12 +73,20 @@ func NewSQLiteCollector(cfg SQLiteCollectorConfig) (Collector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening signal db: %w", err)
 	}
+	gpu := newGPUMemReader(cfg.Log)
+	if gpu.Available() {
+		cfg.Log.Info("gpu memory: nvidia-smi available, using GPU memory for headroom signal")
+	} else {
+		cfg.Log.Info("gpu memory: nvidia-smi unavailable, falling back to host RAM proxy")
+	}
 	return &sqliteCollector{
-		store:   s,
-		sys:     sysinfo.New(),
-		window:  cfg.Window,
-		numGPUs: cfg.NumGPUs,
-		log:     cfg.Log,
+		store:    s,
+		sys:      sysinfo.New(),
+		gpuMem:   gpu,
+		window:   cfg.Window,
+		numGPUs:  cfg.NumGPUs,
+		log:      cfg.Log,
+		gpuMemOK: gpu.Available(),
 	}, nil
 }
 
@@ -74,20 +95,27 @@ func NewSQLiteCollector(cfg SQLiteCollectorConfig) (Collector, error) {
 //
 //	Throughput = cudaLaunchKernel_count / window_seconds  (raw, kernels/sec)
 //	Compute    = clamp(sum_dur_ns / (window_ns * numGPUs), 0, 1)
-//	Memory     = MemAvailMB / MemTotalMB                   (host RAM proxy for GPU-mem headroom)
+//	Memory     = (gpu_total - gpu_used) / gpu_total        (via nvidia-smi; host RAM proxy when unavailable)
 //	CPU        = 1 - (CPUPercent / 100)
 //
 // Kernel-launch count is returned as the second value and feeds the
 // state machine's idle detection.
 func (c *sqliteCollector) Collect(ctx context.Context, now time.Time) (RawObservation, int, error) {
-	// Rolling window. event_aggregates buckets are minute-granular so we
-	// query a small epsilon past the window to pick up the current bucket.
+	// Rolling window. Windows <= 1 minute read the 5-second aggregate table
+	// for sub-minute reactivity; longer windows use the 1-minute table which
+	// retains deep history.
 	q := store.QueryParams{
 		From:   now.Add(-c.window),
 		To:     now,
 		Source: uint8(events.SourceCUDA),
 	}
-	aggs, err := c.store.QueryAggregatePerOp(q)
+	var aggs []store.AggregateOpStats
+	var err error
+	if c.window <= subMinuteThreshold {
+		aggs, err = c.store.QueryAggregatePerOp5s(q)
+	} else {
+		aggs, err = c.store.QueryAggregatePerOp(q)
+	}
 	if err != nil {
 		return RawObservation{}, 0, fmt.Errorf("query aggregates: %w", err)
 	}
@@ -120,19 +148,13 @@ func (c *sqliteCollector) Collect(ctx context.Context, now time.Time) (RawObserv
 		}
 	}
 
-	// Live system stats for CPU/memory signals.
+	// Live system stats for CPU + memory fallback.
 	snap := c.sys.ReadOnce()
 
-	var memory float64
-	if snap.MemTotalMB > 0 {
-		memory = float64(snap.MemAvailMB) / float64(snap.MemTotalMB)
-		if memory > 1 {
-			memory = 1
-		}
-		if memory < 0 {
-			memory = 0
-		}
-	}
+	// Prefer real GPU memory headroom; fall back to host RAM proxy when
+	// nvidia-smi is unavailable or erroring. Log each state transition
+	// exactly once to avoid flooding the log on every tick.
+	memory := c.readMemorySignal(ctx, snap)
 
 	cpu := 1 - (snap.CPUPercent / 100)
 	if cpu < 0 {
@@ -158,6 +180,44 @@ func (c *sqliteCollector) Collect(ctx context.Context, now time.Time) (RawObserv
 	}
 	_ = totalCount // kept for future per-op breakdown logging
 	return obs, int(launches), nil
+}
+
+// readMemorySignal returns the memory headroom signal in [0, 1]. Uses
+// GPU memory via nvidia-smi when available; falls back to host RAM.
+// State transitions (available->err, err->available) are logged once.
+func (c *sqliteCollector) readMemorySignal(ctx context.Context, snap sysinfo.SystemSnapshot) float64 {
+	if c.gpuMem.Available() {
+		used, total, err := c.gpuMem.Read(ctx)
+		if err == nil && total > 0 {
+			if !c.gpuMemOK {
+				c.log.Info("gpu memory: reads recovered")
+				c.gpuMemOK = true
+			}
+			m := float64(total-used) / float64(total)
+			if m < 0 {
+				m = 0
+			}
+			if m > 1 {
+				m = 1
+			}
+			return m
+		}
+		if c.gpuMemOK {
+			c.log.Warn("gpu memory: read failed, falling back to host RAM", "err", err)
+			c.gpuMemOK = false
+		}
+	}
+	if snap.MemTotalMB <= 0 {
+		return 0
+	}
+	m := float64(snap.MemAvailMB) / float64(snap.MemTotalMB)
+	if m < 0 {
+		m = 0
+	}
+	if m > 1 {
+		m = 1
+	}
+	return m
 }
 
 // Close releases the DB handle.
