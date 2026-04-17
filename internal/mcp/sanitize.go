@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -135,12 +137,12 @@ var injectionMarkers = []string{
 	"</tool",
 }
 
-// stripControlChars removes ASCII 0x00-0x1F except newline (0x0A) and
-// returns a copy. Non-ASCII bytes are left intact so legitimate
-// non-English symbols survive (a real symbol name can contain any
-// valid UTF-8).
+// stripControlChars removes ASCII 0x00-0x1F except newline (0x0A),
+// DEL (0x7F), and Unicode zero-width / bidirectional override codepoints.
+// The bidi/ZW set prevents LooksLikeInjection bypass via invisible
+// character insertion (e.g. "S\u200BYSTEM:" evading the "system:" canary).
 func stripControlChars(s string) string {
-	if !hasControlChar(s) {
+	if !hasStrippableChar(s) {
 		return s
 	}
 	var b strings.Builder
@@ -149,9 +151,10 @@ func stripControlChars(s string) string {
 		if r < 0x20 && r != '\n' {
 			continue
 		}
-		// Also drop DEL (0x7F), which is an ASCII control char above the
-		// 0x1F range.
 		if r == 0x7F {
+			continue
+		}
+		if isInvisibleOrBidi(r) {
 			continue
 		}
 		b.WriteRune(r)
@@ -159,13 +162,39 @@ func stripControlChars(s string) string {
 	return b.String()
 }
 
-// hasControlChar is a fast pre-check: most telemetry strings contain no
-// control chars, so we can skip the builder allocation in the common
-// case.
-func hasControlChar(s string) bool {
+// isInvisibleOrBidi returns true for Unicode codepoints that are invisible
+// or alter text direction. These have no legitimate role in kernel names,
+// process names, or stack symbols, and would let an attacker bypass the
+// injection canary patterns by inserting invisible chars between letters.
+func isInvisibleOrBidi(r rune) bool {
+	switch {
+	case r >= 0x200B && r <= 0x200F: // ZWSP, ZWNJ, ZWJ, LRM, RLM
+		return true
+	case r >= 0x202A && r <= 0x202E: // LRE, RLE, PDF, LRO, RLO
+		return true
+	case r >= 0x2060 && r <= 0x2064: // WJ, invisible operators
+		return true
+	case r == 0xFEFF: // BOM / ZWNBSP
+		return true
+	case r >= 0xFFF0 && r <= 0xFFF8: // interlinear annotation anchors
+		return true
+	case r >= 0x2066 && r <= 0x2069: // LRI, RLI, FSI, PDI (isolates)
+		return true
+	}
+	return false
+}
+
+// hasStrippableChar is a fast pre-check covering ASCII control chars and
+// multi-byte sequences that start the Unicode invisible/bidi ranges.
+func hasStrippableChar(s string) bool {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if (c < 0x20 && c != '\n') || c == 0x7F {
+			return true
+		}
+		// Multi-byte: U+200x starts with 0xE2 0x80, U+202x with 0xE2 0x80,
+		// U+206x with 0xE2 0x81, U+FExx with 0xEF 0xBB, U+FFFx with 0xEF 0xBF.
+		if c == 0xE2 || c == 0xEF {
 			return true
 		}
 	}
@@ -227,6 +256,81 @@ func sanitizeCSV(s string) string {
 		out = append(out, SanitizeTelemetry(p))
 	}
 	return strings.Join(out, " ")
+}
+
+// compactFrame mirrors store.compactFrame for JSON parsing of resolved
+// stack frames stored in stack_traces.frames.
+type compactFrame struct {
+	IP     string `json:"i,omitempty"`
+	Symbol string `json:"s,omitempty"`
+	File   string `json:"f,omitempty"`
+	Line   int    `json:"l,omitempty"`
+	PyFile string `json:"pf,omitempty"`
+	PyFunc string `json:"pfn,omitempty"`
+	PyLine int    `json:"pl,omitempty"`
+}
+
+// parseAndSanitizeFrames parses a stack_traces.frames JSON column,
+// handling both the production format ([]compactFrame objects) and a
+// legacy []string fallback. Each frame is rendered as a human-readable
+// string, sanitized, and wrapped in telemetry delimiters.
+func parseAndSanitizeFrames(framesJSON string) []string {
+	// Try production format: array of compactFrame objects.
+	var compact []compactFrame
+	if json.Unmarshal([]byte(framesJSON), &compact) == nil && len(compact) > 0 {
+		out := make([]string, 0, len(compact))
+		for _, f := range compact {
+			line := renderCompactFrame(f)
+			if line != "" {
+				out = append(out, SanitizeTelemetryTruncate(line, MaxFrameLen))
+			}
+		}
+		return out
+	}
+	// Fallback: try array of plain strings (legacy or hand-crafted DBs).
+	var raw []string
+	if json.Unmarshal([]byte(framesJSON), &raw) == nil && len(raw) > 0 {
+		out := make([]string, len(raw))
+		for i, s := range raw {
+			out[i] = SanitizeTelemetryTruncate(s, MaxFrameLen)
+		}
+		return out
+	}
+	return nil
+}
+
+// renderCompactFrame produces a single-line human-readable representation
+// of a resolved stack frame.
+func renderCompactFrame(f compactFrame) string {
+	var b strings.Builder
+	if f.Symbol != "" {
+		b.WriteString(f.Symbol)
+	} else if f.IP != "" {
+		b.WriteString(f.IP)
+	}
+	if f.File != "" {
+		if b.Len() > 0 {
+			b.WriteString(" at ")
+		}
+		b.WriteString(f.File)
+		if f.Line > 0 {
+			fmt.Fprintf(&b, ":%d", f.Line)
+		}
+	}
+	if f.PyFunc != "" {
+		if b.Len() > 0 {
+			b.WriteString(" -> ")
+		}
+		b.WriteString(f.PyFunc)
+		if f.PyFile != "" {
+			fmt.Fprintf(&b, " (%s", f.PyFile)
+			if f.PyLine > 0 {
+				fmt.Fprintf(&b, ":%d", f.PyLine)
+			}
+			b.WriteByte(')')
+		}
+	}
+	return b.String()
 }
 
 // safeCut returns the longest valid-UTF-8 prefix of s of length <= n

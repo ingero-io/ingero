@@ -210,13 +210,13 @@ func (m *modeEvaluator) decide(now time.Time) (DetectionMode, float64, bool) {
 	}
 
 	// Step 4: Fleet unreachable, cache stale or missing, baseliner warm.
+	// The threshold is LocalBaselineFactor directly (e.g. 0.85), applied
+	// against health scores which are already in [0,1] ratio space.
+	// Previous code multiplied raw baseline magnitudes (throughput in
+	// tokens/sec) by the factor, producing thresholds like 21.8 that
+	// flagged every node as a straggler.
 	if !fleetReachable && m.baseliner.SampleCount() >= m.warmupMin {
-		baseline := m.baseliner.Current()
-		mean := (baseline.Throughput + baseline.Compute + baseline.Memory + baseline.CPU) / 4
-		if mean <= 0 {
-			return ModeNone, 0, false
-		}
-		return ModeLocalBaseline, mean * m.cfg.LocalBaselineFactor, true
+		return ModeLocalBaseline, m.cfg.LocalBaselineFactor, true
 	}
 
 	return ModeNone, 0, false

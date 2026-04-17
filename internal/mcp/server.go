@@ -900,20 +900,12 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 				sr.Processes = sanitizeCSV(*procNames)
 			}
 			// Prefer resolved frames; fall back to raw IPs for old DBs.
-			// Parse, sanitize each frame, re-emit.
-			if framesJSON != "" {
-				var rawFrames []string
-				if json.Unmarshal([]byte(framesJSON), &rawFrames) == nil {
-					sanitized := make([]string, len(rawFrames))
-					for i, f := range rawFrames {
-						sanitized[i] = SanitizeTelemetryTruncate(f, MaxFrameLen)
-					}
-					sr.Frames = sanitized
-				}
+			// Cap input size to prevent memory bombs from crafted DBs.
+			const maxFramesJSONLen = 64 * 1024
+			if framesJSON != "" && len(framesJSON) <= maxFramesJSONLen {
+				sr.Frames = parseAndSanitizeFrames(framesJSON)
 			}
-			if sr.Frames == nil && ipsJSON != "" {
-				// Raw IPs are hex strings — not attacker-influenced, but
-				// wrap for consistency so the model learns one convention.
+			if sr.Frames == nil && ipsJSON != "" && len(ipsJSON) <= maxFramesJSONLen {
 				var ips []string
 				if json.Unmarshal([]byte(ipsJSON), &ips) == nil {
 					sanitized := make([]string, len(ips))

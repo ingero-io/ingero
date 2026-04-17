@@ -130,13 +130,11 @@ func TestEvaluate_LocalBaselineMode(t *testing.T) {
 	if !ok || mode != ModeLocalBaseline {
 		t.Fatalf("mode = %v, threshold = %v, ok = %v", mode, threshold, ok)
 	}
-	// Baseline mean ~ (100 + 0.9 + 0.9 + 0.9)/4 = 25.675 * 0.85 = ~21.8.
-	// Actually the value is whatever the mean is; validate via factor.
-	baseline := b.Current()
-	expectedMean := (baseline.Throughput + baseline.Compute + baseline.Memory + baseline.CPU) / 4
-	expected := expectedMean * 0.85
-	if threshold < expected*0.99 || threshold > expected*1.01 {
-		t.Fatalf("threshold = %v, want ~%v", threshold, expected)
+	// Threshold is LocalBaselineFactor directly (0.85), not derived from
+	// raw baseline magnitudes. The old formula mixed units (raw throughput
+	// in tokens/sec with ratios in [0,1]).
+	if threshold != 0.85 {
+		t.Fatalf("threshold = %v, want 0.85", threshold)
 	}
 }
 
@@ -221,21 +219,25 @@ func TestEvaluate_ReachableButEmptyCache(t *testing.T) {
 	}
 }
 
-// Fleet unreachable + baseline mean = 0 -> None (can't compute a
-// meaningful local baseline threshold).
-func TestEvaluate_UnreachableZeroBaseline_ReturnsNone(t *testing.T) {
+// Fleet unreachable + zero-valued baseline: local-baseline now returns
+// the factor directly regardless of raw magnitudes. A warm baseliner
+// with all-zero observations still counts as warm (SampleCount >= warmup),
+// so LocalBaseline mode is entered. The threshold is 0.85.
+func TestEvaluate_UnreachableZeroBaseline_ReturnsLocalBaseline(t *testing.T) {
 	cache := NewThresholdCache()
 	reachable := &fakeReachable{}
 	reachable.Set(false)
-	// Warm with zero-valued observations so baseline is zero.
 	b, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
 	for i := 0; i < 50; i++ {
 		b.Update(RawObservation{})
 	}
 	m := newModeEvaluatorForTests(t, cache, reachable, b)
-	mode, _, _ := m.Evaluate(time.Now())
-	if mode != ModeNone {
-		t.Fatalf("zero baseline should yield none, got %v", mode)
+	mode, threshold, ok := m.Evaluate(time.Now())
+	if !ok || mode != ModeLocalBaseline {
+		t.Fatalf("warm baseliner should yield local-baseline, got %v ok=%v", mode, ok)
+	}
+	if threshold != 0.85 {
+		t.Fatalf("threshold = %v, want 0.85", threshold)
 	}
 }
 

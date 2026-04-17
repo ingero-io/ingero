@@ -126,6 +126,17 @@ func (c EmitterConfig) Validate() error {
 	if c.WorldSize > 0 && c.NodeRank >= c.WorldSize {
 		return fmt.Errorf("emitter.node_rank (%d) must be < world_size (%d)", c.NodeRank, c.WorldSize)
 	}
+	// Reject CR/LF in identity fields that propagate to OTLP attributes
+	// and gRPC metadata. CR/LF is valid UTF-8 but can cause header injection.
+	for _, pair := range []struct{ name, val string }{
+		{"cluster_id", c.ClusterID},
+		{"node_id", c.NodeID},
+		{"workload_type", c.WorkloadType},
+	} {
+		if strings.ContainsAny(pair.val, "\r\n") {
+			return fmt.Errorf("emitter.%s: contains CR or LF", pair.name)
+		}
+	}
 	// Header-injection: reject any key or value containing \r or \n.
 	for k, v := range c.Headers {
 		if strings.ContainsAny(k, "\r\n") || strings.ContainsAny(v, "\r\n") {

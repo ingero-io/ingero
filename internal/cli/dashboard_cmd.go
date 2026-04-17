@@ -45,6 +45,7 @@ var (
 	dashTLSCert string
 	dashTLSKey  string
 	dashNoTLS   bool
+	dashToken   string
 )
 
 func init() {
@@ -53,6 +54,7 @@ func init() {
 	dashboardCmd.Flags().StringVar(&dashTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted, a self-signed cert is generated")
 	dashboardCmd.Flags().StringVar(&dashTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
 	dashboardCmd.Flags().BoolVar(&dashNoTLS, "no-tls", false, "serve plain HTTP (for fleet queries on trusted networks)")
+	dashboardCmd.Flags().StringVar(&dashToken, "token", "", "Bearer token required for /api/ endpoints (recommended when listening on non-loopback)")
 	rootCmd.AddCommand(dashboardCmd)
 }
 
@@ -83,5 +85,8 @@ func dashboardRunE(cmd *cobra.Command, args []string) error {
 
 	srv := dashboard.New(s, dashAddr, dashTLSCert, dashTLSKey)
 	srv.SetNoTLS(dashNoTLS)
+	if dashToken != "" {
+		srv.SetToken(dashToken)
+	}
 	return srv.Start(ctx)
 }

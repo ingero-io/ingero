@@ -1745,6 +1745,15 @@ func (s *Store) ExecuteReadOnly(ctx context.Context, query string, maxRows int) 
 		}
 	}
 
+	// Reject SQLite functions that can allocate unbounded memory.
+	// zeroblob(N) / randomblob(N) allocate N bytes in a single expression;
+	// a query like SELECT zeroblob(1073741824) causes a 1 GB allocation.
+	for _, fn := range []string{"ZEROBLOB", "RANDOMBLOB"} {
+		if strings.Contains(upper, fn) {
+			return nil, nil, false, fmt.Errorf("function %s is not allowed in read-only queries", fn)
+		}
+	}
+
 	// Reject multi-statement queries: no semicolons followed by non-whitespace.
 	// Find the first semicolon and check if anything meaningful follows it.
 	if idx := strings.Index(trimmed, ";"); idx >= 0 {

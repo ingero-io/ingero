@@ -47,6 +47,12 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listening on UDS %s: %w", s.socketPath, err)
 	}
+	// Restrict socket to owner-only. Default umask leaves it world-accessible,
+	// which lets any local user connect and read straggler events.
+	if err := os.Chmod(s.socketPath, 0o700); err != nil {
+		ln.Close()
+		return fmt.Errorf("chmod socket %s: %w", s.socketPath, err)
+	}
 	s.listener = ln
 
 	go s.acceptLoop()

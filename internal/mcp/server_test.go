@@ -160,7 +160,7 @@ func TestFormatCausalChainsTSC(t *testing.T) {
 	if chain["sev"] != "MEDIUM" {
 		t.Errorf("sev = %v, want MEDIUM", chain["sev"])
 	}
-	if chain["rc"] != "disk latency >50ms" {
+	if chain["rc"] != "[traced-data]disk latency >50ms[/traced-data]" {
 		t.Errorf("rc = %v", chain["rc"])
 	}
 
