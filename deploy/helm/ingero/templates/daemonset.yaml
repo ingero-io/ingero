@@ -33,6 +33,35 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
           args:
+            {{- if eq .Values.mode "fleet-push" }}
+            - "fleet-push"
+            - "--fleet-endpoint"
+            - {{ .Values.fleetPush.endpoint | quote }}
+            - "--fleet-cluster-id"
+            - {{ .Values.fleetPush.clusterID | quote }}
+            {{- if .Values.fleetPush.nodeID }}
+            - "--fleet-node-id"
+            - {{ .Values.fleetPush.nodeID | quote }}
+            {{- else }}
+            - "--fleet-node-id"
+            - "$(MY_NODE_NAME)"
+            {{- end }}
+            - "--fleet-push-interval"
+            - {{ .Values.fleetPush.pushInterval | quote }}
+            {{- if .Values.fleetPush.insecure }}
+            - "--fleet-insecure"
+            {{- end }}
+            {{- if .Values.fleetPush.stub }}
+            - "--stub"
+            {{- end }}
+            {{- if .Values.fleetPush.thresholdUrl }}
+            - "--fleet-threshold-url"
+            - {{ .Values.fleetPush.thresholdUrl | quote }}
+            {{- end }}
+            {{- range .Values.fleetPush.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- else }}
             - "trace"
             - "--record={{ .Values.trace.record }}"
             - "--db"
@@ -41,6 +70,7 @@ spec:
             - {{ .Values.trace.maxDb | quote }}
             {{- range .Values.trace.extraArgs }}
             - {{ . | quote }}
+            {{- end }}
             {{- end }}
           securityContext:
             privileged: true

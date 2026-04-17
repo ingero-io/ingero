@@ -3,11 +3,25 @@ image:
   tag: v0.8
   pullPolicy: IfNotPresent
 
+# mode: "trace" (default) runs `ingero trace --record` for eBPF observability.
+#       "fleet-push" runs `ingero fleet-push` for Fleet integration.
+mode: trace
+
 trace:
   record: true
   dbPath: /var/lib/ingero/ingero.db
   maxDb: "100g"
   extraArgs: []  # e.g., ["--debug", "--stack"]
+
+fleetPush:
+  endpoint: ""         # OTLP HTTP endpoint, e.g., http://ingero-fleet.ingero:4318
+  thresholdUrl: ""     # GET fallback URL, e.g., http://ingero-fleet.ingero:8080
+  clusterID: ""        # required
+  nodeID: ""           # defaults to pod hostname if empty
+  pushInterval: 5s
+  insecure: true       # set false when using mTLS
+  stub: false          # true = synthetic signals (smoke testing)
+  extraArgs: []
 
 resources:
   requests:
