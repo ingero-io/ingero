@@ -117,16 +117,16 @@ func TestServer(t *testing.T) {
 		if d := srv.Dropped(); d != 1 {
 			t.Errorf("Dropped: got %d, want 1", d)
 		}
-		// Gap 16: the per-reason counter names the reason as no_client.
+		// The per-reason counter names the reason as no_client.
 		got := srv.DroppedByReason()
 		if got[remediate.DropReasonNoClient] != 1 {
 			t.Errorf("DroppedByReason[no_client]=%d, want 1; all=%v", got[remediate.DropReasonNoClient], got)
 		}
 	})
 
-	// Gap 16: SendStraggle / SendFleetStraggler* return a typed *DroppedError
-	// that unwraps to ErrDropped when no client is connected. This lets
-	// callers distinguish dropped vs delivered without parsing strings.
+	// SendStraggle / SendFleetStraggler* return a typed *DroppedError that
+	// unwraps to ErrDropped when no client is connected. This lets callers
+	// distinguish dropped vs delivered without parsing strings.
 	t.Run("send_straggle_without_client_returns_typed_error", func(t *testing.T) {
 		srv, _ := startServer(t)
 		err := srv.SendStraggle(straggler.StraggleState{PID: 1})
@@ -308,7 +308,7 @@ func TestServer(t *testing.T) {
 		}
 	})
 
-	// Gap 5: default (no SetSocketGid call) keeps 0o700.
+	// Default (no SetSocketGid call) keeps 0o700.
 	t.Run("default_socket_mode_is_0700", func(t *testing.T) {
 		path := tempSockPath(t)
 		srv := remediate.NewServer(path)
@@ -326,9 +326,9 @@ func TestServer(t *testing.T) {
 		}
 	})
 
-	// Gap 5: SetSocketGid with the current user's primary gid produces a
-	// 0o770 socket. Using the caller's own gid means chown always succeeds,
-	// even in unprivileged CI (chown -1 to self is allowed).
+	// SetSocketGid with the current user's primary gid produces a 0o770
+	// socket. Using the caller's own gid means chown always succeeds, even
+	// in unprivileged CI (chown -1 to self is allowed).
 	t.Run("socket_gid_grants_group_access", func(t *testing.T) {
 		gid := os.Getgid()
 		path := tempSockPath(t)
@@ -348,7 +348,7 @@ func TestServer(t *testing.T) {
 		}
 	})
 
-	// Gap 5: SetSocketGid with a negative value keeps owner-only.
+	// SetSocketGid with a negative value keeps owner-only.
 	t.Run("negative_socket_gid_keeps_0700", func(t *testing.T) {
 		path := tempSockPath(t)
 		srv := remediate.NewServer(path)

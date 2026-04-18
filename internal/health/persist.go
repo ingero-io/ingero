@@ -54,7 +54,17 @@ const (
 	// denied). The file was NOT quarantined — caller should treat as
 	// "try again later" rather than "corruption."
 	LoadUnreadable
+	// LoadNewerVersion: the file declares a schema_version higher than this
+	// binary understands. The file is preserved unchanged (NOT quarantined)
+	// so a newer agent can still use it after a rollback. Caller should
+	// start CALIBRATING and leave the file alone. Supports rolling upgrades
+	// where N-1 and N agents share a persist path.
+	LoadNewerVersion
 )
+
+// CurrentSchemaVersion is the on-disk schema the current binary reads
+// and writes. Bumped whenever savedFile gains or renames a field.
+const CurrentSchemaVersion = 1
 
 func (s LoadStatus) String() string {
 	switch s {
@@ -68,6 +78,8 @@ func (s LoadStatus) String() string {
 		return "corrupt"
 	case LoadUnreadable:
 		return "unreadable"
+	case LoadNewerVersion:
+		return "newer_version"
 	default:
 		return "unknown"
 	}
@@ -224,7 +236,20 @@ func Load(path string, maxAge time.Duration, now time.Time, log *slog.Logger) (P
 	if err := json.Unmarshal(data, &sf); err != nil {
 		return quarantineAndReturn(path, now, log, "corrupt json", "err", err.Error())
 	}
-	if sf.SchemaVersion != 1 {
+	if sf.SchemaVersion != CurrentSchemaVersion {
+		// Distinguish "newer than us" (rolling-upgrade case) from
+		// "older/invalid than us" (corruption or downgrade-and-quarantine).
+		// A newer-version file means a post-upgrade agent wrote it; if a
+		// rollback or autoscaler race lands this older binary on the same
+		// persist path, we must NOT destroy that file — the newer agent
+		// will come back. Just log + calibrate.
+		if sf.SchemaVersion > CurrentSchemaVersion {
+			log.Warn("health baseline was written by a newer schema_version; preserving file and calibrating",
+				"path", path,
+				"file_schema_version", sf.SchemaVersion,
+				"this_schema_version", CurrentSchemaVersion)
+			return PersistedState{}, LoadNewerVersion, nil
+		}
 		return quarantineAndReturn(path, now, log, "unsupported schema_version",
 			"schema_version", sf.SchemaVersion)
 	}

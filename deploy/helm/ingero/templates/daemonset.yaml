@@ -20,7 +20,7 @@ spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: {{ .Values.serviceAccount.name }}
       {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled (ge (int .Values.fleetPush.remediation.socketGid) 0) }}
-      # Gap 5: pod-level fsGroup so the sink sidecar (distroless nonroot,
+      # Pod-level fsGroup so the sink sidecar (distroless nonroot,
       # uid/gid 65532) inherits this as a supplementary group, letting it
       # connect to the 0770 UDS the agent (root) chowned to (-1, socketGid).
       # fsGroup does NOT chown hostPath volumes, so /proc, /sys/kernel/*,
@@ -62,6 +62,14 @@ spec:
             - {{ .Values.fleetPush.pushInterval | quote }}
             {{- if .Values.fleetPush.insecure }}
             - "--fleet-insecure"
+            {{- end }}
+            {{- if .Values.fleetPush.tls.secretName }}
+            - "--fleet-tls-ca"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.caKey }}"
+            - "--fleet-tls-cert"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.certKey }}"
+            - "--fleet-tls-key"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.keyKey }}"
             {{- end }}
             {{- if .Values.fleetPush.stub }}
             - "--stub"
@@ -124,6 +132,11 @@ spec:
             - name: remediate-sock
               mountPath: /tmp
             {{- end }}
+            {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.tls.secretName }}
+            - name: fleet-tls
+              mountPath: {{ .Values.fleetPush.tls.mountPath }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
@@ -152,7 +165,7 @@ spec:
             - name: metrics
               containerPort: {{ .Values.fleetPush.remediation.sinkListenPort }}
               protocol: TCP
-          # Gap 18: /readyz gates on UDS connectivity. The sink stays
+          # /readyz gates on UDS connectivity. The sink stays
           # ready for `readinessWindowSeconds` after the last event even
           # if the UDS flaps, so brief producer restarts don't cause
           # churn. /healthz remains a pure liveness probe.
@@ -189,10 +202,25 @@ spec:
           hostPath:
             path: {{ dir .Values.trace.dbPath }}
             type: DirectoryOrCreate
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.tls.secretName }}
+        # Secret-backed mTLS material for agent push. Keys are projected
+        # under .Values.fleetPush.tls.{caKey,certKey,keyKey}.
+        - name: fleet-tls
+          secret:
+            secretName: {{ .Values.fleetPush.tls.secretName }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.fleetPush.tls.caKey }}
+                path: {{ .Values.fleetPush.tls.caKey }}
+              - key: {{ .Values.fleetPush.tls.certKey }}
+                path: {{ .Values.fleetPush.tls.certKey }}
+              - key: {{ .Values.fleetPush.tls.keyKey }}
+                path: {{ .Values.fleetPush.tls.keyKey }}
+        {{- end }}
         {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
         - name: remediate-sock
         {{- if eq .Values.fleetPush.remediation.tmpVolumeType "hostPath" }}
-          # Gap 7: pod-external volume so a separately-deployed orchestrator
+          # Pod-external volume so a separately-deployed orchestrator
           # (e.g. ingero-ee chart) running in a different pod on the same
           # node sees the same socket file. NOTE: this exposes the node's
           # real /tmp to every container that mounts it.

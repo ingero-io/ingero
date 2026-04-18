@@ -36,6 +36,15 @@ const (
 	// In practice, pruneBySize() also runs after every flushBatch(), so
 	// this ticker only matters when no events arrive for an extended period.
 	DefaultPruneInterval = 1 * time.Hour
+
+	// CurrentUserVersion is what the current binary writes to the SQLite
+	// PRAGMA user_version on every successful open. Bumped whenever the
+	// schema gains or renames a column. A trace DB found with a
+	// user_version LARGER than this refuses to open — a newer agent must
+	// have written it, and opening it with the older schema risks data
+	// loss via subsequent writes. Numbering intentionally matches the
+	// human-facing version string in schema_info (0.10 → 10).
+	CurrentUserVersion = 10
 )
 
 const schema = `
@@ -467,6 +476,15 @@ type Store struct {
 
 	maxDBSize atomic.Int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
 
+	// Cumulative rows deleted by pruneBySize across the lifetime of the
+	// process. Sums deletes across every pruned table (events,
+	// aggregates, snapshots, chains, sessions, process_names, stack_traces).
+	// Exposed via Stats() so operators can alert on "prune stuck":
+	// a bounded db_bytes AND a flat pruned_rows over a window means
+	// pruneBySize is running but failing to reclaim, e.g. because of
+	// WAL checkpoint contention.
+	prunedRows atomic.Uint64
+
 	// Node identity for multi-node correlation (v0.9).
 	node    string       // set via SetNode before Run()
 	eventSeq atomic.Uint64 // monotonic event ID counter
@@ -681,6 +699,23 @@ func New(dbPath string) (*Store, error) {
 	// flush) retry instead of failing immediately with SQLITE_BUSY.
 	db.Exec("PRAGMA busy_timeout = 5000")
 
+	// Reject DBs written by a newer binary before we create any tables or
+	// run migrations. A brand-new DB reads back user_version = 0; existing
+	// older DBs also read 0 until the ratchet below runs for the first
+	// time. The rejection only fires if a future binary has already
+	// written a higher version.
+	var onDiskVersion int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&onDiskVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("reading user_version: %w", err)
+	}
+	if onDiskVersion > CurrentUserVersion {
+		db.Close()
+		return nil, fmt.Errorf(
+			"trace DB at %s was written by a newer agent (user_version=%d, this binary=%d); refusing to open to avoid data loss",
+			dbPath, onDiskVersion, CurrentUserVersion)
+	}
+
 	// Create schema.
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -851,6 +886,16 @@ func New(dbPath string) (*Store, error) {
 	}
 	// On read-only DBs the version stays at 0.9 — read paths must use
 	// hasColumn() guards if they want to be tolerant of either schema.
+
+	// Ratchet PRAGMA user_version forward to the current binary's level.
+	// Only advances; pragma syntax does not accept parameters so the int
+	// value is formatted in. Runs only when the on-disk value is behind
+	// us so a concurrent downgrade-and-upgrade cycle on the same file
+	// doesn't flap the marker. If the DB is read-only this silently
+	// fails, matching how the schema_info writes above behave.
+	if onDiskVersion < CurrentUserVersion {
+		db.Exec(fmt.Sprintf("PRAGMA user_version = %d", CurrentUserVersion))
+	}
 
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
@@ -1242,6 +1287,30 @@ func (s *Store) diskUsage() int64 {
 	return total
 }
 
+// Stats describes the Store's current size + cumulative prune activity.
+// Exported for publication via the Prometheus /metrics endpoint so
+// operators can alert on "DB grew past max-db" (broken prune) or
+// "pruned_rows stopped advancing while db_bytes stays high" (prune
+// running but not reclaiming).
+type Stats struct {
+	// DiskBytes is the sum of the main DB file + WAL + SHM on disk.
+	// Returns 0 for in-memory databases.
+	DiskBytes int64
+	// PrunedRows is the cumulative count of rows deleted by pruneBySize
+	// across all tracked tables since the process started. Monotonic;
+	// does NOT reset when pruneBySize has no work to do.
+	PrunedRows uint64
+}
+
+// ReadStats returns a point-in-time snapshot of the Store's disk + prune
+// counters. Safe to call from any goroutine.
+func (s *Store) ReadStats() Stats {
+	return Stats{
+		DiskBytes:  s.diskUsage(),
+		PrunedRows: s.prunedRows.Load(),
+	}
+}
+
 // pruneBySize deletes oldest events proportionally to bring the DB under maxDBSize.
 // This is the sole retention mechanism — there is no time-based retention.
 // The default --max-db is 10 GB, lasting a few hours under average GPU load.
@@ -1297,18 +1366,41 @@ func (s *Store) pruneBySize() {
 		cutoff := maxTS - int64(float64(maxTS-minTS)*keepFraction)
 
 		// Delete events, aggregates, snapshots, chains, sessions, stale process names.
-		s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
-		s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
-		s.db.Exec("DELETE FROM event_aggregates_5s WHERE bucket < ?", cutoff)
-		s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
-		s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
-		s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
-		s.db.Exec("DELETE FROM process_names WHERE seen_at < ?", cutoff)
+		// Sum RowsAffected across every table so the prune counter reflects
+		// the real deletion volume operators should see after a big prune
+		// cycle. Ignore sql.Result errors — the error fanout here is
+		// already logged by the driver on the bad path.
+		var totalDeleted int64
+		for _, stmt := range []struct {
+			query string
+			arg   int64
+		}{
+			{"DELETE FROM events WHERE timestamp < ?", cutoff},
+			{"DELETE FROM event_aggregates WHERE bucket < ?", cutoff},
+			{"DELETE FROM event_aggregates_5s WHERE bucket < ?", cutoff},
+			{"DELETE FROM system_snapshots WHERE timestamp < ?", cutoff},
+			{"DELETE FROM causal_chains WHERE detected_at < ?", cutoff},
+			{"DELETE FROM sessions WHERE started_at < ?", cutoff},
+			{"DELETE FROM process_names WHERE seen_at < ?", cutoff},
+		} {
+			if res, err := s.db.Exec(stmt.query, stmt.arg); err == nil {
+				if n, rerr := res.RowsAffected(); rerr == nil {
+					totalDeleted += n
+				}
+			}
+		}
 
 		// Clean orphaned stack traces.
-		s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
+		if res, err := s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
 			SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
-		)`)
+		)`); err == nil {
+			if n, rerr := res.RowsAffected(); rerr == nil {
+				totalDeleted += n
+			}
+		}
+		if totalDeleted > 0 {
+			s.prunedRows.Add(uint64(totalDeleted))
+		}
 
 		pruned = true
 

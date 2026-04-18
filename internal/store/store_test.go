@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2280,4 +2281,78 @@ func TestDefaultDBPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A freshly created DB must end up with PRAGMA user_version at
+// CurrentUserVersion; a DB opened twice by the same binary must stay
+// at that value (idempotent).
+func TestUserVersion_WrittenAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.db")
+
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if v != CurrentUserVersion {
+		t.Errorf("user_version after open = %d, want %d", v, CurrentUserVersion)
+	}
+	s.Close()
+
+	// Second open on the same file: no change.
+	s2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	var v2 int
+	if err := s2.db.QueryRow("PRAGMA user_version").Scan(&v2); err != nil {
+		t.Fatalf("reread user_version: %v", err)
+	}
+	if v2 != CurrentUserVersion {
+		t.Errorf("user_version after reopen = %d, want %d", v2, CurrentUserVersion)
+	}
+	s2.Close()
+}
+
+// A DB whose user_version declares it was written by a newer binary
+// must NOT open. Destroying it would lose data the newer agent may
+// still depend on during a rolling upgrade or rollback window.
+func TestUserVersion_RefusesNewerBinary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.db")
+
+	// Create a normal DB, then force user_version past the current binary.
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("seed New: %v", err)
+	}
+	bumped := CurrentUserVersion + 1
+	if _, err := s.db.Exec("PRAGMA user_version = " + strconvI(bumped)); err != nil {
+		t.Fatalf("bump user_version: %v", err)
+	}
+	s.Close()
+
+	// Reopen with the same (older) binary — must refuse.
+	s2, err := New(path)
+	if err == nil {
+		s2.Close()
+		t.Fatalf("expected New() to refuse a DB with user_version=%d > CurrentUserVersion=%d, got success", bumped, CurrentUserVersion)
+	}
+	if !strings.Contains(err.Error(), "newer agent") {
+		t.Errorf("expected 'newer agent' in error, got: %v", err)
+	}
+
+	// And the file must still exist (not destroyed).
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("refused file should still exist: %v", statErr)
+	}
+}
+
+// Tiny helper to avoid pulling in strconv just for two call sites.
+func strconvI(n int) string {
+	return strconv.Itoa(n)
 }

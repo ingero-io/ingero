@@ -30,7 +30,8 @@ func TestHandleLine_StragglerStateTransitions(t *testing.T) {
 	}
 
 	handleLine([]byte(`{"type":"straggler_resolved","node_id":"n1","cluster_id":"c1"}`), m)
-	// Gap 4: entry is deleted on resolve, not zeroed.
+	// Entry must be deleted on resolve, not zeroed, so the gauge stops
+	// emitting a series for it.
 	if _, present := m.stragglerState[stragglerKey{"c1", "n1"}]; present {
 		t.Errorf("after straggler_resolved: key still present, want deleted")
 	}
@@ -118,8 +119,8 @@ func TestMetricsOutput_DeterministicOrder(t *testing.T) {
 	}
 }
 
-// Gap 4: the gauge series must be removed entirely on resolve, not just
-// zeroed — otherwise cardinality grows unboundedly in a high-churn fleet.
+// The gauge series must be removed entirely on resolve, not just zeroed
+// — otherwise cardinality grows unboundedly in a high-churn fleet.
 func TestStragglerState_DeletesOnResolve(t *testing.T) {
 	m := newMetrics(0)
 	handleLine([]byte(`{"type":"straggler_state","node_id":"n1","cluster_id":"c1"}`), m)
@@ -142,8 +143,8 @@ func TestStragglerState_DeletesOnResolve(t *testing.T) {
 	}
 }
 
-// Gap 4: at cap, inserting a new active straggler evicts the oldest
-// (FIFO) and bumps the dropped counter with reason cap_reached.
+// At cap, inserting a new active straggler evicts the oldest (FIFO) and
+// bumps the dropped counter with reason cap_reached.
 func TestStragglerState_EvictsAtCap(t *testing.T) {
 	cap := 3
 	m := newMetrics(cap)
@@ -171,8 +172,8 @@ func TestStragglerState_EvictsAtCap(t *testing.T) {
 	}
 }
 
-// Gap 4: re-sending straggler_state for an already-tracked key is a
-// no-op (no eviction, no dropped count).
+// Re-sending straggler_state for an already-tracked key is a no-op
+// (no eviction, no dropped count).
 func TestStragglerState_DedupeDoesNotEvict(t *testing.T) {
 	cap := 2
 	m := newMetrics(cap)
@@ -189,7 +190,7 @@ func TestStragglerState_DedupeDoesNotEvict(t *testing.T) {
 	}
 }
 
-// Gap 4: the dropped counter is exposed on /metrics with the expected label.
+// The dropped counter is exposed on /metrics with the expected label.
 func TestMetricsOutput_DroppedCounter(t *testing.T) {
 	m := newMetrics(1)
 	handleLine([]byte(`{"type":"straggler_state","node_id":"n1","cluster_id":"c"}`), m)

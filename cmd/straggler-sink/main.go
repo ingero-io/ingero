@@ -5,7 +5,7 @@
 //
 //	ingero_sink_events_total{type="..."}                       counter
 //	ingero_sink_parse_errors_total                             counter
-//	ingero_sink_dropped_total{reason="..."}                    counter (Gap 4)
+//	ingero_sink_dropped_total{reason="..."}                    counter
 //	ingero_sink_connected                                       gauge (0|1)
 //	ingero_sink_last_event_timestamp_seconds                    gauge
 //	ingero_sink_active_stragglers{cluster_id,node_id}           gauge (0|1)
@@ -43,8 +43,8 @@ func main() {
 		socketPath       = flag.String("socket-path", "/tmp/ingero-remediate.sock", "path to the ingero remediation UDS")
 		listenAddr       = flag.String("listen", ":9090", "HTTP listen address for /metrics")
 		reconnectDelay   = flag.Duration("reconnect-delay", 2*time.Second, "delay between reconnect attempts when the socket is unavailable")
-		maxTrackedNodes  = flag.Int("max-tracked-nodes", 10000, "Gap 4: cap on unique (cluster_id, node_id) pairs kept in the active-stragglers gauge. Oldest entry is evicted (FIFO) and counted under ingero_sink_dropped_total{reason=\"cap_reached\"}.")
-		readinessWindow  = flag.Duration("readiness-window", 60*time.Second, "Gap 18: /readyz returns 503 when disconnected AND the last event is older than this window.")
+		maxTrackedNodes  = flag.Int("max-tracked-nodes", 10000, "cap on unique (cluster_id, node_id) pairs kept in the active-stragglers gauge. Oldest entry is evicted (FIFO) and counted under ingero_sink_dropped_total{reason=\"cap_reached\"}.")
+		readinessWindow  = flag.Duration("readiness-window", 60*time.Second, "/readyz returns 503 when disconnected AND the last event is older than this window.")
 	)
 	flag.Parse()
 
@@ -65,12 +65,12 @@ func main() {
 	mux.HandleFunc("/metrics", m.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		// /healthz remains a liveness probe: "is the process up".
-		// /readyz gates on UDS health; see below (Gap 18).
+		// /readyz gates on UDS health; see below.
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		// Gap 18: return 503 when we have no current UDS connection AND
+		// Return 503 when we have no current UDS connection AND
 		// haven't seen any event for longer than the configured window.
 		// Kubernetes uses this to stop sending traffic to a stale sidecar.
 		if atomic.LoadUint32(&m.connected) == 1 {
@@ -206,7 +206,7 @@ func handleLine(line []byte, m *metrics) {
 // writers are goroutines from runConsumer; the /metrics handler is the
 // reader. Sync via mutex for the label-keyed maps, atomics for scalars.
 //
-// Gap 4: stragglerState is capped at maxNodes entries. Insertion order is
+// stragglerState is capped at maxNodes entries. Insertion order is
 // tracked via `order` (a doubly linked list) + `index` (map back to the
 // list element for O(1) removal on resolve or eviction). When a new active
 // straggler arrives at cap, the oldest entry is evicted FIFO and counted
@@ -266,7 +266,7 @@ func (m *metrics) setStraggler(clusterID, nodeID string, active bool) {
 	defer m.mu.Unlock()
 
 	if !active {
-		// Gap 4: delete on resolve so the gauge stops emitting a series for
+		// Delete on resolve so the gauge stops emitting a series for
 		// keys we no longer care about. Idempotent: resolve-before-state is
 		// a no-op rather than an error.
 		if elem, ok := m.index[k]; ok {

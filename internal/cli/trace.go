@@ -808,9 +808,33 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Only created when at least one exporter is configured, to avoid spinning
 	// a sysinfo.Collector goroutine (reading /proc every second) for nothing.
 	var onSnapshot func(*stats.Snapshot)
+	// droppedFn is the sum of ring-buffer + channel drops across every
+	// tracer, used by both the TUI and the snapshot callback. Forward-
+	// declared here so the onSnapshot closure below can reference it;
+	// assigned further down once all tracers are set up.
+	var droppedFn func() uint64
 	if promSrv != nil || otlpExporter != nil {
 		var otlpPushCount int
 		onSnapshot = func(snap *stats.Snapshot) {
+			// Attach trace-DB stats whenever a Store is wired in. Cheap
+			// (os.Stat + atomic load) and published via the Prometheus
+			// /metrics endpoint so operators can monitor prune health.
+			if eventStore != nil {
+				st := eventStore.ReadStats()
+				snap.TraceDB = &stats.TraceDBSnapshot{
+					DiskBytes:  st.DiskBytes,
+					PrunedRows: st.PrunedRows,
+				}
+			}
+			// Ring-buffer overflow total. Summed across every tracer so
+			// operators can alert on "burst larger than ring buffer"
+			// without subscribing to per-tracer series. droppedFn is
+			// defined further below once tracers are set up; the nil
+			// guard keeps this closure safe for snapshots that fire
+			// before tracer attachment completes.
+			if droppedFn != nil {
+				snap.RingbufOverflows = droppedFn()
+			}
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}
@@ -829,7 +853,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// immutable after this point — do not append to cudaTracers/graphTracers.
 
 	// Combined dropped count from all tracers.
-	droppedFn := func() uint64 {
+	droppedFn = func() uint64 {
 		var d uint64
 		for _, ct := range cudaTracers {
 			d += ct.Dropped()

@@ -24,21 +24,21 @@ type Server struct {
 	// 0o770 so a sidecar consumer running under that supplementary group
 	// can connect. When < 0 (default), the socket stays owner-only (0o700).
 	// Numeric GID is required because distroless images carry no NSS
-	// name->gid mapping (Gap 5).
+	// name->gid mapping.
 	socketGid int
 	listener  net.Listener
 	mu        sync.Mutex
 	conn      net.Conn // current consumer connection, nil if none
 	dropped   uint64   // messages dropped due to write timeout or no connection
-	// Gap 16: per-reason drop counters. Writers hold s.mu while bumping
+	// Per-reason drop counters. Writers hold s.mu while bumping
 	// so readers snapshotting via DroppedByReason don't race.
 	droppedByReason map[DropReason]uint64
 }
 
 // DropReason classifies why a Send* call did not deliver its payload.
-// Gap 16: callers previously could not tell why a message was dropped —
-// every failure path incremented a single atomic and returned nil. The
-// typed reason lets callers drive per-reason metrics and alerts.
+// Callers previously could not tell why a message was dropped — every
+// failure path incremented a single atomic and returned nil. The typed
+// reason lets callers drive per-reason metrics and alerts.
 type DropReason string
 
 const (

@@ -158,10 +158,16 @@ func TestLoad_CorruptJSON_Quarantined(t *testing.T) {
 	}
 }
 
-func TestLoad_UnknownSchemaVersion_Quarantined(t *testing.T) {
+// A schema_version LOWER than CurrentSchemaVersion is either corruption
+// or a regressed binary; either way we quarantine so the forensic trail
+// survives and we start calibrating. Paired with the forward-compat
+// test below that covers the opposite direction.
+func TestLoad_LowerSchemaVersion_Quarantined(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "baseline.json")
-	payload := `{"schema_version":99,"saved_at":"2026-04-16T12:00:00Z","sample_count":1,"fast_ema":{},"hard_floor":{}}`
+	// schema_version=0 is what json.Unmarshal produces when the field is
+	// absent from the JSON; it's the "unversioned legacy file" signature.
+	payload := `{"saved_at":"2026-04-16T12:00:00Z","sample_count":1,"fast_ema":{},"hard_floor":{}}`
 	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +179,38 @@ func TestLoad_UnknownSchemaVersion_Quarantined(t *testing.T) {
 		t.Fatalf("status = %v, want LoadCorrupt", status)
 	}
 	assertQuarantined(t, path)
+}
+
+// A schema_version HIGHER than CurrentSchemaVersion means a newer agent
+// wrote this file (rolling upgrade scenario). We must NOT quarantine —
+// destroying the file would corrupt the newer agent's state when it
+// comes back after a rollback or autoscaler race. Return LoadNewerVersion
+// and leave the file in place; the caller starts calibrating.
+func TestLoad_NewerSchemaVersion_Preserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "baseline.json")
+	payload := `{"schema_version":99,"saved_at":"2026-04-16T12:00:00Z","sample_count":1,"fast_ema":{},"hard_floor":{}}`
+	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, status, err := Load(path, time.Hour, persistNow, quietLog)
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if status != LoadNewerVersion {
+		t.Fatalf("status = %v, want LoadNewerVersion", status)
+	}
+	// File must still exist at the original path (no quarantine).
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("file should still exist at original path: %v", err)
+	}
+	// And no .corrupt-* sibling should have been created.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".corrupt-") {
+			t.Fatalf("forward-compat file was quarantined: %s", e.Name())
+		}
+	}
 }
 
 func TestLoad_NegativeSampleCount_Quarantined(t *testing.T) {

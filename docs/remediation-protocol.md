@@ -5,6 +5,32 @@
 > without notice in future releases. Pin to a specific Ingero version if you
 > build on this.
 
+## Contract Version
+
+**Contract version: 1.**
+
+The authoritative machine-readable contract lives in
+`internal/remediate/wire_contract_test.go`. That test fails the build if
+any field listed in the `required` column below is removed or renamed.
+Rules:
+
+- **Stable** types: required fields may not be removed or renamed
+  within a contract version. Adding new optional fields is allowed.
+  Breaking changes require a contract-version bump.
+- **Experimental** types: fields may change between releases. Consumers
+  must tolerate missing or added fields.
+- **Deprecation:** a stable field is deprecated by adding a successor
+  field and marking the old one optional in the contract. It may not be
+  removed until the next contract-version bump and one full release
+  where the new field is the primary.
+
+| Type | Stability | Required fields | Optional fields |
+|---|---|---|---|
+| `memory` | stable | `type`, `pid`, `gpu_id`, `allocated_bytes`, `total_vram`, `utilization_pct`, `last_alloc_size`, `timestamp_ns` | `comm` |
+| `straggle` | stable | `type`, `pid`, `throughput_drop_pct`, `sched_switch_count`, `preempting_pids`, `timestamp_ns`, `sustained` | `comm` |
+| `straggler_state` | experimental | `type`, `node_id`, `cluster_id`, `score`, `threshold`, `detection_mode`, `dominant_signal`, `timestamp` | |
+| `straggler_resolved` | experimental | `type`, `node_id`, `cluster_id`, `timestamp` | |
+
 When Ingero runs with `--remediate`, it exposes a Unix Domain Socket (UDS) that
 streams real-time GPU memory state and CPU straggler detection signals as
 NDJSON. Any external process can connect to this socket and build automated
@@ -50,6 +76,8 @@ Emitted on every CUDA memory allocation or free observed by the eBPF probes.
 |-------|------|-------------|
 | `type` | string | Always `"memory"` |
 | `pid` | uint32 | Process ID of the GPU workload |
+| `comm` | string | Kernel-captured process name (optional; omitted when empty) |
+| `gpu_id` | uint32 | GPU index (0..N-1) the allocation targets |
 | `allocated_bytes` | uint64 | Current net VRAM allocation balance for this PID |
 | `total_vram` | uint64 | Total GPU VRAM in bytes (queried from nvidia-smi at startup) |
 | `utilization_pct` | float64 | `allocated_bytes / total_vram * 100` |
@@ -70,16 +98,47 @@ together to avoid false positives.
 |-------|------|-------------|
 | `type` | string | Always `"straggle"` |
 | `pid` | uint32 | Process ID experiencing scheduling contention |
+| `comm` | string | Kernel-captured process name (optional; omitted when empty) |
 | `throughput_drop_pct` | float64 | Percentage drop from the EMA throughput baseline |
 | `sched_switch_count` | uint32 | Number of `sched_switch` events in the detection interval |
 | `preempting_pids` | []uint32 | PIDs of processes that preempted the affected process |
 | `timestamp_ns` | int64 | Wall-clock timestamp (Unix nanoseconds) |
+| `sustained` | bool | `false` on initial detection, `true` on re-emissions while pressure persists — lets consumers gate "once per episode" remediation |
 
 **Emission rules:**
 - Emitted when both throughput drop and `sched_switch` contention thresholds
   are exceeded for the same PID in the same detection interval.
 - Re-emitted periodically while contention persists, so downstream consumers
   that require periodic signals (e.g., within a 2s window) receive updates.
+
+### `straggler_state` — Fleet peer-relative straggler (experimental)
+
+Emitted by `ingero fleet-push` when a node's health score crosses the
+Fleet-derived threshold downward (healthy → straggler transition). The
+score is peer-relative across the cluster; the threshold comes from the
+Fleet processor's rolling statistic.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Always `"straggler_state"` |
+| `node_id` | string | Stable node identifier (pod hostname by default) |
+| `cluster_id` | string | Logical cluster identifier |
+| `score` | float64 | Latest health score pushed for this node |
+| `threshold` | float64 | Fleet-derived threshold at the moment of transition |
+| `detection_mode` | string | One of `calibrating`, `fleet`, `fleet-cached`, `local-cached`, `local-baseline` |
+| `dominant_signal` | string | The signal that drove classification (e.g. `throughput`, `compute`) |
+| `timestamp` | RFC3339 | Event wall-clock timestamp |
+
+### `straggler_resolved` — straggler → healthy edge (experimental)
+
+Emitted when a previously-straggler node returns above threshold.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Always `"straggler_resolved"` |
+| `node_id` | string | Stable node identifier |
+| `cluster_id` | string | Logical cluster identifier |
+| `timestamp` | RFC3339 | Event wall-clock timestamp |
 
 ## Common Rules
 
