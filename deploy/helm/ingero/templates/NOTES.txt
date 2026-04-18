@@ -11,3 +11,18 @@ Start MCP server for AI-assisted investigation:
   kubectl port-forward -n {{ .Release.Namespace }} ds/{{ include "ingero.fullname" . }} 8080:8080
 
 Database location (on host): {{ .Values.trace.dbPath }}
+{{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+
+Remediation sink sidecar is ENABLED.
+  UDS path:     /tmp/ingero-remediate.sock
+  Socket mode:  {{ if ge (int .Values.fleetPush.remediation.socketGid) 0 }}0770 (gid {{ .Values.fleetPush.remediation.socketGid }}){{ else }}0700 (owner-only){{ end }}
+  Sink metrics: :{{ .Values.fleetPush.remediation.sinkListenPort }}/metrics
+{{- if eq .Values.fleetPush.remediation.tmpVolumeType "hostPath" }}
+
+WARNING: fleetPush.remediation.tmpVolumeType=hostPath mounts the node's
+real /tmp into this DaemonSet. Only use this mode when a separately-
+deployed orchestrator pod (e.g. the ingero-ee chart) needs to see the
+same socket file. The node's /tmp is then shared with every other
+container that also mounts it.
+{{- end }}
+{{- end }}

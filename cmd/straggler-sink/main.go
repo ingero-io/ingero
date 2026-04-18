@@ -5,6 +5,7 @@
 //
 //	ingero_sink_events_total{type="..."}                       counter
 //	ingero_sink_parse_errors_total                             counter
+//	ingero_sink_dropped_total{reason="..."}                    counter (Gap 4)
 //	ingero_sink_connected                                       gauge (0|1)
 //	ingero_sink_last_event_timestamp_seconds                    gauge
 //	ingero_sink_active_stragglers{cluster_id,node_id}           gauge (0|1)
@@ -19,6 +20,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"encoding/json"
 	"flag"
@@ -38,13 +40,15 @@ import (
 
 func main() {
 	var (
-		socketPath     = flag.String("socket-path", "/tmp/ingero-remediate.sock", "path to the ingero remediation UDS")
-		listenAddr     = flag.String("listen", ":9090", "HTTP listen address for /metrics")
-		reconnectDelay = flag.Duration("reconnect-delay", 2*time.Second, "delay between reconnect attempts when the socket is unavailable")
+		socketPath       = flag.String("socket-path", "/tmp/ingero-remediate.sock", "path to the ingero remediation UDS")
+		listenAddr       = flag.String("listen", ":9090", "HTTP listen address for /metrics")
+		reconnectDelay   = flag.Duration("reconnect-delay", 2*time.Second, "delay between reconnect attempts when the socket is unavailable")
+		maxTrackedNodes  = flag.Int("max-tracked-nodes", 10000, "Gap 4: cap on unique (cluster_id, node_id) pairs kept in the active-stragglers gauge. Oldest entry is evicted (FIFO) and counted under ingero_sink_dropped_total{reason=\"cap_reached\"}.")
+		readinessWindow  = flag.Duration("readiness-window", 60*time.Second, "Gap 18: /readyz returns 503 when disconnected AND the last event is older than this window.")
 	)
 	flag.Parse()
 
-	m := newMetrics()
+	m := newMetrics(*maxTrackedNodes)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,8 +64,28 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", m.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// /healthz remains a liveness probe: "is the process up".
+		// /readyz gates on UDS health; see below (Gap 18).
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		// Gap 18: return 503 when we have no current UDS connection AND
+		// haven't seen any event for longer than the configured window.
+		// Kubernetes uses this to stop sending traffic to a stale sidecar.
+		if atomic.LoadUint32(&m.connected) == 1 {
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ready\n")
+			return
+		}
+		last := atomic.LoadInt64(&m.lastEventUnixNano)
+		if last > 0 && time.Since(time.Unix(0, last)) < *readinessWindow {
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ready (recent event)\n")
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "not ready: uds_disconnected\n")
 	})
 	httpSrv := &http.Server{
 		Addr:              *listenAddr,
@@ -181,10 +205,21 @@ func handleLine(line []byte, m *metrics) {
 // metrics holds the tiny set of gauges and counters the sink exports. All
 // writers are goroutines from runConsumer; the /metrics handler is the
 // reader. Sync via mutex for the label-keyed maps, atomics for scalars.
+//
+// Gap 4: stragglerState is capped at maxNodes entries. Insertion order is
+// tracked via `order` (a doubly linked list) + `index` (map back to the
+// list element for O(1) removal on resolve or eviction). When a new active
+// straggler arrives at cap, the oldest entry is evicted FIFO and counted
+// under `dropped["cap_reached"]`. On `straggler_resolved`, the entry is
+// removed entirely so the gauge no longer emits a series for it.
 type metrics struct {
 	mu                sync.Mutex
 	eventsByType      map[string]uint64
-	stragglerState    map[stragglerKey]uint8 // 1 = active, 0 = resolved
+	stragglerState    map[stragglerKey]uint8 // 1 = active; entries are removed on resolve
+	order             *list.List             // FIFO of stragglerKey, oldest at Front
+	index             map[stragglerKey]*list.Element
+	maxNodes          int
+	dropped           map[string]uint64 // reason -> count
 	parseErrors       uint64
 	connected         uint32
 	lastEventUnixNano int64
@@ -192,10 +227,14 @@ type metrics struct {
 
 type stragglerKey struct{ ClusterID, NodeID string }
 
-func newMetrics() *metrics {
+func newMetrics(maxNodes int) *metrics {
 	return &metrics{
 		eventsByType:   map[string]uint64{},
 		stragglerState: map[stragglerKey]uint8{},
+		order:          list.New(),
+		index:          map[stragglerKey]*list.Element{},
+		maxNodes:       maxNodes,
+		dropped:        map[string]uint64{},
 	}
 }
 
@@ -224,12 +263,39 @@ func (m *metrics) markActivity() {
 func (m *metrics) setStraggler(clusterID, nodeID string, active bool) {
 	k := stragglerKey{ClusterID: clusterID, NodeID: nodeID}
 	m.mu.Lock()
-	if active {
-		m.stragglerState[k] = 1
-	} else {
-		m.stragglerState[k] = 0
+	defer m.mu.Unlock()
+
+	if !active {
+		// Gap 4: delete on resolve so the gauge stops emitting a series for
+		// keys we no longer care about. Idempotent: resolve-before-state is
+		// a no-op rather than an error.
+		if elem, ok := m.index[k]; ok {
+			m.order.Remove(elem)
+			delete(m.index, k)
+		}
+		delete(m.stragglerState, k)
+		return
 	}
-	m.mu.Unlock()
+
+	// Active path. If the key already exists, it stays at its current
+	// FIFO position (dedup without churn). Otherwise insert at tail and
+	// evict oldest if we are over cap.
+	if _, ok := m.index[k]; ok {
+		m.stragglerState[k] = 1
+		return
+	}
+	if m.maxNodes > 0 && len(m.stragglerState) >= m.maxNodes {
+		if front := m.order.Front(); front != nil {
+			evicted := front.Value.(stragglerKey)
+			m.order.Remove(front)
+			delete(m.index, evicted)
+			delete(m.stragglerState, evicted)
+			m.dropped["cap_reached"]++
+		}
+	}
+	elem := m.order.PushBack(k)
+	m.index[k] = elem
+	m.stragglerState[k] = 1
 }
 
 // handleMetrics writes a minimal Prometheus text-exposition response. No
@@ -258,6 +324,16 @@ func (m *metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 			v uint8
 		}{k, v})
 	}
+	dropped := make([]struct {
+		reason string
+		n      uint64
+	}, 0, len(m.dropped))
+	for r, n := range m.dropped {
+		dropped = append(dropped, struct {
+			reason string
+			n      uint64
+		}{r, n})
+	}
 	m.mu.Unlock()
 
 	// Stable output order so scrape diffing / tests are deterministic.
@@ -268,6 +344,7 @@ func (m *metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		}
 		return stragglers[i].k.NodeID < stragglers[j].k.NodeID
 	})
+	sort.Slice(dropped, func(i, j int) bool { return dropped[i].reason < dropped[j].reason })
 
 	fmt.Fprintln(w, "# HELP ingero_sink_events_total Total remediation events received by type.")
 	fmt.Fprintln(w, "# TYPE ingero_sink_events_total counter")
@@ -291,9 +368,15 @@ func (m *metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ingero_sink_last_event_timestamp_seconds 0")
 	}
 
-	fmt.Fprintln(w, "# HELP ingero_sink_active_stragglers 1 when a straggler_state has been received without a matching straggler_resolved, 0 otherwise.")
+	fmt.Fprintln(w, "# HELP ingero_sink_active_stragglers 1 when a straggler_state has been received without a matching straggler_resolved. Entries are removed on resolve.")
 	fmt.Fprintln(w, "# TYPE ingero_sink_active_stragglers gauge")
 	for _, s := range stragglers {
 		fmt.Fprintf(w, "ingero_sink_active_stragglers{cluster_id=%q,node_id=%q} %d\n", s.k.ClusterID, s.k.NodeID, s.v)
+	}
+
+	fmt.Fprintln(w, "# HELP ingero_sink_dropped_total Events dropped by the sink, labeled by reason.")
+	fmt.Fprintln(w, "# TYPE ingero_sink_dropped_total counter")
+	for _, d := range dropped {
+		fmt.Fprintf(w, "ingero_sink_dropped_total{reason=%q} %d\n", d.reason, d.n)
 	}
 }

@@ -21,7 +21,7 @@
 #     -v /sys/kernel/btf:/sys/kernel/btf:ro \
 #     ghcr.io/ingero-io/ingero trace                            # live tracing
 
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.26.2-bookworm AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

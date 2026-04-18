@@ -46,6 +46,26 @@ fleetPush:
       tag: ""                    # defaults to .Values.image.tag when empty
       pullPolicy: IfNotPresent
     sinkListenPort: 9090
+    # Gap 7: how to back the shared /tmp that holds the remediation socket.
+    #
+    # "emptyDir" (default): a tmpfs scoped to this pod. Only containers in
+    # this DaemonSet's pod can see the socket. Correct for the common case
+    # where the ingero agent and the sink sidecar ship together here.
+    #
+    # "hostPath": the node's real /tmp. Required when pairing with a
+    # separate ingero-ee orchestrator chart whose pod cannot share an
+    # emptyDir with this one. Be aware: host /tmp becomes shared with every
+    # other consumer on the node, which is why this is opt-in.
+    tmpVolumeType: emptyDir
+    # Gap 5: the agent runs privileged (uid 0) so it can open eBPF
+    # resources; the sink sidecar runs as distroless nonroot (uid 65532,
+    # readOnlyRootFilesystem). The agent bind-chowns the UDS to
+    # (-1, socketGid) and chmods to 0o770 so the sidecar's primary gid
+    # (inherited via pod-level fsGroup) can connect. Numeric GID avoids
+    # NSS lookups that distroless images don't support. Set to -1 to
+    # keep the socket owner-only (0o700); the sink will then only work
+    # if it can run as root, which the chart does not configure.
+    socketGid: 65532
     sinkResources:
       requests:
         cpu: 20m

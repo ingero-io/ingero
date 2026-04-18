@@ -1,6 +1,6 @@
 module github.com/ingero-io/ingero
 
-go 1.26.0
+go 1.26.2
 
 require (
 	github.com/cilium/ebpf v0.20.0

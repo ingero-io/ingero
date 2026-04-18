@@ -19,6 +19,18 @@ spec:
       hostPID: true
       terminationGracePeriodSeconds: 30
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled (ge (int .Values.fleetPush.remediation.socketGid) 0) }}
+      # Gap 5: pod-level fsGroup so the sink sidecar (distroless nonroot,
+      # uid/gid 65532) inherits this as a supplementary group, letting it
+      # connect to the 0770 UDS the agent (root) chowned to (-1, socketGid).
+      # fsGroup does NOT chown hostPath volumes, so /proc, /sys/kernel/*,
+      # and the trace DB hostPath are unaffected. Only the emptyDir-backed
+      # remediate-sock volume inherits the gid.
+      securityContext:
+        fsGroup: {{ .Values.fleetPush.remediation.socketGid }}
+        supplementalGroups:
+          - {{ .Values.fleetPush.remediation.socketGid }}
+      {{- end }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       nodeSelector:
@@ -73,6 +85,13 @@ spec:
             {{- if .Values.fleetPush.warmupSamples }}
             - "--warmup-samples"
             - {{ .Values.fleetPush.warmupSamples | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.remediation.sinkEnabled }}
+            - "--remediate"
+            - "--remediate-socket"
+            - "/tmp/ingero-remediate.sock"
+            - "--remediate-gid"
+            - {{ .Values.fleetPush.remediation.socketGid | quote }}
             {{- end }}
             {{- range .Values.fleetPush.extraArgs }}
             - {{ . | quote }}
@@ -133,12 +152,23 @@ spec:
             - name: metrics
               containerPort: {{ .Values.fleetPush.remediation.sinkListenPort }}
               protocol: TCP
-          readinessProbe:
+          # Gap 18: /readyz gates on UDS connectivity. The sink stays
+          # ready for `readinessWindowSeconds` after the last event even
+          # if the UDS flaps, so brief producer restarts don't cause
+          # churn. /healthz remains a pure liveness probe.
+          livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
             initialDelaySeconds: 2
             periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 15
+            failureThreshold: 4
           volumeMounts:
             - name: remediate-sock
               mountPath: /tmp
@@ -161,6 +191,16 @@ spec:
             type: DirectoryOrCreate
         {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
         - name: remediate-sock
+        {{- if eq .Values.fleetPush.remediation.tmpVolumeType "hostPath" }}
+          # Gap 7: pod-external volume so a separately-deployed orchestrator
+          # (e.g. ingero-ee chart) running in a different pod on the same
+          # node sees the same socket file. NOTE: this exposes the node's
+          # real /tmp to every container that mounts it.
+          hostPath:
+            path: /tmp
+            type: Directory
+        {{- else }}
           emptyDir:
             medium: Memory
+        {{- end }}
         {{- end }}

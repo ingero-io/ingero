@@ -51,6 +51,7 @@ var (
 	fleetPushHysteresis    float64
 	fleetPushRemediate     bool
 	fleetPushRemediateSock string
+	fleetPushRemediateGid  int
 	fleetPushSignalDBPath  string
 	fleetPushSignalWindow  time.Duration
 	fleetPushSignalNumGPUs int
@@ -123,6 +124,8 @@ func init() {
 		"Publish straggler state to the remediation UDS socket (Story 3.4)")
 	fleetPushCmd.Flags().StringVar(&fleetPushRemediateSock, "remediate-socket", "/tmp/ingero-remediate.sock",
 		"UDS path for remediation messages when --remediate is set")
+	fleetPushCmd.Flags().IntVar(&fleetPushRemediateGid, "remediate-gid", 65532,
+		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
 	fleetPushCmd.Flags().StringVar(&fleetPushSignalDBPath, "signal-db-path", store.DefaultDBPath(),
 		"Path to the SQLite DB written by a sibling 'ingero trace --record' process (ignored when --stub)")
 	fleetPushCmd.Flags().DurationVar(&fleetPushSignalWindow, "signal-window", 60*time.Second,
@@ -317,6 +320,7 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	)
 	if fleetPushRemediate {
 		udsServer = remediate.NewServer(fleetPushRemediateSock)
+		udsServer.SetSocketGid(fleetPushRemediateGid)
 		if err := udsServer.Start(); err != nil {
 			return fmt.Errorf("remediate server: %w", err)
 		}
@@ -424,13 +428,11 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		log.Info("baseline not saved: below warmup threshold",
 			"sample_count", baseliner.SampleCount(), "warmup_min", baselineWarmupMin)
 	} else if serr := health.Save(fleetPushPersistPath, baseliner.Snapshot(), time.Now()); serr != nil {
-		log.Warn("baseline save failed", "err", serr.Error())
-		// Bubble up the save failure so operators see a non-zero exit
-		// rather than having to grep the logs.
-		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-			return fmt.Errorf("shutdown: save baseline: %w", serr)
-		}
-		// If Run also returned a non-graceful error, prefer that.
+		// Persistence is best-effort. Do not mask a clean shutdown with a
+		// non-zero exit when the only failure is that /var/lib/ingero is
+		// not writable for this user. WARN is sufficient for operators; a
+		// non-graceful runErr (below) still propagates.
+		log.Warn("baseline save failed (best-effort; not propagated as exit error)", "err", serr.Error(), "path", fleetPushPersistPath)
 	} else {
 		log.Info("baseline saved", "path", fleetPushPersistPath, "sample_count", baseliner.SampleCount())
 	}
