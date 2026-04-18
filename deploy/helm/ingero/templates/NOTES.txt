@@ -1,6 +1,22 @@
 Ingero GPU observability agent deployed as DaemonSet.
 
 Pods will schedule on nodes with label: nvidia.com/gpu.present=true
+{{- if not .Values.namespace.create }}
+
+NOTICE: namespace.create=false. The agent runs a privileged container
+(required for eBPF CAP_BPF + hostPID). If namespace
+"{{ .Release.Namespace }}" is labeled with
+pod-security.kubernetes.io/enforce=baseline or =restricted,
+admission will REJECT the DaemonSet. Before installing, label the
+target namespace explicitly:
+
+  kubectl label --overwrite namespace {{ .Release.Namespace }} \
+    pod-security.kubernetes.io/enforce=privileged \
+    pod-security.kubernetes.io/warn=privileged
+
+Or install with namespace.create=true so the chart creates a
+correctly-labeled namespace for you.
+{{- end }}
 
 Query the agent:
   kubectl exec -n {{ .Release.Namespace }} ds/{{ include "ingero.fullname" . }} -- ingero explain --since 5m

@@ -305,18 +305,7 @@ func (p *Poller) pollOnce(ctx context.Context) (time.Duration, bool) {
 //
 // A malformed or missing value falls back to FallbackBackoff.
 func (p *Poller) parseRetryAfter(s string) time.Duration {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return p.cfg.FallbackBackoff
-	}
-	if n, err := strconv.Atoi(s); err == nil && n >= 0 {
-		return time.Duration(n) * time.Second
-	}
-	if t, err := http.ParseTime(s); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			return 0
-		}
+	if d, ok := parseRetryAfterHeader(s); ok {
 		return d
 	}
 	return p.cfg.FallbackBackoff

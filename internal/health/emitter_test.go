@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -622,4 +623,156 @@ func assertAttrInt(t *testing.T, attrs []otlpKV, key string, want int64) {
 		}
 	}
 	t.Fatalf("attr %q missing", key)
+}
+
+// 429 with Retry-After in seconds surfaces as a typed RetryAfterError
+// so the loop can delay the next tick by the server-requested amount.
+func TestPush_429RetryAfterSeconds(t *testing.T) {
+	rs := newRetryAfterServer(t, http.StatusTooManyRequests, "7")
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	if err == nil {
+		t.Fatal("expected RetryAfterError, got nil")
+	}
+	ra := AsRetryAfter(err)
+	if ra == nil {
+		t.Fatalf("expected RetryAfterError, got %T: %v", err, err)
+	}
+	if ra.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("StatusCode=%d, want 429", ra.StatusCode)
+	}
+	if ra.Delay != 7*time.Second {
+		t.Errorf("Delay=%s, want 7s", ra.Delay)
+	}
+}
+
+// 503 with Retry-After as HTTP-date. Covers the other RFC 7231 form.
+func TestPush_503RetryAfterHTTPDate(t *testing.T) {
+	future := time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat)
+	rs := newRetryAfterServer(t, http.StatusServiceUnavailable, future)
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	ra := AsRetryAfter(err)
+	if ra == nil {
+		t.Fatalf("expected RetryAfterError, got %v", err)
+	}
+	if ra.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("StatusCode=%d, want 503", ra.StatusCode)
+	}
+	if ra.Delay < 10*time.Second || ra.Delay > 25*time.Second {
+		t.Errorf("Delay=%s out of expected range ~20s", ra.Delay)
+	}
+}
+
+// 429 WITHOUT Retry-After falls through to the plain status-error path.
+func TestPush_429NoRetryAfterIsPlainError(t *testing.T) {
+	rs := newRetryAfterServer(t, http.StatusTooManyRequests, "")
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if AsRetryAfter(err) != nil {
+		t.Errorf("plain 429 (no header) should NOT produce RetryAfterError; got %v", err)
+	}
+}
+
+// 400 with Retry-After is ignored; the helper only consults the header
+// for 429 and 503.
+func TestPush_400RetryAfterIsPlainError(t *testing.T) {
+	rs := newRetryAfterServer(t, http.StatusBadRequest, "30")
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	if AsRetryAfter(err) != nil {
+		t.Errorf("400 with Retry-After should NOT produce RetryAfterError; got %v", err)
+	}
+}
+
+func newRetryAfterServer(t *testing.T, status int, retryAfter string) *recordingServer {
+	t.Helper()
+	rs := &recordingServer{t: t, status: status}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		rs.mu.Lock()
+		rs.bodies = append(rs.bodies, body)
+		rs.mu.Unlock()
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.WriteHeader(status)
+	})
+	rs.server = httptest.NewServer(mux)
+	t.Cleanup(rs.server.Close)
+	return rs
+}
+
+// A server that hijacks the connection and slams it shut with
+// SO_LINGER=0 before writing a response. Go surfaces this as either
+// "connection reset by peer" or "EOF"; both count as network-class
+// errors the emitter's retry loop must handle.
+func TestPush_TCPResetIsRetriedAsNetworkError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("response writer is not a Hijacker")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			// SO_LINGER=0 turns Close() into an abortive RST instead of
+			// a graceful FIN-then-wait.
+			_ = tc.SetLinger(0)
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	e, _ := NewEmitter(baseEmitterCfg(srv.URL), nil)
+	start := time.Now()
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from RST; got nil")
+	}
+	if AsRetryAfter(err) != nil {
+		t.Fatalf("RST must NOT look like a Retry-After error; got %v", err)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("push returned in %s — retry backoff likely skipped", elapsed)
+	}
+}
+
+// Blackhole dial: point the emitter at a no-longer-listening port and
+// assert the push fails inside cfg.Timeout + slack. Guards against a
+// future change that forgets to set a dialer timeout or relies on
+// kernel default SYN retries (~63 s on Linux).
+func TestPush_BlackholeDialRespectsTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	cfg := baseEmitterCfg("http://" + addr)
+	cfg.PushInterval = 2 * time.Second
+	cfg.Timeout = 500 * time.Millisecond
+	e, _ := NewEmitter(cfg, nil)
+
+	start := time.Now()
+	perr := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	elapsed := time.Since(start)
+
+	if perr == nil {
+		t.Fatal("expected error")
+	}
+	// Budget: 2x Timeout (first attempt) + 200ms jitter + 2x Timeout
+	// (retry) + 500ms slack.
+	if elapsed > 5*time.Second {
+		t.Errorf("push elapsed %s > 5s budget; dialer timeout drift?", elapsed)
+	}
 }

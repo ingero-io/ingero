@@ -1,0 +1,75 @@
+fleet: honor Retry-After on push, jitter the push tick, extra regressions, namespace pre-req warning
+
+Five related changes on top of commit 3715aed, all surfaced by the
+post-audit review of the push path + chart installation story.
+
+Honor Retry-After on 429/503 push responses
+  The GET poller (fleet_client.go) already parsed Retry-After on
+  rate-limit / service-unavailable responses and advanced its next
+  tick accordingly. The POST push path (emitter.go) ignored the
+  header entirely: every non-2xx collapsed into a single statusErr
+  and the loop pushed again at the regular interval. Under a real
+  Fleet overload — the exact scenario where Retry-After exists —
+  hundreds of agents would keep hammering a server asking them to
+  back off.
+
+  - internal/health/retryafter.go (new): shared parseRetryAfterHeader
+    helper returning (Duration, ok). Also exports a typed
+    RetryAfterError with StatusCode + Delay, and an AsRetryAfter
+    convenience for errors.As callers.
+  - internal/health/emitter.go: doPush on 429 or 503 reads the
+    header; when present, returns *RetryAfterError instead of the
+    plain status error. Other 4xx / 5xx paths unchanged.
+  - internal/health/fleet_client.go: parseRetryAfter delegates to
+    the shared helper, keeping its FallbackBackoff default.
+  - internal/health/loop.go: tick() now returns the server-requested
+    backoff (0 when none); TickOnce() surfaces it for tests; Run()
+    adds that backoff to the next timer delay so ctx cancellation
+    during backoff still exits promptly.
+
+Jitter the push-loop ticker
+  N agents launched by the same Helm rollout used to synchronize
+  push ticks forever because time.NewTicker is deterministic. Run()
+  now uses a self-driven time.Timer seeded from each Loop's own rng,
+  spreading subsequent ticks by ±10% around PushInterval. The Loop
+  struct gains an rng field seeded per-instance so two Loops in the
+  same process draw independent sequences. A nextDelay helper folds
+  the jitter + any outstanding Retry-After backoff into one call.
+
+Regression tests
+  - TestPush_429RetryAfterSeconds, TestPush_503RetryAfterHTTPDate:
+    both RFC 7231 forms produce a RetryAfterError with the right
+    Delay. 20 s HTTP-date has ±5 s slack for test-runtime jitter.
+  - TestPush_429NoRetryAfterIsPlainError,
+    TestPush_400RetryAfterIsPlainError: a missing header and a
+    non-{429,503} status with header MUST fall through to the plain
+    status-error path. Otherwise a hypothetical future change could
+    over-reach and treat any Retry-After as backoff.
+  - TestPush_TCPResetIsRetriedAsNetworkError: a hijacker-based server
+    that sets SO_LINGER=0 and closes mid-handshake produces an EPIPE
+    / EOF / ECONNRESET depending on timing. The test asserts all
+    three shapes hit the one-jittered-retry path (elapsed >= 100 ms)
+    and do NOT look like a status error.
+  - TestPush_BlackholeDialRespectsTimeout: point the emitter at a
+    no-longer-listening port, assert the push fails inside
+    cfg.Timeout plus slack. Guards against future dialer-timeout
+    drift that would let a SYN-dropped packet block for the
+    kernel's ~63 s default.
+  - New newRetryAfterServer helper isolates the "recording server +
+    header injection" case from newRecordingServer to keep each
+    helper narrow.
+
+Installation-time namespace pre-req in NOTES
+  deploy/helm/ingero/templates/NOTES.txt: when namespace.create=false
+  the rendered notes now warn that the agent runs a privileged
+  container and the target namespace MUST carry
+  pod-security.kubernetes.io/enforce=privileged or admission will
+  reject the DaemonSet. The chart's own namespace template already
+  labels correctly when create=true; this closes the silent
+  failure mode for operators installing into a pre-existing
+  namespace that defaults to baseline or restricted.
+
+Verified: full internal/health suite green locally and under
+`go test -race -count=1`. The four new push-path tests pass along
+with the pre-existing poller Retry-After tests that now route
+through the shared helper.

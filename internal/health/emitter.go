@@ -314,6 +314,16 @@ func (e *httpEmitter) doPush(ctx context.Context, body []byte) (statusErr error,
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// If the server set Retry-After on a 429/503, surface it to the
+		// caller so the loop can delay the next tick. Missing header
+		// falls through to the existing generic status-error path; the
+		// loop then uses its normal push-interval tick.
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusServiceUnavailable {
+			if d, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After")); ok {
+				return &RetryAfterError{StatusCode: resp.StatusCode, Delay: d}, nil
+			}
+		}
 		return fmt.Errorf("emitter: push rejected: %d %s", resp.StatusCode, resp.Status), nil
 	}
 	return nil, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -87,6 +88,10 @@ type Loop struct {
 
 	mu               sync.Mutex
 	lastAnomalyLogAt map[string]time.Time
+	// rng seeds the per-tick jitter and runs under `mu`. Seeded per Loop
+	// (not package-global) so multiple Loops in the same process draw
+	// independent sequences.
+	rng *rand.Rand
 }
 
 // NewLoop validates the config and returns a runnable Loop.
@@ -136,33 +141,63 @@ func NewLoop(cfg LoopConfig) (*Loop, error) {
 		log:              log,
 		now:              now,
 		lastAnomalyLogAt: make(map[string]time.Time),
+		// now().UnixNano() seed gives per-agent spread at process start
+		// so N agents launched by the same Helm rollout don't synchronize
+		// their push ticks.
+		rng: rand.New(rand.NewSource(now().UnixNano())),
 	}, nil
 }
 
-// Run blocks until ctx is cancelled, ticking once per PushInterval. Each
-// tick is wrapped in a derived context with TickTimeout so a slow
-// Collector or HTTP server never stalls the whole loop.
+// Run blocks until ctx is cancelled, ticking roughly every PushInterval
+// with ±10% jitter so N agents launched together do not synchronize a
+// thundering-herd push every interval. Each tick is wrapped in a derived
+// context with TickTimeout so a slow Collector or HTTP server never
+// stalls the whole loop. If the last tick returned a RetryAfterError,
+// the next fire waits at least that long before the jittered interval
+// kicks back in — the server's backoff request takes precedence over
+// the normal cadence.
 func (l *Loop) Run(ctx context.Context) error {
-	ticker := time.NewTicker(l.cfg.PushInterval)
-	defer ticker.Stop()
-
+	var extra time.Duration
 	for {
+		timer := time.NewTimer(l.nextDelay(extra))
+		extra = 0
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-ticker.C:
-			l.tick(ctx)
+		case <-timer.C:
+			extra = l.tick(ctx)
 		}
 	}
 }
 
-// TickOnce runs one iteration of the loop synchronously. Tests drive the
-// loop via this instead of Run() to avoid timing dependencies.
-func (l *Loop) TickOnce(ctx context.Context) {
-	l.tick(ctx)
+// nextDelay computes the time until the next tick. Applies a ±10%
+// jitter around PushInterval so rollouts don't synchronize. The
+// `extra` parameter is added unconditionally when a previous tick asked
+// for backoff (server-side Retry-After).
+func (l *Loop) nextDelay(extra time.Duration) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	pct := l.rng.Float64()*0.2 - 0.1 // -10% .. +10%
+	jittered := l.cfg.PushInterval + time.Duration(float64(l.cfg.PushInterval)*pct)
+	if jittered < time.Millisecond {
+		jittered = time.Millisecond
+	}
+	return jittered + extra
 }
 
-func (l *Loop) tick(parentCtx context.Context) {
+// TickOnce runs one iteration of the loop synchronously. Tests drive the
+// loop via this instead of Run() to avoid timing dependencies. The
+// return value is the server-requested Retry-After backoff, if any.
+// Zero means "no explicit backoff; schedule the next tick normally".
+func (l *Loop) TickOnce(ctx context.Context) time.Duration {
+	return l.tick(ctx)
+}
+
+// tick runs one loop iteration. Returns the backoff requested by the
+// server via a Retry-After header on a 429/503 push response, or 0 if
+// the push succeeded or failed without a structured backoff hint.
+func (l *Loop) tick(parentCtx context.Context) time.Duration {
 	// Bound this tick so a slow Collector or HTTP server cannot stall the
 	// next tick indefinitely.
 	ctx, cancel := context.WithTimeout(parentCtx, l.cfg.TickTimeout)
@@ -193,12 +228,12 @@ func (l *Loop) tick(parentCtx context.Context) {
 		// has something to normalize against. Do not emit — the score
 		// would be derived from a zero baseline and is meaningless.
 		l.cfg.Baseliner.Update(raw)
-		return
+		return 0
 	}
 
 	// STALE emits nothing — the agent does not know what its score is.
 	if next == StateStale {
-		return
+		return 0
 	}
 
 	// Signals FIRST, Update after — otherwise the baseline used for the
@@ -224,8 +259,14 @@ func (l *Loop) tick(parentCtx context.Context) {
 		thresholdOK = ok
 	}
 
+	var retryAfter time.Duration
 	if err := l.cfg.Emitter.Push(ctx, now, score, next, mode, l.cfg.Baseliner.DegradationWarning()); err != nil {
 		l.log.Debug("fleet loop: push error", "err", err.Error())
+		if ra := AsRetryAfter(err); ra != nil {
+			retryAfter = ra.Delay
+			l.log.Info("fleet loop: server asked for backoff",
+				"status", ra.StatusCode, "retry_after", ra.Delay.String())
+		}
 	}
 
 	// Straggler classification (Story 3.4). Gated on:
@@ -235,6 +276,7 @@ func (l *Loop) tick(parentCtx context.Context) {
 	if l.cfg.Classifier != nil && next == StateActive && thresholdOK {
 		l.classifyAndEmit(ctx, now, score, threshold, mode, preUpdateBaseline)
 	}
+	return retryAfter
 }
 
 // classifyAndEmit runs the classifier and fires OTLP + UDS notifications.
