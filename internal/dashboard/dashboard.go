@@ -33,6 +33,7 @@ type Server struct {
 	certFile string
 	keyFile  string
 	noTLS    bool     // serve plain HTTP instead of HTTPS
+	token    string   // Bearer token for API auth; empty = no auth
 	gpuInfo  *gpuInfo // cached at startup, nil if no GPU
 }
 
@@ -53,6 +54,14 @@ func New(s *store.Store, addr, certFile, keyFile string) *Server {
 // Used for fleet queries on trusted networks (private subnets, VPNs, WireGuard).
 func (s *Server) SetNoTLS(noTLS bool) {
 	s.noTLS = noTLS
+}
+
+// SetToken configures a required Bearer token for API endpoints. When set,
+// all /api/ requests must carry "Authorization: Bearer <token>". Static file
+// serving (the dashboard UI) is not gated so the browser can load the page;
+// the UI's JS fetch calls include the token from a prompt or URL parameter.
+func (s *Server) SetToken(token string) {
+	s.token = token
 }
 
 // probeGPUInfo queries nvidia-smi for GPU model, driver version, and CUDA version.
@@ -93,13 +102,23 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 
-	// For fleet queries on trusted networks, allow any Host header.
-	// For HTTPS mode, guard against DNS rebinding.
+	// Warn if listening on non-loopback without auth.
+	if s.token == "" && !isLoopbackAddr(s.addr) {
+		fmt.Fprintf(os.Stderr, "  WARNING: dashboard listening on non-loopback address %s without --token authentication\n", s.addr)
+		fmt.Fprintf(os.Stderr, "  Any host on the network can query the database. Set --token to require auth.\n")
+	}
+
+	// Apply token guard to API routes when a token is configured.
 	var handler http.Handler
-	if s.noTLS {
-		handler = mux
+	if s.token != "" {
+		handler = tokenGuard(mux, s.token)
 	} else {
-		handler = hostGuard(mux)
+		handler = mux
+	}
+
+	// For HTTPS mode, guard against DNS rebinding.
+	if !s.noTLS {
+		handler = hostGuard(handler)
 	}
 
 	// Plain HTTP mode (--no-tls) for fleet queries on trusted networks.
@@ -247,4 +266,32 @@ func hostGuard(next http.Handler) http.Handler {
 			http.Error(w, "forbidden: invalid Host header", http.StatusForbidden)
 		}
 	})
+}
+
+// tokenGuard requires a Bearer token on /api/ routes. Static file requests
+// (dashboard UI) pass through so the browser can load the page.
+func tokenGuard(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+token {
+				http.Error(w, "unauthorized: invalid or missing Bearer token", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr returns true if the listen address is bound to localhost only.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

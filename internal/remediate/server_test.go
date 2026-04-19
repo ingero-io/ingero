@@ -3,6 +3,7 @@ package remediate_test
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/ingero-io/ingero/internal/memtrack"
 	"github.com/ingero-io/ingero/internal/remediate"
+	"github.com/ingero-io/ingero/internal/straggler"
 )
 
 func tempSockPath(t *testing.T) string {
@@ -114,6 +116,47 @@ func TestServer(t *testing.T) {
 
 		if d := srv.Dropped(); d != 1 {
 			t.Errorf("Dropped: got %d, want 1", d)
+		}
+		// The per-reason counter names the reason as no_client.
+		got := srv.DroppedByReason()
+		if got[remediate.DropReasonNoClient] != 1 {
+			t.Errorf("DroppedByReason[no_client]=%d, want 1; all=%v", got[remediate.DropReasonNoClient], got)
+		}
+	})
+
+	// SendStraggle / SendFleetStraggler* return a typed *DroppedError that
+	// unwraps to ErrDropped when no client is connected. This lets callers
+	// distinguish dropped vs delivered without parsing strings.
+	t.Run("send_straggle_without_client_returns_typed_error", func(t *testing.T) {
+		srv, _ := startServer(t)
+		err := srv.SendStraggle(straggler.StraggleState{PID: 1})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, remediate.ErrDropped) {
+			t.Errorf("errors.Is(err, ErrDropped)=false; err=%v", err)
+		}
+		var de *remediate.DroppedError
+		if !errors.As(err, &de) {
+			t.Fatalf("errors.As(*DroppedError) failed; err=%v", err)
+		}
+		if de.Reason != remediate.DropReasonNoClient {
+			t.Errorf("Reason=%q, want %q", de.Reason, remediate.DropReasonNoClient)
+		}
+		if got := srv.DroppedByReason()[remediate.DropReasonNoClient]; got != 1 {
+			t.Errorf("DroppedByReason[no_client]=%d, want 1", got)
+		}
+	})
+
+	t.Run("send_fleet_straggler_state_without_client_returns_typed_error", func(t *testing.T) {
+		srv, _ := startServer(t)
+		err := srv.SendFleetStragglerState(time.Now(), "n1", "c1", "mad", "throughput", 0.5, 0.8)
+		if !errors.Is(err, remediate.ErrDropped) {
+			t.Errorf("errors.Is(err, ErrDropped)=false; err=%v", err)
+		}
+		var de *remediate.DroppedError
+		if errors.As(err, &de) && de.Reason != remediate.DropReasonNoClient {
+			t.Errorf("Reason=%q, want %q", de.Reason, remediate.DropReasonNoClient)
 		}
 	})
 
@@ -262,6 +305,65 @@ func TestServer(t *testing.T) {
 
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatal("socket file should not exist after Close")
+		}
+	})
+
+	// Default (no SetSocketGid call) keeps 0o700.
+	t.Run("default_socket_mode_is_0700", func(t *testing.T) {
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o700 {
+			t.Errorf("socket mode=%o, want 0700", mode)
+		}
+	})
+
+	// SetSocketGid with the current user's primary gid produces a 0o770
+	// socket. Using the caller's own gid means chown always succeeds, even
+	// in unprivileged CI (chown -1 to self is allowed).
+	t.Run("socket_gid_grants_group_access", func(t *testing.T) {
+		gid := os.Getgid()
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		srv.SetSocketGid(gid)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o770 {
+			t.Errorf("socket mode=%o, want 0770 when SetSocketGid is called", mode)
+		}
+	})
+
+	// SetSocketGid with a negative value keeps owner-only.
+	t.Run("negative_socket_gid_keeps_0700", func(t *testing.T) {
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		srv.SetSocketGid(-1)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o700 {
+			t.Errorf("socket mode=%o, want 0700 with negative gid", mode)
 		}
 	})
 }

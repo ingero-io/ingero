@@ -19,6 +19,18 @@ spec:
       hostPID: true
       terminationGracePeriodSeconds: 30
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled (ge (int .Values.fleetPush.remediation.socketGid) 0) }}
+      # Pod-level fsGroup so the sink sidecar (distroless nonroot,
+      # uid/gid 65532) inherits this as a supplementary group, letting it
+      # connect to the 0770 UDS the agent (root) chowned to (-1, socketGid).
+      # fsGroup does NOT chown hostPath volumes, so /proc, /sys/kernel/*,
+      # and the trace DB hostPath are unaffected. Only the emptyDir-backed
+      # remediate-sock volume inherits the gid.
+      securityContext:
+        fsGroup: {{ .Values.fleetPush.remediation.socketGid }}
+        supplementalGroups:
+          - {{ .Values.fleetPush.remediation.socketGid }}
+      {{- end }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       nodeSelector:
@@ -33,6 +45,66 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
           args:
+            {{- if eq .Values.mode "fleet-push" }}
+            - "fleet-push"
+            - "--fleet-endpoint"
+            - {{ .Values.fleetPush.endpoint | quote }}
+            - "--fleet-cluster-id"
+            - {{ .Values.fleetPush.clusterID | quote }}
+            {{- if .Values.fleetPush.nodeID }}
+            - "--fleet-node-id"
+            - {{ .Values.fleetPush.nodeID | quote }}
+            {{- else }}
+            - "--fleet-node-id"
+            - "$(MY_NODE_NAME)"
+            {{- end }}
+            - "--fleet-push-interval"
+            - {{ .Values.fleetPush.pushInterval | quote }}
+            {{- if .Values.fleetPush.insecure }}
+            - "--fleet-insecure"
+            {{- end }}
+            {{- if .Values.fleetPush.tls.secretName }}
+            - "--fleet-tls-ca"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.caKey }}"
+            - "--fleet-tls-cert"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.certKey }}"
+            - "--fleet-tls-key"
+            - "{{ .Values.fleetPush.tls.mountPath }}/{{ .Values.fleetPush.tls.keyKey }}"
+            {{- end }}
+            {{- if .Values.fleetPush.stub }}
+            - "--stub"
+            {{- end }}
+            {{- if .Values.fleetPush.thresholdUrl }}
+            - "--fleet-threshold-url"
+            - {{ .Values.fleetPush.thresholdUrl | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.signalDbPath }}
+            - "--signal-db-path"
+            - {{ .Values.fleetPush.signalDbPath | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.signalWindow }}
+            - "--signal-window"
+            - {{ .Values.fleetPush.signalWindow | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.signalNumGPUs }}
+            - "--signal-num-gpus"
+            - {{ .Values.fleetPush.signalNumGPUs | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.warmupSamples }}
+            - "--warmup-samples"
+            - {{ .Values.fleetPush.warmupSamples | quote }}
+            {{- end }}
+            {{- if .Values.fleetPush.remediation.sinkEnabled }}
+            - "--remediate"
+            - "--remediate-socket"
+            - "/tmp/ingero-remediate.sock"
+            - "--remediate-gid"
+            - {{ .Values.fleetPush.remediation.socketGid | quote }}
+            {{- end }}
+            {{- range .Values.fleetPush.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- else }}
             - "trace"
             - "--record={{ .Values.trace.record }}"
             - "--db"
@@ -41,6 +113,7 @@ spec:
             - {{ .Values.trace.maxDb | quote }}
             {{- range .Values.trace.extraArgs }}
             - {{ . | quote }}
+            {{- end }}
             {{- end }}
           securityContext:
             privileged: true
@@ -55,8 +128,66 @@ spec:
               readOnly: true
             - name: data
               mountPath: {{ dir .Values.trace.dbPath }}
+            {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+            - name: remediate-sock
+              mountPath: /tmp
+            {{- end }}
+            {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.tls.secretName }}
+            - name: fleet-tls
+              mountPath: {{ .Values.fleetPush.tls.mountPath }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+        - name: straggler-sink
+          image: "{{ .Values.fleetPush.remediation.sinkImage.repository }}:{{ .Values.fleetPush.remediation.sinkImage.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.fleetPush.remediation.sinkImage.pullPolicy }}
+          # Least privilege: the sink only reads the shared UDS and serves
+          # /metrics. It does not need any host resources that the main
+          # privileged container has access to.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          args:
+            - "--socket-path"
+            - "/tmp/ingero-remediate.sock"
+            - "--listen"
+            - ":{{ .Values.fleetPush.remediation.sinkListenPort }}"
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.fleetPush.remediation.sinkListenPort }}
+              protocol: TCP
+          # /readyz gates on UDS connectivity. The sink stays
+          # ready for `readinessWindowSeconds` after the last event even
+          # if the UDS flaps, so brief producer restarts don't cause
+          # churn. /healthz remains a pure liveness probe.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 15
+            failureThreshold: 4
+          volumeMounts:
+            - name: remediate-sock
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.fleetPush.remediation.sinkResources | nindent 12 }}
+        {{- end }}
       volumes:
         - name: proc
           hostPath:
@@ -71,3 +202,33 @@ spec:
           hostPath:
             path: {{ dir .Values.trace.dbPath }}
             type: DirectoryOrCreate
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.tls.secretName }}
+        # Secret-backed mTLS material for agent push. Keys are projected
+        # under .Values.fleetPush.tls.{caKey,certKey,keyKey}.
+        - name: fleet-tls
+          secret:
+            secretName: {{ .Values.fleetPush.tls.secretName }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.fleetPush.tls.caKey }}
+                path: {{ .Values.fleetPush.tls.caKey }}
+              - key: {{ .Values.fleetPush.tls.certKey }}
+                path: {{ .Values.fleetPush.tls.certKey }}
+              - key: {{ .Values.fleetPush.tls.keyKey }}
+                path: {{ .Values.fleetPush.tls.keyKey }}
+        {{- end }}
+        {{- if and (eq .Values.mode "fleet-push") .Values.fleetPush.remediation.sinkEnabled }}
+        - name: remediate-sock
+        {{- if eq .Values.fleetPush.remediation.tmpVolumeType "hostPath" }}
+          # Pod-external volume so a separately-deployed orchestrator
+          # (e.g. ingero-ee chart) running in a different pod on the same
+          # node sees the same socket file. NOTE: this exposes the node's
+          # real /tmp to every container that mounts it.
+          hostPath:
+            path: /tmp
+            type: Directory
+        {{- else }}
+          emptyDir:
+            medium: Memory
+        {{- end }}
+        {{- end }}

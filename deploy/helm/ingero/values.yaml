@@ -3,11 +3,95 @@ image:
   tag: v0.8
   pullPolicy: IfNotPresent
 
+# mode: "trace" (default) runs `ingero trace --record` for eBPF observability.
+#       "fleet-push" runs `ingero fleet-push` for Fleet integration.
+mode: trace
+
 trace:
   record: true
   dbPath: /var/lib/ingero/ingero.db
   maxDb: "100g"
   extraArgs: []  # e.g., ["--debug", "--stack"]
+
+fleetPush:
+  endpoint: ""         # OTLP HTTP endpoint, e.g., http://ingero-fleet.ingero:4318
+  thresholdUrl: ""     # GET fallback URL, e.g., http://ingero-fleet.ingero:8080
+  clusterID: ""        # required
+  nodeID: ""           # defaults to pod hostname if empty
+  pushInterval: 5s
+  insecure: true       # set false when using mTLS
+
+  # Agent-side mTLS for push. When tls.secretName is non-empty, the
+  # chart mounts a Secret containing the three files and emits
+  # --fleet-tls-ca / --fleet-tls-cert / --fleet-tls-key on the agent
+  # command line. Without this knob, operators must hand-patch the
+  # DaemonSet to enable agent-initiated mTLS.
+  #
+  # Secret layout (keys, not paths):
+  #   secretName must reference a Secret whose keys are ca, cert, key
+  #   (override with tls.caKey / certKey / keyKey if your Secret uses
+  #   different names, e.g. tls.crt / tls.key / ca.crt from cert-manager).
+  # Set insecure=false when enabling tls — the agent rejects both at
+  # startup ("--fleet-insecure is incompatible with --fleet-tls-*").
+  tls:
+    secretName: ""      # e.g. "ingero-fleet-client" (empty = mTLS off)
+    caKey: ca.crt
+    certKey: tls.crt
+    keyKey: tls.key
+    mountPath: /etc/ingero/fleet-tls
+  stub: false          # true = synthetic signals (smoke testing)
+  # When stub=false (production default), fleet-push reads real signals from
+  # the SQLite DB populated by a sibling `ingero trace --record` process. Both
+  # containers must share a volume. The recommended deployment is a sidecar
+  # pod with two containers (mode=trace + mode=fleet-push) sharing an
+  # emptyDir at /var/lib/ingero, OR two DaemonSets (mode=trace first, then
+  # mode=fleet-push) both mounting the same hostPath.
+  signalDbPath: ""     # defaults to store.DefaultDBPath() if empty
+  signalWindow: 60s    # rolling window; event_aggregates are minute-bucketed
+  signalNumGPUs: 0     # 0 = autodetect (falls back to 1)
+  warmupSamples: 30    # samples before first non-calibrating push
+                       # warmup time = warmupSamples * pushInterval (default 30*5s = 150s)
+  extraArgs: []
+
+  # Optional reference sidecar that consumes the UDS remediation event stream
+  # produced by the agent and exposes Prometheus metrics (event counters,
+  # active-straggler gauges, connected gauge). Only evaluated when
+  # mode=fleet-push. The sidecar and the agent share an emptyDir at /tmp so
+  # both containers see the same socket file.
+  remediation:
+    sinkEnabled: false
+    sinkImage:
+      repository: ghcr.io/ingero-io/straggler-sink
+      tag: ""                    # defaults to .Values.image.tag when empty
+      pullPolicy: IfNotPresent
+    sinkListenPort: 9090
+    # How to back the shared /tmp that holds the remediation socket.
+    #
+    # "emptyDir" (default): a tmpfs scoped to this pod. Only containers in
+    # this DaemonSet's pod can see the socket. Correct for the common case
+    # where the ingero agent and the sink sidecar ship together here.
+    #
+    # "hostPath": the node's real /tmp. Required when pairing with a
+    # separate ingero-ee orchestrator chart whose pod cannot share an
+    # emptyDir with this one. Be aware: host /tmp becomes shared with every
+    # other consumer on the node, which is why this is opt-in.
+    tmpVolumeType: emptyDir
+    # The agent runs privileged (uid 0) so it can open eBPF
+    # resources; the sink sidecar runs as distroless nonroot (uid 65532,
+    # readOnlyRootFilesystem). The agent bind-chowns the UDS to
+    # (-1, socketGid) and chmods to 0o770 so the sidecar's primary gid
+    # (inherited via pod-level fsGroup) can connect. Numeric GID avoids
+    # NSS lookups that distroless images don't support. Set to -1 to
+    # keep the socket owner-only (0o700); the sink will then only work
+    # if it can run as root, which the chart does not configure.
+    socketGid: 65532
+    sinkResources:
+      requests:
+        cpu: 20m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
 
 resources:
   requests:

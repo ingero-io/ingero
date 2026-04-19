@@ -127,5 +127,28 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	b.WriteString("# TYPE ingero_anomaly_count counter\n")
 	fmt.Fprintf(&b, "ingero_anomaly_count %d\n", snap.AnomalyEvents)
 
+	// Ring-buffer overflow total across every attached tracer. A
+	// fast-climbing value means the kernel is producing events faster
+	// than userspace drains them; operators should respond by raising
+	// ring sizes or narrowing instrumentation.
+	b.WriteString("# HELP ingero_ringbuf_overflows_total Cumulative eBPF ring-buffer / channel drops across all tracers.\n")
+	b.WriteString("# TYPE ingero_ringbuf_overflows_total counter\n")
+	fmt.Fprintf(&b, "ingero_ringbuf_overflows_total %d\n", snap.RingbufOverflows)
+
+	// Trace DB size + prune counters. Exposed when the snapshot source
+	// has a Store handle; absent otherwise (commands that don't open a
+	// DB don't publish these). The two together answer "is prune
+	// keeping up?" — db_bytes should stay under the operator's --max-db
+	// while pruned_rows advances monotonically.
+	if snap.TraceDB != nil {
+		b.WriteString("# HELP ingero_trace_db_bytes Disk bytes used by the trace DB (main file + WAL + SHM).\n")
+		b.WriteString("# TYPE ingero_trace_db_bytes gauge\n")
+		fmt.Fprintf(&b, "ingero_trace_db_bytes %d\n", snap.TraceDB.DiskBytes)
+
+		b.WriteString("# HELP ingero_trace_db_pruned_rows_total Cumulative rows deleted by size-based pruning across all tracked tables.\n")
+		b.WriteString("# TYPE ingero_trace_db_pruned_rows_total counter\n")
+		fmt.Fprintf(&b, "ingero_trace_db_pruned_rows_total %d\n", snap.TraceDB.PrunedRows)
+	}
+
 	fmt.Fprint(w, b.String())
 }

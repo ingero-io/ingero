@@ -287,6 +287,30 @@ type Snapshot struct {
 	// System is the latest system context (CPU/mem/load) at snapshot time.
 	// Nil if sysinfo collector is not running.
 	System *SystemSnapshot
+
+	// TraceDB is the latest trace-DB size + prune counters at snapshot
+	// time. Nil when the snapshot source has no access to a Store (e.g.
+	// non-trace commands, or the minimal trace setup before the store
+	// is wired in). Populated via Snapshot.WithTraceDB by the caller to
+	// avoid an import cycle stats -> store.
+	TraceDB *TraceDBSnapshot
+
+	// RingbufOverflows is the cumulative eBPF-ringbuf + in-process channel
+	// drop count summed across every attached tracer (cuda, host, driver,
+	// io, tcp, net, host-critical). A non-zero, fast-climbing value means
+	// the kernel is producing events faster than userspace drains them —
+	// increase ring sizes or reduce instrumentation scope. Zero when no
+	// tracer is attached.
+	RingbufOverflows uint64
+}
+
+// TraceDBSnapshot mirrors store.Stats without importing the store
+// package (stats is imported by store transitively through export).
+// The caller (watch.go) copies store.ReadStats() into this struct
+// before calling prom.UpdateSnapshot.
+type TraceDBSnapshot struct {
+	DiskBytes  int64
+	PrunedRows uint64
 }
 
 // SystemSnapshot holds point-in-time CPU/memory/load metrics.

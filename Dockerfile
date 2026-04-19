@@ -25,7 +25,7 @@
 # On K8s with containerd, CAP_BPF+PERFMON+SYS_ADMIN may suffice (see EKS validation).
 
 # ── Stage 1: Build ──────────────────────────────────────────────────
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.26.2-bookworm AS builder
 
 # BPF compilation toolchain: clang-14 (BPF compiler), libbpf-dev (BPF headers),
 # bpftool (vmlinux.h generation), llvm (BPF object tools)

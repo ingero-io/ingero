@@ -213,15 +213,14 @@ func (t *Tracer) Attach() error {
 		t.links = append(t.links, up, uret)
 	}
 
-	// Enable stack capture in the eBPF config map if requested.
-	// ingero_config is 12 bytes on x86_64 (capture_stack + pad1[3] +
-	// sampling_rate + pad2 — natural u32 alignment adds no trailing
-	// padding). Always write the full struct so sampling_rate is zeroed
-	// to "emit all" by default until SetSamplingRate() overrides it.
+	// Enable stack capture in the eBPF config map if requested. The Put
+	// marshals the struct via cilium/ebpf's BTF-aware encoder, so field
+	// layout is kept in sync automatically with bpf2go regeneration.
+	// Zero SamplingRate means "emit every event" until SetSamplingRate
+	// overrides it.
 	if t.stackEnabled && t.objs.ConfigMap != nil {
-		var cfg [12]byte
-		cfg[0] = 1 // capture_stack = 1; sampling_rate (offset 4) stays 0.
-		if err := t.objs.ConfigMap.Put(uint32(0), cfg[:]); err != nil {
+		cfg := cudaTraceIngeroConfig{CaptureStack: 1}
+		if err := t.objs.ConfigMap.Put(uint32(0), &cfg); err != nil {
 			return fmt.Errorf("enabling stack capture: %w", err)
 		}
 	}
@@ -451,14 +450,11 @@ func (t *Tracer) SetSamplingRate(rate uint32) error {
 	if t.objs.ConfigMap == nil {
 		return fmt.Errorf("config map not initialized — call Attach first")
 	}
-	// Build the full 12-byte ingero_config struct (u32 alignment, no trailing pad).
-	var cfg [12]byte
+	cfg := cudaTraceIngeroConfig{SamplingRate: rate}
 	if t.stackEnabled {
-		cfg[0] = 1
+		cfg.CaptureStack = 1
 	}
-	// sampling_rate at offset 4 (little-endian uint32)
-	binary.LittleEndian.PutUint32(cfg[4:8], rate)
-	if err := t.objs.ConfigMap.Put(uint32(0), cfg[:]); err != nil {
+	if err := t.objs.ConfigMap.Put(uint32(0), &cfg); err != nil {
 		return fmt.Errorf("updating sampling rate: %w", err)
 	}
 	return nil

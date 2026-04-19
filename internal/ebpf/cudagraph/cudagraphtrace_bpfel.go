@@ -47,6 +47,14 @@ type cudaGraphTraceGraphEntryState struct {
 	Pad2         uint32
 }
 
+type cudaGraphTraceIngeroConfig struct {
+	_            structs.HostLayout
+	CaptureStack uint8
+	Pad1         [3]uint8
+	SamplingRate uint32
+	Pad2         uint32
+}
+
 // loadCudaGraphTrace returns the embedded CollectionSpec for cudaGraphTrace.
 func loadCudaGraphTrace() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_CudaGraphTraceBytes)
@@ -103,9 +111,11 @@ type cudaGraphTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaGraphTraceMapSpecs struct {
-	GraphEntryMap  *ebpf.MapSpec `ebpf:"graph_entry_map"`
-	GraphEvents    *ebpf.MapSpec `ebpf:"graph_events"`
-	IngeroWatchdog *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	GraphConfigMap     *ebpf.MapSpec `ebpf:"graph_config_map"`
+	GraphEntryMap      *ebpf.MapSpec `ebpf:"graph_entry_map"`
+	GraphEvents        *ebpf.MapSpec `ebpf:"graph_events"`
+	GraphSampleCounter *ebpf.MapSpec `ebpf:"graph_sample_counter"`
+	IngeroWatchdog     *ebpf.MapSpec `ebpf:"ingero_watchdog"`
 }
 
 // cudaGraphTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -113,6 +123,7 @@ type cudaGraphTraceMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type cudaGraphTraceVariableSpecs struct {
 	UnusedCudaGraphEventForceBtf *ebpf.VariableSpec `ebpf:"_unused_cuda_graph_event_force_btf"`
+	UnusedGraphConfigForceBtf    *ebpf.VariableSpec `ebpf:"_unused_graph_config_force_btf"`
 }
 
 // cudaGraphTraceObjects contains all objects after they have been loaded into the kernel.
@@ -135,15 +146,19 @@ func (o *cudaGraphTraceObjects) Close() error {
 //
 // It can be passed to loadCudaGraphTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaGraphTraceMaps struct {
-	GraphEntryMap  *ebpf.Map `ebpf:"graph_entry_map"`
-	GraphEvents    *ebpf.Map `ebpf:"graph_events"`
-	IngeroWatchdog *ebpf.Map `ebpf:"ingero_watchdog"`
+	GraphConfigMap     *ebpf.Map `ebpf:"graph_config_map"`
+	GraphEntryMap      *ebpf.Map `ebpf:"graph_entry_map"`
+	GraphEvents        *ebpf.Map `ebpf:"graph_events"`
+	GraphSampleCounter *ebpf.Map `ebpf:"graph_sample_counter"`
+	IngeroWatchdog     *ebpf.Map `ebpf:"ingero_watchdog"`
 }
 
 func (m *cudaGraphTraceMaps) Close() error {
 	return _CudaGraphTraceClose(
+		m.GraphConfigMap,
 		m.GraphEntryMap,
 		m.GraphEvents,
+		m.GraphSampleCounter,
 		m.IngeroWatchdog,
 	)
 }
@@ -153,6 +168,7 @@ func (m *cudaGraphTraceMaps) Close() error {
 // It can be passed to loadCudaGraphTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cudaGraphTraceVariables struct {
 	UnusedCudaGraphEventForceBtf *ebpf.Variable `ebpf:"_unused_cuda_graph_event_force_btf"`
+	UnusedGraphConfigForceBtf    *ebpf.Variable `ebpf:"_unused_graph_config_force_btf"`
 }
 
 // cudaGraphTracePrograms contains all programs after they have been loaded into the kernel.

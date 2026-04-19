@@ -427,7 +427,9 @@ func copyStacks(src, dst *sql.DB, cache map[int64]bool) (int, error) {
 	}
 	defer stmt.Close()
 
+	const maxFramesSize = 64 * 1024 // reject pathological frames blobs
 	count := 0
+	skipped := 0
 	for rows.Next() {
 		var hash int64
 		var ips, frames string
@@ -441,8 +443,16 @@ func copyStacks(src, dst *sql.DB, cache map[int64]bool) (int, error) {
 		}
 		cache[hash] = true
 
+		if len(frames) > maxFramesSize || len(ips) > maxFramesSize {
+			skipped++
+			continue
+		}
+
 		stmt.Exec(hash, ips, frames)
 		count++
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "    WARNING: skipped %d stack_traces rows with oversized frames/ips (>%d bytes)\n", skipped, maxFramesSize)
 	}
 
 	tx.Commit()

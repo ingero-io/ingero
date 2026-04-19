@@ -46,7 +46,9 @@ type driverTraceEntryState struct {
 type driverTraceIngeroConfig struct {
 	_            structs.HostLayout
 	CaptureStack uint8
-	Pad          [7]uint8
+	Pad1         [3]uint8
+	SamplingRate uint32
+	Pad2         uint32
 }
 
 // loadDriverTrace returns the embedded CollectionSpec for driverTrace.
@@ -109,10 +111,11 @@ type driverTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type driverTraceMapSpecs struct {
-	DriverConfigMap *ebpf.MapSpec `ebpf:"driver_config_map"`
-	DriverEntryMap  *ebpf.MapSpec `ebpf:"driver_entry_map"`
-	DriverEvents    *ebpf.MapSpec `ebpf:"driver_events"`
-	IngeroWatchdog  *ebpf.MapSpec `ebpf:"ingero_watchdog"`
+	DriverConfigMap     *ebpf.MapSpec `ebpf:"driver_config_map"`
+	DriverEntryMap      *ebpf.MapSpec `ebpf:"driver_entry_map"`
+	DriverEvents        *ebpf.MapSpec `ebpf:"driver_events"`
+	DriverSampleCounter *ebpf.MapSpec `ebpf:"driver_sample_counter"`
+	IngeroWatchdog      *ebpf.MapSpec `ebpf:"ingero_watchdog"`
 }
 
 // driverTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -144,10 +147,11 @@ func (o *driverTraceObjects) Close() error {
 //
 // It can be passed to loadDriverTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type driverTraceMaps struct {
-	DriverConfigMap *ebpf.Map `ebpf:"driver_config_map"`
-	DriverEntryMap  *ebpf.Map `ebpf:"driver_entry_map"`
-	DriverEvents    *ebpf.Map `ebpf:"driver_events"`
-	IngeroWatchdog  *ebpf.Map `ebpf:"ingero_watchdog"`
+	DriverConfigMap     *ebpf.Map `ebpf:"driver_config_map"`
+	DriverEntryMap      *ebpf.Map `ebpf:"driver_entry_map"`
+	DriverEvents        *ebpf.Map `ebpf:"driver_events"`
+	DriverSampleCounter *ebpf.Map `ebpf:"driver_sample_counter"`
+	IngeroWatchdog      *ebpf.Map `ebpf:"ingero_watchdog"`
 }
 
 func (m *driverTraceMaps) Close() error {
@@ -155,6 +159,7 @@ func (m *driverTraceMaps) Close() error {
 		m.DriverConfigMap,
 		m.DriverEntryMap,
 		m.DriverEvents,
+		m.DriverSampleCounter,
 		m.IngeroWatchdog,
 	)
 }

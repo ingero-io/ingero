@@ -36,6 +36,15 @@ const (
 	// In practice, pruneBySize() also runs after every flushBatch(), so
 	// this ticker only matters when no events arrive for an extended period.
 	DefaultPruneInterval = 1 * time.Hour
+
+	// CurrentUserVersion is what the current binary writes to the SQLite
+	// PRAGMA user_version on every successful open. Bumped whenever the
+	// schema gains or renames a column. A trace DB found with a
+	// user_version LARGER than this refuses to open — a newer agent must
+	// have written it, and opening it with the older schema risks data
+	// loss via subsequent writes. Numbering intentionally matches the
+	// human-facing version string in schema_info (0.10 → 10).
+	CurrentUserVersion = 10
 )
 
 const schema = `
@@ -254,6 +263,39 @@ CREATE TABLE IF NOT EXISTS event_aggregates (
 CREATE INDEX IF NOT EXISTS idx_aggregates_bucket ON event_aggregates(bucket);
 `
 
+// aggregates5sSchema stores 5-second-granularity aggregates for short-window
+// health signal derivation (fleet-push straggler detection). Identical columns
+// to event_aggregates; only the bucket granularity and retention differ.
+//
+// Retention: rows older than FiveSecondAggregateRetention (10 min) are pruned
+// opportunistically from RecordAggregates5s. The 1m event_aggregates table
+// retains history for the life of the DB (bounded by maxDBSize).
+//
+// Why a separate table? 12x the row cardinality of the 1m table per time unit.
+// Tight retention keeps on-disk size bounded; short window keeps reads fast.
+const aggregates5sSchema = `
+CREATE TABLE IF NOT EXISTS event_aggregates_5s (
+	bucket    INTEGER NOT NULL,  -- 5s-truncated unix nanos
+	source    INTEGER NOT NULL,
+	op        INTEGER NOT NULL,
+	pid       INTEGER NOT NULL DEFAULT 0,
+	count     INTEGER NOT NULL DEFAULT 0,
+	stored    INTEGER NOT NULL DEFAULT 0,
+	sum_dur   INTEGER NOT NULL DEFAULT 0,
+	min_dur   INTEGER NOT NULL DEFAULT 0,
+	max_dur   INTEGER NOT NULL DEFAULT 0,
+	sum_arg0  INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket, source, op, pid)
+);
+CREATE INDEX IF NOT EXISTS idx_aggregates_5s_bucket ON event_aggregates_5s(bucket);
+`
+
+// FiveSecondAggregateRetention is how long rows live in event_aggregates_5s.
+// Health-signal windows that need sub-minute granularity are typically
+// 5s-30s, so 10 minutes is generous headroom. Shorter keeps the table small
+// (~120 buckets/op/pid in the worst case).
+const FiveSecondAggregateRetention = 10 * time.Minute
+
 // cgroupSchedstatSchema stores per-cgroup off-CPU scheduling statistics for
 // noisy neighbor detection. Aggregated from sched_switch events by cgroup_id.
 // Written periodically during tracing — not per-event.
@@ -433,6 +475,15 @@ type Store struct {
 	stackCache map[uint64]bool
 
 	maxDBSize atomic.Int64 // 0 = no limit, >0 = target max DB+WAL+SHM in bytes
+
+	// Cumulative rows deleted by pruneBySize across the lifetime of the
+	// process. Sums deletes across every pruned table (events,
+	// aggregates, snapshots, chains, sessions, process_names, stack_traces).
+	// Exposed via Stats() so operators can alert on "prune stuck":
+	// a bounded db_bytes AND a flat pruned_rows over a window means
+	// pruneBySize is running but failing to reclaim, e.g. because of
+	// WAL checkpoint contention.
+	prunedRows atomic.Uint64
 
 	// Node identity for multi-node correlation (v0.9).
 	node    string       // set via SetNode before Run()
@@ -648,6 +699,23 @@ func New(dbPath string) (*Store, error) {
 	// flush) retry instead of failing immediately with SQLITE_BUSY.
 	db.Exec("PRAGMA busy_timeout = 5000")
 
+	// Reject DBs written by a newer binary before we create any tables or
+	// run migrations. A brand-new DB reads back user_version = 0; existing
+	// older DBs also read 0 until the ratchet below runs for the first
+	// time. The rejection only fires if a future binary has already
+	// written a higher version.
+	var onDiskVersion int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&onDiskVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("reading user_version: %w", err)
+	}
+	if onDiskVersion > CurrentUserVersion {
+		db.Close()
+		return nil, fmt.Errorf(
+			"trace DB at %s was written by a newer agent (user_version=%d, this binary=%d); refusing to open to avoid data loss",
+			dbPath, onDiskVersion, CurrentUserVersion)
+	}
+
 	// Create schema.
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -748,6 +816,12 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("creating event_aggregates table: %w", err)
 	}
 
+	// Create event_aggregates_5s table (sub-minute health signal buckets).
+	if _, err := db.Exec(aggregates5sSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating event_aggregates_5s table: %w", err)
+	}
+
 	// Add sum_arg0 column for mm_page_alloc total bytes. Idempotent.
 	db.Exec(migrateAddSumArg0)
 
@@ -813,6 +887,16 @@ func New(dbPath string) (*Store, error) {
 	// On read-only DBs the version stays at 0.9 — read paths must use
 	// hasColumn() guards if they want to be tolerant of either schema.
 
+	// Ratchet PRAGMA user_version forward to the current binary's level.
+	// Only advances; pragma syntax does not accept parameters so the int
+	// value is formatted in. Runs only when the on-disk value is behind
+	// us so a concurrent downgrade-and-upgrade cycle on the same file
+	// doesn't flap the marker. If the DB is read-only this silently
+	// fails, matching how the schema_info writes above behave.
+	if onDiskVersion < CurrentUserVersion {
+		db.Exec(fmt.Sprintf("PRAGMA user_version = %d", CurrentUserVersion))
+	}
+
 	// When running as root via sudo, chown the DB file to the invoking
 	// user so non-sudo commands (explain, query) can open it.
 	if dbPath != ":memory:" {
@@ -839,6 +923,43 @@ func New(dbPath string) (*Store, error) {
 		s.eventSeq.Store(maxSeq)
 	}
 
+	return s, nil
+}
+
+// NewReadOnly opens an existing SQLite database in read-only mode. The DB
+// file must already exist and have been initialized by a writer (typically
+// an `ingero trace --record` process). Schema migrations, session creation,
+// and lookup-table seeding are skipped because the WAL is another process's.
+//
+// Used by `ingero fleet-push` to read rolling aggregates without fighting
+// the writer for locks.
+func NewReadOnly(dbPath string) (*Store, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("opening read-only db %s: %w", dbPath, err)
+	}
+	// ?mode=ro opens without write permission. ?_journal_mode=WAL is implicit
+	// but we set _query_only for extra safety and to avoid any PRAGMA writes.
+	dsn := "file:" + dbPath + "?mode=ro&_query_only=1"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening read-only db: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("pinging read-only db: %w", err)
+	}
+	// Honor the writer's WAL so concurrent reads don't block the writer.
+	db.Exec("PRAGMA busy_timeout = 2000")
+
+	s := &Store{
+		db:         db,
+		dbPath:     dbPath,
+		insertCh:   nil, // no writes
+		snapshotCh: nil,
+		runDone:    make(chan struct{}),
+		stackCache: nil,
+	}
+	close(s.runDone) // Run() is never called on read-only stores.
 	return s, nil
 }
 
@@ -1166,6 +1287,30 @@ func (s *Store) diskUsage() int64 {
 	return total
 }
 
+// Stats describes the Store's current size + cumulative prune activity.
+// Exported for publication via the Prometheus /metrics endpoint so
+// operators can alert on "DB grew past max-db" (broken prune) or
+// "pruned_rows stopped advancing while db_bytes stays high" (prune
+// running but not reclaiming).
+type Stats struct {
+	// DiskBytes is the sum of the main DB file + WAL + SHM on disk.
+	// Returns 0 for in-memory databases.
+	DiskBytes int64
+	// PrunedRows is the cumulative count of rows deleted by pruneBySize
+	// across all tracked tables since the process started. Monotonic;
+	// does NOT reset when pruneBySize has no work to do.
+	PrunedRows uint64
+}
+
+// ReadStats returns a point-in-time snapshot of the Store's disk + prune
+// counters. Safe to call from any goroutine.
+func (s *Store) ReadStats() Stats {
+	return Stats{
+		DiskBytes:  s.diskUsage(),
+		PrunedRows: s.prunedRows.Load(),
+	}
+}
+
 // pruneBySize deletes oldest events proportionally to bring the DB under maxDBSize.
 // This is the sole retention mechanism — there is no time-based retention.
 // The default --max-db is 10 GB, lasting a few hours under average GPU load.
@@ -1221,17 +1366,41 @@ func (s *Store) pruneBySize() {
 		cutoff := maxTS - int64(float64(maxTS-minTS)*keepFraction)
 
 		// Delete events, aggregates, snapshots, chains, sessions, stale process names.
-		s.db.Exec("DELETE FROM events WHERE timestamp < ?", cutoff)
-		s.db.Exec("DELETE FROM event_aggregates WHERE bucket < ?", cutoff)
-		s.db.Exec("DELETE FROM system_snapshots WHERE timestamp < ?", cutoff)
-		s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
-		s.db.Exec("DELETE FROM sessions WHERE started_at < ?", cutoff)
-		s.db.Exec("DELETE FROM process_names WHERE seen_at < ?", cutoff)
+		// Sum RowsAffected across every table so the prune counter reflects
+		// the real deletion volume operators should see after a big prune
+		// cycle. Ignore sql.Result errors — the error fanout here is
+		// already logged by the driver on the bad path.
+		var totalDeleted int64
+		for _, stmt := range []struct {
+			query string
+			arg   int64
+		}{
+			{"DELETE FROM events WHERE timestamp < ?", cutoff},
+			{"DELETE FROM event_aggregates WHERE bucket < ?", cutoff},
+			{"DELETE FROM event_aggregates_5s WHERE bucket < ?", cutoff},
+			{"DELETE FROM system_snapshots WHERE timestamp < ?", cutoff},
+			{"DELETE FROM causal_chains WHERE detected_at < ?", cutoff},
+			{"DELETE FROM sessions WHERE started_at < ?", cutoff},
+			{"DELETE FROM process_names WHERE seen_at < ?", cutoff},
+		} {
+			if res, err := s.db.Exec(stmt.query, stmt.arg); err == nil {
+				if n, rerr := res.RowsAffected(); rerr == nil {
+					totalDeleted += n
+				}
+			}
+		}
 
 		// Clean orphaned stack traces.
-		s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
+		if res, err := s.db.Exec(`DELETE FROM stack_traces WHERE NOT EXISTS (
 			SELECT 1 FROM events WHERE events.stack_hash = stack_traces.hash LIMIT 1
-		)`)
+		)`); err == nil {
+			if n, rerr := res.RowsAffected(); rerr == nil {
+				totalDeleted += n
+			}
+		}
+		if totalDeleted > 0 {
+			s.prunedRows.Add(uint64(totalDeleted))
+		}
 
 		pruned = true
 
@@ -1745,6 +1914,15 @@ func (s *Store) ExecuteReadOnly(ctx context.Context, query string, maxRows int) 
 		}
 	}
 
+	// Reject SQLite functions that can allocate unbounded memory.
+	// zeroblob(N) / randomblob(N) allocate N bytes in a single expression;
+	// a query like SELECT zeroblob(1073741824) causes a 1 GB allocation.
+	for _, fn := range []string{"ZEROBLOB", "RANDOMBLOB"} {
+		if strings.Contains(upper, fn) {
+			return nil, nil, false, fmt.Errorf("function %s is not allowed in read-only queries", fn)
+		}
+	}
+
 	// Reject multi-statement queries: no semicolons followed by non-whitespace.
 	// Find the first semicolon and check if anything meaningful follows it.
 	if idx := strings.Index(trimmed, ";"); idx >= 0 {
@@ -2106,6 +2284,25 @@ func (s *Store) RecordProcessNames(names map[uint32]string) {
 // The "stored" count tracks how many events were individually stored in the
 // events table, so consumers can compute: discarded = count - stored.
 func (s *Store) RecordAggregates(aggs []Aggregate) {
+	s.recordAggregatesInto("event_aggregates", aggs)
+}
+
+// RecordAggregates5s batch-inserts 5-second-granularity aggregate rows into
+// event_aggregates_5s and opportunistically prunes rows older than
+// FiveSecondAggregateRetention. Intended for the health signal pipeline,
+// which needs tighter time resolution than the 1m table offers.
+func (s *Store) RecordAggregates5s(aggs []Aggregate) {
+	s.recordAggregatesInto("event_aggregates_5s", aggs)
+	// Opportunistic retention. Runs on the write path so the caller never
+	// has to remember to sweep; the single DELETE on an indexed column is
+	// cheap (deletes at most a few thousand rows per flush cycle).
+	cutoff := time.Now().Add(-FiveSecondAggregateRetention).UnixNano()
+	s.db.Exec("DELETE FROM event_aggregates_5s WHERE bucket < ?", cutoff)
+}
+
+// recordAggregatesInto is the shared writer for both granularity tables.
+// Schema is identical; only the table name differs.
+func (s *Store) recordAggregatesInto(table string, aggs []Aggregate) {
 	if len(aggs) == 0 {
 		return
 	}
@@ -2115,7 +2312,7 @@ func (s *Store) RecordAggregates(aggs []Aggregate) {
 		return
 	}
 
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO event_aggregates
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ` + table + `
 		(bucket, source, op, pid, count, stored, sum_dur, min_dur, max_dur, sum_arg0)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
@@ -2195,15 +2392,31 @@ type AggregateOpStats struct {
 }
 
 // QueryAggregatePerOp returns per-operation aggregate statistics from the
-// event_aggregates table. Groups by (source, op) and returns count, sum_dur,
-// min_dur, max_dur for each operation. Supports PID filtering via QueryParams.
+// event_aggregates (minute-granularity) table. Groups by (source, op) and
+// returns count, sum_dur, min_dur, max_dur for each operation. Supports PID
+// filtering via QueryParams.
 //
 // This is the "fast path" for get_trace_stats on large DBs (>500K events):
 // instead of loading all events into memory for percentile calculation, it
 // reads pre-computed aggregates and returns count/avg/min/max.
 func (s *Store) QueryAggregatePerOp(q QueryParams) ([]AggregateOpStats, error) {
+	return s.queryAggregatePerOp("event_aggregates", q)
+}
+
+// QueryAggregatePerOp5s returns per-operation aggregate statistics from the
+// event_aggregates_5s (5-second-granularity) table. Same shape as
+// QueryAggregatePerOp but reads the sub-minute retention table. Used by the
+// health signal collector when the derivation window is shorter than a
+// minute.
+func (s *Store) QueryAggregatePerOp5s(q QueryParams) ([]AggregateOpStats, error) {
+	return s.queryAggregatePerOp("event_aggregates_5s", q)
+}
+
+// queryAggregatePerOp is the shared reader for both granularity tables.
+// Schema is identical; only the table name differs.
+func (s *Store) queryAggregatePerOp(table string, q QueryParams) ([]AggregateOpStats, error) {
 	query := `SELECT source, op, SUM(count), SUM(sum_dur), MIN(min_dur), MAX(max_dur)
-		FROM event_aggregates WHERE 1=1`
+		FROM ` + table + ` WHERE 1=1`
 	var args []interface{}
 
 	if !q.From.IsZero() {
@@ -2223,7 +2436,7 @@ func (s *Store) QueryAggregatePerOp(q QueryParams) ([]AggregateOpStats, error) {
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("querying aggregate per-op: %w", err)
+		return nil, fmt.Errorf("querying aggregate per-op (%s): %w", table, err)
 	}
 	defer rows.Close()
 
