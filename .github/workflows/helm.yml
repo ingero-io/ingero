@@ -29,8 +29,16 @@ jobs:
       - name: Render default (mode=trace)
         run: |
           helm template test ./deploy/helm/ingero > /tmp/trace.yaml
-          grep -q 'ingero trace' /tmp/trace.yaml || \
-            (echo "trace mode render missing trace command" && exit 1)
+          # Helm renders each arg on its own line, e.g. `- "trace"` followed
+          # by `- "--record=true"`. There is no literal "ingero trace"
+          # two-word phrase in the YAML — the image reference contains
+          # "ingero" and the args list starts with "trace" separately.
+          # Assert the two tokens that prove the trace command mode
+          # rendered correctly.
+          grep -qE '^\s+- "trace"$' /tmp/trace.yaml || \
+            (echo "trace mode render missing top-level \"trace\" arg" && exit 1)
+          grep -qE '^\s+- "--record' /tmp/trace.yaml || \
+            (echo "trace mode render missing --record flag" && exit 1)
 
   render-fleet-push-mode:
     runs-on: ubuntu-latest
