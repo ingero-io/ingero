@@ -64,7 +64,7 @@ fleetPush:
       repository: ghcr.io/ingero-io/straggler-sink
       tag: ""                    # defaults to .Values.image.tag when empty
       pullPolicy: IfNotPresent
-    sinkListenPort: 9090
+    sinkListenPort: 9464
     # How to back the shared /tmp that holds the remediation socket.
     #
     # "emptyDir" (default): a tmpfs scoped to this pod. Only containers in

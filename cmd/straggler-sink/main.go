@@ -41,7 +41,7 @@ import (
 func main() {
 	var (
 		socketPath       = flag.String("socket-path", "/tmp/ingero-remediate.sock", "path to the ingero remediation UDS")
-		listenAddr       = flag.String("listen", ":9090", "HTTP listen address for /metrics")
+		listenAddr       = flag.String("listen", ":9464", "HTTP listen address for /metrics")
 		reconnectDelay   = flag.Duration("reconnect-delay", 2*time.Second, "delay between reconnect attempts when the socket is unavailable")
 		maxTrackedNodes  = flag.Int("max-tracked-nodes", 10000, "cap on unique (cluster_id, node_id) pairs kept in the active-stragglers gauge. Oldest entry is evicted (FIFO) and counted under ingero_sink_dropped_total{reason=\"cap_reached\"}.")
 		readinessWindow  = flag.Duration("readiness-window", 60*time.Second, "/readyz returns 503 when disconnected AND the last event is older than this window.")

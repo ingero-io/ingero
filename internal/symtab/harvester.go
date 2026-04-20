@@ -178,12 +178,14 @@ if peer[0]:
         except IndexError: break
 
 # --- InterpTstateHead ---
+# Scan 1024 slots (8 KiB) to cover PyInterpreterState in 3.13+ where the
+# struct grew past ~7 KB; 3.10–3.12 still find the match in the first 128.
 ctypes.pythonapi.PyInterpreterState_Get.restype = ctypes.c_void_p
 interp = ctypes.pythonapi.PyInterpreterState_Get()
-is_buf = (ctypes.c_uint64 * 128).from_address(interp)
+is_buf = (ctypes.c_uint64 * 1024).from_address(interp)
 for needle in (tstate, peer[0]):
     if not needle: continue
-    for i in range(2, 128):
+    for i in range(2, 1024):
         try:
             if is_buf[i] == needle:
                 emit('InterpTstateHead', i * 8); break

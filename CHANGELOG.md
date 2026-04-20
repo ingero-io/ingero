@@ -59,6 +59,54 @@ Fleet-side changes (the OTel Collector distribution) live in the
   table, warmup behavior, detection modes, straggler classification,
   UDS stream format.
 
+### Fixed
+
+- **Stack trace capture (`trace --stack`)** no longer fails with
+  `marshal value: []uint8 doesn't marshal to 8 bytes` on modern 6.x
+  kernels. Cross-kernel validation on AL2023 (6.1), Ubuntu 22.04
+  (6.8), and Ubuntu 24.04 (6.17) reproduced the failure on every
+  tested 6.x kernel (not just Azure, as originally reported in
+  [issue #24](https://github.com/ingero-io/ingero/issues/24)). The
+  root cause was that `cuda_trace.bpf.c`'s `config_map.Put` was
+  given a raw `[]byte` whose length had to match the kernel-side
+  BTF-derived value size; on newer kernels that size is resolved
+  differently. The cuda and driver tracers now pass a typed
+  `*IngeroConfig` struct, which cilium/ebpf marshals via BTF rather
+  than by length, making the write robust across kernel versions.
+
+- **`--py-walker=ebpf` now emits frames for Python 3.10 and 3.11.**
+  Previously the walker advertised support for 3.10/3.11/3.12 but
+  empirically only 3.12 produced Python frames on mainstream builds:
+  `find_thread_state` would walk the PyThreadState list looking for a
+  match on `native_thread_id`, but Ubuntu's patched CPython 3.10/3.11
+  leaves that field zero on the main thread. The walker now falls
+  back to the first (and only) PyThreadState when exactly one thread
+  is present and no match was found, mirroring the userspace walker's
+  long-standing single-thread fallback. Multi-threaded workloads
+  without a populated `native_thread_id` still return empty frames so
+  we don't emit a wrong thread's stack. Hardcoded PyFrameObject and
+  PyCodeObject offsets for 3.10 were also corrected (`FrameCode` 16 →
+  32, `CodeFirstLineNo` 48 → 40).
+
+### Added
+
+- **eBPF Python walker support for CPython 3.9, 3.13, and 3.14.**
+  The walker dispatcher gained `case 9` (routed to `walker_310`, same
+  legacy PyFrameObject layout) and `case 13`/`case 14` (routed to
+  `walker_312`, direct `_PyInterpreterFrame` layout; 3.13 dropped the
+  `_PyCFrame` indirection). New offset tables `pyOffsets39`,
+  `pyOffsets313`, and `pyOffsets314` cover the PyInterpreterState
+  size growth (3.13's `interpreters.head` sits at byte 632 vs 3.12's
+  40, 3.14's at byte 808) and the PyASCIIObject layout change in
+  3.13+ (`UnicodeState` 20 → 32, `UnicodeData` 48 → 40). The runtime
+  harvester's `InterpTstateHead` scan was widened from 128 to 1024
+  slots (8 KiB) so it reaches 3.13+'s far-deep `threads.head` field.
+  Harvester overlay is skipped for 3.13+ because its frame-walking
+  heuristics were written against 3.12's `_PyInterpreterFrame` layout
+  (f_executable at offset 0) and emit incorrect offsets on 3.13's
+  reshuffled struct; the hardcoded tables and, eventually, the
+  `_Py_DebugOffsets` reader are the authoritative sources on 3.13+.
+
 ### Known limitations in v1.0
 
 - **Memory signal source:** GPU memory is read via the `nvidia-smi`
@@ -75,9 +123,21 @@ Fleet-side changes (the OTel Collector distribution) live in the
   is v1.1.
 - **Kernel minimum:** 5.4 for CO-RE-compatible BTF. `ingero trace`
   may fail to attach on older kernels.
-- **Stack trace capture (`trace --stack`)** fails on some kernel 6.x
-  builds with `marshal value: []uint8 doesn't marshal to 8 bytes`.
-  Use `--stack=false` (the default) as a workaround.
+- **`--py-walker=ebpf` Python 3.13 and 3.14 emit a single frame per
+  cuda event instead of the full call chain.** The walker correctly
+  identifies the current Python frame (filename + function name +
+  line) but `_PyInterpreterFrame.previous` traversal across 3.13's
+  new frame-stack allocator is not yet implemented; the chain walk
+  stops after the top frame. 3.10/3.11/3.12 produce the full chain.
+- **`--py-walker=ebpf` Python 3.9 dispatches to `walker_310` but
+  returns zero frames on mainstream builds.** The PyThreadState and
+  PyFrameObject offsets that worked for 3.10 do not carry over
+  cleanly; needs a 3.9-specific validation pass on a vanilla build.
+- **`--py-walker=ebpf` on CUDA 13 hosts (Ubuntu 24.04 DLAMI):** the
+  CUDA runtime uprobes do not fire on `libcudart.so.13`, so the
+  runtime-tracer-side walker integration never runs. Only driver
+  events are captured on these hosts. Unrelated to the walker itself
+  but masks it on that environment.
 
 ### Dependencies
 

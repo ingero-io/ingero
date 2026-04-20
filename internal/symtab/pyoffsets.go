@@ -410,12 +410,18 @@ func logOffsetComparison(dwarf *PyOffsets, minor int) {
 // Returns nil if the version is not supported.
 func GetPyOffsets(minor int) *PyOffsets {
 	switch minor {
+	case 9:
+		return pyOffsets39()
 	case 10:
 		return pyOffsets310()
 	case 11:
 		return pyOffsets311()
 	case 12:
 		return pyOffsets312()
+	case 13:
+		return pyOffsets313()
+	case 14:
+		return pyOffsets314()
 	default:
 		return nil
 	}
@@ -441,12 +447,19 @@ func pyOffsets310() *PyOffsets {
 
 		CframeCurrentFrame: 0, // Not used in 3.10
 
+		// PyFrameObject on x86_64: PyObject_VAR_HEAD (24) + f_back (8) + f_code (8) + ...
+		// The 16 value previously hardcoded here matched an older (3.7/3.8) layout.
 		FrameBack: 24, // PyFrameObject.f_back
-		FrameCode: 16, // PyFrameObject.f_code
+		FrameCode: 32, // PyFrameObject.f_code (verified on Ubuntu 22.04 CPython 3.10.12)
 
 		CodeFilename:    104, // PyCodeObject.co_filename
 		CodeName:        112, // PyCodeObject.co_name
-		CodeFirstLineNo: 48,  // PyCodeObject.co_firstlineno
+		// Verified on Ubuntu 22.04 CPython 3.10.12: co_firstlineno sits at
+		// byte 40 (u32), just after co_argcount/co_posonlyargcount/... which
+		// pack into the preceding 8 bytes. The 48 value previously here
+		// matched a different build's layout and produced garbage line
+		// numbers on vanilla 3.10.
+		CodeFirstLineNo: 40,
 
 		UnicodeLength: 16, // PyASCIIObject.length
 		UnicodeData:   48, // Compact ASCII data offset
@@ -489,6 +502,82 @@ func pyOffsets311() *PyOffsets {
 
 		NewStyleFrames: true,
 	}
+}
+
+// CPython 3.9 uses the same legacy PyFrameObject layout as 3.10. Treated by the
+// walker as "walker_310" (see python_walker.bpf.h dispatcher). Kept
+// distinct so we can diverge fields from 3.10 where needed. Verified on
+// cpython 3.9.25 from the uv python distribution: _PyRuntime.interpreters.head
+// sits at byte 32, not at 40 (3.10's value).
+func pyOffsets39() *PyOffsets {
+	o := pyOffsets310()
+	o.Version = "3.9"
+	o.RuntimeInterpretersHead = 32
+	return o
+}
+
+// CPython 3.13 (stable since 2024-10)
+//
+// 3.13 dropped the _PyCFrame indirection and made PyThreadState.current_frame
+// a direct pointer to _PyInterpreterFrame, so the frame-walk path matches 3.12.
+// Notable deltas from 3.12 (verified empirically on an upstream cpython-3.13.13
+// build with ctypes): PyCodeObject.co_firstlineno moved from byte 48 to byte 68.
+// _Py_DebugOffsets is the authoritative source for 3.13+ but only comes into
+// play when the reader at `ReadDebugOffsetsFromPID` has the 3.13 layout
+// constants wired up; these fallback values unblock the walker in the
+// meantime and get overlaid by the harvester for fields it can discover.
+func pyOffsets313() *PyOffsets {
+	return &PyOffsets{
+		Version: "3.13",
+		// 3.13 embeds _Py_DebugOffsets at the start of _PyRuntime. That
+		// prefix pushes the `interpreters.head` field far past 3.12's
+		// byte 40 (empirically byte 632 on cpython 3.13.13). Once the
+		// _Py_DebugOffsets reader is extended to 3.13, this fallback
+		// becomes a backstop; until then it's the only way the walker
+		// can reach the interpreter list on 3.13.
+		RuntimeInterpretersHead: 632,
+
+		// PyInterpreterState grew dramatically in 3.13 (PEP 684 per-
+		// interpreter state + debug offsets + more). threads.head sits
+		// at byte 7344, far beyond the 16 that was valid in 3.12.
+		InterpTstateHead: 7344,
+
+		TstateNext:           8,
+		TstateThreadID:       152,
+		TstateNativeThreadID: 160,
+		TstateFrame:          232, // current_frame (_PyInterpreterFrame*, direct)
+
+		CframeCurrentFrame: 0,
+
+		// _PyInterpreterFrame in 3.13 re-ordered fields vs 3.12.
+		// f_executable moved from byte 0 to byte 32, previous from 24 to 8.
+		FrameBack: 8,
+		FrameCode: 32,
+
+		CodeFilename:    112,
+		CodeName:        120,
+		CodeFirstLineNo: 68,
+
+		// PyASCIIObject layout shifted in 3.13 (PEP 623 cleanup, removed
+		// wstr/wstr_length). State and inline-data offsets are not the
+		// same as 3.12's (20 and 48).
+		UnicodeLength: 16,
+		UnicodeState:  32,
+		UnicodeData:   40,
+
+		NewStyleFrames: true,
+	}
+}
+
+// CPython 3.14 uses direct current_frame like 3.13. _Py_DebugOffsets grew
+// again, shifting interpreters.head from 3.13's 632 to 808 on cpython
+// 3.14.4 (empirical). Other fields (TstateFrame, FrameCode) stayed put
+// so we reuse 3.13's values for those.
+func pyOffsets314() *PyOffsets {
+	o := pyOffsets313()
+	o.Version = "3.14"
+	o.RuntimeInterpretersHead = 808
+	return o
 }
 
 // CPython 3.12 (conda default, common in ML)

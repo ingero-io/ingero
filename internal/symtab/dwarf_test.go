@@ -254,10 +254,14 @@ func TestGetPyOffsetsBest_Fallback(t *testing.T) {
 }
 
 // TestGetPyOffsetsBest_UnsupportedVersion verifies nil for unsupported version with no DWARF.
+// 3.9 and 3.13/3.14 now have fallback tables (eBPF walker scaffolding), so the
+// nil sentinel moved to 3.8 (below the scaffolded range) and 3.15 (above it).
 func TestGetPyOffsetsBest_UnsupportedVersion(t *testing.T) {
-	offsets := GetPyOffsetsBest("/nonexistent/libpython3.so", 9)
-	if offsets != nil {
-		t.Error("expected nil for unsupported version 3.9 with no DWARF, got non-nil")
+	if offsets := GetPyOffsetsBest("/nonexistent/libpython3.so", 8); offsets != nil {
+		t.Error("expected nil for unsupported version 3.8 with no DWARF, got non-nil")
+	}
+	if offsets := GetPyOffsetsBest("/nonexistent/libpython3.so", 15); offsets != nil {
+		t.Error("expected nil for unsupported version 3.15 with no DWARF, got non-nil")
 	}
 }
 

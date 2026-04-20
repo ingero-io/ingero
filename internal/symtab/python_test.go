@@ -139,7 +139,11 @@ func TestPythonInfo_IsSupportedVersion(t *testing.T) {
 }
 
 func TestGetPyOffsets(t *testing.T) {
-	for _, minor := range []int{10, 11, 12} {
+	// 3.9 and 3.13/3.14 got scaffolding (dispatcher + offset tables) for
+	// the eBPF walker even though the userspace walker (IsSupportedVersion)
+	// still gates at 10-12 only. Assert each scaffolded version returns a
+	// non-nil table with the critical string-extraction offsets populated.
+	for _, minor := range []int{9, 10, 11, 12, 13, 14} {
 		offsets := GetPyOffsets(minor)
 		if offsets == nil {
 			t.Errorf("GetPyOffsets(%d) returned nil", minor)
@@ -156,7 +160,12 @@ func TestGetPyOffsets(t *testing.T) {
 		}
 	}
 
-	if offsets := GetPyOffsets(9); offsets != nil {
-		t.Error("expected nil for unsupported version 3.9")
+	// Bracketing sentinels: anything below 3.9 or above 3.14 hits the
+	// switch default and MUST return nil so callers skip the ebpf walker.
+	if offsets := GetPyOffsets(8); offsets != nil {
+		t.Error("expected nil for unsupported version 3.8")
+	}
+	if offsets := GetPyOffsets(15); offsets != nil {
+		t.Error("expected nil for unsupported version 3.15")
 	}
 }
