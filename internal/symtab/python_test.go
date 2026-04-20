@@ -118,6 +118,71 @@ func TestDetectPythonFromRegions_BinaryBeforeLibpython(t *testing.T) {
 	}
 }
 
+func TestDetectPythonFromExeTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		target   string
+		wantVer  string
+		wantNil  bool
+	}{
+		{
+			name:    "ubuntu system python",
+			target:  "/usr/bin/python3.12",
+			wantVer: "3.12",
+		},
+		{
+			name:    "uv distribution",
+			target:  "/home/ubuntu/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+			wantVer: "3.13",
+		},
+		{
+			name:    "opt/pytorch symlink target",
+			target:  "/opt/pytorch/bin/python3.10",
+			wantVer: "3.10",
+		},
+		{
+			name:    "new minor version works via regex",
+			target:  "/usr/bin/python3.14",
+			wantVer: "3.14",
+		},
+		{
+			name:    "no version suffix - rejected",
+			target:  "/usr/bin/python3",
+			wantNil: true,
+		},
+		{
+			name:    "non-python exe - rejected",
+			target:  "/usr/bin/bash",
+			wantNil: true,
+		},
+		{
+			name:    "empty target - rejected",
+			target:  "",
+			wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectPythonFromExeTarget(tt.target)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("want nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("want non-nil PythonInfo for %q", tt.target)
+			}
+			if got.Version != tt.wantVer {
+				t.Errorf("Version = %q, want %q", got.Version, tt.wantVer)
+			}
+			if got.LibPath != tt.target {
+				t.Errorf("LibPath = %q, want %q (should be the exe target)", got.LibPath, tt.target)
+			}
+		})
+	}
+}
+
 func TestFindPyRegion(t *testing.T) {
 	uvPath := "/home/ubuntu/.local/share/uv/python/cpython-3.14.4-linux-x86_64-gnu/bin/python3.14"
 	otherPath := "/tmp/venv-3.14/lib/python3.14/site-packages/_internal/python3.14-shim"
