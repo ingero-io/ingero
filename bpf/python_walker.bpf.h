@@ -42,6 +42,18 @@
  *     will each get their own private py_runtime_map + py_scratch, or
  *     (b) use BPF map pinning / BPF_F_EXPORTED to share across programs.
  *
+ * Generator / coroutine frames: the walker handles these implicitly.
+ * _PyInterpreterFrame carries an `owner` byte distinguishing thread-
+ * allocated, generator-embedded, PyFrameObject-owned, and C-stack
+ * entry frames, but `owner` only describes who allocated the storage,
+ * not whether the frame is in the `tstate.current_frame -> previous`
+ * chain. A currently-executing generator or coroutine has its embedded
+ * frame linked into that chain exactly like a regular frame; only
+ * suspended generators are detached, and no cuda can fire from one by
+ * definition. So `async def inner(): await cudaop()` and generator
+ * `yield from` chains walk correctly without special-case code. See
+ * tests/workloads/async_cuda.py for the verification workload.
+ *
  * Verifier safety:
  *   - All loops are #pragma unroll with compile-time bounds.
  *   - Every bpf_probe_read_user return value is checked.
