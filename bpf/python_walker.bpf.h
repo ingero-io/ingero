@@ -179,6 +179,15 @@ static __always_inline int read_compact_ascii(
  * Bounded by PY_MAX_THREADS — workloads with more Python threads than
  * that will miss frames for later threads (acceptable trade-off for
  * verifier safety).
+ *
+ * Single-thread fallback: on some builds (e.g., Ubuntu 22.04's patched
+ * CPython 3.10) PyThreadState.native_thread_id is 0 for the main thread
+ * because the interpreter never populates it for the thread that called
+ * Py_Initialize(). When exactly one tstate exists and none matched the
+ * kernel tid, we return that one tstate. For the common case of single-
+ * threaded Python workloads this yields correct frames; multi-threaded
+ * workloads with a genuinely-mismatched offset correctly return 0
+ * (rather than returning a wrong thread's frames).
  */
 static __always_inline __u64 find_thread_state(
     __u32 native_tid, const struct py_runtime_state *st)
@@ -199,11 +208,15 @@ static __always_inline __u64 find_thread_state(
 		return 0;
 	py_debug_inc(4);  /* read_threads_head_ok */
 
+	__u64 first_tstate = tstate;
+	int walked = 0;
+
 	/* Walk thread list (bounded). */
 	#pragma unroll(8)
 	for (int i = 0; i < PY_MAX_THREADS; i++) {
 		if (tstate == 0)
 			break;
+		walked++;
 		py_debug_inc(5);  /* thread_loop_iterations */
 
 		__u64 cur_tid = 0;
@@ -223,6 +236,11 @@ static __always_inline __u64 find_thread_state(
 		    (const void *)(tstate + st->off_tstate_next)) != 0)
 			break;
 		tstate = next;
+	}
+
+	if (walked == 1 && first_tstate != 0) {
+		py_debug_inc(18);  /* single_thread_fallback */
+		return first_tstate;
 	}
 	return 0;
 }
@@ -595,6 +613,9 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 	 * non-zero, use cframe indirection; when zero, assume direct access.
 	 * Userspace harvester sets this based on empirical runtime probing. */
 	switch (minor) {
+	case 9:
+		/* 3.9 uses the same legacy PyFrameObject layout as 3.10. */
+		return walk_python_frames_310(pid, native_tid, st, result);
 	case 10:
 		return walk_python_frames_310(pid, native_tid, st, result);
 	case 11:
@@ -604,6 +625,11 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 		 * on whether the harvester discovered a non-zero cframe offset. */
 		if (st->off_cframe_current_frame > 0)
 			return walk_python_frames_311(pid, native_tid, st, result);
+		return walk_python_frames_312(pid, native_tid, st, result);
+	case 13:
+	case 14:
+		/* 3.13+ dropped cframe; current_frame points directly at
+		 * _PyInterpreterFrame. walker_312 handles that layout. */
 		return walk_python_frames_312(pid, native_tid, st, result);
 	default:
 		/* Unsupported minor — return 0 frames; userspace walker fills in. */

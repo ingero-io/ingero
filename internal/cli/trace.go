@@ -68,6 +68,7 @@ var (
 	traceNoTCP        bool          // Disable TCP retransmit tracing.
 	traceNoNet        bool          // Disable network socket tracing.
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
+	traceRemediateGid int           // Numeric GID for remediation socket group access. Mirrors fleet-push.
 	traceNode         string        // Node identity for multi-node correlation.
 	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
 	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
@@ -111,6 +112,8 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
+	traceCmd.Flags().IntVar(&traceRemediateGid, "remediate-gid", 65532,
+		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
 	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
 	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
@@ -766,6 +769,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				log.Printf("INFO: remediate: vram_detected gpu_id=%d total_vram_mib=%d total_vram_bytes=%d", gpuID, vram/(1024*1024), vram)
 			}
 			srv := remediate.NewServer("")
+			srv.SetSocketGid(traceRemediateGid)
 			if err := srv.Start(); err != nil {
 				log.Printf("ERROR: remediate: uds_bind_failed path=/tmp/ingero-remediate.sock error=%v", err)
 				// Fall through — degrade to OSS mode (tracker stays nil).
@@ -1078,7 +1082,8 @@ func dumpPyDebugStats(maps []*ebpf.Map) {
 		"311_frame_nonzero",
 		"311_loop_code_read_ok",
 		"311_loop_code_nonzero",
-		"_unused_18", "_unused_19", "_unused_20", "_unused_21",
+		"single_thread_fallback",
+		"_unused_19", "_unused_20", "_unused_21",
 		"_unused_22", "_unused_23", "_unused_24",
 		"scratch_lookup_ok",
 		"have_py_set",
@@ -1860,11 +1865,13 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 		debugf("py-walker: PID %d not a Python process — skipping", pid)
 		return
 	}
-	// Previously this function returned early if minor != 12.
-	// Now we support 10, 11, and 12 via per-version dispatch in the
-	// BPF walker (see bpf/python_walker.bpf.h).
-	if info.Minor != 10 && info.Minor != 11 && info.Minor != 12 {
-		debugf("py-walker: PID %d is Python %s — python_minor %d not supported by BPF walker (only 3.10/3.11/3.12); userspace walker will handle", pid, info.Version, info.Minor)
+	// Per-version dispatch lives in bpf/python_walker.bpf.h. Supported
+	// minors: 3.9 (legacy PyFrameObject via walker_310 path),
+	// 3.10 and 3.11 (dedicated walkers), 3.12/3.13/3.14 (direct
+	// _PyInterpreterFrame via walker_312 path). Anything else falls
+	// through to the userspace walker.
+	if info.Minor < 9 || info.Minor > 14 {
+		debugf("py-walker: PID %d is Python %s (python_minor %d) not supported by BPF walker (only 3.9-3.14); userspace walker will handle", pid, info.Version, info.Minor)
 		return
 	}
 
@@ -1908,12 +1915,22 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 		return
 	}
 
-	// Overlay runtime harvester (most authoritative for the offsets it discovers).
-	if harvested, hErr := symtab.HarvestOffsets(info.LibPath, int(pid)); hErr != nil {
-		debugf("py-walker: harvester subprocess failed for PID %d (%s): %v — using fallback offsets", pid, info.LibPath, hErr)
-	} else if harvested != nil {
-		offsets = harvested.Overlay(offsets)
-		debugf("py-walker: overlaid runtime-harvested offsets onto %s table for PID %d", offsets.Version, pid)
+	// Overlay runtime harvester (most authoritative for the offsets it
+	// discovers), but only for 3.10/3.11/3.12. The harvester's frame-
+	// walking heuristics were written against 3.12's _PyInterpreterFrame
+	// layout (f_executable at offset 0). 3.13 moved f_executable to
+	// offset 32 and reshuffled other fields, so the harvester emits
+	// plausibly-valid but wrong offsets (TstateFrame, FrameCode,
+	// FrameBack) that overlay the hardcoded 3.13 table and break the
+	// walker. For 3.13+ we rely on the hardcoded table (and, once
+	// implemented, _Py_DebugOffsets from the running process).
+	if info.Minor <= 12 {
+		if harvested, hErr := symtab.HarvestOffsets(info.LibPath, int(pid)); hErr != nil {
+			debugf("py-walker: harvester subprocess failed for PID %d (%s): %v (using fallback offsets)", pid, info.LibPath, hErr)
+		} else if harvested != nil {
+			offsets = harvested.Overlay(offsets)
+			debugf("py-walker: overlaid runtime-harvested offsets onto %s table for PID %d", offsets.Version, pid)
+		}
 	}
 
 	// CPython 3.12 ALWAYS uses tstate.current_frame directly (no cframe

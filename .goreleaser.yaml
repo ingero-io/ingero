@@ -3,7 +3,8 @@ version: 2
 project_name: ingero
 
 builds:
-  - main: ./cmd/ingero/
+  - id: ingero
+    main: ./cmd/ingero/
     binary: ingero
     env:
       - CGO_ENABLED=0
@@ -21,10 +22,36 @@ builds:
       - -X github.com/ingero-io/ingero/internal/version.commit={{.ShortCommit}}
       - -X github.com/ingero-io/ingero/internal/version.date={{.Date}}
 
+  - id: straggler-sink
+    main: ./cmd/straggler-sink/
+    binary: straggler-sink
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
 archives:
-  - formats:
+  - ids:
+      - ingero
+    formats:
       - tar.gz
     name_template: "ingero_{{.Version}}_{{.Os}}_{{.Arch}}"
+    files:
+      - LICENSE
+      - README.md
+
+  - ids:
+      - straggler-sink
+    formats:
+      - tar.gz
+    name_template: "straggler-sink_{{.Version}}_{{.Os}}_{{.Arch}}"
     files:
       - LICENSE
       - README.md
@@ -59,6 +86,8 @@ release:
 dockers:
   - image_templates:
       - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
+    ids:
+      - ingero
     use: buildx
     dockerfile: deploy/docker/Dockerfile.goreleaser
     build_flag_templates:
@@ -74,6 +103,8 @@ dockers:
 
   - image_templates:
       - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+    ids:
+      - ingero
     use: buildx
     dockerfile: deploy/docker/Dockerfile.goreleaser
     build_flag_templates:
@@ -85,6 +116,38 @@ dockers:
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=io.modelcontextprotocol.server.name=io.github.ingero-io/ingero"
+    goarch: arm64
+
+  - image_templates:
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-amd64"
+    ids:
+      - straggler-sink
+    use: buildx
+    dockerfile: cmd/straggler-sink/Dockerfile
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=Ingero Straggler Sink"
+      - "--label=org.opencontainers.image.description=Reference UDS consumer for Ingero remediation events"
+      - "--label=org.opencontainers.image.source=https://github.com/ingero-io/ingero"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+    goarch: amd64
+
+  - image_templates:
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-arm64"
+    ids:
+      - straggler-sink
+    use: buildx
+    dockerfile: cmd/straggler-sink/Dockerfile
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=Ingero Straggler Sink"
+      - "--label=org.opencontainers.image.description=Reference UDS consumer for Ingero remediation events"
+      - "--label=org.opencontainers.image.source=https://github.com/ingero-io/ingero"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
     goarch: arm64
 
 docker_manifests:
@@ -102,6 +165,21 @@ docker_manifests:
     image_templates:
       - "ghcr.io/ingero-io/ingero:v{{ .Version }}-amd64"
       - "ghcr.io/ingero-io/ingero:v{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}"
+    image_templates:
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/ingero-io/straggler-sink:v{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/ingero-io/straggler-sink:latest"
+    image_templates:
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-amd64"
+      - "ghcr.io/ingero-io/straggler-sink:v{{ .Version }}-arm64"
 
 snapshot:
   version_template: "{{.Tag}}-next"
