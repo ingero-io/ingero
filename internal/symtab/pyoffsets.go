@@ -520,12 +520,29 @@ func pyOffsets39() *PyOffsets {
 //
 // 3.13 dropped the _PyCFrame indirection and made PyThreadState.current_frame
 // a direct pointer to _PyInterpreterFrame, so the frame-walk path matches 3.12.
-// Notable deltas from 3.12 (verified empirically on an upstream cpython-3.13.13
-// build with ctypes): PyCodeObject.co_firstlineno moved from byte 48 to byte 68.
+// _PyInterpreterFrame layout is unchanged from 3.12 on x86_64 (verified against
+// CPython v3.13.0..v3.13.13 Include/internal/pycore_frame.h):
+//
+//   offset 0:  PyObject *f_executable   (code object)
+//   offset 8:  _PyInterpreterFrame *previous
+//   offset 16: PyObject *f_funcobj
+//   offset 24: PyObject *f_globals
+//   offset 32: PyObject *f_builtins
+//   offset 40: PyObject *f_locals
+//   ...
+//
+// The real 3.12→3.13 deltas are outside the frame struct:
+//   - _PyRuntime grew a _Py_DebugOffsets prefix, pushing interpreters.head
+//     from byte 40 to byte 632.
+//   - PyInterpreterState grew (PEP 684 per-interpreter state), pushing
+//     threads.head from byte 16 to byte 7344.
+//   - PyThreadState.current_frame moved from byte 56 to byte 232.
+//   - PyCodeObject.co_firstlineno moved from byte 48 to byte 68.
+//
 // _Py_DebugOffsets is the authoritative source for 3.13+ but only comes into
 // play when the reader at `ReadDebugOffsetsFromPID` has the 3.13 layout
 // constants wired up; these fallback values unblock the walker in the
-// meantime and get overlaid by the harvester for fields it can discover.
+// meantime.
 func pyOffsets313() *PyOffsets {
 	return &PyOffsets{
 		Version: "3.13",
@@ -545,14 +562,23 @@ func pyOffsets313() *PyOffsets {
 		TstateNext:           8,
 		TstateThreadID:       152,
 		TstateNativeThreadID: 160,
-		TstateFrame:          232, // current_frame (_PyInterpreterFrame*, direct)
+		// current_frame in 3.13 sits at byte 72 of PyThreadState, not 232.
+		// Layout per Include/cpython/pystate.h: prev/next/interp (24) +
+		// eval_breaker (8) + _status+_whence+state+py_recursion_* +
+		// c_recursion_*+tracing+what_event (10 ints = 40) + 4-byte pad = 72.
+		// Verified on /proc/<pid>/mem of cpython-3.13.13 (uv distribution)
+		// by walking `previous` from every pointer in tstate[:2KB] and
+		// confirming only the one at +72 chains to sys._getframe().f_frame.
+		// The earlier 232 pointed at datastack_chunk (a _PyStackChunk
+		// header), which explains the "1 garbage frame then 0" symptom.
+		TstateFrame:          72,
 
 		CframeCurrentFrame: 0,
 
-		// _PyInterpreterFrame in 3.13 re-ordered fields vs 3.12.
-		// f_executable moved from byte 0 to byte 32, previous from 24 to 8.
+		// _PyInterpreterFrame field order on 3.13 matches 3.12:
+		// f_executable at 0, previous at 8.
 		FrameBack: 8,
-		FrameCode: 32,
+		FrameCode: 0,
 
 		CodeFilename:    112,
 		CodeName:        120,
@@ -571,8 +597,15 @@ func pyOffsets313() *PyOffsets {
 
 // CPython 3.14 uses direct current_frame like 3.13. _Py_DebugOffsets grew
 // again, shifting interpreters.head from 3.13's 632 to 808 on cpython
-// 3.14.4 (empirical). Other fields (TstateFrame, FrameCode) stayed put
-// so we reuse 3.13's values for those.
+// 3.14.4 (empirical). _PyInterpreterFrame field order at frame-walk offsets
+// (0 and 8) is unchanged, so FrameCode and FrameBack from 3.13 carry over.
+//
+// NOTE: 3.14 re-typed f_executable from `PyObject *` to the `_PyStackRef`
+// union (Include/internal/pycore_interpframe_structs.h). The low bits of
+// the 8-byte word carry a tag (Py_TAG_REFCNT = 1 in default GIL build).
+// The eBPF walker masks `code_ptr &= ~0x7ULL` after reading f_executable
+// to strip the tag before treating the value as a PyCodeObject pointer;
+// see walk_python_frames_312 in bpf/python_walker.bpf.h.
 func pyOffsets314() *PyOffsets {
 	o := pyOffsets313()
 	o.Version = "3.14"

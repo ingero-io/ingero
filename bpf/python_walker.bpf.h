@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * python_walker.bpf.h — inline CPython 3.10/3.11/3.12 frame walker for eBPF.
+ * python_walker.bpf.h — inline CPython 3.9..3.14 frame walker for eBPF.
  *
  * Single source of truth for the in-kernel Python frame walker. Included
  * by cuda_trace.bpf.c so the walker runs inline on the same probe that
  * emits the CUDA event — no tail call, no per-program map coordination.
  *
  * Version dispatch: walk_python_frames() reads py_runtime_state.python_minor
- * from the per-PID py_runtime_map and dispatches to one of three variants:
- *   - 3.10: PyThreadState.frame -> PyFrameObject*, walk via f_back/f_code.
- *   - 3.11: PyThreadState.cframe -> _PyCFrame*, then cframe->current_frame
- *           -> _PyInterpreterFrame*, walk via previous/executable.
- *   - 3.12: PyThreadState.current_frame -> _PyInterpreterFrame* directly.
+ * from the per-PID py_runtime_map and routes to one of three variants:
+ *   - 3.9/3.10: PyThreadState.frame -> PyFrameObject*, walk via f_back/f_code.
+ *   - 3.11:     PyThreadState.cframe -> _PyCFrame*, then cframe->current_frame
+ *               -> _PyInterpreterFrame*, walk via previous/f_code.
+ *   - 3.12:     PyThreadState.current_frame -> _PyInterpreterFrame* directly
+ *               (or via cframe on distro builds that retain indirection —
+ *                harvester-discovered off_cframe_current_frame selects).
+ *   - 3.13:     same as 3.12 direct (_PyCFrame dropped upstream).
+ *   - 3.14:     same frame layout as 3.13, but f_executable is a _PyStackRef
+ *               tagged union — the walker masks low 3 bits off code_ptr.
  * python_minor==0 (legacy 32-byte struct writers) is treated as 3.12 for
  * backward compatibility with pre-v2 clients.
  *
@@ -246,12 +251,16 @@ static __always_inline __u64 find_thread_state(
 }
 
 /*
- * walk_python_frames_312: CPython 3.12 frame walker.
+ * walk_python_frames_312: CPython 3.12/3.13/3.14 frame walker.
  *
- * In 3.12, PyThreadState.current_frame is a DIRECT _PyInterpreterFrame*
+ * Shared across 3.12, 3.13, and 3.14 because the frame-walk field layout
+ * is the same (f_executable at 0, previous at 8; only the surrounding
+ * struct sizes and per-version offsets in py_runtime_state differ). In
+ * 3.12+ PyThreadState.current_frame is a DIRECT _PyInterpreterFrame*
  * (no cframe indirection — that was 3.11's design). Each frame has:
- *   - .f_code     (PyCodeObject*, off_frame_code)
- *   - .previous   (walk pointer, off_frame_back)
+ *   - .f_code/.f_executable (PyCodeObject*, off_frame_code; 3.14 wraps
+ *     this in a _PyStackRef tagged-pointer union — see mask below)
+ *   - .previous             (walk pointer, off_frame_back)
  *
  * At uprobe time inside a C extension call (e.g. cudaMalloc), CPython
  * pushes a stack-allocated "entry frame stub" on top. The stub may have
@@ -260,6 +269,13 @@ static __always_inline __u64 find_thread_state(
  * to be a userspace heap pointer (>= 0x100000 and below the canonical
  * x86_64 user VA top) and walk .previous over stubs until we find a
  * real Python frame.
+ *
+ * _PyStackRef tag bits (3.14): 3.14 changed f_executable from a raw
+ * PyObject* to a _PyStackRef union whose low bits carry a tag
+ * (Py_TAG_REFCNT=1 in default GIL build, Py_INT_TAG=3 for tagged ints).
+ * Masking `code_ptr & ~0x7ULL` strips those tags. This is a safe no-op
+ * for 3.10–3.13 because PyCodeObject allocations are always 8-byte
+ * aligned, so the low 3 bits are already zero.
  *
  * Preconditions:
  *   - result is non-NULL and already zeroed (depth=0, truncated=0).
@@ -297,6 +313,12 @@ static __always_inline int walk_python_frames_312(
 		if (bpf_probe_read_user(&code_ptr, sizeof(code_ptr),
 		    (const void *)(frame + st->off_frame_code)) != 0)
 			break;
+
+		/* Strip _PyStackRef tag bits. See function doc: safe no-op on
+		 * 3.10–3.13, required on 3.14 where f_executable is a tagged
+		 * union. Must happen before the range check so a tagged-but-
+		 * valid pointer isn't skipped. */
+		code_ptr &= ~0x7ULL;
 
 		/* frame->previous (read before deciding so we can skip stubs). */
 		__u64 prev = 0;
@@ -601,17 +623,19 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 	if (minor == 0)
 		minor = 12;
 
-	/* CPython layout note: both 3.11 and 3.12 use the cframe indirection
-	 * (tstate.cframe -> _PyCFrame.current_frame -> _PyInterpreterFrame).
-	 * CPython 3.13+ dropped the cframe and made current_frame direct.
+	/* CPython layout recap:
+	 *   - 3.11 uses cframe indirection (tstate.cframe -> _PyCFrame.current_frame
+	 *     -> _PyInterpreterFrame). walker_311 handles the double chase.
+	 *   - 3.12 uses direct tstate.current_frame -> _PyInterpreterFrame (the
+	 *     cframe field still exists but isn't the walk entry point).
+	 *   - 3.13 dropped the _PyCFrame struct entirely; layout matches 3.12.
+	 *   - 3.14 same frame field order as 3.13, but f_executable is a tagged
+	 *     _PyStackRef union — walker_312 masks the tag bits.
 	 *
-	 * walker_311 handles the two-pointer-chase correctly; walker_312 was
-	 * previously (mis)configured for the direct layout and is kept for
-	 * 3.13+ use once we wire up a 3.13 dispatch path.
-	 *
-	 * Dispatch heuristic for 3.12+ uses off_cframe_current_frame: when
-	 * non-zero, use cframe indirection; when zero, assume direct access.
-	 * Userspace harvester sets this based on empirical runtime probing. */
+	 * The `off_cframe_current_frame > 0` escape hatch on case 12 below is a
+	 * safety net for distro-patched 3.12 builds that keep the cframe walk
+	 * path; normal 3.12 is forced to direct in userspace (trace.go) before
+	 * the state is pushed. */
 	switch (minor) {
 	case 9:
 		/* 3.9 uses the same legacy PyFrameObject layout as 3.10. */
