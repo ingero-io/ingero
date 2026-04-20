@@ -118,6 +118,89 @@ func TestDetectPythonFromRegions_BinaryBeforeLibpython(t *testing.T) {
 	}
 }
 
+func TestFindPyRegion(t *testing.T) {
+	uvPath := "/home/ubuntu/.local/share/uv/python/cpython-3.14.4-linux-x86_64-gnu/bin/python3.14"
+	otherPath := "/tmp/venv-3.14/lib/python3.14/site-packages/_internal/python3.14-shim"
+	libcudaPath := "/usr/lib/x86_64-linux-gnu/libcudart.so.12"
+
+	tests := []struct {
+		name        string
+		regions     []MapRegion
+		info        *PythonInfo
+		wantPath    string
+		wantExact   bool
+		wantMatched bool
+	}{
+		{
+			name: "exact path match",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: uvPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    uvPath,
+			wantExact:   true,
+			wantMatched: true,
+		},
+		{
+			name: "fallback to equivalent 3.14 region when exact path differs",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: otherPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    otherPath,
+			wantExact:   false,
+			wantMatched: true,
+		},
+		{
+			name: "minor mismatch rejects fallback",
+			regions: []MapRegion{
+				{Path: "/usr/bin/python3.12"},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantMatched: false,
+		},
+		{
+			name: "no python region at all",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: "/usr/lib/libc.so.6"},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantMatched: false,
+		},
+		{
+			name: "exact wins over equivalent when both present",
+			regions: []MapRegion{
+				{Path: otherPath, Start: 0x300000},
+				{Path: uvPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    uvPath,
+			wantExact:   true,
+			wantMatched: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, exact, ok := findPyRegion(tt.regions, tt.info)
+			if ok != tt.wantMatched {
+				t.Fatalf("matched = %v, want %v", ok, tt.wantMatched)
+			}
+			if !ok {
+				return
+			}
+			if r.Path != tt.wantPath {
+				t.Errorf("Path = %q, want %q", r.Path, tt.wantPath)
+			}
+			if exact != tt.wantExact {
+				t.Errorf("exact = %v, want %v", exact, tt.wantExact)
+			}
+		})
+	}
+}
+
 func TestPythonInfo_IsSupportedVersion(t *testing.T) {
 	tests := []struct {
 		minor int
