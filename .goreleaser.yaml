@@ -38,7 +38,8 @@ builds:
       - -s -w
 
 archives:
-  - ids:
+  - id: ingero
+    ids:
       - ingero
     formats:
       - tar.gz
@@ -47,7 +48,8 @@ archives:
       - LICENSE
       - README.md
 
-  - ids:
+  - id: straggler-sink
+    ids:
       - straggler-sink
     formats:
       - tar.gz
