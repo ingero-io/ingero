@@ -143,7 +143,9 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 		return nil, err
 	}
 
-	// Try _Py_DebugOffsets first (CPython 3.12+ — no DWARF needed).
+	// Try _Py_DebugOffsets first (CPython 3.13+ — no DWARF needed).
+	// readDebugOffsets returns nil, nil for pre-3.13 builds, so the
+	// fallback chain below picks up 3.10 / 3.11 / 3.12 unchanged.
 	var offsets *PyOffsets
 	debugOffsets, debugErr := readDebugOffsets(mem, runtimeAddr, info.Minor)
 	if debugErr != nil {
