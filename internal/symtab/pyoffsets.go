@@ -440,10 +440,18 @@ func pyOffsets310() *PyOffsets {
 
 		InterpTstateHead: 8, // PyInterpreterState.tstate_head
 
-		TstateNext:           8,   // PyThreadState.next
-		TstateThreadID:       176, // PyThreadState.thread_id (pthread_self)
-		TstateNativeThreadID: 184, // PyThreadState.native_thread_id (gettid, 3.8+)
-		TstateFrame:          24,  // PyThreadState.frame (PyFrameObject*)
+		TstateNext:     8,   // PyThreadState.next
+		TstateThreadID: 176, // PyThreadState.thread_id (pthread_self)
+		// native_thread_id (gettid) was added to PyThreadState upstream in
+		// 3.11, not 3.8 as an earlier comment in this file claimed. Ubuntu
+		// backports the field to 3.10 via a distro patch (where it sits at
+		// byte 184 but is never populated for the main thread, which is why
+		// find_thread_state needs the single-tstate fallback). On vanilla
+		// 3.9/3.10 builds the field does not exist at all; the walker reads
+		// whatever happens to live at byte 184 and relies entirely on the
+		// single-tstate fallback to still return a correct tstate.
+		TstateNativeThreadID: 184,
+		TstateFrame:          24, // PyThreadState.frame (PyFrameObject*)
 
 		CframeCurrentFrame: 0, // Not used in 3.10
 
@@ -484,7 +492,7 @@ func pyOffsets311() *PyOffsets {
 
 		TstateNext:           8,
 		TstateThreadID:       176, // pthread_self
-		TstateNativeThreadID: 184, // gettid (3.8+)
+		TstateNativeThreadID: 184, // gettid (added upstream in 3.11)
 		TstateFrame:          40,  // PyThreadState.cframe (_PyCFrame*)
 
 		CframeCurrentFrame: 0, // _PyCFrame.current_frame (offset 0)
@@ -504,11 +512,54 @@ func pyOffsets311() *PyOffsets {
 	}
 }
 
-// CPython 3.9 uses the same legacy PyFrameObject layout as 3.10. Treated by the
-// walker as "walker_310" (see python_walker.bpf.h dispatcher). Kept
-// distinct so we can diverge fields from 3.10 where needed. Verified on
-// cpython 3.9.25 from the uv python distribution: _PyRuntime.interpreters.head
-// sits at byte 32, not at 40 (3.10's value).
+// CPython 3.9 uses the legacy PyFrameObject layout (no _PyInterpreterFrame,
+// no cframe indirection). Routed to walker_310 by the dispatcher.
+//
+// Offsets derived from cpython v3.9.25 upstream headers:
+//
+//   _PyRuntime (pycore_runtime.h):
+//     4 ints (preinitializing..initialized) -> 16
+//     _Py_atomic_address _finalizing         -> +8  = 24
+//     pyinterpreters.mutex                   -> +8  = 32
+//     pyinterpreters.head                    -> RuntimeInterpretersHead = 32
+//
+//   PyInterpreterState (pycore_interp.h):
+//     next (8) -> 0
+//     tstate_head -> InterpTstateHead = 8
+//
+//   PyThreadState (cpython/pystate.h):
+//     prev/next/interp (3 * 8)         -> 24
+//     frame                            -> TstateFrame = 24
+//     recursion_depth/overflowed/...   -> +8  = 32
+//     stackcheck/tracing/use_tracing   -> +16 = 48
+//     pad+c_profilefunc/c_tracefunc/c_profileobj/c_traceobj (4*8)
+//     curexc_type/value/traceback (3*8) -> +32 = 104
+//     exc_state (_PyErr_StackItem, 32) -> +32 = 144
+//     exc_info/dict (2*8)              -> 160
+//     gilstate_counter+pad+async_exc   -> 176
+//     thread_id                        -> TstateThreadID = 176
+//
+//   native_thread_id does NOT exist in vanilla 3.9 (upstream added it in
+//   3.11). The walker still sets TstateNativeThreadID = 184 (inherited
+//   from 3.10) because find_thread_state reads that offset unconditionally;
+//   on 3.9 it ends up reading `trash_delete_nesting` (int) and fails the
+//   kernel-tid match, at which point the single-tstate fallback returns
+//   the first (and only) tstate for the common single-threaded case.
+//
+//   PyFrameObject (cpython/frameobject.h):
+//     PyObject_VAR_HEAD (24) + f_back (8) + f_code (8) = FrameCode offset 32
+//     FrameBack = 24
+//
+//   PyCodeObject (cpython/code.h) layout is identical to 3.10, so
+//   CodeFilename=104, CodeName=112, CodeFirstLineNo=40 carry over unchanged.
+//
+// Open question: the plan's pre-validation matrix reported "3.9: 0 frames,
+// walker enters, emits nothing". That observation was made before the
+// precursor single-tstate fallback landed; with that fallback now in place,
+// the walker should emit frames for single-threaded 3.9 workloads. Live
+// /proc/<pid>/mem verification on a uv-distributed cpython-3.9.x process
+// is still pending to rule out any build-specific quirk not covered by the
+// upstream header derivation above.
 func pyOffsets39() *PyOffsets {
 	o := pyOffsets310()
 	o.Version = "3.9"
