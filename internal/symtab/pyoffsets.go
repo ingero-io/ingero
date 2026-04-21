@@ -31,6 +31,7 @@ type PyOffsets struct {
 
 	// PyInterpreterState offsets
 	InterpTstateHead uint64 // PyInterpreterState.tstate_head (3.10) or .threads.head (3.12)
+	InterpNext       uint64 // PyInterpreterState.next — first field across 3.9..3.14, so 0
 
 	// PyThreadState offsets
 	TstateNext           uint64 // PyThreadState.next
@@ -83,6 +84,7 @@ type PyOffsets struct {
 // the runtime header, not a dedicated file).
 type debugOffsetsLayout struct {
 	runtimeInterpretersHead uint64 // -> _PyRuntimeState.interpreters.head
+	interpNext              uint64 // -> PyInterpreterState.next
 	interpThreadsHead       uint64 // -> PyInterpreterState.threads.head
 	tstateCurrentFrame      uint64 // -> PyThreadState.current_frame
 	tstateThreadID          uint64 // -> PyThreadState.thread_id (pthread_self)
@@ -114,6 +116,7 @@ type debugOffsetsLayout struct {
 var debugOffsetsLayouts = map[int]debugOffsetsLayout{
 	13: {
 		runtimeInterpretersHead: 40,
+		interpNext:              64,
 		interpThreadsHead:       72,
 		tstateCurrentFrame:      184,
 		tstateThreadID:          192,
@@ -129,6 +132,7 @@ var debugOffsetsLayouts = map[int]debugOffsetsLayout{
 	},
 	14: {
 		runtimeInterpretersHead: 40,
+		interpNext:              64,
 		interpThreadsHead:       72,
 		tstateCurrentFrame:      208,
 		tstateThreadID:          216,
@@ -249,6 +253,7 @@ func parseDebugOffsets(buf []byte, minor int) (*PyOffsets, error) {
 		Version:                 fmt.Sprintf("3.%d-debugoffsets", minor),
 		RuntimeInterpretersHead: readU64(layout.runtimeInterpretersHead),
 		InterpTstateHead:        readU64(layout.interpThreadsHead),
+		InterpNext:              readU64(layout.interpNext),
 		// PyThreadState.next is not exported via _Py_DebugOffsets but has
 		// been at byte 8 since 3.9 (stable across all supported versions).
 		// Hardcoding it here keeps the layout table focused on fields that

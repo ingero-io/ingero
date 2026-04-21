@@ -300,6 +300,14 @@ struct py_runtime_state {
 	__u8  python_minor;                  /* 10, 11, or 12; 0 = legacy caller, treat as 12 */
 	__u8  _pad3;
 	__u16 off_cframe_current_frame;      /* _PyCFrame.current_frame offset (3.11 only; 0 for others) */
+	/* v3 field — appended for PEP 684 subinterpreter support.
+	 * PyInterpreterState.next is the first field of struct _is across
+	 * 3.9..3.14, so the value is 0 on every supported version. The
+	 * walker reads at this offset inside an outer loop bounded by
+	 * PY_MAX_INTERPRETERS; single-interpreter processes see next==NULL
+	 * on the second iteration and exit the loop with identical behavior
+	 * to the legacy single-interpreter path. */
+	__u16 off_interp_next;               /* PyInterpreterState.next offset */
 };
 
 /* Single Python frame extracted by the BPF walker. */

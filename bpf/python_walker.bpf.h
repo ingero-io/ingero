@@ -72,6 +72,7 @@
 #include "common.bpf.h"
 
 #define PY_MAX_THREADS 8
+#define PY_MAX_INTERPRETERS 4   /* bound the subinterpreter walk for the verifier */
 #define PY_STRING_MAX 127  /* leave 1 byte for NUL */
 
 /*
@@ -200,21 +201,29 @@ static __always_inline int read_compact_ascii(
 }
 
 /*
- * find_thread_state: walks the PyThreadState linked list to find one
- * matching the given native thread id. Returns the tstate address, or 0.
+ * find_thread_state: walks the PyInterpreterState chain, and within
+ * each interpreter the PyThreadState linked list, to find one matching
+ * the given native thread id. Returns the tstate address, or 0.
  *
- * Bounded by PY_MAX_THREADS — workloads with more Python threads than
- * that will miss frames for later threads (acceptable trade-off for
- * verifier safety).
+ * Subinterpreters (PEP 684): the outer loop iterates
+ * PyInterpreterState.next up to PY_MAX_INTERPRETERS. Single-interpreter
+ * processes see next==NULL on the second iteration and exit early, so
+ * there is no behavior change vs the prior single-interp implementation.
+ *
+ * Bounded by PY_MAX_THREADS per interpreter and PY_MAX_INTERPRETERS
+ * across interpreters. Workloads with more Python threads or
+ * subinterpreters than those bounds will miss frames for the overflow
+ * (acceptable trade-off for verifier safety).
  *
  * Single-thread fallback: on some builds (e.g., Ubuntu 22.04's patched
  * CPython 3.10) PyThreadState.native_thread_id is 0 for the main thread
  * because the interpreter never populates it for the thread that called
- * Py_Initialize(). When exactly one tstate exists and none matched the
- * kernel tid, we return that one tstate. For the common case of single-
- * threaded Python workloads this yields correct frames; multi-threaded
- * workloads with a genuinely-mismatched offset correctly return 0
- * (rather than returning a wrong thread's frames).
+ * Py_Initialize(). When the outer walk finishes without finding a
+ * native_tid match and exactly one tstate was observed across all
+ * interpreters, we fall back to that single tstate. For the common
+ * case of single-threaded single-interpreter Python workloads this
+ * yields correct frames; multi-threaded workloads with a
+ * genuinely-mismatched offset correctly return 0.
  */
 static __always_inline __u64 find_thread_state(
     __u32 native_tid, const struct py_runtime_state *st)
@@ -228,41 +237,57 @@ static __always_inline __u64 find_thread_state(
 	if (interp == 0)
 		return 0;
 
-	/* threads.head -> first PyThreadState */
-	__u64 tstate = 0;
-	if (bpf_probe_read_user(&tstate, sizeof(tstate),
-	    (const void *)(interp + st->off_tstate_head)) != 0)
-		return 0;
-	py_debug_inc(4);  /* read_threads_head_ok */
-
-	__u64 first_tstate = tstate;
+	__u64 first_tstate = 0;
 	int walked = 0;
 
-	/* Walk thread list (bounded). */
-	#pragma unroll(8)
-	for (int i = 0; i < PY_MAX_THREADS; i++) {
-		if (tstate == 0)
+	#pragma unroll(4)
+	for (int ii = 0; ii < PY_MAX_INTERPRETERS; ii++) {
+		if (interp == 0)
 			break;
-		walked++;
-		py_debug_inc(5);  /* thread_loop_iterations */
 
-		__u64 cur_tid = 0;
-		if (bpf_probe_read_user(&cur_tid, sizeof(cur_tid),
-		    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
+		/* threads.head -> first PyThreadState for this interpreter */
+		__u64 tstate = 0;
+		if (bpf_probe_read_user(&tstate, sizeof(tstate),
+		    (const void *)(interp + st->off_tstate_head)) != 0)
 			break;
-		if (i == 0)
-			py_debug_inc(9);  /* read_first_native_tid */
+		if (ii == 0)
+			py_debug_inc(4);  /* read_threads_head_ok (first interp only) */
 
-		if ((__u32)cur_tid == native_tid) {
-			py_debug_inc(6);  /* thread_match_found */
-			return tstate;
+		/* Walk this interpreter's thread list (bounded). */
+		#pragma unroll(8)
+		for (int i = 0; i < PY_MAX_THREADS; i++) {
+			if (tstate == 0)
+				break;
+			if (first_tstate == 0)
+				first_tstate = tstate;
+			walked++;
+			py_debug_inc(5);  /* thread_loop_iterations */
+
+			__u64 cur_tid = 0;
+			if (bpf_probe_read_user(&cur_tid, sizeof(cur_tid),
+			    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
+				break;
+			if (ii == 0 && i == 0)
+				py_debug_inc(9);  /* read_first_native_tid */
+
+			if ((__u32)cur_tid == native_tid) {
+				py_debug_inc(6);  /* thread_match_found */
+				return tstate;
+			}
+
+			__u64 next = 0;
+			if (bpf_probe_read_user(&next, sizeof(next),
+			    (const void *)(tstate + st->off_tstate_next)) != 0)
+				break;
+			tstate = next;
 		}
 
-		__u64 next = 0;
-		if (bpf_probe_read_user(&next, sizeof(next),
-		    (const void *)(tstate + st->off_tstate_next)) != 0)
+		/* Advance to next PyInterpreterState; NULL exits the outer loop. */
+		__u64 next_interp = 0;
+		if (bpf_probe_read_user(&next_interp, sizeof(next_interp),
+		    (const void *)(interp + st->off_interp_next)) != 0)
 			break;
-		tstate = next;
+		interp = next_interp;
 	}
 
 	if (walked == 1 && first_tstate != 0) {

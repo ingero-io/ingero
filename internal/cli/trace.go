@@ -2118,6 +2118,9 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor in
 	if o.CframeCurrentFrame > 0xFFFF {
 		return pytrace.PyRuntimeState{}, fmt.Errorf("offset CframeCurrentFrame=%d exceeds uint16 range", o.CframeCurrentFrame)
 	}
+	if o.InterpNext > 0xFFFF {
+		return pytrace.PyRuntimeState{}, fmt.Errorf("offset InterpNext=%d exceeds uint16 range", o.InterpNext)
+	}
 	return pytrace.PyRuntimeState{
 		RuntimeAddr:                runtimeAddr,
 		OffRuntimeInterpretersHead: uint16(o.RuntimeInterpretersHead),
@@ -2136,6 +2139,10 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor in
 		// CframeCurrentFrame is populated only for 3.11 by
 		// symtab.GetPyOffsets; 0 for 3.10/3.12 by design.
 		OffCframeCurrentFrame: uint16(o.CframeCurrentFrame),
+		// InterpNext is PyInterpreterState.next — first struct field
+		// on every supported CPython version, so 0 is the correct
+		// runtime value, not a sentinel for "disabled".
+		OffInterpNext: uint16(o.InterpNext),
 	}, nil
 }
 
