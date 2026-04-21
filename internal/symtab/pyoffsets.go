@@ -488,9 +488,17 @@ func pyOffsets311() *PyOffsets {
 		CodeName:        112,
 		CodeFirstLineNo: 48,
 
+		// PyASCIIObject on x86_64 (3.11 upstream layout, pre-PEP-623):
+		//   PyObject_HEAD (16) + length (8) + hash (8) + state (4) +
+		//   pad (4) + wstr (8) = 48 bytes total.
+		// Compact ASCII data starts immediately after the struct, at 48.
+		// The earlier hardcoded UnicodeState=20 pointed at the middle of
+		// `hash`, which silently failed the compact+ascii bit check and
+		// made read_compact_ascii return zero-length filenames and
+		// funcnames on every frame.
 		UnicodeLength: 16,
 		UnicodeData:   48,
-		UnicodeState:  20,
+		UnicodeState:  32,
 
 		NewStyleFrames: true,
 	}
@@ -675,9 +683,20 @@ func pyOffsets312() *PyOffsets {
 		CodeName:        120,
 		CodeFirstLineNo: 48,
 
+		// PyASCIIObject on x86_64 (3.12 upstream layout, post-PEP-623
+		// removed wstr):
+		//   PyObject_HEAD (16) + length (8) + hash (8) + state (4) +
+		//   pad (4) = 40 bytes total.
+		// Compact ASCII data starts immediately after the struct, at 40.
+		// Earlier hardcoded values (state=20 / data=48) matched an older
+		// pre-PEP-623 layout; on vanilla 3.12 they point at the middle
+		// of `hash` (for state) and past the struct tail (for data),
+		// silently producing empty filenames. Ubuntu distro builds that
+		// retain the pre-PEP-623 layout are covered by the runtime
+		// harvester's pattern-scan override.
 		UnicodeLength: 16,
-		UnicodeData:   48,
-		UnicodeState:  20,
+		UnicodeData:   40,
+		UnicodeState:  32,
 
 		NewStyleFrames: true,
 	}

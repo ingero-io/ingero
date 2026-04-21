@@ -1996,7 +1996,11 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 			"pid", pid, "python_version", info.Version, "python_minor", info.Minor,
 			"runtime_addr", fmt.Sprintf("0x%x", runtimeAddr))
 	}
-	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d)", pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps))
+	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d) values: RIH=%d ITH=%d TF=%d FB=%d FC=%d CF=%d CN=%d CFL=%d US=%d UD=%d",
+		pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps),
+		offsets.RuntimeInterpretersHead, offsets.InterpTstateHead, offsets.TstateFrame,
+		offsets.FrameBack, offsets.FrameCode, offsets.CodeFilename, offsets.CodeName,
+		offsets.CodeFirstLineNo, offsets.UnicodeState, offsets.UnicodeData)
 }
 
 // pyPushedPIDs is a per-PID dedup cache for the walker push pipeline.

@@ -78,17 +78,24 @@ def _make_torch_driver():
     return drive
 
 
-def mx_inner(drive, iterations):
-    for _ in range(iterations):
+def mx_inner(drive, iterations, sleep_between):
+    for i in range(iterations):
         drive()
+        # Sleep between cuda calls so the event stream is spread over
+        # multiple seconds. State push from ingero userspace is async
+        # off the ring buffer; if all cuda fires in a single tight
+        # burst, every event's walker sees no state and the later-
+        # pushed state is useless because there are no more events.
+        if sleep_between > 0 and i % 4 == 3:
+            time.sleep(sleep_between)
 
 
-def mx_middle(drive, iterations):
-    mx_inner(drive, iterations)
+def mx_middle(drive, iterations, sleep_between):
+    mx_inner(drive, iterations, sleep_between)
 
 
-def mx_outer(drive, iterations):
-    mx_middle(drive, iterations)
+def mx_outer(drive, iterations, sleep_between):
+    mx_middle(drive, iterations, sleep_between)
 
 
 def main() -> int:
@@ -111,7 +118,20 @@ def main() -> int:
     sys.stdout.flush()
     time.sleep(wait)
 
-    mx_outer(drive, iterations=40)
+    # Run cuda in batches separated by sleeps so the event stream
+    # extends over ~20 seconds. Ingero's Go-side event handler reads
+    # from the ring buffer asynchronously and calls DetectPython +
+    # pushes walker state after the first event from a new PID. The
+    # FIRST 40 cuda events come back with state_lookup_ok=0 because
+    # state hasn't been pushed yet; a second round of cuda calls run
+    # AFTER detection has finished is what actually exercises the
+    # frame walker. Hence 100 iterations with a larger pause.
+    mx_outer(drive, iterations=100, sleep_between=0.2)
+
+    # Drain sleep: let ingero finish processing the ring buffer and
+    # emit the debug counter dump before its timeout fires.
+    time.sleep(5)
+
     print("done")
     return 0
 

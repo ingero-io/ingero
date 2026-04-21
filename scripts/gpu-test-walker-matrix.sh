@@ -83,25 +83,39 @@ run_one_version() {
     local jsonl="$tmpdir/events.jsonl"
     local errlog="$tmpdir/ingero.err"
 
-    log "== 3.${minor} ($py, mode=$mode) =="
+    log "== ${minor} ($py, mode=$mode) =="
 
     # Start ingero, wait for uprobes to attach, run workload, stop.
+    # Use `timeout --foreground` so SIGINT reaches ingero, not the
+    # intermediate sudo wrapper. `$!` otherwise captures sudo's PID
+    # and kill -INT to it does not forward to the child; ingero keeps
+    # running in the background holding the output FD, and by the time
+    # we read $jsonl nothing has been flushed.
     sudo rm -f "$jsonl" "$errlog"
-    sudo timeout 40 "$INGERO_BIN" trace --py-walker=ebpf --json --debug \
+    sudo timeout 60 "$INGERO_BIN" trace --py-walker=ebpf --json --debug \
         >"$jsonl" 2>"$errlog" &
     local ing_pid=$!
-    sleep 4
+    # ingero startup (open ring buffers, attach uprobes to every
+    # discovered libcudart inode, load BPF objects, open session DB)
+    # takes ~12s on this host. Short sleeps here mean the workload
+    # runs and exits before ingero's event reader is alive; /proc
+    # then disappears before DetectPython can look at it.
+    sleep 15
 
     local preload=()
     [[ -n "$SYSTEM_CUDART" ]] && preload=("LD_PRELOAD=$SYSTEM_CUDART")
 
     # Run workload via env so LD_PRELOAD propagates without affecting
-    # the invoking shell.
+    # the invoking shell. The workload holds itself alive after the
+    # cuda loop so ingero has time to call DetectPython on its PID
+    # before /proc disappears.
     env "${preload[@]}" "$py" "$WORKLOAD" "$mode" 2 2>&1 | tail -4 || true
 
-    # Give ingero a moment to flush the ring buffer, then stop.
-    sleep 3
-    sudo kill -INT "$ing_pid" 2>/dev/null || true
+    # Let the 30s ingero timeout fire naturally so the ring buffer
+    # drains and the debug counter dump lands in the err log. Killing
+    # ingero early via `sudo kill -INT $ing_pid` did not work because
+    # $ing_pid is the sudo process, not ingero, and SIGINT does not
+    # propagate; the output file stayed empty.
     wait "$ing_pid" 2>/dev/null || true
 
     # --- Assertions ---
@@ -111,15 +125,19 @@ run_one_version() {
                    "$jsonl" 2>/dev/null | sort -u)
     chain_hits=$(echo "$py_funcs" | grep -cE '^mx_(inner|middle|outer)$' || true)
 
-    local entered_dispatcher depth_gt_zero
+    local entered_dispatcher have_py_set
     entered_dispatcher=$(grep -oE 'entered_dispatcher[[:space:]]+[0-9]+' "$errlog" \
                              | tail -1 | awk '{print $2}')
-    depth_gt_zero=$(grep -oE 'depth_gt_zero[[:space:]]+[0-9]+' "$errlog" \
+    # have_py_set (slot 26) is the version-agnostic "walker emitted
+    # frames" counter. depth_gt_zero (slot 8) is only incremented by
+    # walker_311/walker_312 and stays 0 on walker_310 (3.9/3.10) even
+    # when frames ARE emitted, making it a misleading assertion.
+    have_py_set=$(grep -oE 'have_py_set[[:space:]]+[0-9]+' "$errlog" \
                              | tail -1 | awk '{print $2}')
     entered_dispatcher=${entered_dispatcher:-0}
-    depth_gt_zero=${depth_gt_zero:-0}
+    have_py_set=${have_py_set:-0}
 
-    local tag="3.${minor}"
+    local tag="${minor}"
     if [[ "$cuda_events" -eq 0 ]]; then
         fail "$tag: no cuda events captured — uprobe attach likely broke; see $errlog"
         return 1
@@ -132,13 +150,13 @@ run_one_version() {
     fi
     pass "$tag: walker entered $entered_dispatcher times"
 
-    if [[ "$depth_gt_zero" -eq 0 ]]; then
-        fail "$tag: walker emitted zero frames on every event (depth_gt_zero=0)"
+    if [[ "$have_py_set" -eq 0 ]]; then
+        fail "$tag: walker emitted zero frames on every event (have_py_set=0)"
         return 1
     fi
-    pass "$tag: walker emitted frames on $depth_gt_zero events"
+    pass "$tag: walker emitted frames on $have_py_set events"
 
-    if [[ "$minor" == "9" ]]; then
+    if [[ "$minor" == "3.9" ]]; then
         # Soft expectation: 3.9 may have only the single-tstate fallback
         # path emitting frames, chain depth varies by build.
         if [[ -n "$py_funcs" ]]; then

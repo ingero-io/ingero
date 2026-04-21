@@ -55,11 +55,19 @@ var freeThreadedRe = regexp.MustCompile(`(?:lib)?python3\.\d+t(?:\.|$)`)
 //     per-PID dedup in the caller marks the PID as "not Python"
 //     forever and the walker never fires.
 func DetectPython(pid uint32) *PythonInfo {
-	regions, _ := ParseProcMaps(pid)
+	regions, mapsErr := ParseProcMaps(pid)
 	if info := detectPythonFromRegions(regions); info != nil {
 		return info
 	}
-	return detectPythonFromProcExe(pid)
+	info := detectPythonFromProcExe(pid)
+	if info == nil {
+		// Temporary instrumentation to diagnose why the /proc/exe
+		// fallback isn't catching processes it should. Dumps the
+		// region count, maps error if any, and the readlink result.
+		target, linkErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		symDebugf("DetectPython: PID %d rejected — regions=%d mapsErr=%v exeTarget=%q linkErr=%v", pid, len(regions), mapsErr, target, linkErr)
+	}
+	return info
 }
 
 // detectPythonFromProcExe resolves /proc/<pid>/exe and runs the python
