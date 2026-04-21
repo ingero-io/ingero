@@ -119,12 +119,19 @@ static const struct py_frame *_unused_py_frame __attribute__((unused));
  *   [1] state_lookup_ok             (per-PID state found in py_runtime_map)
  *   [2] entered_312                 (3.12 variant entered)
  *   [3] read_interp_ok              (first read of interpreters_head succeeded)
- *   [4] read_threads_head_ok        (read of threads.head succeeded)
+ *   [4] read_threads_head_ok        (read of interp-0 threads.head succeeded)
  *   [5] thread_loop_iterations      (sum of iterations across all calls)
  *   [6] thread_match_found          (find_thread_state returned non-zero)
  *   [7] frame_loop_first_iteration  (entered the frame walk loop at least once)
  *   [8] depth_gt_zero               (walker returned with depth > 0)
- *   [9] read_first_native_tid       (read of first tstate's native_thread_id ok)
+ *   [9] read_first_native_tid       (read of interp-0's first tstate
+ *                                    native_thread_id ok; stays 0 if interp 0
+ *                                    has no threads — see slot 19 for a
+ *                                    version that covers any interpreter)
+ *   [19] read_any_native_tid        (read of the first non-null tstate's
+ *                                    native_thread_id succeeded, across any
+ *                                    interpreter; complements slot 9 when
+ *                                    interpreter 0 has zero threads)
  *   [29] unicode_non_compact_skipped (read_compact_ascii returned 0 because
  *                                    the target PyUnicodeObject is not a
  *                                    compact-ASCII string; emitted py_frame
@@ -239,11 +246,26 @@ static __always_inline __u64 find_thread_state(
 
 	__u64 first_tstate = 0;
 	int walked = 0;
+	/* Set to 1 when the outer loop exits normally via next==NULL. Stays
+	 * 0 if we hit PY_MAX_INTERPRETERS or bail via a read failure, which
+	 * means we may have missed the firing thread's interpreter. In that
+	 * case the walked==1 fallback below must NOT fire, because returning
+	 * interp-0's only tstate would silently mis-attribute frames to the
+	 * wrong interpreter. */
+	int saw_null_interp = 0;
+	/* Set after the first successful native_thread_id read on any
+	 * interpreter's first tstate. Distinct from slot 9 which is gated
+	 * on ii==0 — when interpreter 0 has an empty thread list, slot 9
+	 * never fires and operators can't tell observation from true zero.
+	 * Slot 19 covers that gap. */
+	int any_native_tid_ok = 0;
 
 	#pragma unroll(4)
 	for (int ii = 0; ii < PY_MAX_INTERPRETERS; ii++) {
-		if (interp == 0)
+		if (interp == 0) {
+			saw_null_interp = 1;
 			break;
+		}
 
 		/* threads.head -> first PyThreadState for this interpreter */
 		__u64 tstate = 0;
@@ -268,7 +290,11 @@ static __always_inline __u64 find_thread_state(
 			    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
 				break;
 			if (ii == 0 && i == 0)
-				py_debug_inc(9);  /* read_first_native_tid */
+				py_debug_inc(9);  /* read_first_native_tid (interp-0) */
+			if (i == 0 && !any_native_tid_ok) {
+				any_native_tid_ok = 1;
+				py_debug_inc(19);  /* read_any_native_tid */
+			}
 
 			if ((__u32)cur_tid == native_tid) {
 				py_debug_inc(6);  /* thread_match_found */
@@ -290,7 +316,10 @@ static __always_inline __u64 find_thread_state(
 		interp = next_interp;
 	}
 
-	if (walked == 1 && first_tstate != 0) {
+	/* Single-thread fallback: only safe when we observed the full
+	 * interpreter chain. If the outer loop was truncated, returning
+	 * first_tstate would mis-attribute frames. */
+	if (walked == 1 && first_tstate != 0 && saw_null_interp) {
 		py_debug_inc(18);  /* single_thread_fallback */
 		return first_tstate;
 	}

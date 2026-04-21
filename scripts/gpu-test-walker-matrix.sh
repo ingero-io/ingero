@@ -61,6 +61,15 @@ if [[ ! -f "$MANIFEST" ]]; then
     fail "manifest not found: $MANIFEST (run scripts/install-python-versions.sh first)"
     exit 2
 fi
+# Reject an empty manifest explicitly. `while read` over an empty file
+# produces zero iterations and the summary would show 0 PASS / 0 FAIL /
+# exit 0, which CI treats as a green run. Catching it here surfaces the
+# provisioning failure instead of silently claiming coverage we do not
+# have.
+if [[ ! -s "$MANIFEST" ]]; then
+    fail "manifest is empty: $MANIFEST (install-python-versions.sh did not populate any versions)"
+    exit 2
+fi
 if [[ ! -x "$INGERO_BIN" ]]; then
     fail "ingero binary not executable: $INGERO_BIN (run make build)"
     exit 2
@@ -69,6 +78,28 @@ if ! command -v jq >/dev/null 2>&1; then
     fail "jq required for JSON assertions"
     exit 2
 fi
+
+# wait_for_ingero_ready polls the ingero stderr log for the "probes
+# attached" marker emitted by trace.go once the CUDA tracer has
+# completed uprobe attach. A fixed `sleep 15` was previously used, but
+# startup time varies with host load and the number of libcudart inodes
+# in /proc/maps; if the sleep is too short the workload runs before the
+# ring-buffer reader is alive and the harness reports spurious failures.
+# Returns 0 when ready; returns 1 on timeout (caller decides whether to
+# fail or proceed). Poll interval 0.5s, default timeout 60s.
+wait_for_ingero_ready() {
+    local errlog=$1 timeout_s=${2:-60}
+    local waited=0
+    while (( waited < timeout_s * 2 )); do
+        if [[ -s "$errlog" ]] && grep -q 'probes attached' "$errlog" 2>/dev/null; then
+            log "  ingero ready after $(awk "BEGIN { printf \"%.1f\", $waited / 2 }")s"
+            return 0
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return 1
+}
 
 # Per-version runner -----------------------------------------------------
 
@@ -91,16 +122,24 @@ run_one_version() {
     # and kill -INT to it does not forward to the child; ingero keeps
     # running in the background holding the output FD, and by the time
     # we read $jsonl nothing has been flushed.
+    #
+    # Timeout budget: 90s gives headroom for startup (~15s on a cold
+    # host, more on busier ones) plus ~15s of workload runtime plus
+    # drain and counter-dump after SIGTERM. The previous 60s was tight
+    # enough that slow starts left the counter dump truncated, which
+    # masqueraded as walker regressions.
     sudo rm -f "$jsonl" "$errlog"
-    sudo timeout 60 "$INGERO_BIN" trace --py-walker=ebpf --json --debug \
+    sudo timeout 90 "$INGERO_BIN" trace --py-walker=ebpf --json --debug \
         >"$jsonl" 2>"$errlog" &
     local ing_pid=$!
-    # ingero startup (open ring buffers, attach uprobes to every
-    # discovered libcudart inode, load BPF objects, open session DB)
-    # takes ~12s on this host. Short sleeps here mean the workload
-    # runs and exits before ingero's event reader is alive; /proc
-    # then disappears before DetectPython can look at it.
-    sleep 15
+    # Wait for the "probes attached" readiness marker instead of a
+    # fixed sleep. Falls back to a short grace sleep on timeout so we
+    # still collect diagnostic output rather than racing with a broken
+    # startup.
+    if ! wait_for_ingero_ready "$errlog" 60; then
+        warn "$minor: ingero startup readiness marker not seen within 60s; proceeding anyway"
+        sleep 2
+    fi
 
     local preload=()
     [[ -n "$SYSTEM_CUDART" ]] && preload=("LD_PRELOAD=$SYSTEM_CUDART")
@@ -108,21 +147,36 @@ run_one_version() {
     # Run workload via env so LD_PRELOAD propagates without affecting
     # the invoking shell. The workload holds itself alive after the
     # cuda loop so ingero has time to call DetectPython on its PID
-    # before /proc disappears.
-    env "${preload[@]}" "$py" "$WORKLOAD" "$mode" 2 2>&1 | tail -4 || true
+    # before /proc disappears. Capture the workload PID so downstream
+    # jq filters can scope assertions to this run and not stray events
+    # from prior processes still present in the JSONL.
+    local workload_pid workload_tmp
+    workload_tmp=$(mktemp)
+    env "${preload[@]}" "$py" "$WORKLOAD" "$mode" 2 >"$workload_tmp" 2>&1 &
+    workload_pid=$!
+    wait "$workload_pid" 2>/dev/null || true
+    tail -4 "$workload_tmp" || true
+    rm -f "$workload_tmp"
 
-    # Let the 30s ingero timeout fire naturally so the ring buffer
-    # drains and the debug counter dump lands in the err log. Killing
-    # ingero early via `sudo kill -INT $ing_pid` did not work because
+    # Let the ingero timeout fire naturally so the ring buffer drains
+    # and the debug counter dump lands in the err log. Killing ingero
+    # early via `sudo kill -INT $ing_pid` did not work because
     # $ing_pid is the sudo process, not ingero, and SIGINT does not
     # propagate; the output file stayed empty.
     wait "$ing_pid" 2>/dev/null || true
 
     # --- Assertions ---
+    # jq stderr is routed into errlog (not /dev/null) so a truncated
+    # JSONL from an abnormal ingero exit surfaces as a real diagnostic
+    # rather than silently pushing cuda_events to 0 and blaming the
+    # uprobe path. py_funcs filters on the workload PID so any stray
+    # events from prior runs left in shared state cannot accidentally
+    # satisfy the chain assertion.
     local cuda_events py_funcs chain_hits
-    cuda_events=$(jq -c 'select(.source=="cuda")' "$jsonl" 2>/dev/null | wc -l)
-    py_funcs=$(jq -r 'select(.source=="cuda") | .stack[]? | select(.py_func) | .py_func' \
-                   "$jsonl" 2>/dev/null | sort -u)
+    cuda_events=$(jq -c 'select(.source=="cuda" and .pid == '"$workload_pid"')' \
+                      "$jsonl" 2>>"$errlog" | wc -l)
+    py_funcs=$(jq -r 'select(.source=="cuda" and .pid == '"$workload_pid"') | .stack[]? | select(.py_func) | .py_func' \
+                   "$jsonl" 2>>"$errlog" | sort -u)
     chain_hits=$(echo "$py_funcs" | grep -cE '^mx_(inner|middle|outer)$' || true)
 
     local entered_dispatcher have_py_set

@@ -310,6 +310,19 @@ struct py_runtime_state {
 	__u16 off_interp_next;               /* PyInterpreterState.next offset */
 };
 
+/*
+ * Size invariant: the Go-side pyRuntimeStateSize constant in
+ * internal/ebpf/pytrace/pytrace.go is 40, chosen to match the natural
+ * size of this struct (38 bytes used + 2 bytes trailing alignment
+ * padding since the struct's alignment is u64). Any future field
+ * addition that pushes past 40 must bump the Go side too, otherwise
+ * the BPF map value-size check rejects writes at runtime with an
+ * opaque "invalid argument" error. Failing the build here makes the
+ * mismatch loud.
+ */
+_Static_assert(sizeof(struct py_runtime_state) == 40,
+               "py_runtime_state size must match Go pyRuntimeStateSize (40)");
+
 /* Single Python frame extracted by the BPF walker. */
 struct py_frame {
 	char filename[128];

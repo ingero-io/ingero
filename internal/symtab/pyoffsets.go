@@ -284,6 +284,22 @@ func parseDebugOffsets(buf []byte, minor int) (*PyOffsets, error) {
 		return nil, fmt.Errorf("_Py_DebugOffsets sanity check failed for 3.%d: InterpTstateHead=%d TstateFrame=%d FrameCode=%d CodeFilename=%d UnicodeData=%d",
 			minor, offsets.InterpTstateHead, offsets.TstateFrame, offsets.FrameCode, offsets.CodeFilename, offsets.UnicodeData)
 	}
+	// Zero-value guard: every field below must be non-zero on every
+	// supported CPython layout. A torn read or a future debug-offsets
+	// table whose slot mapping is stale can land zero in a load-bearing
+	// offset, and the walker would then read from offset 0 of
+	// PyThreadState as if it were the frame pointer. FrameCode is
+	// intentionally NOT checked — on 3.13+ f_executable is the first
+	// field of _PyInterpreterFrame, so FrameCode == 0 is legitimate.
+	if offsets.InterpTstateHead == 0 || offsets.TstateFrame == 0 ||
+		offsets.CodeFilename == 0 || offsets.CodeName == 0 ||
+		offsets.UnicodeLength == 0 || offsets.UnicodeState == 0 ||
+		offsets.UnicodeData == 0 {
+		return nil, fmt.Errorf("_Py_DebugOffsets zero-field guard failed for 3.%d: InterpTstateHead=%d TstateFrame=%d CodeFilename=%d CodeName=%d UnicodeLength=%d UnicodeState=%d UnicodeData=%d",
+			minor, offsets.InterpTstateHead, offsets.TstateFrame,
+			offsets.CodeFilename, offsets.CodeName,
+			offsets.UnicodeLength, offsets.UnicodeState, offsets.UnicodeData)
+	}
 
 	symDebugf("_Py_DebugOffsets 3.%d parsed: RuntimeInterpretersHead=%d InterpTstateHead=%d TstateFrame=%d FrameBack=%d FrameCode=%d CodeFilename=%d CodeName=%d UnicodeData=%d",
 		minor,

@@ -125,6 +125,7 @@ func TestParseDebugOffsets_Valid314(t *testing.T) {
 		layout.runtimeInterpretersHead: 808,
 		layout.interpThreadsHead:       7344,
 		layout.tstateCurrentFrame:      72,
+		layout.tstateThreadID:          152,
 		layout.tstateNativeThreadID:    160,
 		layout.framePrevious:           8,
 		layout.frameExecutable:         0,
@@ -149,6 +150,9 @@ func TestParseDebugOffsets_Valid314(t *testing.T) {
 	}
 	if got.TstateFrame != 72 {
 		t.Errorf("TstateFrame = %d, want 72", got.TstateFrame)
+	}
+	if got.TstateThreadID != 152 {
+		t.Errorf("TstateThreadID = %d, want 152", got.TstateThreadID)
 	}
 	if got.FrameCode != 0 {
 		t.Errorf("FrameCode = %d, want 0", got.FrameCode)

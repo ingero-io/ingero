@@ -1878,18 +1878,30 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 	// Free-threaded (PEP 703, Py_GIL_DISABLED) builds add PyMutex fields
 	// to PyThreadState that the GIL-build offset tables don't account
 	// for, so the walker would emit garbage. Skip these processes
-	// entirely; the userspace walker picks them up on the fallback path.
-	// Marking the PID as "tried" in pyPushedPIDs (via the caller) keeps
-	// this a one-shot per-PID decision, not per-event.
+	// entirely. The userspace walker currently only supports GIL builds
+	// of 3.10/3.11/3.12 (see PyFrameWalker.IsSupportedVersion), so
+	// Python frames will be missing from cuda events on free-threaded
+	// 3.13/3.14 processes until either the BPF walker grows a
+	// free-threaded offset table or the userspace walker extends
+	// support. Marking the PID as "tried" in pyPushedPIDs (via the
+	// caller) keeps this a one-shot per-PID decision, not per-event.
 	if info.FreeThreaded {
-		slog.Info("py-walker: free-threaded Python build detected, skipping BPF walker — userspace walker will handle",
+		slog.Info("py-walker: free-threaded Python build detected — BPF walker skipped; Python frames will not be attached (userspace walker does not yet support free-threaded builds)",
 			"pid", pid, "python_version", info.Version, "lib_path", info.LibPath)
 		return
 	}
 
 	runtimeAddr, err := symtab.FindPyRuntimeAddr(pid, info)
 	if err != nil || runtimeAddr == 0 {
-		debugf("py-walker: _PyRuntime not found for PID %d: %v", pid, err)
+		// Transient failure: DetectPython succeeded (we know it's Python)
+		// but _PyRuntime did not resolve. The most common cause is a
+		// race where DetectPython's /proc/<pid>/exe fallback fires
+		// before the libpython PT_LOAD is mapped. Clear the dedup
+		// entry so a later event retries the push once /proc/maps
+		// stabilizes; otherwise the PID stays permanently marked
+		// false and the walker never engages.
+		debugf("py-walker: _PyRuntime not found for PID %d (transient — retrying on next event): %v", pid, err)
+		pyPushedPIDs.Delete(pid)
 		return
 	}
 

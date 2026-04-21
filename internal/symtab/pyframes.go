@@ -199,43 +199,19 @@ func FindPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 // it can never find _PyRuntime. We use FindSymbolByName() which searches
 // all symbol types.
 func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
-	// When ingero runs in a container, info.LibPath (from /proc/PID/maps) is
-	// in the target's mount namespace. Resolve via /proc/<pid>/root/ so we
-	// can open the ELF from our own namespace. On bare metal / shared mounts
-	// this is a no-op. The /proc/PID/maps match loop below continues to use
-	// info.LibPath unchanged — it compares against target-namespace strings.
-	elfPath := procpath.ResolveContainerPath(int(pid), info.LibPath)
-
-	// Look up _PyRuntime by name — searches STT_FUNC, STT_OBJECT, STT_NOTYPE.
-	symValue, pie, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
-	if !found {
-		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
-	}
-
-	// Parse /proc/[pid]/maps to find the library's base address.
-	// We use the first executable region for this path to compute
-	// the load address (base = region.Start - region.Offset).
+	// Parse /proc/[pid]/maps to locate the interpreter's executable region.
+	// We need the region FIRST so _PyRuntime is resolved against the ELF
+	// that actually backs it. When findPyRegion falls back (exact-path
+	// match failed, equivalence match won) the backing ELF may be a
+	// different file than info.LibPath — loader-early detection via
+	// /proc/<pid>/exe yields the python binary, while the stabilized maps
+	// show libpython.so. Applying the binary's symValue/baseVA to
+	// libpython's load addresses produces a plausibly-shaped but wrong
+	// runtime address and silent walker misbehavior.
 	regions, err := parseMapsFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return 0, err
 	}
-
-	// Address calculation for a matched region.
-	//
-	// Formula: addr = region.Start - region.Offset + sym.Value - baseVA
-	//
-	// Works uniformly for both PIE/shared libraries (ET_DYN, baseVA typically
-	// 0) and non-PIE executables (ET_EXEC, baseVA = the linker's virtual
-	// base, e.g. 0x400000 for a standard x86_64 ELF). For non-PIE the symbol
-	// value is already an absolute VA equal to its in-process address;
-	// subtracting baseVA cancels the region.Start contribution, yielding
-	// sym.Value directly. For PIE, baseVA is the prog.Vaddr-prog.Off of the
-	// first executable PT_LOAD (typically 0), so the formula resolves to
-	// load_base + sym_offset.
-	addrOf := func(r MapRegion) uint64 {
-		return r.Start - r.Offset + symValue - baseVA
-	}
-	_ = pie // kept for future PIE-specific logic if needed
 
 	region, exact, ok := findPyRegion(regions, info)
 	if !ok {
@@ -245,7 +221,30 @@ func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 		symDebugf("findPyRuntimeAddr: exact match on %q failed for PID %d; accepting equivalent region %q",
 			info.LibPath, pid, region.Path)
 	}
-	return addrOf(region), nil
+
+	// Resolve _PyRuntime from the ELF that actually backs the matched
+	// region, not from info.LibPath. On an exact match these are the
+	// same path. On a fallback match (different ELF / different inode),
+	// using info.LibPath's symbol values would be wrong.
+	//
+	// When ingero runs in a container, region.Path (from /proc/PID/maps)
+	// is in the target's mount namespace. Resolve via /proc/<pid>/root/
+	// so we can open the ELF from our own namespace. On bare metal /
+	// shared mounts this is a no-op.
+	elfPath := procpath.ResolveContainerPath(int(pid), region.Path)
+	symValue, _, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
+	if !found {
+		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
+	}
+
+	// Address calculation: addr = region.Start - region.Offset + sym.Value - baseVA.
+	// Works uniformly for PIE/shared libraries (ET_DYN, baseVA typically 0)
+	// and non-PIE executables (ET_EXEC, baseVA = the linker's virtual base,
+	// e.g. 0x400000 for a standard x86_64 ELF). For non-PIE the symbol value
+	// is already an absolute VA equal to its in-process address; subtracting
+	// baseVA cancels the region.Start contribution. For PIE, baseVA is the
+	// prog.Vaddr - prog.Off of the first executable PT_LOAD (typically 0).
+	return region.Start - region.Offset + symValue - baseVA, nil
 }
 
 // findPyRegion picks the /proc/pid/maps executable region that hosts
