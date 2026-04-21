@@ -1089,6 +1089,7 @@ func dumpPyDebugStats(maps []*ebpf.Map) {
 		"have_py_set",
 		"entered_pyextended_branch",
 		"reserved_pyextended",
+		"unicode_non_compact_skipped",
 	}
 	numCPU := runtime.NumCPU()
 	fmt.Fprintf(os.Stderr, "  py-walker debug counters (aggregated across %d cuda tracer(s)):\n", len(maps))

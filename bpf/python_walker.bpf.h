@@ -124,6 +124,10 @@ static const struct py_frame *_unused_py_frame __attribute__((unused));
  *   [7] frame_loop_first_iteration  (entered the frame walk loop at least once)
  *   [8] depth_gt_zero               (walker returned with depth > 0)
  *   [9] read_first_native_tid       (read of first tstate's native_thread_id ok)
+ *   [29] unicode_non_compact_skipped (read_compact_ascii returned 0 because
+ *                                    the target PyUnicodeObject is not a
+ *                                    compact-ASCII string; emitted py_frame
+ *                                    has an empty filename or funcname)
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -143,8 +147,13 @@ static __always_inline void py_debug_inc(__u32 slot) {
  *
  * We only support compact ASCII to keep the BPF program bounded:
  *   - Compact strings have inline data at unicode_addr + off_unicode_data.
- *   - Non-compact strings require a second pointer chase (skipped — dst
- *     will be an empty NUL string).
+ *   - Non-compact strings require a second pointer chase. Full support
+ *     means reading PyCompactUnicodeObject.utf8 (or PyUnicodeObject.data
+ *     on older layouts), which differs per CPython version and adds
+ *     verifier complexity we would rather not carry until there is a
+ *     concrete workload that needs it. For now the function increments
+ *     py_debug_stats[29] on rejection so operators can distinguish
+ *     "silently truncated because non-compact" from "walker bug".
  */
 static __always_inline int read_compact_ascii(
     void *dst, __u32 dst_size,
@@ -173,6 +182,7 @@ static __always_inline int read_compact_ascii(
 	__u32 mask = (1U << 5) | (1U << 6);
 	if ((state & mask) != mask) {
 		((char *)dst)[0] = 0;
+		py_debug_inc(29);  /* unicode_non_compact_skipped */
 		return 0;
 	}
 
