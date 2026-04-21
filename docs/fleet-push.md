@@ -132,6 +132,7 @@ Prometheus metrics. See its `main.go` doc comment for wire format.
 
 ## Minimum Fleet compatibility
 
+<!-- ingero-version:min-fleet-compat product=ingero-fleet channel=dev -->
 - Fleet `0.10.0-dev` (`builder-config.yaml` `dist.version`) and later.
 - The fleet-push contract (metric names, attribute names, header
   names) is stable; see `pkg/contract/contract.go` for the authoritative
