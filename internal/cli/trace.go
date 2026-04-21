@@ -2325,15 +2325,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			if eventStore != nil && len(chains) > 0 {
 				eventStore.RecordChains(chainsToStored(chains))
 			}
-			var d uint64
-			var dd string
-			if droppedFn != nil {
-				d = droppedFn()
-			}
-			if droppedDetailFn != nil {
-				dd = droppedDetailFn()
-			}
-			renderTable(snap, d, dd, &linesDrawn, true, corrs, chains)
+			renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 			return nil
 
 		case evt, ok := <-eventCh:
@@ -2353,15 +2345,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 				if eventStore != nil && len(chains) > 0 {
 					eventStore.RecordChains(chainsToStored(chains))
 				}
-				var d uint64
-			var dd string
-			if droppedFn != nil {
-				d = droppedFn()
-			}
-			if droppedDetailFn != nil {
-				dd = droppedDetailFn()
-			}
-			renderTable(snap, d, dd, &linesDrawn, true, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, true, corrs, chains)
 				return nil
 			}
 
@@ -2579,25 +2563,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 						eventStore.ExpireChains(2 * time.Minute)
 					}
 				}
-
-				var d uint64
-				var dd string
-				if droppedFn != nil {
-					d = droppedFn()
-				}
-				if droppedDetailFn != nil {
-					dd = droppedDetailFn()
-				}
-				renderTable(snap, d, dd, &linesDrawn, false, corrs, chains)
+				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, false, corrs, chains)
 			}
 
 		case <-debugTickerCh:
-			var d uint64
-			if droppedFn != nil {
-				d = droppedFn()
-			}
 			debugf("throughput: %d events in last 10s (%.0f/sec), total=%d, stored=%d, dropped=%d",
-				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents, storedEventCount, d)
+				debugEventCount, float64(debugEventCount)/10.0, collector.Snapshot().TotalEvents, storedEventCount, droppedFn())
 			debugEventCount = 0
 		}
 	}
