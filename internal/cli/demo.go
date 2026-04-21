@@ -261,10 +261,11 @@ func runSyntheticScenario(ctx context.Context, s *synth.Scenario, loop bool) err
 
 	var err error
 	demoCfg := &eventLoopConfig{Collector: collector}
+	noDetail := func() string { return "" }
 	if demoJSON {
 		err = runJSONMode(ctx, ch, demoCfg)
 	} else {
-		err = runTableMode(ctx, ch, demoCfg, 0, noDrops, nil, correlator)
+		err = runTableMode(ctx, ch, demoCfg, 0, noDrops, noDetail, correlator)
 	}
 
 	if !demoJSON {
@@ -500,10 +501,11 @@ func runGPUScenario(ctx context.Context, s *synth.Scenario) error {
 		Resolver:  resolver,
 		CUDAPIDs:  demoPIDFilter,
 	}
+	noDetail := func() string { return "" }
 	if demoJSON {
 		runJSONMode(workloadCtx, merged, workloadCfg, trackPID)
 	} else {
-		runTableMode(workloadCtx, merged, workloadCfg, uint32(targetPID), droppedFn, nil, corr, trackPID)
+		runTableMode(workloadCtx, merged, workloadCfg, uint32(targetPID), droppedFn, noDetail, corr, trackPID)
 	}
 
 	// Print insight after the table.
