@@ -9,7 +9,7 @@ import (
 
 // completionCmd generates shell completion scripts for bash, zsh, fish, and powershell.
 var completionCmd = &cobra.Command{
-	Use:   "completion [bash|zsh|fish|powershell]",
+	Use:   "completion [bash|zsh|fish]",
 	Short: "Generate completion script",
 	Long: fmt.Sprintf(`To load completions:
 
@@ -17,7 +17,7 @@ Bash:
 
   $ source <(%[1]s completion bash)
 
-  # To load completions for each session, add to your .bashrc:
+  # To load completions for every new session, run once:
   $ %[1]s completion bash > /etc/bash_completion.d/%[1]s
 
 Zsh:
@@ -27,28 +27,34 @@ Zsh:
 
   $ echo "autoload -U compinit; compinit" >> ~/.zshrc
 
-  # To load completions for each session, add to your .zshrc:
-  $ %[1]s completion zsh > "${fpath[1]}/_%[1]s"
+  # For the current user, run once:
+  $ mkdir -p ~/.zsh/completions
+  $ %[1]s completion zsh > ~/.zsh/completions/_%[1]s
+  $ echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc  
+
+  # For all users, run as root once:
+  # %[1]s completion zsh > /usr/local/share/zsh/site-functions/_%[1]s
 
 Fish:
 
   $ %[1]s completion fish | source
 
-  # To load completions for each session, add to your ~/.config/fish/config.fish:
+  # For the current user, run once:
+  $ mkdir -p ~/.config/fish/completions
   $ %[1]s completion fish > ~/.config/fish/completions/%[1]s.fish
 
-PowerShell:
+  # For all users, run as root once:
+  # %[1]s completion fish > /etc/fish/completions/%[1]s.fish
 
-  PS> %[1]s completion powershell | Out-String | Invoke-Expression
-
-  # To load completions for every new session, run:
-  PS> %[1]s completion powershell > %[1]s.ps1
-  # and source this file in your PowerShell profile.
 `, "ingero"),
 	DisableFlagsInUseLine: true,
-	ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
-	Args:                  cobra.ExactValidArgs(1),
+	ValidArgs:             []string{"bash", "zsh", "fish"},
+	Args:                  cobra.MatchAll(cobra.MaximumNArgs(1), cobra.OnlyValidArgs),
 	Run: func(cmd *cobra.Command, args []string) {
+		if len(args) == 0 {
+			cmd.Help()
+			return
+		}
 		switch args[0] {
 		case "bash":
 			cmd.Root().GenBashCompletion(os.Stdout)
@@ -56,8 +62,6 @@ PowerShell:
 			cmd.Root().GenZshCompletion(os.Stdout)
 		case "fish":
 			cmd.Root().GenFishCompletion(os.Stdout, true)
-		case "powershell":
-			cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
 		}
 	},
 }
