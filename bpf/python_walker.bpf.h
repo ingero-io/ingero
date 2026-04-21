@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * python_walker.bpf.h — inline CPython 3.10/3.11/3.12 frame walker for eBPF.
+ * python_walker.bpf.h — inline CPython 3.9..3.14 frame walker for eBPF.
  *
  * Single source of truth for the in-kernel Python frame walker. Included
  * by cuda_trace.bpf.c so the walker runs inline on the same probe that
  * emits the CUDA event — no tail call, no per-program map coordination.
  *
  * Version dispatch: walk_python_frames() reads py_runtime_state.python_minor
- * from the per-PID py_runtime_map and dispatches to one of three variants:
- *   - 3.10: PyThreadState.frame -> PyFrameObject*, walk via f_back/f_code.
- *   - 3.11: PyThreadState.cframe -> _PyCFrame*, then cframe->current_frame
- *           -> _PyInterpreterFrame*, walk via previous/executable.
- *   - 3.12: PyThreadState.current_frame -> _PyInterpreterFrame* directly.
+ * from the per-PID py_runtime_map and routes to one of three variants:
+ *   - 3.9/3.10: PyThreadState.frame -> PyFrameObject*, walk via f_back/f_code.
+ *   - 3.11:     PyThreadState.cframe -> _PyCFrame*, then cframe->current_frame
+ *               -> _PyInterpreterFrame*, walk via previous/f_code.
+ *   - 3.12:     PyThreadState.current_frame -> _PyInterpreterFrame* directly
+ *               (or via cframe on distro builds that retain indirection —
+ *                harvester-discovered off_cframe_current_frame selects).
+ *   - 3.13:     same as 3.12 direct (_PyCFrame dropped upstream).
+ *   - 3.14:     same frame layout as 3.13, but f_executable is a _PyStackRef
+ *               tagged union — the walker masks low 3 bits off code_ptr.
  * python_minor==0 (legacy 32-byte struct writers) is treated as 3.12 for
  * backward compatibility with pre-v2 clients.
  *
@@ -37,6 +42,18 @@
  *     will each get their own private py_runtime_map + py_scratch, or
  *     (b) use BPF map pinning / BPF_F_EXPORTED to share across programs.
  *
+ * Generator / coroutine frames: the walker handles these implicitly.
+ * _PyInterpreterFrame carries an `owner` byte distinguishing thread-
+ * allocated, generator-embedded, PyFrameObject-owned, and C-stack
+ * entry frames, but `owner` only describes who allocated the storage,
+ * not whether the frame is in the `tstate.current_frame -> previous`
+ * chain. A currently-executing generator or coroutine has its embedded
+ * frame linked into that chain exactly like a regular frame; only
+ * suspended generators are detached, and no cuda can fire from one by
+ * definition. So `async def inner(): await cudaop()` and generator
+ * `yield from` chains walk correctly without special-case code. See
+ * tests/workloads/async_cuda.py for the verification workload.
+ *
  * Verifier safety:
  *   - All loops are #pragma unroll with compile-time bounds.
  *   - Every bpf_probe_read_user return value is checked.
@@ -55,6 +72,7 @@
 #include "common.bpf.h"
 
 #define PY_MAX_THREADS 8
+#define PY_MAX_INTERPRETERS 4   /* bound the subinterpreter walk for the verifier */
 #define PY_STRING_MAX 127  /* leave 1 byte for NUL */
 
 /*
@@ -101,12 +119,23 @@ static const struct py_frame *_unused_py_frame __attribute__((unused));
  *   [1] state_lookup_ok             (per-PID state found in py_runtime_map)
  *   [2] entered_312                 (3.12 variant entered)
  *   [3] read_interp_ok              (first read of interpreters_head succeeded)
- *   [4] read_threads_head_ok        (read of threads.head succeeded)
+ *   [4] read_threads_head_ok        (read of interp-0 threads.head succeeded)
  *   [5] thread_loop_iterations      (sum of iterations across all calls)
  *   [6] thread_match_found          (find_thread_state returned non-zero)
  *   [7] frame_loop_first_iteration  (entered the frame walk loop at least once)
  *   [8] depth_gt_zero               (walker returned with depth > 0)
- *   [9] read_first_native_tid       (read of first tstate's native_thread_id ok)
+ *   [9] read_first_native_tid       (read of interp-0's first tstate
+ *                                    native_thread_id ok; stays 0 if interp 0
+ *                                    has no threads — see slot 19 for a
+ *                                    version that covers any interpreter)
+ *   [19] read_any_native_tid        (read of the first non-null tstate's
+ *                                    native_thread_id succeeded, across any
+ *                                    interpreter; complements slot 9 when
+ *                                    interpreter 0 has zero threads)
+ *   [29] unicode_non_compact_skipped (read_compact_ascii returned 0 because
+ *                                    the target PyUnicodeObject is not a
+ *                                    compact-ASCII string; emitted py_frame
+ *                                    has an empty filename or funcname)
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -126,8 +155,13 @@ static __always_inline void py_debug_inc(__u32 slot) {
  *
  * We only support compact ASCII to keep the BPF program bounded:
  *   - Compact strings have inline data at unicode_addr + off_unicode_data.
- *   - Non-compact strings require a second pointer chase (skipped — dst
- *     will be an empty NUL string).
+ *   - Non-compact strings require a second pointer chase. Full support
+ *     means reading PyCompactUnicodeObject.utf8 (or PyUnicodeObject.data
+ *     on older layouts), which differs per CPython version and adds
+ *     verifier complexity we would rather not carry until there is a
+ *     concrete workload that needs it. For now the function increments
+ *     py_debug_stats[29] on rejection so operators can distinguish
+ *     "silently truncated because non-compact" from "walker bug".
  */
 static __always_inline int read_compact_ascii(
     void *dst, __u32 dst_size,
@@ -156,6 +190,7 @@ static __always_inline int read_compact_ascii(
 	__u32 mask = (1U << 5) | (1U << 6);
 	if ((state & mask) != mask) {
 		((char *)dst)[0] = 0;
+		py_debug_inc(29);  /* unicode_non_compact_skipped */
 		return 0;
 	}
 
@@ -173,21 +208,29 @@ static __always_inline int read_compact_ascii(
 }
 
 /*
- * find_thread_state: walks the PyThreadState linked list to find one
- * matching the given native thread id. Returns the tstate address, or 0.
+ * find_thread_state: walks the PyInterpreterState chain, and within
+ * each interpreter the PyThreadState linked list, to find one matching
+ * the given native thread id. Returns the tstate address, or 0.
  *
- * Bounded by PY_MAX_THREADS — workloads with more Python threads than
- * that will miss frames for later threads (acceptable trade-off for
- * verifier safety).
+ * Subinterpreters (PEP 684): the outer loop iterates
+ * PyInterpreterState.next up to PY_MAX_INTERPRETERS. Single-interpreter
+ * processes see next==NULL on the second iteration and exit early, so
+ * there is no behavior change vs the prior single-interp implementation.
+ *
+ * Bounded by PY_MAX_THREADS per interpreter and PY_MAX_INTERPRETERS
+ * across interpreters. Workloads with more Python threads or
+ * subinterpreters than those bounds will miss frames for the overflow
+ * (acceptable trade-off for verifier safety).
  *
  * Single-thread fallback: on some builds (e.g., Ubuntu 22.04's patched
  * CPython 3.10) PyThreadState.native_thread_id is 0 for the main thread
  * because the interpreter never populates it for the thread that called
- * Py_Initialize(). When exactly one tstate exists and none matched the
- * kernel tid, we return that one tstate. For the common case of single-
- * threaded Python workloads this yields correct frames; multi-threaded
- * workloads with a genuinely-mismatched offset correctly return 0
- * (rather than returning a wrong thread's frames).
+ * Py_Initialize(). When the outer walk finishes without finding a
+ * native_tid match and exactly one tstate was observed across all
+ * interpreters, we fall back to that single tstate. For the common
+ * case of single-threaded single-interpreter Python workloads this
+ * yields correct frames; multi-threaded workloads with a
+ * genuinely-mismatched offset correctly return 0.
  */
 static __always_inline __u64 find_thread_state(
     __u32 native_tid, const struct py_runtime_state *st)
@@ -201,44 +244,82 @@ static __always_inline __u64 find_thread_state(
 	if (interp == 0)
 		return 0;
 
-	/* threads.head -> first PyThreadState */
-	__u64 tstate = 0;
-	if (bpf_probe_read_user(&tstate, sizeof(tstate),
-	    (const void *)(interp + st->off_tstate_head)) != 0)
-		return 0;
-	py_debug_inc(4);  /* read_threads_head_ok */
-
-	__u64 first_tstate = tstate;
+	__u64 first_tstate = 0;
 	int walked = 0;
+	/* Set to 1 when the outer loop exits normally via next==NULL. Stays
+	 * 0 if we hit PY_MAX_INTERPRETERS or bail via a read failure, which
+	 * means we may have missed the firing thread's interpreter. In that
+	 * case the walked==1 fallback below must NOT fire, because returning
+	 * interp-0's only tstate would silently mis-attribute frames to the
+	 * wrong interpreter. */
+	int saw_null_interp = 0;
+	/* Set after the first successful native_thread_id read on any
+	 * interpreter's first tstate. Distinct from slot 9 which is gated
+	 * on ii==0 — when interpreter 0 has an empty thread list, slot 9
+	 * never fires and operators can't tell observation from true zero.
+	 * Slot 19 covers that gap. */
+	int any_native_tid_ok = 0;
 
-	/* Walk thread list (bounded). */
-	#pragma unroll(8)
-	for (int i = 0; i < PY_MAX_THREADS; i++) {
-		if (tstate == 0)
+	#pragma unroll(4)
+	for (int ii = 0; ii < PY_MAX_INTERPRETERS; ii++) {
+		if (interp == 0) {
+			saw_null_interp = 1;
 			break;
-		walked++;
-		py_debug_inc(5);  /* thread_loop_iterations */
-
-		__u64 cur_tid = 0;
-		if (bpf_probe_read_user(&cur_tid, sizeof(cur_tid),
-		    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
-			break;
-		if (i == 0)
-			py_debug_inc(9);  /* read_first_native_tid */
-
-		if ((__u32)cur_tid == native_tid) {
-			py_debug_inc(6);  /* thread_match_found */
-			return tstate;
 		}
 
-		__u64 next = 0;
-		if (bpf_probe_read_user(&next, sizeof(next),
-		    (const void *)(tstate + st->off_tstate_next)) != 0)
+		/* threads.head -> first PyThreadState for this interpreter */
+		__u64 tstate = 0;
+		if (bpf_probe_read_user(&tstate, sizeof(tstate),
+		    (const void *)(interp + st->off_tstate_head)) != 0)
 			break;
-		tstate = next;
+		if (ii == 0)
+			py_debug_inc(4);  /* read_threads_head_ok (first interp only) */
+
+		/* Walk this interpreter's thread list (bounded). */
+		#pragma unroll(8)
+		for (int i = 0; i < PY_MAX_THREADS; i++) {
+			if (tstate == 0)
+				break;
+			if (first_tstate == 0)
+				first_tstate = tstate;
+			walked++;
+			py_debug_inc(5);  /* thread_loop_iterations */
+
+			__u64 cur_tid = 0;
+			if (bpf_probe_read_user(&cur_tid, sizeof(cur_tid),
+			    (const void *)(tstate + st->off_tstate_native_tid)) != 0)
+				break;
+			if (ii == 0 && i == 0)
+				py_debug_inc(9);  /* read_first_native_tid (interp-0) */
+			if (i == 0 && !any_native_tid_ok) {
+				any_native_tid_ok = 1;
+				py_debug_inc(19);  /* read_any_native_tid */
+			}
+
+			if ((__u32)cur_tid == native_tid) {
+				py_debug_inc(6);  /* thread_match_found */
+				return tstate;
+			}
+
+			__u64 next = 0;
+			if (bpf_probe_read_user(&next, sizeof(next),
+			    (const void *)(tstate + st->off_tstate_next)) != 0)
+				break;
+			tstate = next;
+		}
+
+		/* Advance to next PyInterpreterState; NULL exits the outer loop. */
+		__u64 next_interp = 0;
+		if (bpf_probe_read_user(&next_interp, sizeof(next_interp),
+		    (const void *)(interp + st->off_interp_next)) != 0)
+			break;
+		interp = next_interp;
 	}
 
-	if (walked == 1 && first_tstate != 0) {
+	/* Single-thread fallback: only safe when we observed the full
+	 * interpreter chain. If the outer loop was truncated, returning
+	 * first_tstate would mis-attribute frames. */
+	if (walked == 1 && first_tstate != 0 && saw_null_interp) {
 		py_debug_inc(18);  /* single_thread_fallback */
 		return first_tstate;
 	}
@@ -246,12 +327,16 @@ static __always_inline __u64 find_thread_state(
 }
 
 /*
- * walk_python_frames_312: CPython 3.12 frame walker.
+ * walk_python_frames_312: CPython 3.12/3.13/3.14 frame walker.
  *
- * In 3.12, PyThreadState.current_frame is a DIRECT _PyInterpreterFrame*
+ * Shared across 3.12, 3.13, and 3.14 because the frame-walk field layout
+ * is the same (f_executable at 0, previous at 8; only the surrounding
+ * struct sizes and per-version offsets in py_runtime_state differ). In
+ * 3.12+ PyThreadState.current_frame is a DIRECT _PyInterpreterFrame*
  * (no cframe indirection — that was 3.11's design). Each frame has:
- *   - .f_code     (PyCodeObject*, off_frame_code)
- *   - .previous   (walk pointer, off_frame_back)
+ *   - .f_code/.f_executable (PyCodeObject*, off_frame_code; 3.14 wraps
+ *     this in a _PyStackRef tagged-pointer union — see mask below)
+ *   - .previous             (walk pointer, off_frame_back)
  *
  * At uprobe time inside a C extension call (e.g. cudaMalloc), CPython
  * pushes a stack-allocated "entry frame stub" on top. The stub may have
@@ -260,6 +345,13 @@ static __always_inline __u64 find_thread_state(
  * to be a userspace heap pointer (>= 0x100000 and below the canonical
  * x86_64 user VA top) and walk .previous over stubs until we find a
  * real Python frame.
+ *
+ * _PyStackRef tag bits (3.14): 3.14 changed f_executable from a raw
+ * PyObject* to a _PyStackRef union whose low bits carry a tag
+ * (Py_TAG_REFCNT=1 in default GIL build, Py_INT_TAG=3 for tagged ints).
+ * Masking `code_ptr & ~0x7ULL` strips those tags. This is a safe no-op
+ * for 3.10–3.13 because PyCodeObject allocations are always 8-byte
+ * aligned, so the low 3 bits are already zero.
  *
  * Preconditions:
  *   - result is non-NULL and already zeroed (depth=0, truncated=0).
@@ -297,6 +389,12 @@ static __always_inline int walk_python_frames_312(
 		if (bpf_probe_read_user(&code_ptr, sizeof(code_ptr),
 		    (const void *)(frame + st->off_frame_code)) != 0)
 			break;
+
+		/* Strip _PyStackRef tag bits. See function doc: safe no-op on
+		 * 3.10–3.13, required on 3.14 where f_executable is a tagged
+		 * union. Must happen before the range check so a tagged-but-
+		 * valid pointer isn't skipped. */
+		code_ptr &= ~0x7ULL;
 
 		/* frame->previous (read before deciding so we can skip stubs). */
 		__u64 prev = 0;
@@ -601,17 +699,19 @@ static __always_inline int walk_python_frames(__u32 pid, __u32 native_tid,
 	if (minor == 0)
 		minor = 12;
 
-	/* CPython layout note: both 3.11 and 3.12 use the cframe indirection
-	 * (tstate.cframe -> _PyCFrame.current_frame -> _PyInterpreterFrame).
-	 * CPython 3.13+ dropped the cframe and made current_frame direct.
+	/* CPython layout recap:
+	 *   - 3.11 uses cframe indirection (tstate.cframe -> _PyCFrame.current_frame
+	 *     -> _PyInterpreterFrame). walker_311 handles the double chase.
+	 *   - 3.12 uses direct tstate.current_frame -> _PyInterpreterFrame (the
+	 *     cframe field still exists but isn't the walk entry point).
+	 *   - 3.13 dropped the _PyCFrame struct entirely; layout matches 3.12.
+	 *   - 3.14 same frame field order as 3.13, but f_executable is a tagged
+	 *     _PyStackRef union — walker_312 masks the tag bits.
 	 *
-	 * walker_311 handles the two-pointer-chase correctly; walker_312 was
-	 * previously (mis)configured for the direct layout and is kept for
-	 * 3.13+ use once we wire up a 3.13 dispatch path.
-	 *
-	 * Dispatch heuristic for 3.12+ uses off_cframe_current_frame: when
-	 * non-zero, use cframe indirection; when zero, assume direct access.
-	 * Userspace harvester sets this based on empirical runtime probing. */
+	 * The `off_cframe_current_frame > 0` escape hatch on case 12 below is a
+	 * safety net for distro-patched 3.12 builds that keep the cframe walk
+	 * path; normal 3.12 is forced to direct in userspace (trace.go) before
+	 * the state is pushed. */
 	switch (minor) {
 	case 9:
 		/* 3.9 uses the same legacy PyFrameObject layout as 3.10. */

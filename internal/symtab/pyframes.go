@@ -143,7 +143,9 @@ func (w *PyFrameWalker) getProcessState(pid uint32) (*pyProcessState, error) {
 		return nil, err
 	}
 
-	// Try _Py_DebugOffsets first (CPython 3.12+ — no DWARF needed).
+	// Try _Py_DebugOffsets first (CPython 3.13+ — no DWARF needed).
+	// readDebugOffsets returns nil, nil for pre-3.13 builds, so the
+	// fallback chain below picks up 3.10 / 3.11 / 3.12 unchanged.
 	var offsets *PyOffsets
 	debugOffsets, debugErr := readDebugOffsets(mem, runtimeAddr, info.Minor)
 	if debugErr != nil {
@@ -197,55 +199,87 @@ func FindPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
 // it can never find _PyRuntime. We use FindSymbolByName() which searches
 // all symbol types.
 func findPyRuntimeAddr(pid uint32, info *PythonInfo) (uint64, error) {
-	// When ingero runs in a container, info.LibPath (from /proc/PID/maps) is
-	// in the target's mount namespace. Resolve via /proc/<pid>/root/ so we
-	// can open the ELF from our own namespace. On bare metal / shared mounts
-	// this is a no-op. The /proc/PID/maps match loop below continues to use
-	// info.LibPath unchanged — it compares against target-namespace strings.
-	elfPath := procpath.ResolveContainerPath(int(pid), info.LibPath)
-
-	// Look up _PyRuntime by name — searches STT_FUNC, STT_OBJECT, STT_NOTYPE.
-	symValue, pie, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
-	if !found {
-		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
-	}
-
-	// Parse /proc/[pid]/maps to find the library's base address.
-	// We use the first executable region for this path to compute
-	// the load address (base = region.Start - region.Offset).
+	// Parse /proc/[pid]/maps to locate the interpreter's executable region.
+	// We need the region FIRST so _PyRuntime is resolved against the ELF
+	// that actually backs it. When findPyRegion falls back (exact-path
+	// match failed, equivalence match won) the backing ELF may be a
+	// different file than info.LibPath — loader-early detection via
+	// /proc/<pid>/exe yields the python binary, while the stabilized maps
+	// show libpython.so. Applying the binary's symValue/baseVA to
+	// libpython's load addresses produces a plausibly-shaped but wrong
+	// runtime address and silent walker misbehavior.
 	regions, err := parseMapsFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return 0, err
 	}
 
-	// Find the first region for this library path.
-	for i := range regions {
-		if regions[i].Path == info.LibPath {
-			// Calculate the runtime address in process memory.
-			//
-			// Formula: addr = region.Start - region.Offset + sym.Value - baseVA
-			//
-			// This works uniformly for both PIE/shared libraries (ET_DYN, baseVA
-			// typically 0) and non-PIE executables (ET_EXEC, baseVA = the
-			// linker's virtual base, e.g. 0x400000 for a standard x86_64 ELF).
-			//
-			// For non-PIE the symbol value is already an absolute VA equal to
-			// its in-process address (since the binary is loaded at its linked
-			// base). Subtracting baseVA cancels the region.Start contribution,
-			// yielding sym.Value directly. Without the subtract we'd compute
-			// region.Start + sym.Value = 2x the base, landing in unmapped
-			// memory between the binary's last segment and the heap.
-			//
-			// For PIE, baseVA is the prog.Vaddr-prog.Off of the first
-			// executable PT_LOAD, typically 0; region.Start holds the runtime
-			// load address, so the formula resolves to load_base + sym_offset.
-			addr := regions[i].Start - regions[i].Offset + symValue - baseVA
-			_ = pie // kept for future PIE-specific logic if needed
-			return addr, nil
-		}
+	region, exact, ok := findPyRegion(regions, info)
+	if !ok {
+		return 0, fmt.Errorf("library region not found for %s in PID %d", info.LibPath, pid)
+	}
+	if !exact {
+		symDebugf("findPyRuntimeAddr: exact match on %q failed for PID %d; accepting equivalent region %q",
+			info.LibPath, pid, region.Path)
 	}
 
-	return 0, fmt.Errorf("library region not found for %s in PID %d", info.LibPath, pid)
+	// Resolve _PyRuntime from the ELF that actually backs the matched
+	// region, not from info.LibPath. On an exact match these are the
+	// same path. On a fallback match (different ELF / different inode),
+	// using info.LibPath's symbol values would be wrong.
+	//
+	// When ingero runs in a container, region.Path (from /proc/PID/maps)
+	// is in the target's mount namespace. Resolve via /proc/<pid>/root/
+	// so we can open the ELF from our own namespace. On bare metal /
+	// shared mounts this is a no-op.
+	elfPath := procpath.ResolveContainerPath(int(pid), region.Path)
+	symValue, _, baseVA, found := FindSymbolByName(elfPath, "_PyRuntime")
+	if !found {
+		return 0, fmt.Errorf("_PyRuntime symbol not found in %s", elfPath)
+	}
+
+	// Address calculation: addr = region.Start - region.Offset + sym.Value - baseVA.
+	// Works uniformly for PIE/shared libraries (ET_DYN, baseVA typically 0)
+	// and non-PIE executables (ET_EXEC, baseVA = the linker's virtual base,
+	// e.g. 0x400000 for a standard x86_64 ELF). For non-PIE the symbol value
+	// is already an absolute VA equal to its in-process address; subtracting
+	// baseVA cancels the region.Start contribution. For PIE, baseVA is the
+	// prog.Vaddr - prog.Off of the first executable PT_LOAD (typically 0).
+	return region.Start - region.Offset + symValue - baseVA, nil
+}
+
+// findPyRegion picks the /proc/pid/maps executable region that hosts
+// the python interpreter described by info. It prefers an exact path
+// match against info.LibPath; if that fails, it accepts any region whose
+// path matches the same (3, info.Minor) version string. The second
+// return is true when the exact-path match won, false when the fallback
+// did; the third return is true when any region matched.
+//
+// The fallback exists because the exact-path match is occasionally
+// defeated by a path divergence between DetectPython's first /proc/maps
+// parse and the later parseMapsFile call in findPyRuntimeAddr — most
+// reliably seen with uv-distributed CPython 3.14 processes, where the
+// two scans disagree on the path string even though they're inspecting
+// the same process. Accepting an equivalent region keeps the walker
+// functional; the divergence itself is logged for later root-causing.
+func findPyRegion(regions []MapRegion, info *PythonInfo) (MapRegion, bool, bool) {
+	for i := range regions {
+		if regions[i].Path == info.LibPath {
+			return regions[i], true, true
+		}
+	}
+	for i := range regions {
+		m := pythonRe.FindStringSubmatch(regions[i].Path)
+		if m == nil {
+			continue
+		}
+		minor := 0
+		fmt.Sscanf(m[2], "%d", &minor)
+		if minor != info.Minor {
+			continue
+		}
+		return regions[i], false, true
+	}
+	return MapRegion{}, false, false
 }
 
 // findThreadState walks the PyThreadState linked list to find the one matching tid.

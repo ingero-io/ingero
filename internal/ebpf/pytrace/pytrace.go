@@ -29,13 +29,16 @@ import (
 )
 
 // PyRuntimeState mirrors `struct py_runtime_state` in bpf/common.bpf.h.
-// Layout: u64 + 12 * u16 + u8 + u8(pad) + u16 = 36 bytes total.
 // Field order MUST match C.
 //
 // The v2 fields (PythonMinor, OffCframeCurrentFrame) were appended for
-// multi-version support (3.10, 3.11, 3.12). When the walker reads
-// PythonMinor == 0 (legacy 32-byte write, treat as 3.12), it preserves
-// the original 3.12-only semantics. See bpf/python_walker.bpf.h.
+// multi-version support (3.10, 3.11, 3.12). The v3 field
+// (OffInterpNext) was appended for PEP 684 subinterpreter walking. All
+// appended fields default-zero for clients that haven't updated their
+// marshal size; the walker treats zero-valued OffInterpNext as "read
+// next at struct offset 0", which is correct on every supported
+// CPython version (PyInterpreterState.next is the first struct field
+// across 3.9..3.14).
 type PyRuntimeState struct {
 	RuntimeAddr                uint64 // address of _PyRuntime in target process
 	OffRuntimeInterpretersHead uint16
@@ -53,24 +56,24 @@ type PyRuntimeState struct {
 	PythonMinor                uint8  // 10, 11, or 12; 0 = legacy (walker treats as 12)
 	_                          uint8  // pad — not serialized directly (zero-filled by MarshalBinary)
 	OffCframeCurrentFrame      uint16 // _PyCFrame.current_frame offset (3.11 only)
+	OffInterpNext              uint16 // PyInterpreterState.next offset (0 on all supported versions)
 }
 
 // pyRuntimeStateSize is the marshaled size of PyRuntimeState in bytes.
 // The C struct's natural size on x86_64 is 40 bytes — clang aligns to
-// the largest member (u64 = 8 bytes), so the trailing u16 forces 4 bytes
-// of structure tail padding to round 36 up to a multiple of 8.
+// the largest member (u64 = 8 bytes). After the v3 append the tail
+// looks like:
 //
-// The BPF map's value size is fixed at compile time to sizeof(struct),
-// so the userspace write MUST be 40 bytes — a 36-byte write is rejected
-// by the kernel with "marshal value: []uint8 doesn't marshal to 40 bytes".
-//
-// Layout (40 bytes total):
-//   [0..8)   runtime_addr  u64
-//   [8..32)  12 × u16 offsets (interpreters_head ... unicode_data)
-//   [32]     python_minor  u8
-//   [33]     _pad3         u8
+//   [32]     python_minor            u8
+//   [33]     _pad3                   u8
 //   [34..36) off_cframe_current_frame u16
-//   [36..40) trailing struct alignment pad (zero-filled)
+//   [36..38) off_interp_next         u16  (v3, new)
+//   [38..40) struct alignment pad    (zero-filled)
+//
+// Total stays at 40 bytes because the new u16 fits inside the trailing
+// alignment padding of the v2 layout. The BPF map's value size is
+// sizeof(struct py_runtime_state) = 40, so no BPF-side size change is
+// needed; bpf2go picks up the new field via BTF on the next regen.
 const pyRuntimeStateSize = 40
 
 // MarshalBinary serializes the struct to little-endian bytes for writing
@@ -95,6 +98,8 @@ func (s *PyRuntimeState) MarshalBinary() ([]byte, error) {
 	buf[32] = s.PythonMinor
 	buf[33] = 0 // explicit pad byte — make() already zero-filled, but be explicit
 	binary.LittleEndian.PutUint16(buf[34:36], s.OffCframeCurrentFrame)
+	// v3 field (appended for PEP 684 subinterpreter walking).
+	binary.LittleEndian.PutUint16(buf[36:38], s.OffInterpNext)
 	return buf, nil
 }
 

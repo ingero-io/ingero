@@ -300,7 +300,28 @@ struct py_runtime_state {
 	__u8  python_minor;                  /* 10, 11, or 12; 0 = legacy caller, treat as 12 */
 	__u8  _pad3;
 	__u16 off_cframe_current_frame;      /* _PyCFrame.current_frame offset (3.11 only; 0 for others) */
+	/* v3 field — appended for PEP 684 subinterpreter support.
+	 * PyInterpreterState.next is the first field of struct _is across
+	 * 3.9..3.14, so the value is 0 on every supported version. The
+	 * walker reads at this offset inside an outer loop bounded by
+	 * PY_MAX_INTERPRETERS; single-interpreter processes see next==NULL
+	 * on the second iteration and exit the loop with identical behavior
+	 * to the legacy single-interpreter path. */
+	__u16 off_interp_next;               /* PyInterpreterState.next offset */
 };
+
+/*
+ * Size invariant: the Go-side pyRuntimeStateSize constant in
+ * internal/ebpf/pytrace/pytrace.go is 40, chosen to match the natural
+ * size of this struct (38 bytes used + 2 bytes trailing alignment
+ * padding since the struct's alignment is u64). Any future field
+ * addition that pushes past 40 must bump the Go side too, otherwise
+ * the BPF map value-size check rejects writes at runtime with an
+ * opaque "invalid argument" error. Failing the build here makes the
+ * mismatch loud.
+ */
+_Static_assert(sizeof(struct py_runtime_state) == 40,
+               "py_runtime_state size must match Go pyRuntimeStateSize (40)");
 
 /* Single Python frame extracted by the BPF walker. */
 struct py_frame {
