@@ -9,11 +9,12 @@ import (
 
 // PythonInfo describes a CPython interpreter found in a process.
 type PythonInfo struct {
-	Version    string // e.g., "3.10", "3.11", "3.12"
-	Major      int    // 3
-	Minor      int    // 10, 11, 12
-	LibPath    string // path to libpython3.X.so or python3.X binary
-	RuntimeAddr uint64 // address of _PyRuntime symbol (0 if not found)
+	Version      string // e.g., "3.10", "3.11", "3.12"
+	Major        int    // 3
+	Minor        int    // 10, 11, 12
+	LibPath      string // path to libpython3.X.so or python3.X binary
+	RuntimeAddr  uint64 // address of _PyRuntime symbol (0 if not found)
+	FreeThreaded bool   // true for Py_GIL_DISABLED builds (python3.Xt / libpython3.Xt.so.*)
 }
 
 // pythonRe matches libpython or python binary paths in /proc/maps.
@@ -23,6 +24,17 @@ type PythonInfo struct {
 //	/usr/bin/python3.12
 //	/home/user/miniconda3/lib/libpython3.11.so.1.0
 var pythonRe = regexp.MustCompile(`(?:lib)?python(3)\.(\d+)`)
+
+// freeThreadedRe matches the `t` suffix CPython uses on Py_GIL_DISABLED
+// builds (PEP 703). Matches on the basename so a "t" that happens to
+// appear elsewhere in a directory path doesn't trigger a false
+// positive. Examples:
+//
+//	/opt/venv/bin/python3.13t                        -> match
+//	/usr/lib/x86_64-linux-gnu/libpython3.14t.so.1.0  -> match
+//	/usr/bin/python3.13                              -> no match (GIL build)
+//	/tmp/gated/python3.13                            -> no match (the t is in the dir)
+var freeThreadedRe = regexp.MustCompile(`(?:lib)?python3\.\d+t(?:\.|$)`)
 
 // DetectPython checks if a process has CPython loaded. Returns nil if
 // no Python interpreter is found.
@@ -77,10 +89,11 @@ func detectPythonFromExeTarget(exeTarget string) *PythonInfo {
 	minor := 0
 	fmt.Sscanf(m[2], "%d", &minor)
 	return &PythonInfo{
-		Version: fmt.Sprintf("%d.%d", major, minor),
-		Major:   major,
-		Minor:   minor,
-		LibPath: exeTarget,
+		Version:      fmt.Sprintf("%d.%d", major, minor),
+		Major:        major,
+		Minor:        minor,
+		LibPath:      exeTarget,
+		FreeThreaded: detectFreeThreadedFromPath(exeTarget),
 	}
 }
 
@@ -109,10 +122,11 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 		isLib := strings.Contains(r.Path, "libpython")
 
 		info := &PythonInfo{
-			Version: fmt.Sprintf("%d.%d", major, minor),
-			Major:   major,
-			Minor:   minor,
-			LibPath: r.Path,
+			Version:      fmt.Sprintf("%d.%d", major, minor),
+			Major:        major,
+			Minor:        minor,
+			LibPath:      r.Path,
+			FreeThreaded: detectFreeThreadedFromPath(r.Path),
 		}
 
 		if isLib {
@@ -126,6 +140,17 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 	}
 
 	return fallback
+}
+
+// detectFreeThreadedFromPath reports whether path looks like a
+// Py_GIL_DISABLED (PEP 703) build. CPython 3.13+ distributes these as
+// python3.Xt / libpython3.Xt.so.* alongside the default GIL build;
+// PyThreadState has additional PyMutex fields on free-threaded builds
+// so the walker's GIL-build offset tables produce garbage there. The
+// caller uses this flag to skip walker state push entirely on
+// free-threaded processes, punting to the userspace walker.
+func detectFreeThreadedFromPath(path string) bool {
+	return freeThreadedRe.MatchString(path)
 }
 
 // IsSupportedVersion returns true if we have hardcoded offsets for this version.

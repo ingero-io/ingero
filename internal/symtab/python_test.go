@@ -118,6 +118,54 @@ func TestDetectPythonFromRegions_BinaryBeforeLibpython(t *testing.T) {
 	}
 }
 
+func TestDetectFreeThreadedFromPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"plain 3.13 binary", "/usr/bin/python3.13", false},
+		{"plain 3.14 binary", "/usr/bin/python3.14", false},
+		{"free-threaded 3.13 binary", "/opt/venv/bin/python3.13t", true},
+		{"free-threaded 3.14 binary", "/usr/bin/python3.14t", true},
+		{"free-threaded libpython 3.13", "/usr/lib/x86_64-linux-gnu/libpython3.13t.so.1.0", true},
+		{"free-threaded libpython 3.14", "/usr/lib/libpython3.14t.so", true},
+		{"plain libpython 3.13", "/usr/lib/libpython3.13.so.1.0", false},
+		{"stray t in directory only", "/tmp/gated/python3.13", false},
+		{"stray t at binary name end but not after digits", "/usr/bin/pythont3.13", false},
+		{"future 3.15 free-threaded", "/usr/bin/python3.15t", true},
+		{"non-python path", "/usr/bin/bash", false},
+		{"empty path", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectFreeThreadedFromPath(tt.path); got != tt.want {
+				t.Errorf("detectFreeThreadedFromPath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectPythonFromExeTarget_FreeThreadedFlag(t *testing.T) {
+	// When the exe target is a free-threaded build, the returned
+	// PythonInfo should have FreeThreaded=true so the caller can skip
+	// the BPF walker.
+	info := detectPythonFromExeTarget("/opt/venv/bin/python3.13t")
+	if info == nil {
+		t.Fatal("expected non-nil info for python3.13t")
+	}
+	if !info.FreeThreaded {
+		t.Error("expected FreeThreaded=true for python3.13t")
+	}
+	if info.Minor != 13 {
+		t.Errorf("Minor = %d, want 13", info.Minor)
+	}
+	plain := detectPythonFromExeTarget("/usr/bin/python3.13")
+	if plain == nil || plain.FreeThreaded {
+		t.Errorf("plain 3.13 should not be free-threaded: %+v", plain)
+	}
+}
+
 func TestDetectPythonFromExeTarget(t *testing.T) {
 	tests := []struct {
 		name     string

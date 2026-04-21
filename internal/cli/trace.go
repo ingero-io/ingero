@@ -1874,6 +1874,17 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 		debugf("py-walker: PID %d is Python %s (python_minor %d) not supported by BPF walker (only 3.9-3.14); userspace walker will handle", pid, info.Version, info.Minor)
 		return
 	}
+	// Free-threaded (PEP 703, Py_GIL_DISABLED) builds add PyMutex fields
+	// to PyThreadState that the GIL-build offset tables don't account
+	// for, so the walker would emit garbage. Skip these processes
+	// entirely; the userspace walker picks them up on the fallback path.
+	// Marking the PID as "tried" in pyPushedPIDs (via the caller) keeps
+	// this a one-shot per-PID decision, not per-event.
+	if info.FreeThreaded {
+		slog.Info("py-walker: free-threaded Python build detected, skipping BPF walker — userspace walker will handle",
+			"pid", pid, "python_version", info.Version, "lib_path", info.LibPath)
+		return
+	}
 
 	runtimeAddr, err := symtab.FindPyRuntimeAddr(pid, info)
 	if err != nil || runtimeAddr == 0 {
