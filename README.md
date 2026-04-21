@@ -18,6 +18,7 @@
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
 [mcpservers.org](https://mcpservers.org)
 
+<!-- ingero-version:install-header product=ingero channel=stable -->
 **Version: 0.9.2**
 
 **v0.9.2 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
@@ -34,7 +35,8 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 ```bash
 # Install (Linux amd64 — see below for arm64/Docker)
-VERSION=0.9.1
+# ingero-version:install-curl product=ingero channel=stable
+VERSION=0.9.2
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
@@ -192,12 +194,14 @@ Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. R
 
 ```bash
 # Linux amd64
-VERSION=0.9.1
+# ingero-version:install-archive-amd64 product=ingero channel=stable
+VERSION=0.9.2
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
-VERSION=0.9.1
+# ingero-version:install-archive-arm64 product=ingero channel=stable
+VERSION=0.9.2
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -211,7 +215,8 @@ Multi-arch images (amd64 + arm64) are published to GHCR on every release:
 docker pull ghcr.io/ingero-io/ingero:latest
 
 # Or pin to a specific version
-docker pull ghcr.io/ingero-io/ingero:v0.9.1
+# ingero-version:docker-pull-example product=ingero channel=stable
+docker pull ghcr.io/ingero-io/ingero:v0.9.2
 
 # Quick test (no root, no GPU needed)
 docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
@@ -261,8 +266,9 @@ docker run --rm \
 The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building the dev Dockerfile locally, pass version info via build args:
 
 ```bash
+# ingero-version:docker-build-arg product=ingero channel=stable
 docker build -f deploy/docker/Dockerfile \
-  --build-arg VERSION=0.9.1 \
+  --build-arg VERSION=0.9.2 \
   --build-arg COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
   -t ingero:local .
