@@ -2,8 +2,8 @@ apiVersion: v2
 name: ingero
 description: eBPF-based GPU causal observability agent
 type: application
-version: 0.8.0
-appVersion: "0.8.0"
+version: 0.10.0
+appVersion: "0.10.0"
 keywords:
   - gpu
   - ebpf
