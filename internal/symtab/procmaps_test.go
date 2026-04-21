@@ -1,19 +1,21 @@
 package symtab
 
 import (
+	"regexp"
 	"testing"
 )
 
 func TestParseMapsLine(t *testing.T) {
 	tests := []struct {
-		name     string
-		line     string
-		wantOK   bool
-		wantPath string
-		wantExec bool
+		name      string
+		line      string
+		wantOK    bool
+		wantPath  string
+		wantExec  bool
 		wantStart uint64
 		wantEnd   uint64
 		wantOff   uint64
+		wantInode uint64
 	}{
 		{
 			name:      "executable region with path",
@@ -24,6 +26,7 @@ func TestParseMapsLine(t *testing.T) {
 			wantStart: 0x7f1234000000,
 			wantEnd:   0x7f1234100000,
 			wantOff:   0x1000,
+			wantInode: 12345,
 		},
 		{
 			name:      "read-write region",
@@ -96,7 +99,83 @@ func TestParseMapsLine(t *testing.T) {
 			if tt.wantOff != 0 && r.Offset != tt.wantOff {
 				t.Errorf("Offset = 0x%x, want 0x%x", r.Offset, tt.wantOff)
 			}
+			if tt.wantInode != 0 && r.Inode != tt.wantInode {
+				t.Errorf("Inode = %d, want %d", r.Inode, tt.wantInode)
+			}
 		})
+	}
+}
+
+func TestUniqueFilesMatching(t *testing.T) {
+	libcudartRe := regexp.MustCompile(`libcudart\.so`)
+
+	tests := []struct {
+		name    string
+		regions []MapRegion
+		want    []string // expected paths, in order
+	}{
+		{
+			name: "three segments of same library dedup to one",
+			regions: []MapRegion{
+				{Path: "/usr/lib/libcudart.so.12", Inode: 100, Perms: "r--p"},
+				{Path: "/usr/lib/libcudart.so.12", Inode: 100, Perms: "r-xp"},
+				{Path: "/usr/lib/libcudart.so.12", Inode: 100, Perms: "rw-p"},
+			},
+			want: []string{"/usr/lib/libcudart.so.12"},
+		},
+		{
+			name: "two venvs with same path but different inodes yield two entries",
+			regions: []MapRegion{
+				{Path: "/opt/venv/nvidia/cu13/lib/libcudart.so.12", Inode: 100, Perms: "r-xp"},
+				{Path: "/opt/venv/nvidia/cu13/lib/libcudart.so.12", Inode: 200, Perms: "r-xp"},
+			},
+			want: []string{
+				"/opt/venv/nvidia/cu13/lib/libcudart.so.12",
+				"/opt/venv/nvidia/cu13/lib/libcudart.so.12",
+			},
+		},
+		{
+			name: "anonymous and non-matching regions are skipped",
+			regions: []MapRegion{
+				{Path: "", Inode: 0},
+				{Path: "[stack]", Inode: 0},
+				{Path: "/lib/libc.so.6", Inode: 300, Perms: "r-xp"},
+				{Path: "/usr/lib/libcudart.so.12", Inode: 100, Perms: "r-xp"},
+			},
+			want: []string{"/usr/lib/libcudart.so.12"},
+		},
+		{
+			name: "inode=0 path is rejected even when name matches",
+			regions: []MapRegion{
+				{Path: "/tmp/libcudart.so", Inode: 0},
+			},
+			want: nil,
+		},
+		{
+			name:    "empty input",
+			regions: nil,
+			want:    nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UniqueFilesMatching(tt.regions, libcudartRe)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d regions, want %d: %+v", len(got), len(tt.want), got)
+			}
+			for i := range tt.want {
+				if got[i].Path != tt.want[i] {
+					t.Errorf("got[%d].Path = %q, want %q", i, got[i].Path, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestUniqueFilesMatching_NilPattern(t *testing.T) {
+	regions := []MapRegion{{Path: "/lib/libcudart.so", Inode: 1}}
+	if got := UniqueFilesMatching(regions, nil); got != nil {
+		t.Errorf("nil pattern should return nil, got %+v", got)
 	}
 }
 
