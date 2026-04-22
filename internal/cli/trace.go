@@ -1083,8 +1083,12 @@ func dumpPyDebugStats(maps []*ebpf.Map) {
 		"311_loop_code_read_ok",
 		"311_loop_code_nonzero",
 		"single_thread_fallback",
-		"_unused_19", "_unused_20", "_unused_21",
-		"_unused_22", "_unused_23", "_unused_24",
+		"read_any_native_tid",
+		"walker_310_entered",
+		"walker_310_frame_nonzero",
+		"walker_310_code_read_ok",
+		"walker_310_code_nonzero",
+		"walker_310_emitted_frames",
 		"scratch_lookup_ok",
 		"have_py_set",
 		"entered_pyextended_branch",
@@ -1939,16 +1943,18 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 		return
 	}
 
-	// Overlay runtime harvester (most authoritative for the offsets it
-	// discovers), but only for 3.10/3.11/3.12. The harvester's frame-
-	// walking heuristics were written against 3.12's _PyInterpreterFrame
-	// layout (f_executable at offset 0). 3.13 moved f_executable to
-	// offset 32 and reshuffled other fields, so the harvester emits
-	// plausibly-valid but wrong offsets (TstateFrame, FrameCode,
-	// FrameBack) that overlay the hardcoded 3.13 table and break the
-	// walker. For 3.13+ we rely on the hardcoded table (and, once
-	// implemented, _Py_DebugOffsets from the running process).
-	if info.Minor <= 12 {
+	// Overlay runtime harvester, but only for 3.11. The harvester's
+	// frame-walking heuristics were written against 3.12's
+	// _PyInterpreterFrame layout; on uv-distributed CPython 3.11.15 /
+	// 3.12.13 the pointer-chasing scans match plausibly-valid but wrong
+	// offsets (e.g., TstateFrame=240 on 3.12 where the real value is
+	// 56, InterpTstateHead=1048 where the real value is 16). The bad
+	// overlay then overwrites now-correct hardcoded tables and the
+	// walker emits empty py_func strings. 3.10 has distro-invariant
+	// offsets and does not need the harvester. 3.12 is covered by the
+	// hardcoded table. 3.13+ uses _Py_DebugOffsets. Only 3.11 still
+	// benefits from the harvester.
+	if info.Minor == 11 {
 		if harvested, hErr := symtab.HarvestOffsets(info.LibPath, int(pid)); hErr != nil {
 			debugf("py-walker: harvester subprocess failed for PID %d (%s): %v (using fallback offsets)", pid, info.LibPath, hErr)
 		} else if harvested != nil {

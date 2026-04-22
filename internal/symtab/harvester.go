@@ -314,8 +314,24 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 		return nil, fmt.Errorf("running harvester via %s: %w", effectiveBinary, err)
 	}
 
+	return parseHarvesterOutput(out), nil
+}
+
+// parseHarvesterOutput parses KEY=value lines emitted by the harvester
+// subprocess and returns the discovered offsets. Extracted from
+// HarvestOffsets so tests can exercise the parse + sanity-cap logic
+// without spawning a Python subprocess.
+func parseHarvesterOutput(out []byte) *HarvestedOffsets {
 	result := &HarvestedOffsets{}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	// Sanity caps on numeric offsets: the harvester's pointer-chasing
+	// heuristics can match plausibly-valid but wrong offsets on certain
+	// CPython builds (seen on uv-distributed 3.11.15 / 3.12.13 where
+	// TstateFrame returned 240 against a true value of 56, and
+	// InterpTstateHead returned 1048 against a true value of 16).
+	// Values above the caps are dropped so the fallback table survives
+	// the overlay. Caps are generous, picked from struct sizes plus
+	// headroom; fields within cap are trusted.
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		k, v, ok := strings.Cut(line, "=")
@@ -328,7 +344,7 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 				result.PyMinor = &n
 			}
 		case "TstateNativeThreadID":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 512 {
 				result.TstateNativeThreadID = &n
 			}
 		case "TstateNext":
@@ -336,11 +352,11 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 				result.TstateNext = &n
 			}
 		case "InterpTstateHead":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 1024 {
 				result.InterpTstateHead = &n
 			}
 		case "TstateFrame":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 256 {
 				result.TstateFrame = &n
 			}
 		case "OffCframeCurrentFrame":
@@ -352,7 +368,7 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 				result.FrameBack = &n
 			}
 		case "FrameCode":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 512 {
 				result.FrameCode = &n
 			}
 		case "CodeFilename":
@@ -364,7 +380,7 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 				result.CodeName = &n
 			}
 		case "CodeFirstLineNo":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 256 {
 				result.CodeFirstLineNo = &n
 			}
 		case "UnicodeLength":
@@ -381,7 +397,7 @@ func HarvestOffsets(pythonBinary string, pid int) (*HarvestedOffsets, error) {
 			}
 		}
 	}
-	return result, nil
+	return result
 }
 
 // Overlay copies harvested offsets onto an existing PyOffsets table,
