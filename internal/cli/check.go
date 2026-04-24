@@ -49,6 +49,9 @@ and running GPU processes. Reports what Ingero can trace and what's missing.`,
 			if r.Detail != "" {
 				fmt.Printf("      %s\n", r.Detail)
 			}
+			if !r.OK && r.Recommendation != "" {
+				fmt.Printf("      Recommendation: %s\n", r.Recommendation)
+			}
 		}
 
 		debugf("check: %d checks completed, all_ok=%v", len(results), allOK)
@@ -72,22 +75,24 @@ func init() {
 // checkOutputJSON renders system check results as JSON.
 func checkOutputJSON(results []discover.CheckResult) error {
 	type jsonCheck struct {
-		Name     string `json:"name"`
-		Pass     bool   `json:"pass"`
-		Optional bool   `json:"optional,omitempty"`
-		Value    string `json:"value,omitempty"`
-		Detail   string `json:"detail,omitempty"`
+		Name           string `json:"name"`
+		Pass           bool   `json:"pass"`
+		Optional       bool   `json:"optional,omitempty"`
+		Value          string `json:"value,omitempty"`
+		Detail         string `json:"detail,omitempty"`
+		Recommendation string `json:"recommendation,omitempty"`
 	}
 
 	allOK := true
 	items := make([]jsonCheck, len(results))
 	for i, r := range results {
 		items[i] = jsonCheck{
-			Name:     r.Name,
-			Pass:     r.OK,
-			Optional: r.Optional,
-			Value:    r.Value,
-			Detail:   r.Detail,
+			Name:           r.Name,
+			Pass:           r.OK,
+			Optional:       r.Optional,
+			Value:          r.Value,
+			Detail:         r.Detail,
+			Recommendation: r.Recommendation,
 		}
 		if !r.OK && !r.Optional {
 			allOK = false
@@ -96,10 +101,10 @@ func checkOutputJSON(results []discover.CheckResult) error {
 
 	output := struct {
 		AllPassed bool        `json:"all_passed"`
-		Checks   []jsonCheck `json:"checks"`
+		Checks    []jsonCheck `json:"checks"`
 	}{
 		AllPassed: allOK,
-		Checks:   items,
+		Checks:    items,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
