@@ -13,11 +13,12 @@ import (
 
 // CheckResult represents the outcome of a single system readiness check.
 type CheckResult struct {
-	Name     string // What we checked (e.g., "Kernel version")
-	OK       bool   // Whether the check passed
-	Optional bool   // If true, failure is informational (not a blocker)
-	Value    string // What we found (e.g., "5.15.0-generic")
-	Detail   string // Extra context (e.g., "need 5.15+, got 5.15.0")
+	Name           string // What we checked (e.g., "Kernel version")
+	OK             bool   // Whether the check passed
+	Optional       bool   // If true, failure is informational (not a blocker)
+	Value          string // What we found (e.g., "5.15.0-generic")
+	Detail         string // Extra context (e.g., "need 5.15+, got 5.15.0")
+	Recommendation string // How to fix if not OK (e.g., "Upgrade kernel to 5.15+")
 }
 
 // KernelVersion returns the running kernel version string via uname(2).
@@ -69,19 +70,21 @@ func CheckKernel() CheckResult {
 	version, err := KernelVersion()
 	if err != nil {
 		return CheckResult{
-			Name:   "Kernel version",
-			OK:     false,
-			Detail: fmt.Sprintf("failed to read: %v", err),
+			Name:           "Kernel version",
+			OK:             false,
+			Detail:         fmt.Sprintf("failed to read: %v", err),
+			Recommendation: "Upgrade kernel to 5.15+",
 		}
 	}
 
 	major, minor, err := ParseKernelMajorMinor(version)
 	if err != nil {
 		return CheckResult{
-			Name:   "Kernel version",
-			OK:     false,
-			Value:  version,
-			Detail: fmt.Sprintf("failed to parse: %v", err),
+			Name:           "Kernel version",
+			OK:             false,
+			Value:          version,
+			Detail:         fmt.Sprintf("failed to parse: %v", err),
+			Recommendation: "Upgrade kernel to 5.15+",
 		}
 	}
 
@@ -96,19 +99,43 @@ func CheckKernel() CheckResult {
 		OK:     ok,
 		Value:  version,
 		Detail: detail,
+		Recommendation: func() string {
+			if !ok {
+				return "Upgrade kernel to 5.15+ (see your distro's kernel upgrade docs)"
+			}
+			return ""
+		}(),
 	}
 }
 
 // CheckBTF verifies that BTF (BPF Type Format) is available at /sys/kernel/btf/vmlinux.
 // Required for CO-RE: compile once, load on any kernel 5.15+.
-func CheckBTF() CheckResult {
+func btfRecommendationForPackageManager(pm string) string {
+	recommendation := "Install kernel debug symbols for BTF support (package name varies by distro)"
+	switch pm {
+	case "apt":
+		return "Install linux-tools for the running kernel using `sudo apt install linux-tools-$(uname -r)`"
+	case "pacman":
+		return "Install linux-tools for BTF support using `sudo pacman -S linux-tools`"
+	case "zypper":
+		return "Install kernel debug symbols for BTF support using `sudo zypper install kernel-debuginfo`"
+	case "dnf", "yum":
+		return fmt.Sprintf("Install kernel-debuginfo package for BTF support using `sudo %s install kernel-debuginfo`", pm)
+	case "apk":
+		return "Install linux-headers package for BTF support using `sudo apk add linux-headers`"
+	}
+	return recommendation
+}
+
+func CheckBTF(pm string) CheckResult {
 	btfPath := "/sys/kernel/btf/vmlinux"
 	info, err := os.Stat(btfPath)
 	if err != nil {
 		return CheckResult{
-			Name:   "BTF support",
-			OK:     false,
-			Detail: "CONFIG_DEBUG_INFO_BTF=y not enabled — required for CO-RE eBPF",
+			Name:           "BTF support",
+			OK:             false,
+			Detail:         "CONFIG_DEBUG_INFO_BTF=y not enabled — required for CO-RE eBPF",
+			Recommendation: btfRecommendationForPackageManager(pm),
 		}
 	}
 
@@ -185,9 +212,10 @@ func CheckNVIDIA() CheckResult {
 	}
 
 	return CheckResult{
-		Name:   "NVIDIA driver",
-		OK:     false,
-		Detail: "not found — nvidia-smi not in PATH and /proc/driver/nvidia/ missing",
+		Name:           "NVIDIA driver",
+		OK:             false,
+		Detail:         "not found — nvidia-smi not in PATH and /proc/driver/nvidia/ missing",
+		Recommendation: fmt.Sprintf("Download drivers at %s", "https://www.nvidia.com/en-in/drivers"),
 	}
 }
 
@@ -197,15 +225,40 @@ func checkNVIDIAVersion(version string) CheckResult {
 
 	ok := major >= 550
 	detail := "open kernel modules (550+)"
+	recommendation := ""
 	if !ok {
 		detail = fmt.Sprintf("found %s — need 550+ for kprobe support (v0.3). uprobes (v0.1) work with any driver", version)
+		recommendation = "Download updated drivers at https://www.nvidia.com/en-in/drivers"
 	}
 
 	return CheckResult{
-		Name:   "NVIDIA driver",
-		OK:     ok,
-		Value:  version,
-		Detail: detail,
+		Name:           "NVIDIA driver",
+		OK:             ok,
+		Value:          version,
+		Detail:         detail,
+		Recommendation: recommendation,
+	}
+}
+
+// CheckPrivileges verifies whether ingero is running with root privileges.
+// Non-root mode is supported, but some advanced tracing features require sudo.
+func CheckPrivileges() CheckResult {
+	if os.Geteuid() == 0 {
+		return CheckResult{
+			Name:   "Privileges",
+			OK:     true,
+			Value:  "running as root",
+			Detail: "full tracing features available",
+		}
+	}
+
+	return CheckResult{
+		Name:           "Privileges",
+		OK:             false,
+		Optional:       true,
+		Value:          "running as non-root",
+		Detail:         "some features require sudo: eBPF attach and full kernel-level tracing",
+		Recommendation: "Run with sudo for full tracing, e.g. `sudo ingero trace ...`",
 	}
 }
 
@@ -252,9 +305,10 @@ func CheckCUDALibrary() CheckResult {
 			}
 		}
 		return CheckResult{
-			Name:   "CUDA runtime",
-			OK:     false,
-			Detail: "libcudart.so not found — install CUDA toolkit",
+			Name:           "CUDA runtime",
+			OK:             false,
+			Detail:         "libcudart.so not found — install CUDA toolkit",
+			Recommendation: "Download CUDA toolkit at https://developer.nvidia.com/cuda-downloads",
 		}
 	}
 
@@ -271,10 +325,11 @@ func CheckLibCUDA() CheckResult {
 	path, err := FindLibCUDA()
 	if err != nil {
 		return CheckResult{
-			Name:   "CUDA driver (libcuda.so)",
-			OK:     false,
-			Value:  "not found",
-			Detail: "needed for driver API tracing (cuBLAS, cuDNN)",
+			Name:           "CUDA driver (libcuda.so)",
+			OK:             false,
+			Value:          "not found",
+			Detail:         "needed for driver API tracing (cuBLAS, cuDNN)",
+			Recommendation: "Ensure you install the NVIDIA Driver (which provides libcuda.so) and the CUDA Toolkit (which includes cuBLAS).",
 		}
 	}
 	return CheckResult{
@@ -325,9 +380,10 @@ func CheckGPUModel() CheckResult {
 	out, err := runNvidiaSMI("--query-gpu=name,memory.total", "--format=csv,noheader")
 	if err != nil {
 		return CheckResult{
-			Name:   "GPU model",
-			OK:     false,
-			Detail: "No GPU detected",
+			Name:           "GPU model",
+			OK:             false,
+			Detail:         "No GPU detected",
+			Recommendation: "Ensure NVIDIA drivers are installed and GPU is accessible (nvidia-smi should work)",
 		}
 	}
 
@@ -490,31 +546,47 @@ func CheckPtraceScopeResult() CheckResult {
 		}
 	case 2:
 		return CheckResult{
-			Name:   "ptrace_scope",
-			OK:     false,
-			Value:  value,
-			Detail: "admin-only — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+			Name:           "ptrace_scope",
+			OK:             false,
+			Value:          value,
+			Detail:         "admin-only — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+			Recommendation: "Set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE to allow Python frame walking",
 		}
 	default: // 3 or unknown
 		return CheckResult{
-			Name:   "ptrace_scope",
-			OK:     false,
-			Value:  value,
-			Detail: "ptrace disabled — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+			Name:           "ptrace_scope",
+			OK:             false,
+			Value:          value,
+			Detail:         "ptrace disabled — set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE for Python frames",
+			Recommendation: "Set kernel.yama.ptrace_scope=0 or add CAP_SYS_PTRACE to allow Python frame walking",
 		}
 	}
 }
 
+func getPackageManager() string {
+	// Common package managers to check
+	managers := []string{"apt", "dnf", "yum", "pacman", "zypper", "apk"}
+
+	for _, mgr := range managers {
+		if _, err := exec.LookPath(mgr); err == nil {
+			return mgr
+		}
+	}
+	return "unknown"
+}
+
 // RunAllChecks executes all system readiness checks and returns them in order.
 func RunAllChecks() []CheckResult {
+	pm := getPackageManager()
 	checks := []func() CheckResult{
 		CheckKernel,
-		CheckBTF,
+		func() CheckResult { return CheckBTF(pm) },
 		CheckNVIDIA,
 		CheckGPUModel,
 		CheckCUDALibrary,
 		CheckLibCUDA,
 		CheckCUDAProcesses,
+		CheckPrivileges,
 		CheckPtraceScopeResult,
 	}
 
