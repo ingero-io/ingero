@@ -21,8 +21,6 @@
 <!-- ingero-version:install-header product=ingero channel=stable -->
 **Version: 0.10.0**
 
-**v0.9.2 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
-
 **The only GPU observability tool your AI assistant can talk to.**
 
 *"What caused the GPU stall?" → "`forward()` at `train.py:142`  -  cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
