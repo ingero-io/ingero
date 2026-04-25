@@ -738,6 +738,12 @@ Metrics use OTEL semantic conventions: `gpu.cuda.operation.duration`, `gpu.cuda.
 
 Zero external dependencies  -  no OTEL SDK import. The JSON payload is constructed directly using Go's standard library.
 
+## Ingero Fleet Collector (Cross-Node Straggler Detection)
+
+Separate from Ingero's built-in multi-node `query --nodes` fan-out (see [`ingero query`](#ingero-query) above), the [Ingero Fleet Collector](https://github.com/ingero-io/ingero-fleet) is a custom OpenTelemetry Collector distribution that computes a cluster-wide straggler threshold from agent-reported health scores and returns it to agents over OTLP response headers.
+
+Use Fleet when you want the cluster itself to classify stragglers in real time, rather than querying ad hoc across nodes after the fact. Agents run the `ingero fleet-push` subcommand alongside `ingero trace --record`; see [`docs/fleet-push.md`](docs/fleet-push.md) for the command reference, and the [Fleet multi-node quickstart](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart.md) for an end-to-end walkthrough.
+
 ## How It Works
 
 ```
