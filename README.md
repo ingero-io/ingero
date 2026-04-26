@@ -55,6 +55,16 @@ No ClickHouse, no PostgreSQL, no MinIO  -  just one statically linked Go binary 
 
 See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md)  -  an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL  -  just questions and answers.
 
+## Quick Start (Multi-node GPU cluster)
+
+Three multi-node quickstart guides take you from zero to a detected straggler on three GPU hosts in about 20 minutes. Pick the deployment style that matches your environment:
+
+- [Kubernetes (Helm)](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-k8s.md)
+- [Bare-metal binary](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-binary.md)
+- [Docker](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-docker.md)
+
+See [`docs/quickstart.md`](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart.md) for a one-page comparison if you are not sure which to pick. The cluster-side service that backs these guides is the [Ingero Fleet Collector](#ingero-fleet-collector-cross-node-straggler-detection)  -  see that section below for the architecture.
+
 ## What It Does
 
 Ingero uses eBPF to trace GPU workloads at three layers, reads system metrics from `/proc`, and assembles causal chains that explain root causes:
@@ -742,7 +752,7 @@ Zero external dependencies  -  no OTEL SDK import. The JSON payload is construct
 
 Separate from Ingero's built-in multi-node `query --nodes` fan-out (see [`ingero query`](#ingero-query) above), the [Ingero Fleet Collector](https://github.com/ingero-io/ingero-fleet) is a custom OpenTelemetry Collector distribution that computes a cluster-wide straggler threshold from agent-reported health scores and returns it to agents over OTLP response headers.
 
-Use Fleet when you want the cluster itself to classify stragglers in real time, rather than querying ad hoc across nodes after the fact. Agents run the `ingero fleet-push` subcommand alongside `ingero trace --record`; see [`docs/fleet-push.md`](docs/fleet-push.md) for the command reference, and the [Fleet multi-node quickstart](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart.md) for an end-to-end walkthrough.
+Use Fleet when you want the cluster itself to classify stragglers in real time, rather than querying ad hoc across nodes after the fact. Agents run the `ingero fleet-push` subcommand alongside `ingero trace --record`; see [`docs/fleet-push.md`](docs/fleet-push.md) for the command reference. To get started, jump to [Quick Start (Multi-node GPU cluster)](#quick-start-multi-node-gpu-cluster) at the top.
 
 ## How It Works
 
