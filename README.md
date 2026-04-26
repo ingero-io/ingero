@@ -29,7 +29,7 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 <img src="docs/assets/readme-demo-incident.gif" width="800" alt="ingero demo incident — CPU contention causes GPU latency spike, full causal chain diagnosis with root cause and fix recommendation">
 
-## Quick Start
+## Quick Start (Single-node)
 
 ```bash
 # Install (Linux amd64 — see below for arm64/Docker)
@@ -52,6 +52,16 @@ ingero explain --since 5m
 No ClickHouse, no PostgreSQL, no MinIO  -  just one statically linked Go binary and embedded SQLite.
 
 See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md)  -  an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL  -  just questions and answers.
+
+## Quick Start (Multi-node GPU cluster)
+
+Three multi-node quickstart guides take you from zero to a detected straggler on three GPU hosts in about 20 minutes. Pick the deployment style that matches your environment:
+
+- [Kubernetes (Helm)](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-k8s.md)
+- [Bare-metal binary](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-binary.md)
+- [Docker](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-docker.md)
+
+See [`docs/quickstart.md`](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart.md) for a one-page comparison if you are not sure which to pick. The cluster-side service that backs these guides is the [Ingero Fleet Collector](#ingero-fleet-collector-cross-node-straggler-detection)  -  see that section below for the architecture.
 
 ## What It Does
 
@@ -735,6 +745,12 @@ OTLP uses the HTTP JSON transport (`POST /v1/metrics`). Compatible with: OpenTel
 Metrics use OTEL semantic conventions: `gpu.cuda.operation.duration`, `gpu.cuda.operation.count`, `system.cpu.utilization`, `system.memory.utilization`, `ingero.anomaly.count`. Per-operation, per-source granularity.
 
 Zero external dependencies  -  no OTEL SDK import. The JSON payload is constructed directly using Go's standard library.
+
+## Ingero Fleet Collector (Cross-Node Straggler Detection)
+
+Separate from Ingero's built-in multi-node `query --nodes` fan-out (see [`ingero query`](#ingero-query) above), the [Ingero Fleet Collector](https://github.com/ingero-io/ingero-fleet) is a custom OpenTelemetry Collector distribution that computes a cluster-wide straggler threshold from agent-reported health scores and returns it to agents over OTLP response headers.
+
+Use Fleet when you want the cluster itself to classify stragglers in real time, rather than querying ad hoc across nodes after the fact. Agents run the `ingero fleet-push` subcommand alongside `ingero trace --record`; see [`docs/fleet-push.md`](docs/fleet-push.md) for the command reference. To get started, jump to [Quick Start (Multi-node GPU cluster)](#quick-start-multi-node-gpu-cluster) at the top.
 
 ## How It Works
 

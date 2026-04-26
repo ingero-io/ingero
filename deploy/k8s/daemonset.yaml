@@ -23,7 +23,8 @@ metadata:
   labels:
     app.kubernetes.io/name: ingero
     app.kubernetes.io/component: observability
-    app.kubernetes.io/version: "0.9.1"
+    # ingero-version:daemonset-image product=ingero channel=stable
+    app.kubernetes.io/version: "0.10.0"
 spec:
   # OnDelete: prevents eBPF event loss during rolling updates. Probes detach
   # when the old pod dies — OnDelete lets the operator control upgrade pace.
@@ -37,7 +38,8 @@ spec:
       labels:
         app.kubernetes.io/name: ingero
         app.kubernetes.io/component: observability
-        app.kubernetes.io/version: "0.9.1"
+        # ingero-version:daemonset-template-version product=ingero channel=stable
+        app.kubernetes.io/version: "0.10.0"
     spec:
       hostPID: true
       terminationGracePeriodSeconds: 30
