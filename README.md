@@ -31,7 +31,7 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 <img src="docs/assets/readme-demo-incident.gif" width="800" alt="ingero demo incident — CPU contention causes GPU latency spike, full causal chain diagnosis with root cause and fix recommendation">
 
-## Quick Start
+## Quick Start (Single-node)
 
 ```bash
 # Install (Linux amd64 — see below for arm64/Docker)
