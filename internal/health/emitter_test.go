@@ -3,11 +3,14 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -774,5 +777,175 @@ func TestPush_BlackholeDialRespectsTimeout(t *testing.T) {
 	// (retry) + 500ms slack.
 	if elapsed > 5*time.Second {
 		t.Errorf("push elapsed %s > 5s budget; dialer timeout drift?", elapsed)
+	}
+}
+
+// ============================================================================
+// Multi-replica failover tests (added 2026-04-26)
+// ============================================================================
+//
+// These tests cover Fleet pod selection / failover behavior in multi-replica
+// deployments. They use a test-only http.RoundTripper injected into the
+// emitter's http.Client to simulate multi-backend routing without depending
+// on a custom net.Resolver. See `ingero-fleet/docs/ARCHITECTURE.md`
+// "Multi-replica behavior" section for the public design context.
+
+// failoverRT is a test RoundTripper: fails the first request (simulating a
+// dead Fleet pod) and forwards every subsequent request to the fallback URL.
+type failoverRT struct {
+	fallbackURL string
+	callCount   int32
+}
+
+func (r *failoverRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	n := atomic.AddInt32(&r.callCount, 1)
+	if n == 1 {
+		return nil, &net.OpError{Op: "dial", Err: errors.New("connection refused (simulated)")}
+	}
+	u, err := url.Parse(r.fallbackURL)
+	if err != nil {
+		return nil, err
+	}
+	newReq := req.Clone(req.Context())
+	newReq.URL.Scheme = u.Scheme
+	newReq.URL.Host = u.Host
+	return http.DefaultTransport.RoundTrip(newReq)
+}
+
+// randomBackendRT is a test RoundTripper: picks one of two backends at
+// random for each request and tracks per-backend hit counts.
+type randomBackendRT struct {
+	serverA, serverB *httptest.Server
+	mu               sync.Mutex
+	rng              *rand.Rand
+	countA, countB   int32
+}
+
+func (r *randomBackendRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	pick := r.rng.Intn(2)
+	r.mu.Unlock()
+
+	var target string
+	if pick == 0 {
+		target = r.serverA.URL
+		atomic.AddInt32(&r.countA, 1)
+	} else {
+		target = r.serverB.URL
+		atomic.AddInt32(&r.countB, 1)
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	newReq := req.Clone(req.Context())
+	newReq.URL.Scheme = u.Scheme
+	newReq.URL.Host = u.Host
+	return http.DefaultTransport.RoundTrip(newReq)
+}
+
+// TestPush_RedialAfterFailure_PicksFreshBackend verifies that on a network
+// error to one backend, the emitter's retry triggers a fresh RoundTrip
+// (which a real http.Transport would back with a fresh DNS lookup), and
+// the second attempt succeeds against the fallback backend.
+func TestPush_RedialAfterFailure_PicksFreshBackend(t *testing.T) {
+	var fallbackHits int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fallbackHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fallback.Close()
+
+	rt := &failoverRT{fallbackURL: fallback.URL}
+
+	cfg := baseEmitterCfg(fallback.URL)
+	cfg.Timeout = 500 * time.Millisecond
+	e, err := NewEmitter(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	e.(*httpEmitter).client.Transport = rt
+
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+		t.Fatalf("push should have succeeded after retry: %v", err)
+	}
+	if calls := atomic.LoadInt32(&rt.callCount); calls != 2 {
+		t.Errorf("expected 2 RoundTrip calls (initial fail + retry succeed), got %d", calls)
+	}
+	if hits := atomic.LoadInt32(&fallbackHits); hits != 1 {
+		t.Errorf("expected fallback to receive 1 successful request, got %d", hits)
+	}
+}
+
+// TestPush_ManyAgentInstances_DistributeAcrossBackends verifies that when
+// N emitter instances each push once via a randomly-routing RoundTripper,
+// hits distribute roughly uniformly across backends. Models the "50 agents,
+// 2 Fleet pods, ~25/25 split" property.
+//
+// Tolerance: with N=50 and p=0.5, stddev is ~3.5; we accept any split
+// within [10, 40] (well outside any plausible variance).
+func TestPush_ManyAgentInstances_DistributeAcrossBackends(t *testing.T) {
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer serverB.Close()
+
+	rt := &randomBackendRT{
+		serverA: serverA,
+		serverB: serverB,
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+
+	cfg := baseEmitterCfg(serverA.URL)
+
+	const N = 50
+	for i := 0; i < N; i++ {
+		e, err := NewEmitter(cfg, nil)
+		if err != nil {
+			t.Fatalf("NewEmitter %d: %v", i, err)
+		}
+		e.(*httpEmitter).client.Transport = rt
+		if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+			t.Errorf("push %d: %v", i, err)
+		}
+	}
+
+	a := atomic.LoadInt32(&rt.countA)
+	b := atomic.LoadInt32(&rt.countB)
+	if a+b != N {
+		t.Errorf("expected %d total pushes across backends, got A=%d B=%d (sum %d)", N, a, b, a+b)
+	}
+	if a < 10 || a > 40 {
+		t.Errorf("distribution skewed: A=%d B=%d (expected ~25/25, accepting [10,40] each)", a, b)
+	}
+}
+
+// TestEmitterTransport_HasStickyConnectionConfig verifies that the emitter's
+// HTTP transport is configured for connection-pool stickiness: one idle
+// connection per host with a 30s idle timeout. With 10s push intervals these
+// settings keep the agent bound to one Fleet pod in steady state, which is
+// the design intent for multi-replica HA without an L7 LB. Connection-level
+// stickiness itself can't be exercised through a custom RoundTripper (it
+// lives in *http.Transport's pool), so this is a configuration-validation
+// test.
+func TestEmitterTransport_HasStickyConnectionConfig(t *testing.T) {
+	cfg := baseEmitterCfg("http://127.0.0.1:9999")
+	e, err := NewEmitter(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	transport, ok := e.(*httpEmitter).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", e.(*httpEmitter).client.Transport)
+	}
+	if transport.MaxIdleConnsPerHost != 1 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 1 (sticky pool behavior)", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 30s", transport.IdleConnTimeout)
 	}
 }
