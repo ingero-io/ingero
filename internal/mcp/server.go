@@ -53,6 +53,7 @@ import (
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/synth"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -70,7 +71,7 @@ type Server struct {
 func New(s *store.Store) *Server {
 	srv := gomcp.NewServer(&gomcp.Implementation{
 		Name:    "ingero",
-		Version: "0.9.0",
+		Version: version.Version(),
 		Title:   "Ingero GPU Causal Observability — AI-first analysis",
 	}, nil)
 
