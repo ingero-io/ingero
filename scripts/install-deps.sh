@@ -17,7 +17,16 @@ ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; exit 1; }
 
 GO_VERSION="1.26.1"
-GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
+
+# Detect host architecture so the same script works on x86_64 and aarch64
+# (GH200, Graviton, Jetson, DGX Spark, Apple Silicon under Linux, etc.).
+case "$(uname -m)" in
+    x86_64)  GO_ARCH=amd64;  LIB_TRIPLET=x86_64-linux-gnu  ;;
+    aarch64) GO_ARCH=arm64;  LIB_TRIPLET=aarch64-linux-gnu ;;
+    *)       echo "  ✗ Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TARBALL}"
 
 install_go() {
@@ -152,7 +161,7 @@ echo ""
 echo "[6/7] Checking libcudart.so..."
 if ldconfig -p 2>/dev/null | grep -q 'libcudart\.so'; then
     ok "libcudart.so already discoverable via ldconfig"
-elif [ -L /usr/lib/x86_64-linux-gnu/libcudart.so ]; then
+elif [ -L "/usr/lib/${LIB_TRIPLET}/libcudart.so" ]; then
     ok "libcudart.so symlink already exists"
 else
     # Search common locations for libcudart. Deep Learning AMIs (AWS, GCP)
@@ -173,12 +182,12 @@ else
         fi
     done
     if [ -n "$CUDART_PATH" ]; then
-        sudo ln -sf "$CUDART_PATH" /usr/lib/x86_64-linux-gnu/libcudart.so
-        ok "symlinked $CUDART_PATH → /usr/lib/x86_64-linux-gnu/libcudart.so"
+        sudo ln -sf "$CUDART_PATH" "/usr/lib/${LIB_TRIPLET}/libcudart.so"
+        ok "symlinked $CUDART_PATH → /usr/lib/${LIB_TRIPLET}/libcudart.so"
     else
         echo "  SKIP: libcudart.so not found (not needed for build, needed for 'ingero check/trace')"
         echo "  If using a PyTorch venv, run:"
-        echo "    sudo ln -sf \$(find /opt -name 'libcudart.so*' -type f | grep -v '\\.a\$' | head -1) /usr/lib/x86_64-linux-gnu/libcudart.so"
+        echo "    sudo ln -sf \$(find /opt -name 'libcudart.so*' -type f | grep -v '\\.a\$' | head -1) /usr/lib/${LIB_TRIPLET}/libcudart.so"
     fi
 fi
 
