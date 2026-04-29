@@ -1,4 +1,4 @@
-.PHONY: all build generate clean test test-ci lint install uninstall wsl-setup gpu-deploy gpu-start gpu-stop gpu-destroy gpu-status gpu-ssh gpu-info gpu-validate gpu-logs lambda-deploy lambda-destroy lambda-status lambda-ssh lambda-info lambda-sync lambda-test lambda-validate lambda-logs azure-deploy azure-start azure-stop azure-destroy azure-status azure-ssh azure-info azure-sync azure-test azure-validate azure-logs fmt dev gpu-k3s-setup gpu-k3s-test lambda-k3s-setup lambda-k3s-test
+.PHONY: all build generate clean test test-ci lint install uninstall wsl-setup gpu-deploy gpu-start gpu-stop gpu-destroy gpu-status gpu-ssh gpu-info gpu-validate gpu-logs gpu-test-walker-matrix lambda-deploy lambda-destroy lambda-status lambda-ssh lambda-info lambda-sync lambda-test lambda-validate lambda-logs azure-deploy azure-start azure-stop azure-destroy azure-status azure-ssh azure-info azure-sync azure-test azure-validate azure-logs fmt dev gpu-k3s-setup gpu-k3s-test lambda-k3s-setup lambda-k3s-test
 
 # Variables
 REPO_ROOT := $(shell pwd)
@@ -12,11 +12,6 @@ BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_TARGET_ARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
-
-# Semantic version for README: 0.6.32 (base tag + commits-since-tag)
-BASE_VER := $(shell echo $(VERSION) | sed 's/^v//; s/-.*//')
-PATCH    := $(shell echo $(VERSION) | sed -n 's/^v[^-]*-\([0-9]*\)-.*/\1/p')
-SEMVER   := $(BASE_VER).$(if $(PATCH),$(PATCH),0)
 
 LDFLAGS := -ldflags "-X github.com/ingero-io/ingero/internal/version.version=$(VERSION) \
 	-X github.com/ingero-io/ingero/internal/version.commit=$(COMMIT) \
@@ -39,7 +34,6 @@ endif
 build:
 	@mkdir -p bin
 	go build $(GOFLAGS) $(LDFLAGS) -o $(BINARY) ./cmd/ingero/
-	-@sed -i 's/^\*\*Version: [^*]*\*\*/**Version: $(SEMVER)**/' README.md
 
 # Run tests
 test:
@@ -139,6 +133,17 @@ gpu-validate:
 # Runs make generate && make build first to regenerate eBPF objects for the VM's kernel
 gpu-test: gpu-sync
 	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/gpu-test.sh'
+
+# Per-Python-version eBPF walker regression. Provisions python 3.9..3.14
+# via uv (once), builds the ingero binary for the VM's kernel, and runs
+# the walker matrix harness. Much faster than `make gpu-test` for walker
+# iteration: runs only the matrix phase, not the full 2000-line suite.
+#
+# First run on a fresh VM: install-python-versions.sh takes ~5-10 min
+# (uv downloads + per-venv torch install). Re-runs are idempotent and
+# skip already-provisioned versions, typically completing in under 2 min.
+gpu-test-walker-matrix: gpu-sync
+	bash scripts/tensordock/vm.sh ssh 'export PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$$HOME/go/bin:$$HOME/.local/bin && cd ~/workspace/ingero && make generate && make build && bash scripts/install-python-versions.sh && bash scripts/gpu-test-walker-matrix.sh'
 
 # Transfer logs from TensorDock GPU VM to local logs/<datetime_provider_gpu>/ directory
 gpu-logs:

@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +25,18 @@ import (
 // The file offset is crucial for PIE (Position Independent Executables) / ASLR:
 //
 //	file_offset_of_ip = ip - region.Start + region.Offset
+//
+// Inode is the identifier of the backing file. Two regions with the same
+// inode map the same physical file; two regions with the same path string
+// but different inodes map distinct files (e.g., a venv-bundled library
+// next to a system-installed one, or the same path in different mount
+// namespaces). Inode is the right key when you need to dedup "have we
+// already attached to this file?" across processes.
 type MapRegion struct {
 	Start  uint64 // virtual address start
 	End    uint64 // virtual address end (exclusive)
 	Offset uint64 // file offset of this mapping
+	Inode  uint64 // backing-file inode (0 for anonymous mappings)
 	Perms  string // permissions (r-xp, rw-p, etc.)
 	Path   string // file path (empty for anonymous mappings)
 }
@@ -108,6 +117,12 @@ func parseMapsLine(line string) (MapRegion, bool) {
 		return MapRegion{}, false
 	}
 
+	// Inode: decimal (fields[4]). 0 for anonymous mappings.
+	// parseUint is defensive against oddly-formatted kernels; a parse
+	// failure leaves Inode=0 and does not reject the region, since the
+	// other fields are still useful for symbol resolution.
+	inode, _ := strconv.ParseUint(fields[4], 10, 64)
+
 	// Pathname (field 6+ joined, may contain spaces).
 	var path string
 	if len(fields) >= 6 {
@@ -122,6 +137,7 @@ func parseMapsLine(line string) (MapRegion, bool) {
 		Start:  start,
 		End:    end,
 		Offset: offset,
+		Inode:  inode,
 		Perms:  perms,
 		Path:   path,
 	}, true
@@ -145,4 +161,37 @@ func FindRegion(regions []MapRegion, addr uint64) *MapRegion {
 		return r
 	}
 	return nil
+}
+
+// UniqueFilesMatching scans regions and returns one representative region
+// per distinct backing-file inode whose path matches pat. Regions without
+// a path, with inode 0 (anonymous), or that don't match the pattern are
+// skipped. The first region encountered for each inode wins; subsequent
+// regions with the same inode (typically r--p / rw-p segments of the
+// same file) are dropped.
+//
+// Typical use: scan /proc/<pid>/maps for all distinct libraries matching
+// a library-name pattern so a caller can attach one uprobe set per
+// physical file regardless of how many times it is mapped.
+func UniqueFilesMatching(regions []MapRegion, pat *regexp.Regexp) []MapRegion {
+	if pat == nil {
+		return nil
+	}
+	seen := make(map[uint64]struct{})
+	var out []MapRegion
+	for i := range regions {
+		r := regions[i]
+		if r.Path == "" || r.Inode == 0 {
+			continue
+		}
+		if !pat.MatchString(r.Path) {
+			continue
+		}
+		if _, ok := seen[r.Inode]; ok {
+			continue
+		}
+		seen[r.Inode] = struct{}{}
+		out = append(out, r)
+	}
+	return out
 }

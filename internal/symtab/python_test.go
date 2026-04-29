@@ -118,6 +118,202 @@ func TestDetectPythonFromRegions_BinaryBeforeLibpython(t *testing.T) {
 	}
 }
 
+func TestDetectFreeThreadedFromPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"plain 3.13 binary", "/usr/bin/python3.13", false},
+		{"plain 3.14 binary", "/usr/bin/python3.14", false},
+		{"free-threaded 3.13 binary", "/opt/venv/bin/python3.13t", true},
+		{"free-threaded 3.14 binary", "/usr/bin/python3.14t", true},
+		{"free-threaded libpython 3.13", "/usr/lib/x86_64-linux-gnu/libpython3.13t.so.1.0", true},
+		{"free-threaded libpython 3.14", "/usr/lib/libpython3.14t.so", true},
+		{"plain libpython 3.13", "/usr/lib/libpython3.13.so.1.0", false},
+		{"stray t in directory only", "/tmp/gated/python3.13", false},
+		{"stray t at binary name end but not after digits", "/usr/bin/pythont3.13", false},
+		{"future 3.15 free-threaded", "/usr/bin/python3.15t", true},
+		{"non-python path", "/usr/bin/bash", false},
+		{"empty path", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectFreeThreadedFromPath(tt.path); got != tt.want {
+				t.Errorf("detectFreeThreadedFromPath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectPythonFromExeTarget_FreeThreadedFlag(t *testing.T) {
+	// When the exe target is a free-threaded build, the returned
+	// PythonInfo should have FreeThreaded=true so the caller can skip
+	// the BPF walker.
+	info := detectPythonFromExeTarget("/opt/venv/bin/python3.13t")
+	if info == nil {
+		t.Fatal("expected non-nil info for python3.13t")
+	}
+	if !info.FreeThreaded {
+		t.Error("expected FreeThreaded=true for python3.13t")
+	}
+	if info.Minor != 13 {
+		t.Errorf("Minor = %d, want 13", info.Minor)
+	}
+	plain := detectPythonFromExeTarget("/usr/bin/python3.13")
+	if plain == nil || plain.FreeThreaded {
+		t.Errorf("plain 3.13 should not be free-threaded: %+v", plain)
+	}
+}
+
+func TestDetectPythonFromExeTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		target   string
+		wantVer  string
+		wantNil  bool
+	}{
+		{
+			name:    "ubuntu system python",
+			target:  "/usr/bin/python3.12",
+			wantVer: "3.12",
+		},
+		{
+			name:    "uv distribution",
+			target:  "/home/ubuntu/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+			wantVer: "3.13",
+		},
+		{
+			name:    "opt/pytorch symlink target",
+			target:  "/opt/pytorch/bin/python3.10",
+			wantVer: "3.10",
+		},
+		{
+			name:    "new minor version works via regex",
+			target:  "/usr/bin/python3.14",
+			wantVer: "3.14",
+		},
+		{
+			name:    "no version suffix - rejected",
+			target:  "/usr/bin/python3",
+			wantNil: true,
+		},
+		{
+			name:    "non-python exe - rejected",
+			target:  "/usr/bin/bash",
+			wantNil: true,
+		},
+		{
+			name:    "empty target - rejected",
+			target:  "",
+			wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectPythonFromExeTarget(tt.target)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("want nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("want non-nil PythonInfo for %q", tt.target)
+			}
+			if got.Version != tt.wantVer {
+				t.Errorf("Version = %q, want %q", got.Version, tt.wantVer)
+			}
+			if got.LibPath != tt.target {
+				t.Errorf("LibPath = %q, want %q (should be the exe target)", got.LibPath, tt.target)
+			}
+		})
+	}
+}
+
+func TestFindPyRegion(t *testing.T) {
+	uvPath := "/home/ubuntu/.local/share/uv/python/cpython-3.14.4-linux-x86_64-gnu/bin/python3.14"
+	otherPath := "/tmp/venv-3.14/lib/python3.14/site-packages/_internal/python3.14-shim"
+	libcudaPath := "/usr/lib/x86_64-linux-gnu/libcudart.so.12"
+
+	tests := []struct {
+		name        string
+		regions     []MapRegion
+		info        *PythonInfo
+		wantPath    string
+		wantExact   bool
+		wantMatched bool
+	}{
+		{
+			name: "exact path match",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: uvPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    uvPath,
+			wantExact:   true,
+			wantMatched: true,
+		},
+		{
+			name: "fallback to equivalent 3.14 region when exact path differs",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: otherPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    otherPath,
+			wantExact:   false,
+			wantMatched: true,
+		},
+		{
+			name: "minor mismatch rejects fallback",
+			regions: []MapRegion{
+				{Path: "/usr/bin/python3.12"},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantMatched: false,
+		},
+		{
+			name: "no python region at all",
+			regions: []MapRegion{
+				{Path: libcudaPath},
+				{Path: "/usr/lib/libc.so.6"},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantMatched: false,
+		},
+		{
+			name: "exact wins over equivalent when both present",
+			regions: []MapRegion{
+				{Path: otherPath, Start: 0x300000},
+				{Path: uvPath, Start: 0x400000},
+			},
+			info:        &PythonInfo{Minor: 14, LibPath: uvPath},
+			wantPath:    uvPath,
+			wantExact:   true,
+			wantMatched: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, exact, ok := findPyRegion(tt.regions, tt.info)
+			if ok != tt.wantMatched {
+				t.Fatalf("matched = %v, want %v", ok, tt.wantMatched)
+			}
+			if !ok {
+				return
+			}
+			if r.Path != tt.wantPath {
+				t.Errorf("Path = %q, want %q", r.Path, tt.wantPath)
+			}
+			if exact != tt.wantExact {
+				t.Errorf("exact = %v, want %v", exact, tt.wantExact)
+			}
+		})
+	}
+}
+
 func TestPythonInfo_IsSupportedVersion(t *testing.T) {
 	tests := []struct {
 		minor int

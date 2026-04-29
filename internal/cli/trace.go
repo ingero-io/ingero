@@ -1089,6 +1089,7 @@ func dumpPyDebugStats(maps []*ebpf.Map) {
 		"have_py_set",
 		"entered_pyextended_branch",
 		"reserved_pyextended",
+		"unicode_non_compact_skipped",
 	}
 	numCPU := runtime.NumCPU()
 	fmt.Fprintf(os.Stderr, "  py-walker debug counters (aggregated across %d cuda tracer(s)):\n", len(maps))
@@ -1874,10 +1875,33 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 		debugf("py-walker: PID %d is Python %s (python_minor %d) not supported by BPF walker (only 3.9-3.14); userspace walker will handle", pid, info.Version, info.Minor)
 		return
 	}
+	// Free-threaded (PEP 703, Py_GIL_DISABLED) builds add PyMutex fields
+	// to PyThreadState that the GIL-build offset tables don't account
+	// for, so the walker would emit garbage. Skip these processes
+	// entirely. The userspace walker currently only supports GIL builds
+	// of 3.10/3.11/3.12 (see PyFrameWalker.IsSupportedVersion), so
+	// Python frames will be missing from cuda events on free-threaded
+	// 3.13/3.14 processes until either the BPF walker grows a
+	// free-threaded offset table or the userspace walker extends
+	// support. Marking the PID as "tried" in pyPushedPIDs (via the
+	// caller) keeps this a one-shot per-PID decision, not per-event.
+	if info.FreeThreaded {
+		slog.Info("py-walker: free-threaded Python build detected — BPF walker skipped; Python frames will not be attached (userspace walker does not yet support free-threaded builds)",
+			"pid", pid, "python_version", info.Version, "lib_path", info.LibPath)
+		return
+	}
 
 	runtimeAddr, err := symtab.FindPyRuntimeAddr(pid, info)
 	if err != nil || runtimeAddr == 0 {
-		debugf("py-walker: _PyRuntime not found for PID %d: %v", pid, err)
+		// Transient failure: DetectPython succeeded (we know it's Python)
+		// but _PyRuntime did not resolve. The most common cause is a
+		// race where DetectPython's /proc/<pid>/exe fallback fires
+		// before the libpython PT_LOAD is mapped. Clear the dedup
+		// entry so a later event retries the push once /proc/maps
+		// stabilizes; otherwise the PID stays permanently marked
+		// false and the walker never engages.
+		debugf("py-walker: _PyRuntime not found for PID %d (transient — retrying on next event): %v", pid, err)
+		pyPushedPIDs.Delete(pid)
 		return
 	}
 
@@ -1984,7 +2008,11 @@ func tryPushPyRuntimeState(pid uint32, pyMaps []*ebpf.Map) {
 			"pid", pid, "python_version", info.Version, "python_minor", info.Minor,
 			"runtime_addr", fmt.Sprintf("0x%x", runtimeAddr))
 	}
-	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d)", pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps))
+	debugf("py-walker: pushed state for PID %d (_PyRuntime=0x%x, python_minor=%d, offsets=%s, maps=%d) values: RIH=%d ITH=%d TF=%d FB=%d FC=%d CF=%d CN=%d CFL=%d US=%d UD=%d",
+		pid, runtimeAddr, info.Minor, offsets.Version, len(pyMaps),
+		offsets.RuntimeInterpretersHead, offsets.InterpTstateHead, offsets.TstateFrame,
+		offsets.FrameBack, offsets.FrameCode, offsets.CodeFilename, offsets.CodeName,
+		offsets.CodeFirstLineNo, offsets.UnicodeState, offsets.UnicodeData)
 }
 
 // pyPushedPIDs is a per-PID dedup cache for the walker push pipeline.
@@ -2106,6 +2134,9 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor in
 	if o.CframeCurrentFrame > 0xFFFF {
 		return pytrace.PyRuntimeState{}, fmt.Errorf("offset CframeCurrentFrame=%d exceeds uint16 range", o.CframeCurrentFrame)
 	}
+	if o.InterpNext > 0xFFFF {
+		return pytrace.PyRuntimeState{}, fmt.Errorf("offset InterpNext=%d exceeds uint16 range", o.InterpNext)
+	}
 	return pytrace.PyRuntimeState{
 		RuntimeAddr:                runtimeAddr,
 		OffRuntimeInterpretersHead: uint16(o.RuntimeInterpretersHead),
@@ -2124,6 +2155,10 @@ func pyRuntimeStateFromOffsets(runtimeAddr uint64, o *symtab.PyOffsets, minor in
 		// CframeCurrentFrame is populated only for 3.11 by
 		// symtab.GetPyOffsets; 0 for 3.10/3.12 by design.
 		OffCframeCurrentFrame: uint16(o.CframeCurrentFrame),
+		// InterpNext is PyInterpreterState.next — first struct field
+		// on every supported CPython version, so 0 is the correct
+		// runtime value, not a sentinel for "disabled".
+		OffInterpNext: uint16(o.InterpNext),
 	}, nil
 }
 

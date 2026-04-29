@@ -68,3 +68,17 @@ jobs:
 
       - name: Run go vet
         run: go vet ./...
+
+  validate-anchors:
+    name: Validate version anchors
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate ingero-version anchors
+        run: python .github/scripts/validate_anchors.py --root .

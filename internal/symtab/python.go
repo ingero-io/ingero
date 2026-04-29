@@ -2,17 +2,19 @@ package symtab
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 )
 
 // PythonInfo describes a CPython interpreter found in a process.
 type PythonInfo struct {
-	Version    string // e.g., "3.10", "3.11", "3.12"
-	Major      int    // 3
-	Minor      int    // 10, 11, 12
-	LibPath    string // path to libpython3.X.so or python3.X binary
-	RuntimeAddr uint64 // address of _PyRuntime symbol (0 if not found)
+	Version      string // e.g., "3.10", "3.11", "3.12"
+	Major        int    // 3
+	Minor        int    // 10, 11, 12
+	LibPath      string // path to libpython3.X.so or python3.X binary
+	RuntimeAddr  uint64 // address of _PyRuntime symbol (0 if not found)
+	FreeThreaded bool   // true for Py_GIL_DISABLED builds (python3.Xt / libpython3.Xt.so.*)
 }
 
 // pythonRe matches libpython or python binary paths in /proc/maps.
@@ -23,15 +25,84 @@ type PythonInfo struct {
 //	/home/user/miniconda3/lib/libpython3.11.so.1.0
 var pythonRe = regexp.MustCompile(`(?:lib)?python(3)\.(\d+)`)
 
-// DetectPython checks if a process has CPython loaded.
-// Returns nil if no Python interpreter is found.
+// freeThreadedRe matches the `t` suffix CPython uses on Py_GIL_DISABLED
+// builds (PEP 703). Matches on the basename so a "t" that happens to
+// appear elsewhere in a directory path doesn't trigger a false
+// positive. Examples:
+//
+//	/opt/venv/bin/python3.13t                        -> match
+//	/usr/lib/x86_64-linux-gnu/libpython3.14t.so.1.0  -> match
+//	/usr/bin/python3.13                              -> no match (GIL build)
+//	/tmp/gated/python3.13                            -> no match (the t is in the dir)
+var freeThreadedRe = regexp.MustCompile(`(?:lib)?python3\.\d+t(?:\.|$)`)
+
+// DetectPython checks if a process has CPython loaded. Returns nil if
+// no Python interpreter is found.
+//
+// Two signals are consulted in order:
+//
+//  1. /proc/<pid>/maps — executable regions whose path matches
+//     libpython3.X.so or python3.X. This is the primary signal and
+//     gives us the exact library/binary the process has mapped.
+//
+//  2. /proc/<pid>/exe — the kernel sets this symlink at exec() time,
+//     before ld-linux runs. When the maps scan happens very early
+//     during process startup (the first cuda event can fire before
+//     the binary's executable PT_LOAD is mapped — observed on
+//     /opt/pytorch/bin/python3.12 workloads launched immediately
+//     after trace start), the maps are incomplete but the exe
+//     symlink is already correct. Without this fallback, the
+//     per-PID dedup in the caller marks the PID as "not Python"
+//     forever and the walker never fires.
 func DetectPython(pid uint32) *PythonInfo {
-	regions, err := ParseProcMaps(pid)
+	regions, mapsErr := ParseProcMaps(pid)
+	if info := detectPythonFromRegions(regions); info != nil {
+		return info
+	}
+	info := detectPythonFromProcExe(pid)
+	if info == nil {
+		// Temporary instrumentation to diagnose why the /proc/exe
+		// fallback isn't catching processes it should. Dumps the
+		// region count, maps error if any, and the readlink result.
+		target, linkErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		symDebugf("DetectPython: PID %d rejected — regions=%d mapsErr=%v exeTarget=%q linkErr=%v", pid, len(regions), mapsErr, target, linkErr)
+	}
+	return info
+}
+
+// detectPythonFromProcExe resolves /proc/<pid>/exe and runs the python
+// name regex on the symlink target. Loader-early fallback: see
+// DetectPython. Extracted from DetectPython so the pure name-matching
+// logic in detectPythonFromExeTarget is unit-testable.
+func detectPythonFromProcExe(pid uint32) *PythonInfo {
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {
 		return nil
 	}
+	return detectPythonFromExeTarget(target)
+}
 
-	return detectPythonFromRegions(regions)
+// detectPythonFromExeTarget matches a resolved /proc/<pid>/exe path
+// against the python name regex and returns a minimal PythonInfo.
+// LibPath is the exe target itself; findPyRuntimeAddr opens this path
+// to resolve _PyRuntime, so it must point at an ELF with symbol info
+// (the python binary, which is statically linked on uv distributions
+// and Ubuntu's vanilla packages both).
+func detectPythonFromExeTarget(exeTarget string) *PythonInfo {
+	m := pythonRe.FindStringSubmatch(exeTarget)
+	if m == nil {
+		return nil
+	}
+	major := 3 // m[1] is always "3"
+	minor := 0
+	fmt.Sscanf(m[2], "%d", &minor)
+	return &PythonInfo{
+		Version:      fmt.Sprintf("%d.%d", major, minor),
+		Major:        major,
+		Minor:        minor,
+		LibPath:      exeTarget,
+		FreeThreaded: detectFreeThreadedFromPath(exeTarget),
+	}
 }
 
 // detectPythonFromRegions scans map regions for a Python interpreter.
@@ -59,10 +130,11 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 		isLib := strings.Contains(r.Path, "libpython")
 
 		info := &PythonInfo{
-			Version: fmt.Sprintf("%d.%d", major, minor),
-			Major:   major,
-			Minor:   minor,
-			LibPath: r.Path,
+			Version:      fmt.Sprintf("%d.%d", major, minor),
+			Major:        major,
+			Minor:        minor,
+			LibPath:      r.Path,
+			FreeThreaded: detectFreeThreadedFromPath(r.Path),
 		}
 
 		if isLib {
@@ -76,6 +148,17 @@ func detectPythonFromRegions(regions []MapRegion) *PythonInfo {
 	}
 
 	return fallback
+}
+
+// detectFreeThreadedFromPath reports whether path looks like a
+// Py_GIL_DISABLED (PEP 703) build. CPython 3.13+ distributes these as
+// python3.Xt / libpython3.Xt.so.* alongside the default GIL build;
+// PyThreadState has additional PyMutex fields on free-threaded builds
+// so the walker's GIL-build offset tables produce garbage there. The
+// caller uses this flag to skip walker state push entirely on
+// free-threaded processes, punting to the userspace walker.
+func detectFreeThreadedFromPath(path string) bool {
+	return freeThreadedRe.MatchString(path)
 }
 
 // IsSupportedVersion returns true if we have hardcoded offsets for this version.

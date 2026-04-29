@@ -31,6 +31,7 @@ type PyOffsets struct {
 
 	// PyInterpreterState offsets
 	InterpTstateHead uint64 // PyInterpreterState.tstate_head (3.10) or .threads.head (3.12)
+	InterpNext       uint64 // PyInterpreterState.next — first field across 3.9..3.14, so 0
 
 	// PyThreadState offsets
 	TstateNext           uint64 // PyThreadState.next
@@ -59,46 +60,122 @@ type PyOffsets struct {
 	NewStyleFrames bool
 }
 
-// readDebugOffsets reads CPython's _Py_DebugOffsets struct from the beginning of
-// _PyRuntime in the target process's memory. Available in CPython 3.12+.
+// CPython's _Py_DebugOffsets struct is embedded as the first field of
+// _PyRuntimeState starting in CPython 3.13 (earlier versions did NOT have
+// this struct — the field at _PyRuntime+0 was just `int _initialized`).
+// It contains self-describing byte offsets for the runtime, interpreter,
+// thread, frame, code, and unicode structs, letting an out-of-process
+// observer walk Python frames without DWARF debug info or hardcoded
+// offset tables.
 //
-// Currently only supports CPython 3.12. The _Py_DebugOffsets group layout
-// (field counts per group, and therefore group start offsets) varies between
-// minor versions, so 3.13+ will need their own layout constants.
+// The struct is decidedly NOT backwards compatible: members are added,
+// reordered, and resized between minor versions. CPython documents this
+// directly in pycore_runtime.h: "only guaranteed to be stable between
+// patch versions for a given minor version". So we hardcode one layout
+// table per supported minor.
 //
-// The _Py_DebugOffsets struct is embedded at offset 0 of _PyRuntime and contains
-// self-describing offset information, making it possible to walk Python frames
-// without DWARF debug info or hardcoded offset tables.
+// For each minor we care about the byte offset within _Py_DebugOffsets
+// of the specific fields we actually use. The VALUES at those byte
+// offsets are themselves offsets (into PyThreadState, _PyInterpreterFrame,
+// PyCodeObject, PyASCIIObject, etc.) emitted by the CPython build system.
 //
-// Struct layout (all fields uint64, little-endian on x86_64):
+// Layouts verified against Include/internal/pycore_debug_offsets.h (3.14)
+// and Include/internal/pycore_runtime.h (3.13 — the 3.13 struct lives in
+// the runtime header, not a dedicated file).
+type debugOffsetsLayout struct {
+	runtimeInterpretersHead uint64 // -> _PyRuntimeState.interpreters.head
+	interpNext              uint64 // -> PyInterpreterState.next
+	interpThreadsHead       uint64 // -> PyInterpreterState.threads.head
+	tstateCurrentFrame      uint64 // -> PyThreadState.current_frame
+	tstateThreadID          uint64 // -> PyThreadState.thread_id (pthread_self)
+	tstateNativeThreadID    uint64 // -> PyThreadState.native_thread_id (gettid)
+	framePrevious           uint64 // -> _PyInterpreterFrame.previous
+	frameExecutable         uint64 // -> _PyInterpreterFrame.f_executable
+	codeFilename            uint64 // -> PyCodeObject.co_filename
+	codeName                uint64 // -> PyCodeObject.co_name
+	codeFirstLineNo         uint64 // -> PyCodeObject.co_firstlineno
+	unicodeState            uint64 // -> PyASCIIObject.state
+	unicodeLength           uint64 // -> PyASCIIObject.length
+	unicodeASCII            uint64 // -> PyASCIIObject ASCII inline-data start
+}
+
+// debugOffsetsLayouts maps a CPython minor version to the field offsets
+// inside _Py_DebugOffsets for that version. Offsets computed from the
+// field order in the upstream struct definition: 24-byte header
+// (cookie[8] + version + free_threaded) followed by per-group sub-structs
+// of uint64 fields. Each field is 8 bytes.
 //
-//	offset  0: version (uint64) — encoded CPython version
-//	offset  8: free_threaded (uint64) — free-threading flag (3.13+, always 0 for 3.12)
+// 3.13 (13 fields in interpreter_state, 6 in interpreter_frame, 10 in
+// code_object, 3 pyobject+4 type+3 tuple+3 list+3 dict+2 float+3 long+3
+// bytes groups before unicode_object):
 //
-//	Then groups of offsets, each starting with a size field:
-//	  runtime_state: size, finalizing, interpreters_head
-//	  interpreter_state: size, threads_head, ...
-//	  thread_state: size, prev, next, interp, current_frame, native_thread_id, ...
-//	  interpreter_frame: size, previous, executable, ...
-//	  code_object: size, filename, name, firstlineno, ...
-//	  unicode_object: size, length, state, ascii (data start offset)
+// 3.14 (16 fields in interpreter_state after threads_main + code/tlbc
+// generations; 8 fields in interpreter_frame after stackpointer +
+// tlbc_index; 11 fields in code_object after co_tlbc; plus a new 4-field
+// set_object group between list_object and dict_object):
+var debugOffsetsLayouts = map[int]debugOffsetsLayout{
+	13: {
+		runtimeInterpretersHead: 40,
+		interpNext:              64,
+		interpThreadsHead:       72,
+		tstateCurrentFrame:      184,
+		tstateThreadID:          192,
+		tstateNativeThreadID:    200,
+		framePrevious:           232,
+		frameExecutable:         240,
+		codeFilename:            280,
+		codeName:                288,
+		codeFirstLineNo:         312,
+		unicodeState:            544,
+		unicodeLength:           552,
+		unicodeASCII:            560,
+	},
+	14: {
+		runtimeInterpretersHead: 40,
+		interpNext:              64,
+		interpThreadsHead:       72,
+		tstateCurrentFrame:      208,
+		tstateThreadID:          216,
+		tstateNativeThreadID:    224,
+		framePrevious:           256,
+		frameExecutable:         264,
+		codeFilename:            320,
+		codeName:                328,
+		codeFirstLineNo:         352,
+		unicodeState:            624,
+		unicodeLength:           632,
+		unicodeASCII:            640,
+	},
+}
+
+// debugOffsetsCookie is the 8-byte magic value CPython 3.13+ writes at
+// _Py_DebugOffsets.cookie (see _Py_Debug_Cookie in pycore_debug_offsets.h).
+// Validating it before trusting anything else rejects both pre-3.13
+// builds (no cookie at all, just `int _initialized`) and accidental
+// bad-pointer reads.
+const debugOffsetsCookie = "xdebugpy"
+
+// ReadDebugOffsetsFromPID opens /proc/<pid>/mem and extracts the
+// _Py_DebugOffsets struct from a running CPython 3.13+ process. The
+// struct is embedded at offset 0 of _PyRuntime, so runtimeAddr is the
+// address the caller already located via the _PyRuntime ELF symbol.
 //
-// ReadDebugOffsetsFromPID opens /proc/<pid>/mem (or falls back to
-// process_vm_readv at YAMA ptrace_scope<=2) and extracts the
-// _Py_DebugOffsets struct from the running CPython 3.12+ process. This
-// returns the AUTHORITATIVE offset table — offsets from the exact binary
-// the workload is using, immune to distro-patch layout drift or
-// release-vs-debug-build ABI differences that can poison DWARF lookups
-// from sibling libraries.
+// Returns (nil, nil) when:
+//   - minor is < 13 (the struct did not exist before 3.13)
+//   - runtimeAddr is 0 (caller couldn't resolve _PyRuntime)
+//   - cookie validation fails (stale or partially-initialized memory)
+//   - no layout is registered for this minor
 //
-// Returns (nil, nil) if the Python version is < 3.12 or the runtime
-// marker is not present (e.g., partial init). Returns an error only for
-// actual memory-access failures the caller may want to log.
+// Returns an error only for actual memory-access failures the caller
+// may want to log. All callers treat a nil result as "fall through to
+// DWARF / hardcoded offsets".
 //
-// Safe to call for 3.10/3.11 — returns nil, nil unconditionally and the
-// caller should fall through to DWARF/hardcoded offsets.
+// When it DOES return a populated PyOffsets, that table is authoritative
+// for the exact CPython build the workload is running: immune to
+// distro-patch layout drift, release-vs-debug ABI differences, and DWARF
+// lookups from sibling libraries.
 func ReadDebugOffsetsFromPID(pid uint32, runtimeAddr uint64, minor int) (*PyOffsets, error) {
-	if minor < 12 || runtimeAddr == 0 {
+	if minor < 13 || runtimeAddr == 0 {
 		return nil, nil
 	}
 	mem, err := OpenProcMem(pid)
@@ -109,33 +186,48 @@ func ReadDebugOffsetsFromPID(pid uint32, runtimeAddr uint64, minor int) (*PyOffs
 	return readDebugOffsets(mem, runtimeAddr, minor)
 }
 
-// Returns nil for minor < 12 (struct does not exist before 3.12).
+// readDebugOffsets reads the _Py_DebugOffsets struct and parses it via
+// parseDebugOffsets. Split out so parseDebugOffsets can be unit-tested
+// against synthetic byte buffers without going through /proc.
 func readDebugOffsets(mem *ProcMem, runtimeAddr uint64, minor int) (*PyOffsets, error) {
-	if minor < 12 {
+	if minor < 13 {
 		return nil, nil
 	}
-
-	// _Py_DebugOffsets layout varies between CPython minor versions.
-	// We only support 3.12 with known group offsets. For 3.13+, fall
-	// through to DWARF/hardcoded until we add their layouts.
-	if minor != 12 {
-		symDebugf("_Py_DebugOffsets: version 3.%d not yet supported, falling back to DWARF/hardcoded", minor)
-		return nil, nil
-	}
-
-	// Read the _Py_DebugOffsets header. The struct is at the very start of _PyRuntime.
-	// We need enough bytes to cover all the offset groups we care about.
-	// CPython 3.12 _Py_DebugOffsets is approximately 200-300 bytes.
-	// Read a generous buffer to cover current and future versions.
-	const bufSize = 512
+	// 3.14's _Py_DebugOffsets is ~648 bytes; 3.13's is ~584 bytes. 1024
+	// leaves comfortable headroom for any future minor that grows the
+	// struct without requiring a re-size on every patch bump.
+	const bufSize = 1024
 	buf := make([]byte, bufSize)
 	if err := mem.ReadAt(buf, runtimeAddr); err != nil {
 		return nil, fmt.Errorf("reading _Py_DebugOffsets at 0x%x: %w", runtimeAddr, err)
 	}
+	return parseDebugOffsets(buf, minor)
+}
 
-	// Helper to read a uint64 at a byte offset within the buffer.
-	readU64 := func(off int) uint64 {
-		if off+8 > len(buf) {
+// parseDebugOffsets extracts field offsets from a raw _Py_DebugOffsets
+// byte buffer. Pure function — no I/O, no globals beyond the per-version
+// layout tables — so the parser can be exercised in unit tests against
+// fixture buffers built with Go.
+func parseDebugOffsets(buf []byte, minor int) (*PyOffsets, error) {
+	layout, ok := debugOffsetsLayouts[minor]
+	if !ok {
+		symDebugf("_Py_DebugOffsets: no layout registered for CPython 3.%d, falling back to DWARF/hardcoded", minor)
+		return nil, nil
+	}
+
+	// Cookie: exactly 8 bytes, no NUL terminator. If the cookie is wrong
+	// we're almost certainly reading the wrong address or a pre-3.13
+	// build; either way, walking the rest of the struct would produce
+	// garbage offsets.
+	if len(buf) < 24 {
+		return nil, fmt.Errorf("_Py_DebugOffsets buffer too short: %d bytes", len(buf))
+	}
+	if string(buf[0:8]) != debugOffsetsCookie {
+		return nil, fmt.Errorf("_Py_DebugOffsets cookie mismatch: got %q, want %q", string(buf[0:8]), debugOffsetsCookie)
+	}
+
+	readU64 := func(off uint64) uint64 {
+		if off+8 > uint64(len(buf)) {
 			return 0
 		}
 		return uint64(buf[off]) | uint64(buf[off+1])<<8 | uint64(buf[off+2])<<16 |
@@ -143,167 +235,75 @@ func readDebugOffsets(mem *ProcMem, runtimeAddr uint64, minor int) (*PyOffsets, 
 			uint64(buf[off+6])<<48 | uint64(buf[off+7])<<56
 	}
 
-	// Validate the version field. It encodes the CPython version.
-	// For 3.12.x it should encode major=3, minor=12.
-	version := readU64(0)
-	if version == 0 {
-		return nil, fmt.Errorf("_Py_DebugOffsets version is 0 — not a valid debug offsets struct")
+	// Version field is PY_VERSION_HEX, a packed integer whose high bits
+	// encode major.minor. Validate the minor to reject "cookie matched
+	// by chance on stale memory" and "we're reading the wrong struct".
+	// PY_VERSION_HEX format: (major << 24) | (minor << 16) | (micro << 8) | (release << 4) | serial.
+	version := readU64(8)
+	gotMajor := int((version >> 24) & 0xff)
+	gotMinor := int((version >> 16) & 0xff)
+	if gotMajor != 3 || gotMinor != minor {
+		return nil, fmt.Errorf("_Py_DebugOffsets version mismatch: buffer encodes 3.%d, caller asked for 3.%d (version=0x%x)",
+			gotMinor, minor, version)
 	}
 
-	symDebugf("_Py_DebugOffsets version field: 0x%x", version)
-
-	// _Py_DebugOffsets layout for CPython 3.12 (each field is uint64):
-	//
-	// Header (2 fields):
-	//   [0]  version
-	//   [8]  free_threaded
-	//
-	// runtime_state group (3 fields):
-	//   [16] size
-	//   [24] finalizing
-	//   [32] interpreters_head
-	//
-	// interpreter_state group (variable fields):
-	//   [40] size
-	//   [48] threads_head
-	//   ... (we only need threads_head)
-	//
-	// To find subsequent groups, we use the size field of each group
-	// to determine how many uint64s it contains, then skip ahead.
-	// However, the size field is the size of the *target struct*, not
-	// the offset group. The number of fields per group is fixed per
-	// CPython version.
-	//
-	// For CPython 3.12, the layout is well-defined. We use fixed offsets
-	// based on the known struct layout.
-
-	// Fixed byte offsets within _Py_DebugOffsets for CPython 3.12:
-	const (
-		offVersion         = 0
-		offFreeThreaded    = 8
-		offRuntimeSize     = 16
-		offRuntimeFinalizing    = 24
-		offRuntimeInterpretersHead = 32
-		offInterpSize      = 40
-		offInterpThreadsHead = 48
-	)
-
-	// Read the runtime_state offsets.
-	runtimeInterpretersHead := readU64(offRuntimeInterpretersHead)
-	interpThreadsHead := readU64(offInterpThreadsHead)
-
-	// For the remaining groups, we need to know how many fields are in the
-	// interpreter_state group. In CPython 3.12, the groups after interpreter_state
-	// are at fixed positions. We compute these by counting fields.
-	//
-	// CPython 3.12 _Py_DebugOffsets field layout (verified against cpython/Include/internal/pycore_debug_offsets.h):
-	//   interpreter_state: size, threads_head, gc, modules, builtins, sysdict, ceval_gil, gil_runtime_state
-	//   That's 8 fields = 64 bytes, starting at offset 40, so next group at 40+64=104
-	//
-	// But the exact count varies by CPython patch version. We use the interpreter_state
-	// size field to detect the group boundary. Each offset group has:
-	//   1 size field + N named offset fields
-	//
-	// Simpler approach: the interp group in 3.12 has a known number of fields.
-	// We'll read the interp group size to validate, then use fixed offsets.
-
-	// CPython 3.12 thread_state group starts after interpreter_state group.
-	// interpreter_state group in 3.12 has 8 fields (size + 7 offsets) = 64 bytes.
-	// So thread_state group starts at offset 40 + 64 = 104.
-	//
-	// However, this varies between 3.12.x patch releases. A more robust approach:
-	// scan for the thread_state group by looking at the size field values.
-	// The "size" field of each group contains the sizeof() of the corresponding
-	// CPython struct (e.g., sizeof(PyThreadState) is typically 300-500 bytes).
-
-	// For robustness, we scan forward from the interpreter_state group to find
-	// the thread_state group. We know:
-	// - Each group starts with a "size" field containing sizeof(struct)
-	// - PyThreadState size is typically 200-600 bytes
-	// - _PyInterpreterFrame size is typically 40-100 bytes
-
-	// Start scanning after the interp group's first two fields we already read.
-	// The interp group starts at offset 40. We look for where the next "size"
-	// field starts by checking plausible offsets.
-
-	// CPython 3.12.0-3.12.x: interpreter_state group has these fields:
-	//   size, threads_head, gc, modules, builtins, sysdict, ceval_gil, gil_runtime_state
-	// That's 8 fields = 64 bytes. Thread state group at 104.
-
-	const threadsGroupStart = 104
-
-	tstateNext := readU64(threadsGroupStart + 2*8)         // next (3rd field after size, prev)
-	tstateCurrentFrame := readU64(threadsGroupStart + 4*8)  // current_frame (5th field)
-	tstateNativeThreadID := readU64(threadsGroupStart + 5*8) // native_thread_id (6th field)
-
-	// Validate: these should look like struct offsets (small positive numbers, < 1000).
-	if tstateNext > 1000 || tstateCurrentFrame > 1000 || tstateNativeThreadID > 1000 {
-		return nil, fmt.Errorf("_Py_DebugOffsets thread_state offsets look invalid (next=%d, current_frame=%d, native_thread_id=%d)",
-			tstateNext, tstateCurrentFrame, tstateNativeThreadID)
-	}
-
-	// Thread state group in 3.12 has: size, prev, next, interp, current_frame, native_thread_id
-	// That's 6 fields = 48 bytes. Frame group starts at 104 + 48 = 152.
-	const frameGroupStart = 152
-
-	framePrevious := readU64(frameGroupStart + 1*8)   // previous (2nd field after size)
-	frameExecutable := readU64(frameGroupStart + 2*8)  // executable (3rd field)
-
-	// Frame group in 3.12 has: size, previous, executable, instr_ptr, ...
-	// Typically 4-6 fields. Code object group follows.
-	// 3.12: frame group has 4 fields = 32 bytes. Code group at 152 + 32 = 184.
-	const codeGroupStart = 184
-
-	codeFilename := readU64(codeGroupStart + 1*8)      // filename (2nd field)
-	codeName := readU64(codeGroupStart + 2*8)           // name (3rd field)
-	codeFirstLineNo := readU64(codeGroupStart + 4*8)    // firstlineno (5th field, after qualname)
-
-	// Code group in 3.12 has: size, filename, name, qualname, firstlineno, ...
-	// Typically 5-6 fields. Unicode group follows.
-	// 3.12: code group has 5 fields = 40 bytes. Unicode group at 184 + 40 = 224.
-	const unicodeGroupStart = 224
-
-	unicodeLength := readU64(unicodeGroupStart + 1*8)   // length (2nd field)
-	unicodeState := readU64(unicodeGroupStart + 2*8)    // state (3rd field, used for ascii/compact flags)
-	unicodeASCII := readU64(unicodeGroupStart + 3*8)    // ascii (4th field, data start for compact ASCII)
-
-	// Validate unicode offsets.
-	if unicodeASCII > 256 || unicodeLength > 256 {
-		return nil, fmt.Errorf("_Py_DebugOffsets unicode offsets look invalid (length=%d, ascii=%d)",
-			unicodeLength, unicodeASCII)
-	}
-
-	// thread_id (pthread_self) is stored immediately before native_thread_id
-	// in CPython 3.12's PyThreadState. This offset relationship is stable
-	// within 3.12.x but NOT guaranteed across minor versions — another
-	// reason to gate this function by minor version.
-	if tstateNativeThreadID < 8 {
-		return nil, fmt.Errorf("_Py_DebugOffsets: native_thread_id offset %d too small to derive thread_id", tstateNativeThreadID)
-	}
-	tstateThreadID := tstateNativeThreadID - 8
-
+	// Extract the offsets we actually use.
+	tstateNativeThreadID := readU64(layout.tstateNativeThreadID)
 	offsets := &PyOffsets{
 		Version:                 fmt.Sprintf("3.%d-debugoffsets", minor),
-		RuntimeInterpretersHead: runtimeInterpretersHead,
-		InterpTstateHead:        interpThreadsHead,
-		TstateNext:              tstateNext,
-		TstateThreadID:          tstateThreadID,
-		TstateNativeThreadID:    tstateNativeThreadID,
-		TstateFrame:             tstateCurrentFrame,
-		CframeCurrentFrame:      0, // 3.12+ uses direct pointer, no cframe indirection
-		FrameBack:               framePrevious,
-		FrameCode:               frameExecutable,
-		CodeFilename:            codeFilename,
-		CodeName:                codeName,
-		CodeFirstLineNo:         codeFirstLineNo,
-		UnicodeLength:           unicodeLength,
-		UnicodeData:             unicodeASCII,
-		UnicodeState:            unicodeState,
-		NewStyleFrames:          true,
+		RuntimeInterpretersHead: readU64(layout.runtimeInterpretersHead),
+		InterpTstateHead:        readU64(layout.interpThreadsHead),
+		InterpNext:              readU64(layout.interpNext),
+		// PyThreadState.next is not exported via _Py_DebugOffsets but has
+		// been at byte 8 since 3.9 (stable across all supported versions).
+		// Hardcoding it here keeps the layout table focused on fields that
+		// genuinely drift between versions.
+		TstateNext:           8,
+		TstateThreadID:       readU64(layout.tstateThreadID),
+		TstateNativeThreadID: tstateNativeThreadID,
+		TstateFrame:          readU64(layout.tstateCurrentFrame),
+		CframeCurrentFrame:   0, // 3.13+ dropped cframe; current_frame is direct.
+		FrameBack:            readU64(layout.framePrevious),
+		FrameCode:            readU64(layout.frameExecutable),
+		CodeFilename:         readU64(layout.codeFilename),
+		CodeName:             readU64(layout.codeName),
+		CodeFirstLineNo:      readU64(layout.codeFirstLineNo),
+		UnicodeLength:        readU64(layout.unicodeLength),
+		UnicodeState:         readU64(layout.unicodeState),
+		UnicodeData:          readU64(layout.unicodeASCII),
+		NewStyleFrames:       true,
 	}
 
-	symDebugf("_Py_DebugOffsets extracted: RuntimeInterpretersHead=%d InterpTstateHead=%d TstateNext=%d TstateFrame=%d FrameBack=%d FrameCode=%d CodeFilename=%d CodeName=%d UnicodeData=%d",
-		offsets.RuntimeInterpretersHead, offsets.InterpTstateHead, offsets.TstateNext,
+	// Basic sanity check: every offset here is a position within a
+	// CPython struct, so kilobyte-scale values almost certainly mean we
+	// mis-parsed the buffer. PyInterpreterState has grown past 7000
+	// bytes in 3.13, so use a forgiving upper bound.
+	if offsets.InterpTstateHead > 32768 || offsets.TstateFrame > 4096 ||
+		offsets.FrameCode > 4096 || offsets.CodeFilename > 4096 ||
+		offsets.UnicodeData > 256 {
+		return nil, fmt.Errorf("_Py_DebugOffsets sanity check failed for 3.%d: InterpTstateHead=%d TstateFrame=%d FrameCode=%d CodeFilename=%d UnicodeData=%d",
+			minor, offsets.InterpTstateHead, offsets.TstateFrame, offsets.FrameCode, offsets.CodeFilename, offsets.UnicodeData)
+	}
+	// Zero-value guard: every field below must be non-zero on every
+	// supported CPython layout. A torn read or a future debug-offsets
+	// table whose slot mapping is stale can land zero in a load-bearing
+	// offset, and the walker would then read from offset 0 of
+	// PyThreadState as if it were the frame pointer. FrameCode is
+	// intentionally NOT checked — on 3.13+ f_executable is the first
+	// field of _PyInterpreterFrame, so FrameCode == 0 is legitimate.
+	if offsets.InterpTstateHead == 0 || offsets.TstateFrame == 0 ||
+		offsets.CodeFilename == 0 || offsets.CodeName == 0 ||
+		offsets.UnicodeLength == 0 || offsets.UnicodeState == 0 ||
+		offsets.UnicodeData == 0 {
+		return nil, fmt.Errorf("_Py_DebugOffsets zero-field guard failed for 3.%d: InterpTstateHead=%d TstateFrame=%d CodeFilename=%d CodeName=%d UnicodeLength=%d UnicodeState=%d UnicodeData=%d",
+			minor, offsets.InterpTstateHead, offsets.TstateFrame,
+			offsets.CodeFilename, offsets.CodeName,
+			offsets.UnicodeLength, offsets.UnicodeState, offsets.UnicodeData)
+	}
+
+	symDebugf("_Py_DebugOffsets 3.%d parsed: RuntimeInterpretersHead=%d InterpTstateHead=%d TstateFrame=%d FrameBack=%d FrameCode=%d CodeFilename=%d CodeName=%d UnicodeData=%d",
+		minor,
+		offsets.RuntimeInterpretersHead, offsets.InterpTstateHead,
 		offsets.TstateFrame, offsets.FrameBack, offsets.FrameCode,
 		offsets.CodeFilename, offsets.CodeName, offsets.UnicodeData)
 
@@ -440,10 +440,18 @@ func pyOffsets310() *PyOffsets {
 
 		InterpTstateHead: 8, // PyInterpreterState.tstate_head
 
-		TstateNext:           8,   // PyThreadState.next
-		TstateThreadID:       176, // PyThreadState.thread_id (pthread_self)
-		TstateNativeThreadID: 184, // PyThreadState.native_thread_id (gettid, 3.8+)
-		TstateFrame:          24,  // PyThreadState.frame (PyFrameObject*)
+		TstateNext:     8,   // PyThreadState.next
+		TstateThreadID: 176, // PyThreadState.thread_id (pthread_self)
+		// native_thread_id (gettid) was added to PyThreadState upstream in
+		// 3.11, not 3.8 as an earlier comment in this file claimed. Ubuntu
+		// backports the field to 3.10 via a distro patch (where it sits at
+		// byte 184 but is never populated for the main thread, which is why
+		// find_thread_state needs the single-tstate fallback). On vanilla
+		// 3.9/3.10 builds the field does not exist at all; the walker reads
+		// whatever happens to live at byte 184 and relies entirely on the
+		// single-tstate fallback to still return a correct tstate.
+		TstateNativeThreadID: 184,
+		TstateFrame:          24, // PyThreadState.frame (PyFrameObject*)
 
 		CframeCurrentFrame: 0, // Not used in 3.10
 
@@ -484,7 +492,7 @@ func pyOffsets311() *PyOffsets {
 
 		TstateNext:           8,
 		TstateThreadID:       176, // pthread_self
-		TstateNativeThreadID: 184, // gettid (3.8+)
+		TstateNativeThreadID: 184, // gettid (added upstream in 3.11)
 		TstateFrame:          40,  // PyThreadState.cframe (_PyCFrame*)
 
 		CframeCurrentFrame: 0, // _PyCFrame.current_frame (offset 0)
@@ -496,19 +504,70 @@ func pyOffsets311() *PyOffsets {
 		CodeName:        112,
 		CodeFirstLineNo: 48,
 
+		// PyASCIIObject on x86_64 (3.11 upstream layout, pre-PEP-623):
+		//   PyObject_HEAD (16) + length (8) + hash (8) + state (4) +
+		//   pad (4) + wstr (8) = 48 bytes total.
+		// Compact ASCII data starts immediately after the struct, at 48.
+		// The earlier hardcoded UnicodeState=20 pointed at the middle of
+		// `hash`, which silently failed the compact+ascii bit check and
+		// made read_compact_ascii return zero-length filenames and
+		// funcnames on every frame.
 		UnicodeLength: 16,
 		UnicodeData:   48,
-		UnicodeState:  20,
+		UnicodeState:  32,
 
 		NewStyleFrames: true,
 	}
 }
 
-// CPython 3.9 uses the same legacy PyFrameObject layout as 3.10. Treated by the
-// walker as "walker_310" (see python_walker.bpf.h dispatcher). Kept
-// distinct so we can diverge fields from 3.10 where needed. Verified on
-// cpython 3.9.25 from the uv python distribution: _PyRuntime.interpreters.head
-// sits at byte 32, not at 40 (3.10's value).
+// CPython 3.9 uses the legacy PyFrameObject layout (no _PyInterpreterFrame,
+// no cframe indirection). Routed to walker_310 by the dispatcher.
+//
+// Offsets derived from cpython v3.9.25 upstream headers:
+//
+//   _PyRuntime (pycore_runtime.h):
+//     4 ints (preinitializing..initialized) -> 16
+//     _Py_atomic_address _finalizing         -> +8  = 24
+//     pyinterpreters.mutex                   -> +8  = 32
+//     pyinterpreters.head                    -> RuntimeInterpretersHead = 32
+//
+//   PyInterpreterState (pycore_interp.h):
+//     next (8) -> 0
+//     tstate_head -> InterpTstateHead = 8
+//
+//   PyThreadState (cpython/pystate.h):
+//     prev/next/interp (3 * 8)         -> 24
+//     frame                            -> TstateFrame = 24
+//     recursion_depth/overflowed/...   -> +8  = 32
+//     stackcheck/tracing/use_tracing   -> +16 = 48
+//     pad+c_profilefunc/c_tracefunc/c_profileobj/c_traceobj (4*8)
+//     curexc_type/value/traceback (3*8) -> +32 = 104
+//     exc_state (_PyErr_StackItem, 32) -> +32 = 144
+//     exc_info/dict (2*8)              -> 160
+//     gilstate_counter+pad+async_exc   -> 176
+//     thread_id                        -> TstateThreadID = 176
+//
+//   native_thread_id does NOT exist in vanilla 3.9 (upstream added it in
+//   3.11). The walker still sets TstateNativeThreadID = 184 (inherited
+//   from 3.10) because find_thread_state reads that offset unconditionally;
+//   on 3.9 it ends up reading `trash_delete_nesting` (int) and fails the
+//   kernel-tid match, at which point the single-tstate fallback returns
+//   the first (and only) tstate for the common single-threaded case.
+//
+//   PyFrameObject (cpython/frameobject.h):
+//     PyObject_VAR_HEAD (24) + f_back (8) + f_code (8) = FrameCode offset 32
+//     FrameBack = 24
+//
+//   PyCodeObject (cpython/code.h) layout is identical to 3.10, so
+//   CodeFilename=104, CodeName=112, CodeFirstLineNo=40 carry over unchanged.
+//
+// Open question: the plan's pre-validation matrix reported "3.9: 0 frames,
+// walker enters, emits nothing". That observation was made before the
+// precursor single-tstate fallback landed; with that fallback now in place,
+// the walker should emit frames for single-threaded 3.9 workloads. Live
+// /proc/<pid>/mem verification on a uv-distributed cpython-3.9.x process
+// is still pending to rule out any build-specific quirk not covered by the
+// upstream header derivation above.
 func pyOffsets39() *PyOffsets {
 	o := pyOffsets310()
 	o.Version = "3.9"
@@ -520,12 +579,29 @@ func pyOffsets39() *PyOffsets {
 //
 // 3.13 dropped the _PyCFrame indirection and made PyThreadState.current_frame
 // a direct pointer to _PyInterpreterFrame, so the frame-walk path matches 3.12.
-// Notable deltas from 3.12 (verified empirically on an upstream cpython-3.13.13
-// build with ctypes): PyCodeObject.co_firstlineno moved from byte 48 to byte 68.
+// _PyInterpreterFrame layout is unchanged from 3.12 on x86_64 (verified against
+// CPython v3.13.0..v3.13.13 Include/internal/pycore_frame.h):
+//
+//   offset 0:  PyObject *f_executable   (code object)
+//   offset 8:  _PyInterpreterFrame *previous
+//   offset 16: PyObject *f_funcobj
+//   offset 24: PyObject *f_globals
+//   offset 32: PyObject *f_builtins
+//   offset 40: PyObject *f_locals
+//   ...
+//
+// The real 3.12→3.13 deltas are outside the frame struct:
+//   - _PyRuntime grew a _Py_DebugOffsets prefix, pushing interpreters.head
+//     from byte 40 to byte 632.
+//   - PyInterpreterState grew (PEP 684 per-interpreter state), pushing
+//     threads.head from byte 16 to byte 7344.
+//   - PyThreadState.current_frame moved from byte 56 to byte 232.
+//   - PyCodeObject.co_firstlineno moved from byte 48 to byte 68.
+//
 // _Py_DebugOffsets is the authoritative source for 3.13+ but only comes into
 // play when the reader at `ReadDebugOffsetsFromPID` has the 3.13 layout
 // constants wired up; these fallback values unblock the walker in the
-// meantime and get overlaid by the harvester for fields it can discover.
+// meantime.
 func pyOffsets313() *PyOffsets {
 	return &PyOffsets{
 		Version: "3.13",
@@ -545,14 +621,23 @@ func pyOffsets313() *PyOffsets {
 		TstateNext:           8,
 		TstateThreadID:       152,
 		TstateNativeThreadID: 160,
-		TstateFrame:          232, // current_frame (_PyInterpreterFrame*, direct)
+		// current_frame in 3.13 sits at byte 72 of PyThreadState, not 232.
+		// Layout per Include/cpython/pystate.h: prev/next/interp (24) +
+		// eval_breaker (8) + _status+_whence+state+py_recursion_* +
+		// c_recursion_*+tracing+what_event (10 ints = 40) + 4-byte pad = 72.
+		// Verified on /proc/<pid>/mem of cpython-3.13.13 (uv distribution)
+		// by walking `previous` from every pointer in tstate[:2KB] and
+		// confirming only the one at +72 chains to sys._getframe().f_frame.
+		// The earlier 232 pointed at datastack_chunk (a _PyStackChunk
+		// header), which explains the "1 garbage frame then 0" symptom.
+		TstateFrame:          72,
 
 		CframeCurrentFrame: 0,
 
-		// _PyInterpreterFrame in 3.13 re-ordered fields vs 3.12.
-		// f_executable moved from byte 0 to byte 32, previous from 24 to 8.
+		// _PyInterpreterFrame field order on 3.13 matches 3.12:
+		// f_executable at 0, previous at 8.
 		FrameBack: 8,
-		FrameCode: 32,
+		FrameCode: 0,
 
 		CodeFilename:    112,
 		CodeName:        120,
@@ -571,8 +656,15 @@ func pyOffsets313() *PyOffsets {
 
 // CPython 3.14 uses direct current_frame like 3.13. _Py_DebugOffsets grew
 // again, shifting interpreters.head from 3.13's 632 to 808 on cpython
-// 3.14.4 (empirical). Other fields (TstateFrame, FrameCode) stayed put
-// so we reuse 3.13's values for those.
+// 3.14.4 (empirical). _PyInterpreterFrame field order at frame-walk offsets
+// (0 and 8) is unchanged, so FrameCode and FrameBack from 3.13 carry over.
+//
+// NOTE: 3.14 re-typed f_executable from `PyObject *` to the `_PyStackRef`
+// union (Include/internal/pycore_interpframe_structs.h). The low bits of
+// the 8-byte word carry a tag (Py_TAG_REFCNT = 1 in default GIL build).
+// The eBPF walker masks `code_ptr &= ~0x7ULL` after reading f_executable
+// to strip the tag before treating the value as a PyCodeObject pointer;
+// see walk_python_frames_312 in bpf/python_walker.bpf.h.
 func pyOffsets314() *PyOffsets {
 	o := pyOffsets313()
 	o.Version = "3.14"
@@ -607,9 +699,20 @@ func pyOffsets312() *PyOffsets {
 		CodeName:        120,
 		CodeFirstLineNo: 48,
 
+		// PyASCIIObject on x86_64 (3.12 upstream layout, post-PEP-623
+		// removed wstr):
+		//   PyObject_HEAD (16) + length (8) + hash (8) + state (4) +
+		//   pad (4) = 40 bytes total.
+		// Compact ASCII data starts immediately after the struct, at 40.
+		// Earlier hardcoded values (state=20 / data=48) matched an older
+		// pre-PEP-623 layout; on vanilla 3.12 they point at the middle
+		// of `hash` (for state) and past the struct tail (for data),
+		// silently producing empty filenames. Ubuntu distro builds that
+		// retain the pre-PEP-623 layout are covered by the runtime
+		// harvester's pattern-scan override.
 		UnicodeLength: 16,
-		UnicodeData:   48,
-		UnicodeState:  20,
+		UnicodeData:   40,
+		UnicodeState:  32,
 
 		NewStyleFrames: true,
 	}

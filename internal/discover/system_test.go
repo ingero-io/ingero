@@ -1,7 +1,9 @@
 package discover
 
 import (
+	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -30,4 +32,96 @@ func TestCheckPtraceScope(t *testing.T) {
 		t.Errorf("CheckPtraceScope() = %d, want 0-3", level)
 	}
 	t.Logf("ptrace_scope level: %d", level)
+}
+
+func TestBTFRecommendationForPackageManager(t *testing.T) {
+	tests := []struct {
+		name     string
+		pm       string
+		contains string
+	}{
+		{
+			name:     "apt uses linux-tools with uname",
+			pm:       "apt",
+			contains: "linux-tools-$(uname -r)",
+		},
+		{
+			name:     "dnf uses kernel debuginfo",
+			pm:       "dnf",
+			contains: "dnf install kernel-debuginfo",
+		},
+		{
+			name:     "unknown uses generic guidance",
+			pm:       "unknown",
+			contains: "package name varies by distro",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reco := btfRecommendationForPackageManager(tt.pm)
+			if !strings.Contains(reco, tt.contains) {
+				t.Fatalf("recommendation %q missing %q", reco, tt.contains)
+			}
+		})
+	}
+}
+
+func TestCheckNVIDIAVersionRecommendation(t *testing.T) {
+	old := checkNVIDIAVersion("545.23")
+	if old.OK {
+		t.Fatal("expected old driver to fail 550+ check")
+	}
+	if !strings.Contains(old.Recommendation, "nvidia.com") {
+		t.Fatalf("expected recommendation to include driver download link, got %q", old.Recommendation)
+	}
+
+	newer := checkNVIDIAVersion("550.40")
+	if !newer.OK {
+		t.Fatal("expected 550+ driver to pass")
+	}
+	if newer.Recommendation != "" {
+		t.Fatalf("expected no recommendation for passing driver check, got %q", newer.Recommendation)
+	}
+}
+
+func TestCheckPrivileges(t *testing.T) {
+	res := CheckPrivileges()
+	if res.Name != "Privileges" {
+		t.Fatalf("unexpected check name: %q", res.Name)
+	}
+
+	if os.Geteuid() == 0 {
+		if !res.OK || res.Optional {
+			t.Fatalf("root run should be OK and non-optional, got OK=%v Optional=%v", res.OK, res.Optional)
+		}
+		return
+	}
+
+	if res.OK {
+		t.Fatal("non-root run should not fully pass privileges check")
+	}
+	if !res.Optional {
+		t.Fatal("non-root privileges check should be optional")
+	}
+	if !strings.Contains(strings.ToLower(res.Detail), "sudo") {
+		t.Fatalf("expected non-root detail to mention sudo, got %q", res.Detail)
+	}
+	if res.Recommendation == "" {
+		t.Fatal("expected recommendation for non-root privileges check")
+	}
+}
+
+func TestRunAllChecksIncludesPrivileges(t *testing.T) {
+	results := RunAllChecks()
+	found := false
+	for _, r := range results {
+		if r.Name == "Privileges" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("RunAllChecks() missing Privileges check")
+	}
 }
