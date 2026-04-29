@@ -9,10 +9,13 @@
 **Featured in:**
 [awesome-ebpf](https://github.com/qmonnet/awesome-ebpf) ·
 [awesome-observability](https://github.com/adriannovegil/awesome-observability) ·
+[awesome-opentelemetry](https://github.com/magsther/awesome-opentelemetry) ·
 [awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
 [awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
 [awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
 [Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
+[awesome-gpu-engineering](https://github.com/goabiaryan/awesome-gpu-engineering) ·
+[awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) ·
 [awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
 [MCP Registry](https://registry.modelcontextprotocol.io) ·
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
