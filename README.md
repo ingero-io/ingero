@@ -21,6 +21,8 @@
 <!-- ingero-version:install-header product=ingero channel=stable -->
 **Version: 0.10.0**
 
+**v0.10 improvements:** real GPU memory signal via `nvidia-smi` (with host-RAM fallback), sub-minute signal derivation (`event_aggregates_5s` table for `--signal-window` ≤ 60s), `straggler_state transition` log lines for operator visibility, new `cmd/straggler-sink` reference consumer for the `--remediate` UDS (Prometheus counters out of the box), optional `straggler-sink` Helm sidecar, mTLS material shared between OTLP push and threshold GET poller, and eBPF Python walker support extended to CPython 3.9, 3.13, and 3.14.
+
 **The only GPU observability tool your AI assistant can talk to.**
 
 *"What caused the GPU stall?" → "`forward()` at `train.py:142`  -  cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
@@ -198,7 +200,7 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.9.1`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.10.0`):
 
 ```bash
 # Linux amd64
@@ -362,7 +364,7 @@ sudo ingero trace --sampling-rate 0        # adaptive sampling (default: 1 = emi
 sudo ingero trace --py-walker ebpf         # in-kernel CPython walker (works at ptrace_scope=3)
 ```
 
-**Flag reference (post-v0.9.1 additions):**
+**Flag reference:**
 
 - `--cuda-lib PATH` — Explicit path to `libcudart.so`. Skips auto-discovery. Useful for venv workloads where multiple `libcudart` copies exist.
 - `--ringbuf-size SIZE` — Override ring buffer size for high-throughput probes (cuda, driver, host). Accepts `k`/`m`/`g` suffix. Must be a power of 2, minimum 4096. Default: compiled sizes (8MB cuda/driver, 1MB host).
@@ -618,7 +620,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.9.1 (commit: 01af280, built: 2026-04-06)
+ingero v0.10.0 (commit: <sha>, built: <date>)
 ```
 
 ## Stack Tracing
