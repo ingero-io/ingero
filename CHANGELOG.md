@@ -6,6 +6,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Fleet-side changes (the OTel Collector distribution) live in the
 `ingero-fleet` repo's `CHANGELOG.md`.
 
+## [Unreleased]
+
+### Fixed
+
+- **MCP server reports build-time version.** `ingero mcp` now reports
+  the version embedded at build time (e.g. `v0.10.0`) in the MCP
+  `Implementation.Version` field, instead of the previously hardcoded
+  `"0.9.0"` string. Affects how MCP clients (Claude Desktop, IDE
+  plugins, glama.ai) identify the server. The hardcode shipped in
+  v0.10.0; binaries built from main HEAD or from any v0.10.1+ tag
+  carry the fix.
+
 ## [0.10.0] - 2026-04-21
 
 ### Added
