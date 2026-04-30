@@ -31,7 +31,7 @@ import re
 import sys
 from pathlib import Path
 
-VALID_PRODUCTS = {"ingero", "ingero-fleet", "ingero-ee"}
+VALID_PRODUCTS = {"ingero", "ingero-fleet"}
 VALID_CHANNELS = {"stable"}
 
 ANCHOR_MD = re.compile(

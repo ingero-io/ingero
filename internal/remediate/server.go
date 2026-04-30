@@ -173,8 +173,7 @@ func isClosedError(err error) bool {
 // The "type" field enables the orchestrator to dispatch by message type.
 //
 // v0.10: comm carries the kernel-captured process name. Older orchestrator
-// builds silently ignore unknown JSON fields (Rust serde default behavior,
-// verified — no #[serde(deny_unknown_fields)] in ingero-ee/orchestrator/src/),
+// builds silently ignore unknown JSON fields (Rust serde default behavior),
 // so adding comm is non-breaking on the wire.
 type typedMessage struct {
 	Type           string  `json:"type"`

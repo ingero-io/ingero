@@ -992,7 +992,7 @@ Reference material for power users. The defaults are tuned for typical training 
 
 ## License
 
-**Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
+**Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home.
 
 Dual-licensed following the standard eBPF split-licensing model (same as Cilium, Falco, and most eBPF projects):
 

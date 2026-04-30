@@ -73,9 +73,9 @@ fleetPush:
     # where the ingero agent and the sink sidecar ship together here.
     #
     # "hostPath": the node's real /tmp. Required when pairing with a
-    # separate ingero-ee orchestrator chart whose pod cannot share an
-    # emptyDir with this one. Be aware: host /tmp becomes shared with every
-    # other consumer on the node, which is why this is opt-in.
+    # separate orchestrator chart whose pod cannot share an emptyDir
+    # with this one. Be aware: host /tmp becomes shared with every other
+    # consumer on the node, which is why this is opt-in.
     tmpVolumeType: emptyDir
     # The agent runs privileged (uid 0) so it can open eBPF
     # resources; the sink sidecar runs as distroless nonroot (uid 65532,
