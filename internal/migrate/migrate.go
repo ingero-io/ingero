@@ -28,7 +28,7 @@ import (
 	"errors"
 	"fmt"
 
-	// SQLite driver — same modernc.org/sqlite as the rest of the agent
+	// SQLite driver: same modernc.org/sqlite as the rest of the agent
 	// uses (see internal/store). No CGO required.
 	_ "modernc.org/sqlite"
 )
@@ -51,7 +51,7 @@ type Migration struct {
 // binary knows about. v0.11 defines none; future versions append.
 //
 // Append a new migration by adding a new entry with the next Version
-// number. Never reorder, renumber, or rewrite a published entry —
+// number. Never reorder, renumber, or rewrite a published entry;
 // older binaries will already have applied it under the original ID.
 var migrations = []Migration{
 	// v0.11.0: framework only, no migrations.

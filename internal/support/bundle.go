@@ -194,12 +194,12 @@ func buildMetadata(version, commit string) string {
 }
 
 // sensitiveKeys lists case-insensitive substrings; an env-var key
-// containing any of these has its value masked. Conservative —
+// containing any of these has its value masked. Conservative:
 // false positives are fine, false negatives leak.
 var sensitiveKeys = []string{
 	"TOKEN", "SECRET", "PASS", "KEY", "API_", "_API", "CREDENTIALS",
 	"AUTH", "PRIVATE", "SESSION", "COOKIE", "AWS_", "GCP_",
-	"AZURE_", "GH_TOKEN", "GITHUB_TOKEN", "OPENAI",
+	"AZURE_", "GH_TOKEN", "GITHUB_TOKEN",
 }
 
 func isSensitive(key string) bool {

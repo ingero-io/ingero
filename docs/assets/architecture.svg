@@ -16,7 +16,7 @@
     </style>
   </defs>
 
-  <text x="440" y="26" text-anchor="middle" class="label" font-size="16">Ingero — agent → fleet → backends</text>
+  <text x="440" y="26" text-anchor="middle" class="label" font-size="16">Ingero: agent / fleet / backends</text>
 
   <rect x="20"  y="60"  width="220" height="320" class="group"/>
   <text x="130" y="80"  text-anchor="middle" class="group-l">GPU NODES</text>
@@ -71,7 +71,7 @@
 
   <rect x="660" y="240" width="180" height="50" class="node"/>
   <text x="750" y="259" text-anchor="middle" class="label">MCP clients</text>
-  <text x="750" y="276" text-anchor="middle" class="sub">Claude / IDE plugins / glama.ai</text>
+  <text x="750" y="276" text-anchor="middle" class="sub">MCP-aware editors + glama.ai</text>
 
   <rect x="660" y="310" width="180" height="50" class="node"/>
   <text x="750" y="329" text-anchor="middle" class="label">Sinks (UDS consumers)</text>

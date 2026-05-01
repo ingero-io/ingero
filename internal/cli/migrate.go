@@ -27,7 +27,7 @@ The DB at ~/.ingero/ingero.db (or --db-path) carries a schema_version
 row. ingero migrate compares it against the binary's current
 migration list and applies missing forward migrations in order.
 
-v0.11 defines zero migrations — the command is a no-op on every fresh
+v0.11 defines zero migrations; the command is a no-op on every fresh
 install. Future versions add migrations here without changing how
 operators invoke the command.
 

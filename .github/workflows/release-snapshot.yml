@@ -3,7 +3,7 @@ name: Release Snapshot Smoke
 # Builds a goreleaser snapshot for every PR that touches the release
 # pipeline or any BPF artifact, then static-loads the embedded BPF
 # objects from each per-arch binary and asserts the per-arch CO-RE
-# parity invariants. v0.11 D5 — guards against a goreleaser packaging
+# parity invariants. v0.11 D5: guards against a goreleaser packaging
 # regression where the wrong arch's .bpf.o ships in the wrong tarball.
 
 on:

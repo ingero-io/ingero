@@ -29,7 +29,7 @@ import (
 	"time"
 )
 
-// Config carries the runtime configuration. Loaded from YAML at
+// Config carries the runtime configuration. Loaded from JSON at
 // startup; see ingero-alerter --config <path>.
 type Config struct {
 	UDSPath    string           `json:"uds_path"`
@@ -172,7 +172,7 @@ func connectAndDispatch(ctx context.Context, udsPath string, backends []Backend,
 }
 
 // fanout dispatches one event to every backend in parallel. We log
-// per-backend errors but never abort the loop because of them — a
+// per-backend errors but never abort the loop because of them. A
 // flaky Slack integration must not block PD delivery.
 func fanout(ctx context.Context, backends []Backend, ev StragglerEvent, log *slog.Logger) {
 	for _, b := range backends {
@@ -186,7 +186,7 @@ func fanout(ctx context.Context, backends []Backend, ev StragglerEvent, log *slo
 }
 
 // buildBackends constructs the enabled backend list from Config.
-// The returned slice is empty when no backend is configured —
+// The returned slice is empty when no backend is configured;
 // running with an empty backend list is supported (no-op alerter).
 func buildBackends(cfg *Config, log *slog.Logger) []Backend {
 	timeout := 10 * time.Second
