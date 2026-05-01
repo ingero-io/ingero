@@ -83,12 +83,15 @@ PREFERRED_REGIONS=("us-east-1" "us-west-1" "us-east-2" "us-south-1" "us-midwest-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Navigate to repo root (2 levels up from scripts/lambdalabs/).
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-STATE_FILE="$PROJECT_DIR/.lambdalabs-vm.json"
+STATE_FILE="${INGERO_LAMBDA_STATE_FILE:-$PROJECT_DIR/.lambdalabs-vm.json}"
 ENV_FILE="$PROJECT_DIR/.env"
+# Per-VM SSH host alias override so two parallel deploys don't clobber
+# each other's ~/.ssh/config block.
+SSH_HOST_ALIAS_OVERRIDE="${INGERO_LAMBDA_SSH_ALIAS:-}"
 
 # SSH
 SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
-SSH_HOST_ALIAS="ingero-lambda"
+SSH_HOST_ALIAS="${SSH_HOST_ALIAS_OVERRIDE:-ingero-lambda}"
 SSH_USER="ubuntu"
 
 # Timeouts
