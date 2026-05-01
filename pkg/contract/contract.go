@@ -35,6 +35,12 @@ const (
 	AttrThreshold      = "threshold"
 	AttrScore          = "score"
 	AttrDominantSignal = "dominant_signal"
+	// AttrEventID is the agent-generated UUIDv4 that uniquely identifies
+	// one detection event across both the OTLP push and the UDS NDJSON
+	// straggler message. Consumers correlate the two channels by this
+	// value. Generated at the agent at first emission. JSON field name on
+	// the UDS wire is `event_id`.
+	AttrEventID = "ingero.event.id"
 )
 
 // OTLP resource attribute keys (stable per agent, identify the source).

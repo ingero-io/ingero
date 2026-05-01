@@ -155,13 +155,14 @@ func (r *remediateSink) SendStragglerState(ev health.StragglerEvent) error {
 		ev.ClusterID,
 		string(ev.DetectionMode),
 		ev.DominantSignal,
+		ev.EventID,
 		ev.Score,
 		ev.Threshold,
 	)
 }
 
-func (r *remediateSink) SendStragglerResolved(nodeID, clusterID string, ts time.Time) error {
-	return r.server.SendFleetStragglerResolved(ts, nodeID, clusterID)
+func (r *remediateSink) SendStragglerResolved(ev health.StragglerEvent) error {
+	return r.server.SendFleetStragglerResolved(ev.Timestamp, ev.NodeID, ev.ClusterID, ev.EventID)
 }
 
 func runFleetPush(cmd *cobra.Command, args []string) error {
@@ -321,6 +322,9 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	if fleetPushRemediate {
 		udsServer = remediate.NewServer(fleetPushRemediateSock)
 		udsServer.SetSocketGid(fleetPushRemediateGid)
+		if fleetPushWorldSize > 0 {
+			udsServer.SetRankWorldSize(fleetPushNodeRank, fleetPushWorldSize)
+		}
 		if err := udsServer.Start(); err != nil {
 			return fmt.Errorf("remediate server: %w", err)
 		}

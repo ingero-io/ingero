@@ -150,7 +150,7 @@ func TestServer(t *testing.T) {
 
 	t.Run("send_fleet_straggler_state_without_client_returns_typed_error", func(t *testing.T) {
 		srv, _ := startServer(t)
-		err := srv.SendFleetStragglerState(time.Now(), "n1", "c1", "mad", "throughput", 0.5, 0.8)
+		err := srv.SendFleetStragglerState(time.Now(), "n1", "c1", "mad", "throughput", "evt-test-1", 0.5, 0.8)
 		if !errors.Is(err, remediate.ErrDropped) {
 			t.Errorf("errors.Is(err, ErrDropped)=false; err=%v", err)
 		}
@@ -364,6 +364,152 @@ func TestServer(t *testing.T) {
 		}
 		if mode := info.Mode().Perm(); mode != 0o700 {
 			t.Errorf("socket mode=%o, want 0700 with negative gid", mode)
+		}
+	})
+
+	// SetRankWorldSize stamps every outgoing straggler message with the
+	// agent's distributed-training identity. Per v0.11 P1: rank and
+	// world_size become first-class on the UDS NDJSON wire alongside
+	// the existing OTLP resource-attr emission.
+	t.Run("rank_world_size_stamped_on_straggle", func(t *testing.T) {
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		srv.SetRankWorldSize(2, 8)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		if err := srv.SendStraggle(straggler.StraggleState{PID: 1234}); err != nil {
+			t.Fatalf("SendStraggle: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["rank"] != float64(2) {
+			t.Errorf("rank=%v, want 2", raw["rank"])
+		}
+		if raw["world_size"] != float64(8) {
+			t.Errorf("world_size=%v, want 8", raw["world_size"])
+		}
+	})
+
+	t.Run("rank_world_size_absent_by_default", func(t *testing.T) {
+		// Without SetRankWorldSize, neither field appears on the wire.
+		srv, path := startServer(t)
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		if err := srv.SendStraggle(straggler.StraggleState{PID: 1234}); err != nil {
+			t.Fatalf("SendStraggle: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, present := raw["rank"]; present {
+			t.Errorf("rank field must be absent when SetRankWorldSize was not called; got raw=%v", raw)
+		}
+		if _, present := raw["world_size"]; present {
+			t.Errorf("world_size field must be absent when SetRankWorldSize was not called; got raw=%v", raw)
+		}
+	})
+
+	t.Run("rank_world_size_stamped_on_fleet_straggler_state", func(t *testing.T) {
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		srv.SetRankWorldSize(5, 16)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		ts := time.Unix(1711180800, 0)
+		if err := srv.SendFleetStragglerState(ts, "n1", "c1", "fleet", "throughput", "evt-rwsize-state", 0.42, 0.6); err != nil {
+			t.Fatalf("SendFleetStragglerState: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["type"] != "straggler_state" {
+			t.Errorf("type=%v, want straggler_state", raw["type"])
+		}
+		if raw["rank"] != float64(5) {
+			t.Errorf("rank=%v, want 5", raw["rank"])
+		}
+		if raw["world_size"] != float64(16) {
+			t.Errorf("world_size=%v, want 16", raw["world_size"])
+		}
+	})
+
+	t.Run("rank_world_size_stamped_on_fleet_straggler_resolved", func(t *testing.T) {
+		path := tempSockPath(t)
+		srv := remediate.NewServer(path)
+		srv.SetRankWorldSize(0, 4)
+		if err := srv.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer srv.Close()
+
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		ts := time.Unix(1711180800, 0)
+		if err := srv.SendFleetStragglerResolved(ts, "n1", "c1", "evt-rwsize-resolved"); err != nil {
+			t.Fatalf("SendFleetStragglerResolved: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["type"] != "straggler_resolved" {
+			t.Errorf("type=%v, want straggler_resolved", raw["type"])
+		}
+		// rank=0 with world_size>0 is valid (rank 0 of 4); both must
+		// appear on the wire.
+		if raw["world_size"] != float64(4) {
+			t.Errorf("world_size=%v, want 4", raw["world_size"])
+		}
+		// rank=0 with omitempty skips the field; that's the documented
+		// behavior of Go json. Document it explicitly so consumers know.
+		if v, present := raw["rank"]; present && v != float64(0) {
+			t.Errorf("rank=%v, want 0 or absent (omitempty)", v)
 		}
 	})
 }

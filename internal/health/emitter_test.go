@@ -312,7 +312,11 @@ func TestPush_DetectionModeAttribute(t *testing.T) {
 	}
 }
 
-// AC3: world_size and node_rank attach when WorldSize > 0.
+// AC3: world_size and node_rank attach as RESOURCE attributes (stable
+// per-agent identity, not per-data-point) when WorldSize > 0. v0.11
+// moves these from data-point attrs to resource attrs to follow OTEL
+// convention for identity-shaped attributes; consumers that read
+// resource scope inherit them on every metric automatically.
 func TestPush_OptionalWorldSizeAttrs(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)
 	cfg := baseEmitterCfg(rs.server.URL)
@@ -321,10 +325,107 @@ func TestPush_OptionalWorldSizeAttrs(t *testing.T) {
 	e, _ := NewEmitter(cfg, nil)
 	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
 	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) != 1 {
+		t.Fatalf("want 1 resourceMetrics block, got %d", len(p.ResourceMetrics))
+	}
+	rm := p.ResourceMetrics[0]
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrWorldSize, 8)
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrNodeRank, 3)
+
+	// Verify they're NOT on data-points (the old, deprecated location).
 	m := findMetric(t, p, contract.MetricHealthScore)
 	dp := m.Gauge.DataPoints[0]
-	assertAttrInt(t, dp.Attributes, contract.AttrWorldSize, 8)
-	assertAttrInt(t, dp.Attributes, contract.AttrNodeRank, 3)
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrWorldSize || kv.Key == contract.AttrNodeRank {
+			t.Errorf("attr %q must not appear on data-point in v0.11 (resource-only)", kv.Key)
+		}
+	}
+}
+
+// world_size/node_rank must be ABSENT from the resource block when
+// WorldSize is 0 (the default for non-distributed deployments).
+func TestPush_NoWorldSizeAttrsWhenZero(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	// cfg.WorldSize stays 0
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+	rm := p.ResourceMetrics[0]
+	for _, kv := range rm.Resource.Attributes {
+		if kv.Key == contract.AttrWorldSize || kv.Key == contract.AttrNodeRank {
+			t.Errorf("attr %q must not appear when WorldSize=0", kv.Key)
+		}
+	}
+}
+
+// EmitStragglerEvent must also carry world_size/node_rank on the
+// resource block when configured (per-agent identity is consistent
+// across the regular push and the straggler-edge push).
+func TestEmitStragglerEvent_ResourceCarriesRankWorldSize(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	cfg.WorldSize = 4
+	cfg.NodeRank = 1
+	e, _ := NewEmitter(cfg, nil)
+	ev := StragglerEvent{
+		NodeID:         "test-node",
+		ClusterID:      "test-cluster",
+		Score:          0.42,
+		Threshold:      0.6,
+		DetectionMode:  "fleet",
+		DominantSignal: "throughput",
+		Timestamp:      emitterNow,
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) != 1 {
+		t.Fatalf("want 1 resourceMetrics block, got %d", len(p.ResourceMetrics))
+	}
+	rm := p.ResourceMetrics[0]
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrWorldSize, 4)
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrNodeRank, 1)
+}
+
+// EmitStragglerEvent attaches the per-event UUID as the
+// `ingero.event.id` data-point attribute so consumers correlate the
+// OTLP push with the parallel UDS message.
+func TestEmitStragglerEvent_AttachesEventID(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	ev := StragglerEvent{
+		NodeID:    "test-node",
+		ClusterID: "test-cluster",
+		Score:     0.42,
+		Threshold: 0.6,
+		Timestamp: emitterNow,
+		EventID:   "00000000-0000-0000-0000-000000000abc",
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricStragglerEvent)
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrEventID, ev.EventID)
+}
+
+// EventID attribute is omitted when StragglerEvent.EventID is empty.
+func TestEmitStragglerEvent_OmitsEmptyEventID(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	ev := StragglerEvent{
+		NodeID:    "test-node",
+		ClusterID: "test-cluster",
+		Timestamp: emitterNow,
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricStragglerEvent)
+	dp := m.Gauge.DataPoints[0]
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrEventID {
+			t.Errorf("AttrEventID must be absent when EventID is empty")
+		}
+	}
 }
 
 // AC7: consecutive failures flip FleetReachable to false at threshold,

@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Collector is the source of raw inputs for one tick of the push loop. Real
@@ -316,6 +318,7 @@ func (l *Loop) classifyAndEmit(ctx context.Context, now time.Time, score Score, 
 		DetectionMode:  DetectionMode(mode),
 		DominantSignal: dominantFromScore(score, baseline),
 		Timestamp:      now,
+		EventID:        uuid.NewString(),
 	}
 
 	if err := l.cfg.Emitter.EmitStragglerEvent(ctx, ev, isStraggler); err != nil {
@@ -328,8 +331,11 @@ func (l *Loop) classifyAndEmit(ctx context.Context, now time.Time, score Score, 
 				l.log.Debug("fleet loop: straggler sink error", "err", err.Error())
 			}
 		} else {
-			// changed && !isStraggler => recovery edge.
-			if err := l.cfg.StragglerSink.SendStragglerResolved(ev.NodeID, ev.ClusterID, now); err != nil {
+			// changed && !isStraggler => recovery edge. The recovery has
+			// its own EventID (one per edge). Both the OTLP push and the
+			// UDS message for this edge carry the same id so the two
+			// channels can be reconciled per event.
+			if err := l.cfg.StragglerSink.SendStragglerResolved(ev); err != nil {
 				l.log.Debug("fleet loop: straggler resolved sink error", "err", err.Error())
 			}
 		}

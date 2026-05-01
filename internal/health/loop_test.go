@@ -323,10 +323,10 @@ func (f *fakeMode) CurrentMode() DetectionMode { return f.mode }
 
 // Fake StragglerSink for loop integration tests.
 type fakeSink struct {
-	mu        sync.Mutex
-	states    []StragglerEvent
-	resolved  []struct{ node, cluster string }
-	stateErr  error
+	mu       sync.Mutex
+	states   []StragglerEvent
+	resolved []StragglerEvent
+	stateErr error
 }
 
 func (f *fakeSink) SendStragglerState(ev StragglerEvent) error {
@@ -335,10 +335,10 @@ func (f *fakeSink) SendStragglerState(ev StragglerEvent) error {
 	f.states = append(f.states, ev)
 	return f.stateErr
 }
-func (f *fakeSink) SendStragglerResolved(nodeID, clusterID string, ts time.Time) error {
+func (f *fakeSink) SendStragglerResolved(ev StragglerEvent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.resolved = append(f.resolved, struct{ node, cluster string }{nodeID, clusterID})
+	f.resolved = append(f.resolved, ev)
 	return nil
 }
 
@@ -435,7 +435,7 @@ func TestLoop_ClassifierStragglerAndRecovery(t *testing.T) {
 	em.mu.Unlock()
 	sink.mu.Lock()
 	states := append([]StragglerEvent{}, sink.states...)
-	resolved := append([]struct{ node, cluster string }{}, sink.resolved...)
+	resolved := append([]StragglerEvent{}, sink.resolved...)
 	sink.mu.Unlock()
 
 	// Two straggler emissions (tick 1 = edge, tick 2 = while straggler),
@@ -457,7 +457,7 @@ func TestLoop_ClassifierStragglerAndRecovery(t *testing.T) {
 	if len(resolved) != 1 {
 		t.Fatalf("sink resolved = %d, want 1", len(resolved))
 	}
-	if resolved[0].node != "gpu-node-42" || resolved[0].cluster != "prod" {
+	if resolved[0].NodeID != "gpu-node-42" || resolved[0].ClusterID != "prod" {
 		t.Fatalf("resolved identifiers wrong: %+v", resolved[0])
 	}
 }

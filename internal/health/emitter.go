@@ -369,13 +369,23 @@ func (e *httpEmitter) buildStragglerEventPayload(ev StragglerEvent, isStraggler 
 		{Key: contract.AttrScore, Value: otlpDbl(ev.Score)},
 		{Key: contract.AttrDominantSignal, Value: otlpStr(ev.DominantSignal)},
 	}
+	if ev.EventID != "" {
+		attrs = append(attrs, otlpKV{Key: contract.AttrEventID, Value: otlpStr(ev.EventID)})
+	}
+	resAttrs := []otlpKV{
+		{Key: contract.AttrNodeID, Value: otlpStr(ev.NodeID)},
+		{Key: contract.AttrClusterID, Value: otlpStr(ev.ClusterID)},
+	}
+	if e.cfg.WorldSize > 0 {
+		resAttrs = append(resAttrs,
+			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
+			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
+		)
+	}
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{
 			Resource: otlpResourceBlock{
-				Attributes: []otlpKV{
-					{Key: contract.AttrNodeID, Value: otlpStr(ev.NodeID)},
-					{Key: contract.AttrClusterID, Value: otlpStr(ev.ClusterID)},
-				},
+				Attributes: resAttrs,
 			},
 			ScopeMetrics: []otlpScopeMetricsBlock{{
 				Scope:   otlpScopeBlock{Name: "ingero.health", Version: "0.10.0"},
@@ -414,16 +424,13 @@ func (e *httpEmitter) recordFailure() {
 func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode string, degradation bool) otlpPayload {
 	timeNano := fmt.Sprintf("%d", now.UnixNano())
 
-	// Per-data-point attributes (per-metric, can vary).
+	// Per-data-point attributes (per-metric, can vary). world_size/node_rank
+	// are stable per-agent identity and live on the resource block instead
+	// (see below); placing them only on the resource avoids duplication and
+	// matches OTEL convention for identity-shaped attributes.
 	dpAttrs := []otlpKV{
 		{Key: contract.AttrNodeState, Value: otlpStr(string(state))},
 		{Key: contract.AttrWorkloadType, Value: otlpStr(e.cfg.WorkloadType)},
-	}
-	if e.cfg.WorldSize > 0 {
-		dpAttrs = append(dpAttrs,
-			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
-			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
-		)
 	}
 
 	// Score + per-signal gauges.
@@ -457,10 +464,7 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{
 			Resource: otlpResourceBlock{
-				Attributes: []otlpKV{
-					{Key: contract.AttrNodeID, Value: otlpStr(e.cfg.NodeID)},
-					{Key: contract.AttrClusterID, Value: otlpStr(e.cfg.ClusterID)},
-				},
+				Attributes: e.resourceAttrs(),
 			},
 			ScopeMetrics: []otlpScopeMetricsBlock{{
 				Scope:   otlpScopeBlock{Name: "ingero.health", Version: "0.10.0"},
@@ -468,6 +472,25 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 			}},
 		}},
 	}
+}
+
+// resourceAttrs builds the OTLP resource-attribute set carried on every
+// push. Includes the stable per-agent identity (node_id, cluster_id) and
+// optionally world_size + node_rank when configured. The whole list is
+// stable for the lifetime of the emitter; callers may rely on it being
+// identical across consecutive pushes.
+func (e *httpEmitter) resourceAttrs() []otlpKV {
+	attrs := []otlpKV{
+		{Key: contract.AttrNodeID, Value: otlpStr(e.cfg.NodeID)},
+		{Key: contract.AttrClusterID, Value: otlpStr(e.cfg.ClusterID)},
+	}
+	if e.cfg.WorldSize > 0 {
+		attrs = append(attrs,
+			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
+			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
+		)
+	}
+	return attrs
 }
 
 // buildURL normalizes endpoint into a full OTLP/HTTP metrics URL. Accepts:
