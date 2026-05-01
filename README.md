@@ -24,8 +24,6 @@
 <!-- ingero-version:install-header product=ingero channel=stable -->
 **Version: 0.11.0**
 
-**v0.10 improvements:** real GPU memory signal via `nvidia-smi` (with host-RAM fallback), sub-minute signal derivation (`event_aggregates_5s` table for `--signal-window` ≤ 60s), `straggler_state transition` log lines for operator visibility, new `cmd/straggler-sink` reference consumer for the `--remediate` UDS (Prometheus counters out of the box), optional `straggler-sink` Helm sidecar, mTLS material shared between OTLP push and threshold GET poller, and eBPF Python walker support extended to CPython 3.9, 3.13, and 3.14.
-
 **The only GPU observability tool your AI assistant can talk to.**
 
 *"What caused the GPU stall?" → "`forward()` at `train.py:142`  -  cudaMalloc spiking 48ms during CPU contention. 9,829 calls, 847 scheduler preemptions."*
