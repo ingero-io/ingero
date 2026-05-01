@@ -2,6 +2,29 @@
 #ifndef __INGERO_COMMON_BPF_H
 #define __INGERO_COMMON_BPF_H
 
+/*
+ * Cross-compile shim for the arm64 build of these BPF programs.
+ *
+ * libbpf's bpf_tracing.h expands PT_REGS_PARMx and PT_REGS_RC against
+ * `struct user_pt_regs` when __TARGET_ARCH_arm64 is set. That type only
+ * appears in arm64 kernel BTF, so it is missing from the vmlinux.h we
+ * generate from an x86 host. Provide a forward-compatible declaration
+ * so the compile resolves; CO-RE relocates field access against the
+ * loaded kernel BTF at runtime, so the layout here only needs to match
+ * the arm64 UAPI shape.
+ */
+#if defined(__TARGET_ARCH_arm64) && !defined(__INGERO_USER_PT_REGS_DECLARED)
+#define __INGERO_USER_PT_REGS_DECLARED
+#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
+struct user_pt_regs {
+	__u64 regs[31];
+	__u64 sp;
+	__u64 pc;
+	__u64 pstate;
+};
+#pragma clang attribute pop
+#endif
+
 /* Shared event types for all eBPF programs */
 
 /* Event source identifiers */

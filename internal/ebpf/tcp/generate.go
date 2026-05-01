@@ -7,5 +7,6 @@
 // network-induced GPU idle periods.
 package tcp
 
-// BPF_TARGET_ARCH is set by the Makefile (x86 or arm64) via: make generate
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-14 -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_$BPF_TARGET_ARCH -I../../../bpf/headers -I../../../bpf" -target bpfel -type ingero_tcp_event tcpTrace ../../../bpf/tcp_trace.bpf.c
+// bpf2go compiles once per target arch (amd64, arm64) and injects the
+// matching -D__TARGET_ARCH_<arch> automatically.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-14 -cflags "-O2 -g -Wall -Werror -I../../../bpf/headers -I../../../bpf" -target amd64,arm64 -type ingero_tcp_event tcpTrace ../../../bpf/tcp_trace.bpf.c

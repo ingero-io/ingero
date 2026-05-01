@@ -20,15 +20,14 @@ LDFLAGS := -ldflags "-X github.com/ingero-io/ingero/internal/version.version=$(V
 # Single command to build everything
 all: generate build test lint
 
-# Generate eBPF Go bindings via bpf2go
-# On ARM64 (GPU VMs like GH200), regenerate vmlinux.h first because the
-# committed copy is from x86_64 WSL and rsync overwrites the cloud-init one.
+# Generate eBPF Go bindings via bpf2go.
+# bpf2go is invoked with -target amd64,arm64 in each generate.go and produces
+# per-arch artifacts (<name>_x86_bpfel.{go,o} and <name>_arm64_bpfel.{go,o});
+# Go build constraints in the generated shims select the right object at link
+# time. The committed vmlinux.h is the type catalog only, so it is host-arch
+# independent and does not need regeneration on arm64 hosts.
 generate:
-ifeq ($(BPF_TARGET_ARCH),arm64)
-	@echo "ARM64 detected — regenerating vmlinux.h from kernel BTF..."
-	@$(MAKE) vmlinux
-endif
-	BPF_TARGET_ARCH=$(BPF_TARGET_ARCH) go generate ./internal/ebpf/...
+	go generate ./internal/ebpf/...
 
 # Build the agent binary (injects version from git at link time)
 build:

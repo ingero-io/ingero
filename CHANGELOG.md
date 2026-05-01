@@ -10,6 +10,19 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ### Fixed
 
+- **arm64 release binaries now load BPF probes correctly.** The v0.10.0
+  release archives shipped a single set of pre-compiled BPF objects
+  built for x86_64 and embedded that set into both the linux_amd64 and
+  linux_arm64 binaries. On any aarch64 kernel the `pt_regs` CO-RE
+  relocations resolved against the wrong struct layout and the verifier
+  rejected the load with `bad CO-RE relocation: invalid func unknown`.
+  bpf2go is now invoked with `-target amd64,arm64`; per-arch `.bpf.o`
+  files are committed under
+  `internal/ebpf/<pkg>/<name>_<arch>_bpfel.{go,o}` and selected at Go
+  build time via build constraints. A new `internal/ebpf/parity` test
+  package guards the per-arch output so the same regression cannot
+  reach a release again. Reported by @saiyam1814 against DGX Spark
+  (issue #35); affects every arm64 release-binary user, not only Spark.
 - **MCP server reports build-time version.** `ingero mcp` now reports
   the version embedded at build time (e.g. `v0.10.0`) in the MCP
   `Implementation.Version` field, instead of the previously hardcoded
@@ -17,6 +30,12 @@ Fleet-side changes (the OTel Collector distribution) live in the
   plugins, glama.ai) identify the server. The hardcode shipped in
   v0.10.0; binaries built from main HEAD or from any v0.10.1+ tag
   carry the fix.
+
+### Internal
+
+- New `bpf-freshness` CI job re-runs `make generate` on every PR and
+  asserts no drift in `internal/ebpf/`, catching the original failure
+  mode where committed BPF artifacts diverged from BPF C sources.
 
 ## [0.10.0] - 2026-04-21
 
