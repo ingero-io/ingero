@@ -19,14 +19,24 @@ type StragglerEvent struct {
 	DetectionMode  DetectionMode
 	DominantSignal string // "throughput" | "compute" | "memory" | "cpu" | "unknown"
 	Timestamp      time.Time
+	// EventID is a UUIDv4 generated at the agent at first emission. The
+	// same ID propagates to both the OTLP push (as `ingero.event.id`
+	// data-point attribute) and the UDS NDJSON message (as `event_id`),
+	// so downstream consumers can correlate the two channels.
+	EventID string
 }
 
 // StragglerSink is the optional UDS / remediation consumer. The existing
 // `internal/remediate.Server` satisfies this interface. A nil sink means
 // UDS streaming is disabled (no --remediate flag).
+//
+// Both methods take a full StragglerEvent so the per-event correlation
+// id (EventID) propagates to the UDS wire alongside the same id emitted
+// on OTLP. Recovery events are constructed at the recovery edge with
+// their own fresh UUID.
 type StragglerSink interface {
 	SendStragglerState(ev StragglerEvent) error
-	SendStragglerResolved(nodeID, clusterID string, ts time.Time) error
+	SendStragglerResolved(ev StragglerEvent) error
 }
 
 // ClassifierConfig tunes classification behavior.

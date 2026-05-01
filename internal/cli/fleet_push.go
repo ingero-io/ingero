@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/store"
@@ -155,13 +156,14 @@ func (r *remediateSink) SendStragglerState(ev health.StragglerEvent) error {
 		ev.ClusterID,
 		string(ev.DetectionMode),
 		ev.DominantSignal,
+		ev.EventID,
 		ev.Score,
 		ev.Threshold,
 	)
 }
 
-func (r *remediateSink) SendStragglerResolved(nodeID, clusterID string, ts time.Time) error {
-	return r.server.SendFleetStragglerResolved(ts, nodeID, clusterID)
+func (r *remediateSink) SendStragglerResolved(ev health.StragglerEvent) error {
+	return r.server.SendFleetStragglerResolved(ev.Timestamp, ev.NodeID, ev.ClusterID, ev.EventID)
 }
 
 func runFleetPush(cmd *cobra.Command, args []string) error {
@@ -259,6 +261,10 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	emCfg.Insecure = fleetPushInsecure
 	emCfg.WorldSize = fleetPushWorldSize
 	emCfg.NodeRank = fleetPushNodeRank
+	// v0.11 cost-of-problem: detect GPU model + count once at startup.
+	// Empty / zero results disable the ingero.node.info gauge cleanly,
+	// so an environment without nvidia-smi behaves like v0.10.
+	emCfg.GPUModel, emCfg.GPUCount = discover.GPUInfo()
 	emCfg.ThresholdCache = thresholdCache
 	if fleetPushTLSCA != "" || fleetPushTLSCert != "" || fleetPushTLSKey != "" {
 		emCfg.TLS = health.TLSConfig{
@@ -321,6 +327,9 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	if fleetPushRemediate {
 		udsServer = remediate.NewServer(fleetPushRemediateSock)
 		udsServer.SetSocketGid(fleetPushRemediateGid)
+		if fleetPushWorldSize > 0 {
+			udsServer.SetRankWorldSize(fleetPushNodeRank, fleetPushWorldSize)
+		}
 		if err := udsServer.Start(); err != nil {
 			return fmt.Errorf("remediate server: %w", err)
 		}

@@ -395,6 +395,25 @@ func CheckGPUModel() CheckResult {
 	}
 }
 
+// GPUInfo returns the first GPU's normalized model name and the total
+// GPU count via nvidia-smi. Returns ("", 0) when nvidia-smi is not on
+// PATH, fails to run, or reports no GPUs. The caller treats either
+// zero result as a signal to skip the cost-of-problem ingero.node.info
+// gauge entirely. Multi-GPU nodes with mixed models are uncommon; the
+// first row drives the model attribute and gpu_count carries the
+// homogeneous count.
+func GPUInfo() (model string, count int) {
+	out, err := runNvidiaSMI("--query-gpu=name", "--format=csv,noheader")
+	if err != nil {
+		return "", 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return "", 0
+	}
+	return strings.TrimSpace(lines[0]), len(lines)
+}
+
 // CPUModel reads the CPU model name.
 // Tries /proc/cpuinfo "model name" first (x86_64), then falls back to
 // lscpu "Model name" (works on both x86_64 and aarch64).
