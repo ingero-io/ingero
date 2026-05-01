@@ -37,6 +37,21 @@ builds:
     ldflags:
       - -s -w
 
+  - id: ingero-alerter
+    main: ./cmd/ingero-alerter/
+    binary: ingero-alerter
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
 archives:
   - id: ingero
     ids:
@@ -54,6 +69,16 @@ archives:
     formats:
       - tar.gz
     name_template: "straggler-sink_{{.Version}}_{{.Os}}_{{.Arch}}"
+    files:
+      - LICENSE
+      - README.md
+
+  - id: ingero-alerter
+    ids:
+      - ingero-alerter
+    formats:
+      - tar.gz
+    name_template: "ingero-alerter_{{.Version}}_{{.Os}}_{{.Arch}}"
     files:
       - LICENSE
       - README.md
