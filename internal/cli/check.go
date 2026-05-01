@@ -6,21 +6,41 @@ import (
 	"os"
 
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/support"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/spf13/cobra"
 )
 
-var checkJSON bool
+var (
+	checkJSON          bool
+	checkSupportBundle string
+)
 
 var checkCmd = &cobra.Command{
 	Use:   "check",
 	Short: "Check system readiness for GPU tracing",
 	Long: `Check kernel version, BTF support, NVIDIA driver, CUDA libraries,
-and running GPU processes. Reports what Ingero can trace and what's missing.`,
+and running GPU processes. Reports what Ingero can trace and what's missing.
+
+Add --support-bundle <path> to also write a tarball with kernel info,
+BTF state, GPU + driver state, agent version, last 1000 lines of any
+~/.ingero/{trace,sink}.log, and a redacted environment dump. Attach
+the tarball to a support case so the developer triaging it has every
+diagnostic input in one place.`,
 
 	RunE: func(cmd *cobra.Command, args []string) error {
 		debugf("check: running all system checks")
 
 		results := discover.RunAllChecks()
+
+		if checkSupportBundle != "" {
+			path, n, err := support.Bundle(checkSupportBundle, version.Version(), version.Commit())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ingero check: support bundle: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "ingero check: wrote support bundle to %s (%d entries)\n", path, n)
+			}
+		}
 
 		if checkJSON {
 			return checkOutputJSON(results)
@@ -69,6 +89,8 @@ and running GPU processes. Reports what Ingero can trace and what's missing.`,
 
 func init() {
 	checkCmd.Flags().BoolVar(&checkJSON, "json", false, "output as JSON")
+	checkCmd.Flags().StringVar(&checkSupportBundle, "support-bundle", "",
+		"Write a diagnostic tarball at the given path (e.g. /tmp/ingero-bundle.tgz). Attach to support cases.")
 	rootCmd.AddCommand(checkCmd)
 }
 

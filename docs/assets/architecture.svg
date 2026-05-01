@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 460" font-family="Inter, system-ui, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .node    { fill: #f8fafc; stroke: #334155; stroke-width: 1.4; rx: 6; ry: 6; }
+      .node-em { fill: #ecfdf5; stroke: #047857; stroke-width: 1.6; rx: 6; ry: 6; }
+      .group   { fill: none;     stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 4 3; rx: 12; ry: 12; }
+      .label   { fill: #0f172a; font-weight: 600; }
+      .sub     { fill: #475569; font-size: 11px; }
+      .group-l { fill: #64748b; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
+      .edge    { stroke: #475569; stroke-width: 1.4; fill: none; marker-end: url(#arrow); }
+      .edge-d  { stroke: #94a3b8; stroke-width: 1.2; stroke-dasharray: 4 3; fill: none; marker-end: url(#arrow); }
+      .pill    { fill: #fff; stroke: #cbd5e1; stroke-width: 1; rx: 4; ry: 4; }
+    </style>
+  </defs>
+
+  <text x="440" y="26" text-anchor="middle" class="label" font-size="16">Ingero — agent → fleet → backends</text>
+
+  <rect x="20"  y="60"  width="220" height="320" class="group"/>
+  <text x="130" y="80"  text-anchor="middle" class="group-l">GPU NODES</text>
+
+  <rect x="40"  y="100" width="180" height="80" class="node-em"/>
+  <text x="130" y="124" text-anchor="middle" class="label">Ingero agent</text>
+  <text x="130" y="142" text-anchor="middle" class="sub">eBPF probes (47): CUDA / Graph /</text>
+  <text x="130" y="158" text-anchor="middle" class="sub">Driver / Host / I/O / TCP / Net</text>
+  <text x="130" y="172" text-anchor="middle" class="sub">+ Python frame walker</text>
+
+  <rect x="40"  y="200" width="180" height="50" class="node"/>
+  <text x="130" y="220" text-anchor="middle" class="label">UDS straggler events</text>
+  <text x="130" y="238" text-anchor="middle" class="sub">/tmp/ingero-remediate.sock</text>
+
+  <rect x="40"  y="270" width="180" height="50" class="node"/>
+  <text x="130" y="290" text-anchor="middle" class="label">Local SQLite trace DB</text>
+  <text x="130" y="308" text-anchor="middle" class="sub">~/.ingero/ingero.db</text>
+
+  <rect x="40"  y="340" width="180" height="30" class="node"/>
+  <text x="130" y="360" text-anchor="middle" class="sub">(repeats per GPU node)</text>
+
+  <rect x="320" y="60"  width="240" height="320" class="group"/>
+  <text x="440" y="80"  text-anchor="middle" class="group-l">FLEET (HA OTel collector)</text>
+
+  <rect x="340" y="100" width="200" height="60" class="node-em"/>
+  <text x="440" y="124" text-anchor="middle" class="label">Fleet collector</text>
+  <text x="440" y="140" text-anchor="middle" class="sub">ingero-fleet OCB binary</text>
+  <text x="440" y="155" text-anchor="middle" class="sub">OTLP/gRPC + OTLP/HTTP receivers</text>
+
+  <rect x="340" y="180" width="200" height="50" class="node"/>
+  <text x="440" y="199" text-anchor="middle" class="label">ingeroprocessor</text>
+  <text x="440" y="216" text-anchor="middle" class="sub">peer-relative threshold + score map</text>
+
+  <rect x="340" y="250" width="200" height="50" class="node"/>
+  <text x="440" y="269" text-anchor="middle" class="label">providerprocessor (v0.11)</text>
+  <text x="440" y="286" text-anchor="middle" class="sub">node_providers.yaml → ingero.provider</text>
+
+  <rect x="340" y="320" width="200" height="50" class="node"/>
+  <text x="440" y="339" text-anchor="middle" class="label">Threshold extension</text>
+  <text x="440" y="356" text-anchor="middle" class="sub">GET /api/v1/threshold</text>
+
+  <rect x="640" y="60"  width="220" height="320" class="group"/>
+  <text x="750" y="80"  text-anchor="middle" class="group-l">BACKENDS</text>
+
+  <rect x="660" y="100" width="180" height="50" class="node"/>
+  <text x="750" y="119" text-anchor="middle" class="label">Prometheus</text>
+  <text x="750" y="136" text-anchor="middle" class="sub">scrape :8889 (otlp prom exporter)</text>
+
+  <rect x="660" y="170" width="180" height="50" class="node"/>
+  <text x="750" y="189" text-anchor="middle" class="label">Grafana</text>
+  <text x="750" y="206" text-anchor="middle" class="sub">reference dashboard JSON</text>
+
+  <rect x="660" y="240" width="180" height="50" class="node"/>
+  <text x="750" y="259" text-anchor="middle" class="label">MCP clients</text>
+  <text x="750" y="276" text-anchor="middle" class="sub">Claude / IDE plugins / glama.ai</text>
+
+  <rect x="660" y="310" width="180" height="50" class="node"/>
+  <text x="750" y="329" text-anchor="middle" class="label">Sinks (UDS consumers)</text>
+  <text x="750" y="346" text-anchor="middle" class="sub">straggler-sink, ingero-alerter</text>
+
+  <path d="M 220 130 C 270 130 270 130 340 130" class="edge"/>
+  <text x="280" y="120" text-anchor="middle" class="sub">OTLP push (10s)</text>
+
+  <path d="M 220 220 C 270 220 270 350 340 350" class="edge-d"/>
+  <text x="285" y="265" text-anchor="middle" class="sub">threshold cache</text>
+  <text x="285" y="278" text-anchor="middle" class="sub">(GET fallback)</text>
+
+  <path d="M 540 130 C 590 130 590 130 660 130" class="edge"/>
+  <path d="M 540 200 C 590 200 590 200 660 200" class="edge"/>
+  <path d="M 540 275 C 590 275 590 275 660 270" class="edge-d"/>
+  <text x="600" y="120" text-anchor="middle" class="sub">scrape</text>
+  <text x="600" y="190" text-anchor="middle" class="sub">PromQL</text>
+
+  <path d="M 130 250 C 130 270 130 270 130 270" class="edge-d"/>
+
+  <rect x="40"  y="400" width="800" height="48" class="pill"/>
+  <text x="440" y="420" text-anchor="middle" class="sub">v0.11 cost-of-problem: agent emits ingero.node.info{gpu_model,gpu_count} + ingero.node.world_size; fleet enriches with ingero.provider; PromQL recording rules join with gpu_rates.yaml.</text>
+  <text x="440" y="438" text-anchor="middle" class="sub">v0.10.1 fix: per-arch BPF objects (amd64 + arm64) committed under internal/ebpf/&lt;pkg&gt;/&lt;name&gt;_&lt;arch&gt;_bpfel.{go,o}; CO-RE relocates against the loaded kernel BTF.</text>
+</svg>

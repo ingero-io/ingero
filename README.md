@@ -34,6 +34,12 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 <img src="docs/assets/readme-demo-incident.gif" width="800" alt="ingero demo incident — CPU contention causes GPU latency spike, full causal chain diagnosis with root cause and fix recommendation">
 
+## Architecture
+
+<img src="docs/assets/architecture.svg" width="800" alt="Ingero architecture: per-node agent emits OTLP to Fleet collector; Fleet aggregates via ingeroprocessor + providerprocessor; backends are Prometheus, Grafana, MCP clients, and UDS sinks">
+
+The agent runs per-GPU-node and emits OTLP to a single Fleet collector replica (or HA fleet behind a consistent-hash LB). Fleet handles peer-relative threshold + the cost-of-problem enrichment; Prometheus / Grafana / MCP read from Fleet, never the agent. UDS straggler events flow to local sinks (`straggler-sink`, `ingero-alerter`) for remediation.
+
 ## Quick Start (Single-node)
 
 ```bash
