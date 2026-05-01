@@ -66,6 +66,13 @@ type EmitterConfig struct {
 	// zero WorldSize suppresses both attributes.
 	WorldSize int `yaml:"world_size"`
 	NodeRank  int `yaml:"node_rank"`
+	// GPUModel and GPUCount drive the v0.11 ingero.node.info gauge,
+	// which the cost-of-problem recording-rule layer joins against
+	// gpu_rates.yaml. Empty model or zero count suppresses the gauge.
+	// Caller (cmd/ingero/main.go fleet-push entry) populates from
+	// nvidia-smi at startup.
+	GPUModel string `yaml:"gpu_model"`
+	GPUCount int    `yaml:"gpu_count"`
 	// ThresholdCache, if non-nil, is updated with the `X-Ingero-Threshold`
 	// and `X-Ingero-Quorum-Met` response headers on every push (success
 	// or failure). Nil leaves response-header handling disabled.
@@ -460,6 +467,20 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 		reachable = 0
 	}
 	metrics = append(metrics, intGauge(contract.MetricFleetReachable, timeNano, reachable, nil))
+
+	// v0.11 cost-of-problem support gauges. ingero.node.info lights up
+	// only when the operator has supplied gpu_model / gpu_count (caller
+	// reads them from nvidia-smi at startup); ingero.node.world_size
+	// always emits with the configured value (zero is meaningful — it
+	// signals a non-distributed deployment).
+	if e.cfg.GPUModel != "" && e.cfg.GPUCount > 0 {
+		nodeInfoAttrs := []otlpKV{
+			{Key: contract.AttrGPUModel, Value: otlpStr(e.cfg.GPUModel)},
+			{Key: contract.AttrGPUCount, Value: otlpInt(int64(e.cfg.GPUCount))},
+		}
+		metrics = append(metrics, intGauge(contract.MetricNodeInfo, timeNano, 1, nodeInfoAttrs))
+	}
+	metrics = append(metrics, intGauge(contract.MetricNodeWorldSize, timeNano, int64(e.cfg.WorldSize), nil))
 
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{

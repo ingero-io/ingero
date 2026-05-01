@@ -387,6 +387,68 @@ func TestEmitStragglerEvent_ResourceCarriesRankWorldSize(t *testing.T) {
 	assertAttrInt(t, rm.Resource.Attributes, contract.AttrNodeRank, 1)
 }
 
+// v0.11 cost-of-problem support gauges: ingero.node.info (gpu_model +
+// gpu_count attrs) appears when both fields are configured;
+// ingero.node.world_size always emits with the configured value.
+func TestPush_CostGaugesEmittedWhenConfigured(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	cfg.GPUModel = "NVIDIA GH200 480GB"
+	cfg.GPUCount = 1
+	cfg.WorldSize = 8
+	cfg.NodeRank = 3
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+
+	info := findMetric(t, p, contract.MetricNodeInfo)
+	if info.Gauge == nil || len(info.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeInfo missing or has wrong shape")
+	}
+	if info.Gauge.DataPoints[0].AsInt == nil || *info.Gauge.DataPoints[0].AsInt != 1 {
+		t.Errorf("MetricNodeInfo value should be 1; got %+v", info.Gauge.DataPoints[0])
+	}
+	assertAttr(t, info.Gauge.DataPoints[0].Attributes, contract.AttrGPUModel, "NVIDIA GH200 480GB")
+	assertAttrInt(t, info.Gauge.DataPoints[0].Attributes, contract.AttrGPUCount, 1)
+
+	ws := findMetric(t, p, contract.MetricNodeWorldSize)
+	if ws.Gauge == nil || len(ws.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeWorldSize missing or has wrong shape")
+	}
+	if ws.Gauge.DataPoints[0].AsInt == nil || *ws.Gauge.DataPoints[0].AsInt != 8 {
+		t.Errorf("MetricNodeWorldSize value should be 8; got %+v", ws.Gauge.DataPoints[0])
+	}
+}
+
+// ingero.node.info is suppressed when the operator does not pass
+// gpu_model / gpu_count (e.g. no nvidia-smi in the environment).
+// ingero.node.world_size still emits with value=0 to make the absence
+// of distributed-training affirmative on the wire.
+func TestPush_CostGauges_NodeInfoOmittedWithoutGPU(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	// GPUModel + GPUCount left zero
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) == 0 {
+		t.Fatal("no resource metrics")
+	}
+	for _, m := range p.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if m.Name == contract.MetricNodeInfo {
+			t.Errorf("MetricNodeInfo must be omitted when GPUModel/GPUCount are unset")
+		}
+	}
+	// world_size always emits, even at zero.
+	ws := findMetric(t, p, contract.MetricNodeWorldSize)
+	if ws.Gauge == nil || len(ws.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeWorldSize missing")
+	}
+	if ws.Gauge.DataPoints[0].AsInt == nil || *ws.Gauge.DataPoints[0].AsInt != 0 {
+		t.Errorf("MetricNodeWorldSize value should be 0 when not distributed; got %+v", ws.Gauge.DataPoints[0])
+	}
+}
+
 // EmitStragglerEvent attaches the per-event UUID as the
 // `ingero.event.id` data-point attribute so consumers correlate the
 // OTLP push with the parallel UDS message.

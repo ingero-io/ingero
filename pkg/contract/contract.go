@@ -28,6 +28,17 @@ const (
 	// classification flips to straggler (value = 1) or recovers from
 	// straggler (value = 0, once on the edge). See Story 3.4.
 	MetricStragglerEvent = "ingero.node.straggler_event"
+	// MetricNodeInfo is a value=1 Int64 gauge that carries the node's
+	// hardware identity (gpu_model + gpu_count) as data-point
+	// attributes. The cost-of-problem recording-rule layer joins it
+	// against operator-supplied gpu_rates.yaml to compute event_cost.
+	MetricNodeInfo = "ingero.node.info"
+	// MetricNodeWorldSize is the per-job rank count, emitted as an
+	// Int64 gauge so the cost-of-problem layer can multiply per-event
+	// duration by affected_rank_count without introspecting
+	// data-point attributes. Equals zero when the agent is not part
+	// of a distributed-training group.
+	MetricNodeWorldSize = "ingero.node.world_size"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -47,6 +58,30 @@ const (
 const (
 	AttrNodeID    = "ingero.node.id"
 	AttrClusterID = "ingero.cluster.id"
+	// AttrProvider is added at Fleet ingest by the provider-lookup
+	// processor, sourced from operator-supplied node_providers.yaml
+	// (IP form or k8s node-label form). Free-form, but Lambda / EC2 /
+	// GCP / Azure / CoreWeave are the seed values shipped in the
+	// example config. Cost recording rules key on this attribute to
+	// pick the right per-provider rate from gpu_rates.yaml.
+	AttrProvider = "ingero.provider"
+)
+
+// AttrGPUModel and AttrGPUCount are data-point attributes on the
+// MetricNodeInfo gauge. They identify the hardware class of the node
+// for cost-rate lookup; values are sourced from `nvidia-smi --query-gpu=name`
+// (GPU model normalized; e.g. "NVIDIA H100 80GB HBM3" -> "h100-80gb")
+// or zero / "unknown" when nvidia-smi is unavailable.
+const (
+	AttrGPUModel = "ingero.gpu_model"
+	AttrGPUCount = "ingero.gpu_count"
+	// AttrCgroupPathHash is a stable hash of the traced process's
+	// cgroup path (typically the K8s pod cgroup hierarchy). Emitted
+	// as a data-point attribute on event metrics so cost-of-problem
+	// queries can attribute events to a specific tenant pod without
+	// leaking the raw path. The hash is SHA256 of the cgroup path,
+	// truncated to 16 hex characters.
+	AttrCgroupPathHash = "ingero.cgroup_path_hash"
 )
 
 // OTLP data point attribute keys (per-push, can change).

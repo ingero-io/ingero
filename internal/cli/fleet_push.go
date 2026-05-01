@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/store"
@@ -260,6 +261,10 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	emCfg.Insecure = fleetPushInsecure
 	emCfg.WorldSize = fleetPushWorldSize
 	emCfg.NodeRank = fleetPushNodeRank
+	// v0.11 cost-of-problem: detect GPU model + count once at startup.
+	// Empty / zero results disable the ingero.node.info gauge cleanly,
+	// so an environment without nvidia-smi behaves like v0.10.
+	emCfg.GPUModel, emCfg.GPUCount = discover.GPUInfo()
 	emCfg.ThresholdCache = thresholdCache
 	if fleetPushTLSCA != "" || fleetPushTLSCert != "" || fleetPushTLSKey != "" {
 		emCfg.TLS = health.TLSConfig{
