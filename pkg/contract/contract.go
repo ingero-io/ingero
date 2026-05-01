@@ -93,6 +93,49 @@ const (
 	AttrDetectionMode = "mode"
 )
 
+// NCCL collective metric names. Emitted by the agent's ncclprobe and
+// (for derived metrics) by Fleet's ncclprocessor. See bpf/nccl_trace.bpf.c
+// for the underlying op set.
+const (
+	// MetricNCCLDuration is the agent-side queue time of a single
+	// collective: uretprobe.exit_ts - uprobe.entry_ts. NOT the barrier
+	// wait. Histogram in milliseconds.
+	MetricNCCLDuration = "nccl.collective.duration_ms"
+	// MetricNCCLBarrierWait is the per-rank time spent blocked at the
+	// implicit NCCL barrier, derived Fleet-side by correlating with
+	// the next cudaStreamSynchronize on the same (pid, stream_handle).
+	MetricNCCLBarrierWait = "nccl.collective.barrier_wait_ms"
+	// MetricNCCLPeerLag is per-rank deviation from peer median for the
+	// same (cluster_id, comm_id_hash, op_id). Identifies the slowest
+	// rank in a comm without needing absolute thresholds.
+	MetricNCCLPeerLag = "nccl.collective.peer_lag_ms"
+	// MetricNCCLBytes is element-count times datatype-size for a single
+	// collective. Histogram (bytes).
+	MetricNCCLBytes = "nccl.collective.bytes"
+)
+
+// NCCL collective attribute keys, present on every nccl.collective.* metric.
+const (
+	// AttrNCCLOpType is the collective name (allreduce / allgather /
+	// reducescatter / bcast / send / recv). Stable string from the BPF
+	// op code; downstream dashboards group by this.
+	AttrNCCLOpType = "nccl.op_type"
+	// AttrNCCLCommIDHash is a 64-bit hash of the ncclUniqueId taken at
+	// ncclCommInitRank time. Same value across all ranks of the same
+	// communicator, so Fleet can correlate the same op across the cluster
+	// without exposing the full 128-byte unique ID on the wire.
+	AttrNCCLCommIDHash = "nccl.comm_id_hash"
+	// AttrNCCLRank / AttrNCCLNRanks come from the comm-handle map
+	// populated at ncclCommInitRank uretprobe.
+	AttrNCCLRank   = "nccl.rank"
+	AttrNCCLNRanks = "nccl.nranks"
+	// AttrNCCLDatatype maps the ncclDataType_t enum (FLOAT16 = 0, etc.).
+	AttrNCCLDatatype = "nccl.datatype"
+	// AttrNCCLReduceOp is the ncclRedOp_t enum (SUM / PROD / MIN / MAX
+	// / AVG); only meaningful for AllReduce + ReduceScatter.
+	AttrNCCLReduceOp = "nccl.reduce_op"
+)
+
 // Node states.
 const (
 	StateActive      = "active"

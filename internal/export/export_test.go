@@ -336,6 +336,91 @@ func TestOTLP_BuildPayload(t *testing.T) {
 	}
 }
 
+// TestOTLP_NCCLDataPoints asserts that buildMetricsPayload emits one
+// nccl.collective.duration_ms gauge + one nccl.collective.bytes gauge
+// per stats.NCCLDataPoint, with the v0.12.0 contract attribute set.
+// LHF #1 from the v0.12.0 audit: without these data points, Fleet's
+// ncclprocessor has nothing to consume.
+func TestOTLP_NCCLDataPoints(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+
+	snap := &stats.Snapshot{
+		WallClock: time.Minute,
+		NCCLDataPoints: []stats.NCCLDataPoint{
+			{
+				TimestampUnixNano: 1700000000000000000,
+				OpType:            "ncclAllReduce",
+				CommIDHash:        "deadbeefcafebabe",
+				Rank:              2,
+				NRanks:            8,
+				Datatype:          7,
+				ReduceOp:          0,
+				DurationMs:        4.2,
+				CountBytes:        1048576,
+				ReturnCode:        0,
+			},
+			{
+				TimestampUnixNano: 1700000000000000000,
+				OpType:            "ncclAllGather",
+				CommIDHash:        "1234567890abcdef",
+				Rank:              0,
+				NRanks:            4,
+				Datatype:          0,
+				ReduceOp:          0,
+				DurationMs:        1.5,
+				CountBytes:        524288,
+				ReturnCode:        0,
+			},
+		},
+	}
+
+	payload := e.buildMetricsPayload(snap)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	jsonStr := string(body)
+
+	// Two NCCL data points × 2 metrics each = 4 emissions.
+	for _, want := range []string{
+		"nccl.collective.duration_ms",
+		"nccl.collective.bytes",
+		"nccl.op_type", "ncclAllReduce", "ncclAllGather",
+		"nccl.comm_id_hash", "deadbeefcafebabe", "1234567890abcdef",
+		"nccl.rank", "nccl.nranks",
+	} {
+		if !strings.Contains(jsonStr, want) {
+			t.Errorf("OTLP NCCL payload missing %q", want)
+		}
+	}
+
+	// Count occurrences of each metric name (one per data point).
+	if got := strings.Count(jsonStr, `"name":"nccl.collective.duration_ms"`); got != 2 {
+		t.Errorf("expected 2 nccl.collective.duration_ms metrics, got %d", got)
+	}
+	if got := strings.Count(jsonStr, `"name":"nccl.collective.bytes"`); got != 2 {
+		t.Errorf("expected 2 nccl.collective.bytes metrics, got %d", got)
+	}
+}
+
+// TestOTLP_NCCLDataPoints_EmptyWhenNotProvided asserts that NCCL data
+// points are not emitted when the snapshot's NCCLDataPoints field is
+// nil or empty (e.g. agent ran without --nccl).
+func TestOTLP_NCCLDataPoints_EmptyWhenNotProvided(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+	for _, snap := range []*stats.Snapshot{
+		{},
+		{NCCLDataPoints: nil},
+		{NCCLDataPoints: []stats.NCCLDataPoint{}},
+	} {
+		payload := e.buildMetricsPayload(snap)
+		body, _ := json.Marshal(payload)
+		if strings.Contains(string(body), "nccl.collective") {
+			t.Errorf("nccl.collective.* present in payload with no NCCL data points")
+		}
+	}
+}
+
 func TestOTLP_PushToServer(t *testing.T) {
 	// Create a test OTLP receiver.
 	var receivedBody []byte

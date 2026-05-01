@@ -28,6 +28,7 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/cudagraph"
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
+	"github.com/ingero-io/ingero/internal/ebpf/ncclprobe"
 	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
 	"github.com/ingero-io/ingero/internal/ebpf/pytrace"
 	"github.com/ingero-io/ingero/internal/ebpf/tcp"
@@ -67,6 +68,17 @@ var (
 	traceNoIO         bool          // Disable block I/O tracing.
 	traceNoTCP        bool          // Disable TCP retransmit tracing.
 	traceNoNet        bool          // Disable network socket tracing.
+	traceNCCL         bool          // Opt-in: attach NCCL collective uprobes (v0.12.0).
+	traceNCCLLib      string        // Explicit libnccl.so path (skip discovery).
+
+	// ncclBufMu guards ncclBuf, the per-snapshot drain buffer for NCCL
+	// data points. Producer: NCCL ringbuf goroutine. Consumer: onSnapshot
+	// callback. Capped at ncclBufMax to bound memory if the consumer
+	// stalls; overflow events are dropped silently and surfaced via the
+	// "NCCL tracing: ... dropped" stderr line at shutdown.
+	ncclBufMu  sync.Mutex
+	ncclBuf    []stats.NCCLDataPoint
+	ncclBufMax = 4096
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 	traceRemediateGid int           // Numeric GID for remediation socket group access. Mirrors fleet-push.
 	traceNode         string        // Node identity for multi-node correlation.
@@ -75,6 +87,30 @@ var (
 	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
 	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
 )
+
+// ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
+// silently when the buffer is full (snapshot consumer is too slow OR
+// no exporter is configured to drain it).
+func ncclBufferAdd(p stats.NCCLDataPoint) {
+	ncclBufMu.Lock()
+	defer ncclBufMu.Unlock()
+	if len(ncclBuf) >= ncclBufMax {
+		return
+	}
+	ncclBuf = append(ncclBuf, p)
+}
+
+// ncclBufferDrain returns and clears the buffer. Called from onSnapshot.
+func ncclBufferDrain() []stats.NCCLDataPoint {
+	ncclBufMu.Lock()
+	defer ncclBufMu.Unlock()
+	if len(ncclBuf) == 0 {
+		return nil
+	}
+	out := ncclBuf
+	ncclBuf = nil
+	return out
+}
 
 var traceCmd = &cobra.Command{
 	Use:   "trace",
@@ -111,6 +147,8 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoIO, "no-io", false, "disable block I/O tracing")
 	traceCmd.Flags().BoolVar(&traceNoTCP, "no-tcp", false, "disable TCP retransmit tracing")
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
+	traceCmd.Flags().BoolVar(&traceNCCL, "nccl", false, "experimental: attach NCCL collective uprobes (v0.12.0; opt-in until v0.13)")
+	traceCmd.Flags().StringVar(&traceNCCLLib, "nccl-lib", "", "explicit libnccl.so path (skip /proc/<pid>/maps discovery)")
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
 	traceCmd.Flags().IntVar(&traceRemediateGid, "remediate-gid", 65532,
 		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
@@ -568,6 +606,47 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		defer netTracer.Close()
 	}
 
+	// Step 3f: Optional NCCL tracer (v0.12.0 opt-in). Discover libnccl.so
+	// via /proc/<pid>/maps if --nccl is set and --nccl-lib wasn't given.
+	// Falls back to libtorch_cuda.so / libtorch_global_deps.so for PyTorch
+	// builds that statically link NCCL.
+	var ncclTracer *ncclprobe.Tracer
+	ncclProbeCount := 0
+	if traceNCCL {
+		libPath := traceNCCLLib
+		if libPath == "" {
+			for _, pid := range targetPIDs {
+				if pid > 0 {
+					if p := ncclprobe.FindLibNCCL(pid); p != "" {
+						libPath = p
+						break
+					}
+				}
+			}
+		}
+		if libPath == "" {
+			libPath = ncclprobe.FindLibNCCLSystemwide()
+		}
+		if libPath == "" {
+			fmt.Fprintln(os.Stderr, "  Warning: --nccl set but no libnccl.so / libtorch_cuda.so found; NCCL tracing skipped")
+			debugf("nccl: no libnccl-bearing object found; skipping")
+		} else {
+			nt := ncclprobe.New(libPath)
+			if err := nt.Attach(); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: NCCL tracing unavailable: %v\n", err)
+				debugf("nccl tracer: attach failed: %v", err)
+			} else {
+				ncclTracer = nt
+				ncclProbeCount = 12 // 6 collectives x (uprobe + uretprobe)
+				fmt.Fprintf(os.Stderr, "  NCCL tracing: attached %d probes to %s\n", ncclProbeCount, libPath)
+				debugf("nccl tracer: %d probes attached at %s", ncclProbeCount, libPath)
+			}
+		}
+	}
+	if ncclTracer != nil {
+		defer ncclTracer.Close()
+	}
+
 	// Step 4: Create stats collector and correlation engine.
 	collector := stats.New()
 	corr := correlate.New()
@@ -746,6 +825,51 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go netTracer.Run(ctx)
 		extraChs = append(extraChs, netTracer.Events())
 	}
+	// NCCL tracer: drains ringbuf into a snapshot-attached buffer that the
+	// onSnapshot callback drains and feeds to OTLP / Prometheus exporters.
+	// v0.12.0 keeps NCCL events out of the main events.Event pipeline
+	// (correlator + SQLite store don't yet have a NCCL row shape); v0.12.1
+	// will fold nccl.collective.* into the unified flow + the SQLite store.
+	if ncclTracer != nil {
+		go func() {
+			if err := ncclTracer.Run(ctx); err != nil {
+				debugf("nccl tracer Run: %v", err)
+			}
+		}()
+		go func() {
+			n := uint64(0)
+			for ev := range ncclTracer.Events() {
+				n++
+				if traceVerbose {
+					fmt.Fprintln(os.Stderr, ev.String())
+				}
+				if n%1000 == 0 {
+					debugf("nccl events seen: %d", n)
+				}
+				// Convert ncclprobe.Event into a stats.NCCLDataPoint and
+				// queue for the next snapshot tick. Skip the header-only
+				// CommInitRank / CommDestroy events (op codes 1/2): those
+				// are lifecycle events with no duration data dashboards
+				// can plot.
+				if ev.Op == 1 || ev.Op == 2 {
+					continue
+				}
+				ncclBufferAdd(stats.NCCLDataPoint{
+					TimestampUnixNano: int64(ev.TimestampNs),
+					OpType:            ev.OpName(),
+					CommIDHash:        fmt.Sprintf("%016x", ev.CommIDHash),
+					Rank:              ev.Rank,
+					NRanks:            ev.NRanks,
+					Datatype:          ev.Datatype,
+					ReduceOp:          ev.ReduceOp,
+					DurationMs:        float64(ev.DurationNs) / 1e6,
+					CountBytes:        ev.CountBytes,
+					ReturnCode:        ev.ReturnCode,
+				})
+			}
+			fmt.Fprintf(os.Stderr, "  NCCL tracing: %d events captured (%d dropped)\n", n, ncclTracer.Dropped())
+		}()
+	}
 
 	// Start SQLite writer if recording.
 	if eventStore != nil {
@@ -839,6 +963,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			if droppedFn != nil {
 				snap.RingbufOverflows = droppedFn()
 			}
+			// Drain NCCL events captured between snapshots into the
+			// snapshot so the OTLP exporter emits them as
+			// nccl.collective.* metrics. Empty when --nccl is off.
+			snap.NCCLDataPoints = ncclBufferDrain()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}

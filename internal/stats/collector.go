@@ -302,6 +302,29 @@ type Snapshot struct {
 	// increase ring sizes or reduce instrumentation scope. Zero when no
 	// tracer is attached.
 	RingbufOverflows uint64
+
+	// NCCLDataPoints is a per-snapshot drained buffer of NCCL collective
+	// events captured by ncclprobe between snapshots. Populated by the
+	// caller (cli/trace.go) before passing the snapshot to OTLP/Prometheus
+	// emitters; nil when --nccl is off. Each element becomes one
+	// nccl.collective.duration_ms + nccl.collective.bytes data point.
+	NCCLDataPoints []NCCLDataPoint
+}
+
+// NCCLDataPoint is one captured NCCL collective ready for OTLP emission.
+// Plain fields (no time.Duration) so the export package can emit without
+// importing ncclprobe (avoids import cycle since ncclprobe needs events).
+type NCCLDataPoint struct {
+	TimestampUnixNano int64
+	OpType            string // "ncclAllReduce", "ncclAllGather", etc.
+	CommIDHash        string // 16-hex-char string
+	Rank              uint32
+	NRanks            uint32
+	Datatype          uint32
+	ReduceOp          uint32
+	DurationMs        float64
+	CountBytes        uint64
+	ReturnCode        int32
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

@@ -36,6 +36,21 @@ struct user_pt_regs {
 #define EVENT_SRC_TCP     6
 #define EVENT_SRC_NET     7
 #define EVENT_SRC_CUDA_GRAPH 8
+#define EVENT_SRC_NCCL    9
+
+/* NCCL collective operation types (op field of ingero_event_hdr).
+ * Mirrors the NCCL public API symbol set hooked by nccl_trace.bpf.c.
+ * Values are deliberately sparse; downstream consumers should treat
+ * unknown op codes as "future NCCL collective" rather than error.
+ */
+#define NCCL_OP_COMM_INIT_RANK   1
+#define NCCL_OP_COMM_DESTROY     2
+#define NCCL_OP_ALL_REDUCE       3
+#define NCCL_OP_ALL_GATHER       4
+#define NCCL_OP_REDUCE_SCATTER   5
+#define NCCL_OP_BCAST            6
+#define NCCL_OP_SEND             7
+#define NCCL_OP_RECV             8
 
 /* Host kernel operation types */
 #define HOST_OP_SCHED_SWITCH   1
@@ -204,6 +219,38 @@ struct ingero_net_event {
 	__u8  direction;        /* NET_OP_SEND or NET_OP_RECV */
 	__u8  _pad_net[7];
 };
+
+/* NCCL collective event (104 bytes total).
+ *
+ * Emitted by nccl_trace.bpf.c on every NCCL collective uretprobe
+ * (allreduce / allgather / reducescatter / bcast / send / recv / commInitRank /
+ * commDestroy). Fixed-size record; the Go-side parser dispatches by hdr.op.
+ *
+ * comm_id_hash: stable 64-bit hash of the ncclUniqueId captured at
+ * ncclCommInitRank time. Same value across all ranks of the same
+ * communicator, so Fleet can correlate "the same op across the cluster"
+ * via (comm_id_hash, sequence_number) without needing the full 128-byte
+ * NCCL unique id on the wire.
+ *
+ * For NCCL_OP_COMM_INIT_RANK: count_bytes / op_type / stream_handle are 0;
+ *   rank/nranks/comm_id_hash carry the meaningful data.
+ * For collectives: rank/nranks come from the comm_handle_map lookup
+ *   keyed by (pid, comm_ptr) populated at ncclCommInitRank uretprobe.
+ */
+struct nccl_event {
+	struct ingero_event_hdr hdr;       /* 48 bytes (op = NCCL_OP_*) */
+	__u64 duration_ns;                 /* uretprobe - uprobe time (queue time, not barrier wait) */
+	__u64 comm_id_hash;                /* hash of ncclUniqueId from ncclCommInitRank */
+	__u64 stream_handle;               /* CUDA stream pointer (from PARM7 stack arg for *Reduce*) */
+	__u64 count_bytes;                 /* count * datatype_size */
+	__u32 rank;                        /* this rank's index in the communicator */
+	__u32 nranks;                      /* total ranks in the communicator */
+	__u32 datatype;                    /* ncclDataType_t enum */
+	__u32 reduce_op;                   /* ncclRedOp_t enum (allreduce/reducescatter only) */
+	__s32 return_code;                 /* ncclResult_t */
+	__u32 _pad;
+};
+/* Total: 48 + 8+8+8+8 + 4+4+4+4 + 4+4 = 104 bytes — keep on 8-byte boundary. */
 
 /* Per-thread entry state for CUDA Graph probes.
  * Separate from entry_state to avoid collisions — a thread may be in a

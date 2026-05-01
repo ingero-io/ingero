@@ -258,6 +258,8 @@ type otlpValue struct {
 
 func stringVal(s string) otlpValue { return otlpValue{StringValue: &s} }
 
+func int64Ptr(v int64) *int64 { return &v }
+
 func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	nowNano := fmt.Sprintf("%d", time.Now().UnixNano())
 
@@ -328,6 +330,27 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		int64(snap.AnomalyEvents),
 		nil,
 	))
+
+	// NCCL collective data points (v0.12.0+). One nccl.collective.duration_ms
+	// gauge per captured event with the standard nccl.* attribute set.
+	// Fleet's ncclprocessor consumes these and derives peer_lag_ms.
+	for _, p := range snap.NCCLDataPoints {
+		ts := fmt.Sprintf("%d", p.TimestampUnixNano)
+		attrs := []otlpKeyValue{
+			{Key: "nccl.op_type", Value: stringVal(p.OpType)},
+			{Key: "nccl.comm_id_hash", Value: stringVal(p.CommIDHash)},
+			{Key: "nccl.rank", Value: otlpValue{IntValue: int64Ptr(int64(p.Rank))}},
+			{Key: "nccl.nranks", Value: otlpValue{IntValue: int64Ptr(int64(p.NRanks))}},
+			{Key: "nccl.datatype", Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
+			{Key: "nccl.reduce_op", Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
+		}
+		metrics = append(metrics,
+			gaugeMetric("nccl.collective.duration_ms", "Per-collective queue time (entry-to-exit of NCCL uprobe)", "ms",
+				ts, p.DurationMs, attrs),
+			gaugeMetricInt("nccl.collective.bytes", "Per-collective payload size", "By",
+				ts, int64(p.CountBytes), attrs),
+		)
+	}
 
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetrics{{

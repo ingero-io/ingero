@@ -22,6 +22,7 @@ var bpfObjects = []struct {
 	{"cudagraph", "cudagraphtrace"},
 	{"driver", "drivertrace"},
 	{"host", "hosttrace"},
+	{"ncclprobe", "nccltrace"},
 	{"net", "nettrace"},
 	{"tcp", "tcptrace"},
 }

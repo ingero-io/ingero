@@ -53,6 +53,48 @@ func TestAttributes_NotEmpty(t *testing.T) {
 	}
 }
 
+// TestNCCLContract validates the v0.12.0 NCCL metric + attribute names.
+// Catches accidental rename / typo across the agent emitter, ncclprobe,
+// and Fleet ncclprocessor — drift in any direction silently breaks the
+// dashboard and the pkg/contract is the single source of truth.
+func TestNCCLContract(t *testing.T) {
+	metrics := map[string]string{
+		"MetricNCCLDuration":    MetricNCCLDuration,
+		"MetricNCCLBarrierWait": MetricNCCLBarrierWait,
+		"MetricNCCLPeerLag":     MetricNCCLPeerLag,
+		"MetricNCCLBytes":       MetricNCCLBytes,
+	}
+	for name, val := range metrics {
+		if val == "" {
+			t.Errorf("%s is empty", name)
+		}
+		if !strings.HasPrefix(val, "nccl.collective.") {
+			t.Errorf("%s = %q: expected 'nccl.collective.' prefix", name, val)
+		}
+	}
+	attrs := map[string]string{
+		"AttrNCCLOpType":     AttrNCCLOpType,
+		"AttrNCCLCommIDHash": AttrNCCLCommIDHash,
+		"AttrNCCLRank":       AttrNCCLRank,
+		"AttrNCCLNRanks":     AttrNCCLNRanks,
+		"AttrNCCLDatatype":   AttrNCCLDatatype,
+		"AttrNCCLReduceOp":   AttrNCCLReduceOp,
+	}
+	seen := map[string]string{}
+	for name, val := range attrs {
+		if val == "" {
+			t.Errorf("%s is empty", name)
+		}
+		if !strings.HasPrefix(val, "nccl.") {
+			t.Errorf("%s = %q: expected 'nccl.' prefix", name, val)
+		}
+		if other, dup := seen[val]; dup {
+			t.Errorf("attr %q used by both %s and %s", val, name, other)
+		}
+		seen[val] = name
+	}
+}
+
 func TestHeaders_NotEmpty(t *testing.T) {
 	if HeaderThreshold == "" {
 		t.Error("HeaderThreshold is empty")
