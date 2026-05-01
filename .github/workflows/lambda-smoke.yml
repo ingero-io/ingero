@@ -1,0 +1,97 @@
+name: Lambda GH200 Smoke
+
+# Provisions a Lambda Labs GH200 instance, syncs the current source,
+# builds the agent, runs scripts/gpu-test.sh against the GH200's
+# arm64 kernel, archives the logs, and destroys the instance. Runs
+# only on workflow_dispatch (per v0.11 D6 decision: no scheduled
+# cadence; operators trigger before tag flow or after suspect
+# changes).
+#
+# Cost gate: the deploy script's LAUNCH_RETRY_MAX bounds capacity
+# polling. The destroy step in the post-job hook fires unconditionally
+# so a failed test does not leave a billing instance running.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'Trace duration on the VM'
+        required: false
+        default: '30'
+      retry_max:
+        description: 'Max attempts to find GH200 capacity (each is 30s)'
+        required: false
+        default: '120'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Only one Lambda VM at a time across all runs of this workflow,
+  # so a duplicate trigger never doubles the bill.
+  group: lambda-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: GH200 build + trace
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Provision GH200
+        env:
+          LAMBDALABS_API_TOKEN: ${{ secrets.LAMBDALABS_API_TOKEN }}
+          LAMBDA_INSTANCE_TYPES: gpu_1x_gh200
+          LAUNCH_RETRY_MAX: ${{ inputs.retry_max }}
+          LAUNCH_RETRY_INTERVAL: '30'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          bash scripts/lambdalabs/vm.sh deploy --force
+
+      - name: Wait for cloud-init
+        run: bash scripts/lambdalabs/wait-cloud-init.sh
+
+      - name: Sync source + build + run gpu-test.sh
+        run: |
+          IP=$(jq -r .ip .lambdalabs-vm.json)
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@$IP \
+            "mkdir -p ~/workspace/ingero"
+          rsync -az --delete --exclude='.git' --exclude='/bin/' --exclude='/logs/' \
+            -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519" \
+            ./ ubuntu@$IP:~/workspace/ingero/
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@$IP \
+            'export PATH=/usr/local/go/bin:$PATH && cd ~/workspace/ingero && \
+             make build && bash scripts/gpu-test.sh'
+
+      - name: Pull artifacts
+        if: always()
+        run: |
+          set -e
+          IP=$(jq -r .ip .lambdalabs-vm.json 2>/dev/null || echo "")
+          if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+            mkdir -p artifacts
+            scp -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 -r \
+              ubuntu@$IP:~/workspace/ingero/logs/ artifacts/ || true
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-gh200-smoke
+          path: artifacts/
+
+      - name: Destroy VM (always, even on failure)
+        if: always()
+        env:
+          LAMBDALABS_API_TOKEN: ${{ secrets.LAMBDALABS_API_TOKEN }}
+        run: |
+          if [ -f .lambdalabs-vm.json ]; then
+            bash scripts/lambdalabs/vm.sh destroy --force || true
+          fi
