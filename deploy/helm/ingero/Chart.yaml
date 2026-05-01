@@ -4,7 +4,7 @@ description: eBPF-based GPU causal observability agent
 type: application
 version: 0.10.0
 # ingero-version:helm-appversion product=ingero channel=stable
-appVersion: "0.10.1"
+appVersion: "0.11.0"
 keywords:
   - gpu
   - ebpf
