@@ -3,9 +3,12 @@
 /ingero
 *.a
 
-# eBPF generated (vmlinux.h is machine-specific, not committed)
-# Note: *_bpfel.go and *_bpfel.o ARE committed — CI needs them to build.
-bpf/headers/vmlinux.h
+# eBPF generated. The committed *_bpfel.go and *_bpfel.o pairs ARE
+# release artifacts; CI and goreleaser embed them. The committed
+# bpf/headers/vmlinux.h is the canonical type catalog the per-arch
+# CO-RE compile reads (see Makefile `generate` target). It is host-
+# arch independent — CO-RE relocates field accesses against the
+# loaded kernel BTF at runtime, not the headers used at compile time.
 
 # Go
 vendor/
