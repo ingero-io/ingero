@@ -15,9 +15,14 @@ jobs:
     name: Test (Go ${{ matrix.go-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         go-version: ['1.25', '1.26.2']
-        os: [ubuntu-22.04, ubuntu-24.04]
+        # ubuntu-*-arm runners exercise the arm64 _arm64_bpfel.go shims
+        # and the per-arch CO-RE parity test on real aarch64 hardware,
+        # closing the structural test-coverage gap that produced issue
+        # #35 (arm64 release binary shipped x86 CO-RE relocations).
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm]
 
     steps:
       - uses: actions/checkout@v4
