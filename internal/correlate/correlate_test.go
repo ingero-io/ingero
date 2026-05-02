@@ -425,6 +425,28 @@ func TestWithMaxAgeOption(t *testing.T) {
 	}
 }
 
+func TestWithWindowMode(t *testing.T) {
+	cases := []struct {
+		name     string
+		mode     string
+		expected time.Duration
+	}{
+		{"training", "training", 10 * time.Second},
+		{"inference", "inference", 500 * time.Millisecond},
+		{"unknown", "unknown", 10 * time.Second},
+		{"empty", "", 10 * time.Second},
+		{"bogus", "bogus", 10 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := New(WithWindowMode(tc.mode))
+			if eng.maxAge != tc.expected {
+				t.Fatalf("mode=%q: maxAge = %v, want %v", tc.mode, eng.maxAge, tc.expected)
+			}
+		})
+	}
+}
+
 func TestWithMaxAgeZeroDisablesPruning(t *testing.T) {
 	eng := New(WithMaxAge(0))
 

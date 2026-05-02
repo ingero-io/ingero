@@ -22,6 +22,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/ingero-io/ingero/internal/sampling"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -488,6 +489,15 @@ type Store struct {
 	// Node identity for multi-node correlation (v0.9).
 	node    string       // set via SetNode before Run()
 	eventSeq atomic.Uint64 // monotonic event ID counter
+
+	// sampler optionally gates Record() so inference workloads don't flood
+	// the event store. nil = admit everything (default, training behavior).
+	// atomic.Pointer keeps the Record() hot path lock-free.
+	sampler atomic.Pointer[sampling.Sampler]
+
+	// droppedBySampler counts events rejected by the sampler. Read via
+	// ReadStats() once a metric is wired in a later slice.
+	droppedBySampler atomic.Uint64
 
 	mu      sync.Mutex
 	closed  bool
@@ -977,11 +987,31 @@ func (s *Store) WaitDone() {
 
 // Record enqueues an event for async writing. Non-blocking — drops if buffer full.
 func (s *Store) Record(evt events.Event) {
+	// Optional sampler gate: inference workloads attach a Sampler via
+	// SetSampler so the high-rate event stream is admitted at a small
+	// fraction in healthy state and 100% during degradation.
+	if smp := s.sampler.Load(); smp != nil && !smp.ShouldEmit() {
+		s.droppedBySampler.Add(1)
+		return
+	}
 	select {
 	case s.insertCh <- evt:
 	default:
 		// Buffer full — drop event rather than block the caller.
 	}
+}
+
+// SetSampler installs (or clears, with nil) the optional event sampler.
+// Safe for concurrent use. When nil the store admits every event (default,
+// matches pre-sampler behavior). Typically called once at startup.
+func (s *Store) SetSampler(smp *sampling.Sampler) {
+	s.sampler.Store(smp)
+}
+
+// DroppedBySampler returns the cumulative count of events rejected by the
+// sampler since process start. Returns 0 when no sampler is installed.
+func (s *Store) DroppedBySampler() uint64 {
+	return s.droppedBySampler.Load()
 }
 
 // Run starts the background flush and prune loops. Blocks until ctx is cancelled.

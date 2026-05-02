@@ -470,6 +470,75 @@ func TestEmitStragglerEvent_AttachesEventID(t *testing.T) {
 	assertAttr(t, dp.Attributes, contract.AttrEventID, ev.EventID)
 }
 
+// v0.13 Slice A: cgroup_path_hash is emitted on the health_score data
+// point, resolved once at NewEmitter via the package-level resolver.
+// Fleet groups MAD thresholds by this attribute; absence folds into the
+// legacy cluster-wide bucket. The resolver is stubbed here so the test
+// does not depend on the real /proc/self/cgroup contents (which differ
+// between Linux CI, WSL, macOS, and Windows).
+func TestPush_HealthScoreCarriesCgroupPathHash(t *testing.T) {
+	const stubHash = "abc123def4567890"
+	prev := cgroupPathHashResolver
+	cgroupPathHashResolver = func() (string, error) { return stubHash, nil }
+	t.Cleanup(func() { cgroupPathHashResolver = prev })
+
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricHealthScore)
+	if m.Gauge == nil || len(m.Gauge.DataPoints) != 1 {
+		t.Fatalf("health_score gauge missing or wrong dp count")
+	}
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrCgroupPathHash, stubHash)
+
+	// Hash is fixed-width 16 hex chars per the contract definition on
+	// contract.AttrCgroupPathHash. Assert the stub honored that shape so
+	// future drift in the production resolver is caught by the same test.
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrCgroupPathHash {
+			if kv.Value.StringValue == nil {
+				t.Fatalf("cgroup_path_hash value is nil")
+			}
+			if got := len(*kv.Value.StringValue); got != 16 {
+				t.Fatalf("cgroup_path_hash length = %d, want 16", got)
+			}
+		}
+	}
+}
+
+// Resolver failure path: emitter must not panic, must emit empty string
+// for the attribute, and must continue pushing normally. Mirrors the
+// "no /proc available" case (macOS dev, hostile sandbox).
+func TestPush_HealthScoreCgroupPathHashEmptyOnResolverError(t *testing.T) {
+	prev := cgroupPathHashResolver
+	cgroupPathHashResolver = func() (string, error) {
+		return "", errors.New("simulated /proc unavailable")
+	}
+	t.Cleanup(func() { cgroupPathHashResolver = prev })
+
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricHealthScore)
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrCgroupPathHash, "")
+}
+
 // EventID attribute is omitted when StragglerEvent.EventID is empty.
 func TestEmitStragglerEvent_OmitsEmptyEventID(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)

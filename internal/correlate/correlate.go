@@ -22,6 +22,7 @@ package correlate
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -143,6 +144,25 @@ type Option func(*Engine)
 // Use a longer duration for explain --since, or 0 to disable pruning entirely
 // (required for historical replay where events have past timestamps).
 func WithMaxAge(d time.Duration) Option {
+	return func(e *Engine) {
+		e.maxAge = d
+	}
+}
+
+// WithWindowMode picks maxAge from fleet.workload_type so inference workloads
+// get a sub-second causal window without exposing the magic numbers to callers.
+func WithWindowMode(workload string) Option {
+	var d time.Duration
+	switch workload {
+	case "training", "unknown", "":
+		d = DefaultMaxAge
+	case "inference":
+		d = 500 * time.Millisecond
+	default:
+		slog.Warn("correlate: unknown workload_type, defaulting to training window",
+			"workload_type", workload, "max_age", DefaultMaxAge)
+		d = DefaultMaxAge
+	}
 	return func(e *Engine) {
 		e.maxAge = d
 	}

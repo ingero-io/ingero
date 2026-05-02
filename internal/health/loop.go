@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/ingero-io/ingero/internal/sampling"
 )
 
 // Collector is the source of raw inputs for one tick of the push loop. Real
@@ -78,6 +80,10 @@ type LoopConfig struct {
 	// an Inf/NaN source should not produce tens of thousands of WARN
 	// lines per day. Defaults to 5 minutes when zero.
 	AnomalyLogMinInterval time.Duration
+	// Sampler, if non-nil, is informed of degradation-edge transitions
+	// every tick. The sampler does its own edge detection so calling on
+	// every tick is safe and idempotent within a state.
+	Sampler *sampling.Sampler
 }
 
 // Loop drives one push per interval: collect -> state transition -> update
@@ -261,8 +267,15 @@ func (l *Loop) tick(parentCtx context.Context) time.Duration {
 		thresholdOK = ok
 	}
 
+	// Read DegradationWarning once and forward it to both the push payload
+	// and the sampler. The sampler does its own edge detection internally.
+	degraded := l.cfg.Baseliner.DegradationWarning()
+	if l.cfg.Sampler != nil {
+		l.cfg.Sampler.SetDegraded(degraded)
+	}
+
 	var retryAfter time.Duration
-	if err := l.cfg.Emitter.Push(ctx, now, score, next, mode, l.cfg.Baseliner.DegradationWarning()); err != nil {
+	if err := l.cfg.Emitter.Push(ctx, now, score, next, mode, degraded); err != nil {
 		l.log.Debug("fleet loop: push error", "err", err.Error())
 		if ra := AsRetryAfter(err); ra != nil {
 			retryAfter = ra.Delay

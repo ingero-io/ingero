@@ -3,8 +3,10 @@ package health
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +22,29 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/pkg/contract"
 )
+
+// cgroupPathHashResolver is the function used to resolve the agent's own
+// cgroup path hash at emitter startup. Overridable for tests to avoid
+// depending on the real /proc/self/cgroup contents. Returns the SHA256
+// hash of the cgroup path truncated to 16 hex chars, per the contract
+// described on contract.AttrCgroupPathHash.
+var cgroupPathHashResolver = defaultCgroupPathHash
+
+// defaultCgroupPathHash reads /proc/self/cgroup, resolves the cgroup path,
+// and returns its SHA256 truncated to 16 hex chars. Returns an error if
+// /proc is not available or the file cannot be read (e.g. on macOS/Windows
+// during local development, or inside an environment that hides /proc).
+func defaultCgroupPathHash() (string, error) {
+	path, err := cgroup.ReadCGroupPath(uint32(os.Getpid()))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(sum[:])[:16], nil
+}
 
 // minPushInterval and minTimeout are conservative lower bounds enforced by
 // EmitterConfig.Validate. They prevent pathological configurations that
@@ -179,13 +202,20 @@ type Emitter interface {
 	Stats() (pushes, errors int64)
 }
 
-// httpEmitter is the production Emitter. OTLP/HTTP JSON only — no gRPC,
+// httpEmitter is the production Emitter. OTLP/HTTP JSON only - no gRPC,
 // following the existing internal/export/otlp.go pattern.
 type httpEmitter struct {
 	cfg    EmitterConfig
 	url    string
 	client *http.Client
 	log    *slog.Logger
+
+	// cgroupPathHash is the SHA256-truncated-16 hash of the agent's own
+	// /proc/self/cgroup path, resolved once at NewEmitter and emitted on
+	// every health_score data point so Fleet can group MAD by cohort.
+	// Empty string when resolution failed (e.g. /proc unavailable);
+	// downstream Fleet folds that into the legacy cluster-wide bucket.
+	cgroupPathHash string
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -229,12 +259,24 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 		client.Transport = trTLS
 	}
 
+	// Resolve the agent's own cgroup path hash once at startup. On any
+	// failure (no /proc, permission denied, host process), we emit the
+	// empty string on the wire, which Fleet folds into the legacy
+	// cluster-wide bucket. WARN once so operators see the fallback.
+	cgroupHash, cgroupErr := cgroupPathHashResolver()
+	if cgroupErr != nil {
+		log.Warn("cgroup path hash resolution failed; emitting empty value on health_score",
+			"err", cgroupErr.Error())
+		cgroupHash = ""
+	}
+
 	return &httpEmitter{
-		cfg:    cfg,
-		url:    endpointURL,
-		client: client,
-		log:    log,
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		cfg:            cfg,
+		url:            endpointURL,
+		client:         client,
+		log:            log,
+		cgroupPathHash: cgroupHash,
+		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
 
@@ -440,10 +482,20 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 		{Key: contract.AttrWorkloadType, Value: otlpStr(e.cfg.WorkloadType)},
 	}
 
+	// health_score carries the cgroup_path_hash so Fleet can group MAD
+	// thresholds by cohort. The per-signal sub-gauges share the same
+	// state/workload attrs but do not need cgroup attribution (Fleet's
+	// threshold pipeline only consumes the composite score). The hash
+	// is resolved once at NewEmitter and cached on the emitter.
+	healthDpAttrs := append([]otlpKV{}, dpAttrs...)
+	healthDpAttrs = append(healthDpAttrs,
+		otlpKV{Key: contract.AttrCgroupPathHash, Value: otlpStr(e.cgroupPathHash)},
+	)
+
 	// Score + per-signal gauges.
 	var metrics []otlpMetric
 	metrics = append(metrics,
-		dblGauge(contract.MetricHealthScore, timeNano, score.Value, dpAttrs),
+		dblGauge(contract.MetricHealthScore, timeNano, score.Value, healthDpAttrs),
 		dblGauge(contract.MetricThroughputRatio, timeNano, score.Throughput, dpAttrs),
 		dblGauge(contract.MetricComputeEfficiency, timeNano, score.Compute, dpAttrs),
 		dblGauge(contract.MetricMemoryHeadroom, timeNano, score.Memory, dpAttrs),

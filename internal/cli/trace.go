@@ -87,6 +87,7 @@ var (
 	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
 	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
 	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
+	traceWorkloadType string        // Mirrors fleet.workload_type from configs/ingero.yaml; gates correlator window.
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -159,6 +160,8 @@ func init() {
 	traceCmd.Flags().Uint32Var(&traceSamplingRate, "sampling-rate", 0, "event sampling rate (0 = adaptive, 1 = emit all, N > 1 = emit 1 in N). Adaptive mode auto-increases rate under sustained drop pressure.")
 	traceCmd.Flags().StringVar(&tracePyWalker, "py-walker", "auto",
 		"Python frame walker: auto (userspace, default), ebpf (kernel-side, requires Python 3.12), userspace (force userspace)")
+	traceCmd.Flags().StringVar(&traceWorkloadType, "fleet-workload-type", "unknown",
+		"Workload type from fleet.workload_type (training | inference | unknown). Selects correlator window: training/unknown=10s, inference=500ms.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -704,7 +707,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 
 	// Step 4: Create stats collector and correlation engine.
 	collector := stats.New()
-	corr := correlate.New()
+	corr := correlate.New(correlate.WithWindowMode(traceWorkloadType))
 	corr.SetNode(nodeIdentity)
 
 	// Step 4b: Create OTEL exporters (disabled by default).
