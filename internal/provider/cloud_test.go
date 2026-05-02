@@ -15,10 +15,12 @@ import (
 // helpers indirectly by spinning up local httptest servers and pointing
 // the per-detector logic at them via internal-testing helpers below.
 
-// detectorVia is a test-only helper that swaps the IMDS endpoints for
-// httptest URLs by re-implementing the probe with a custom URL. It
-// mirrors detectAWS / detectGCP / detectAzure exactly except for the
-// hard-coded URL constants.
+// v0.12.4 (Sys Arch ★3): tests now drive the production probeAWS /
+// probeGCP / probeAzure functions directly via the URL-injection
+// parameters. The previous probeAWSAt/probeGCPAt/probeAzureAt
+// reimplementations have been removed -- they could drift away from
+// the real probes silently. The fake handlers below remain as the
+// httptest fixture; the actual probe code is exercised in production form.
 
 func TestDetectDefault_NonCloud(t *testing.T) {
 	// Real call against a sandbox / dev box should return "" within the
@@ -67,7 +69,9 @@ func fakeAWSHandler(t *testing.T) http.Handler {
 				return
 			}
 			w.WriteHeader(200)
-			w.Write([]byte("i-0fakefake"))
+			// v0.12.4 (Sys Arch ★2): canonical AWS instance-id shape
+			// (i-<17 hex>) so probeAWS's body-shape check accepts.
+			w.Write([]byte("i-0123456789abcdef0\n"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -106,69 +110,12 @@ func fakeAzureHandler(t *testing.T) http.Handler {
 	})
 }
 
-// probeAWSAt mirrors detectAWS but lets the test point at a local server.
-// Logic must stay in sync with detectAWS in cloud.go.
-func probeAWSAt(ctx context.Context, base string) Provider {
-	c := httpClient()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, base+"/latest/api/token", nil)
-	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
-	resp, err := c.Do(req)
-	if err != nil {
-		return ""
-	}
-	tok := make([]byte, 256)
-	n, _ := resp.Body.Read(tok)
-	resp.Body.Close()
-	if resp.StatusCode != 200 || n == 0 {
-		return ""
-	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, base+"/latest/meta-data/instance-id", nil)
-	req.Header.Set("X-aws-ec2-metadata-token", string(tok[:n]))
-	resp, err = c.Do(req)
-	if err != nil {
-		return ""
-	}
-	resp.Body.Close()
-	if resp.StatusCode == 200 {
-		return ProviderAWS
-	}
-	return ""
-}
-
-func probeGCPAt(ctx context.Context, base string) Provider {
-	c := httpClient()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/computeMetadata/v1/instance/id", nil)
-	req.Header.Set("Metadata-Flavor", "Google")
-	resp, err := c.Do(req)
-	if err != nil {
-		return ""
-	}
-	resp.Body.Close()
-	if resp.StatusCode == 200 {
-		return ProviderGCP
-	}
-	return ""
-}
-
-func probeAzureAt(ctx context.Context, base string) Provider {
-	c := httpClient()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/metadata/instance?api-version=2021-02-01", nil)
-	req.Header.Set("Metadata", "true")
-	resp, err := c.Do(req)
-	if err != nil {
-		return ""
-	}
-	resp.Body.Close()
-	if resp.StatusCode == 200 {
-		return ProviderAzure
-	}
-	return ""
-}
-
 func TestProbeAWS(t *testing.T) {
 	srv := httptest.NewServer(fakeAWSHandler(t))
 	defer srv.Close()
-	if got := probeAWSAt(context.Background(), srv.URL); got != ProviderAWS {
+	c := httpClient()
+	got := probeAWS(context.Background(), c, srv.URL+"/latest/api/token", srv.URL+"/latest/meta-data/instance-id")
+	if got != ProviderAWS {
 		t.Fatalf("AWS probe: got %q want %q", got, ProviderAWS)
 	}
 }
@@ -176,7 +123,8 @@ func TestProbeAWS(t *testing.T) {
 func TestProbeGCP(t *testing.T) {
 	srv := httptest.NewServer(fakeGCPHandler(t))
 	defer srv.Close()
-	if got := probeGCPAt(context.Background(), srv.URL); got != ProviderGCP {
+	c := httpClient()
+	if got := probeGCP(context.Background(), c, srv.URL+"/computeMetadata/v1/instance/id"); got != ProviderGCP {
 		t.Fatalf("GCP probe: got %q want %q", got, ProviderGCP)
 	}
 }
@@ -184,7 +132,8 @@ func TestProbeGCP(t *testing.T) {
 func TestProbeAzure(t *testing.T) {
 	srv := httptest.NewServer(fakeAzureHandler(t))
 	defer srv.Close()
-	if got := probeAzureAt(context.Background(), srv.URL); got != ProviderAzure {
+	c := httpClient()
+	if got := probeAzure(context.Background(), c, srv.URL+"/metadata/instance?api-version=2021-02-01"); got != ProviderAzure {
 		t.Fatalf("Azure probe: got %q want %q", got, ProviderAzure)
 	}
 }
@@ -194,13 +143,14 @@ func TestProbe_404IsEmpty(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	if got := probeAWSAt(context.Background(), srv.URL); got != "" {
+	c := httpClient()
+	if got := probeAWS(context.Background(), c, srv.URL+"/latest/api/token", srv.URL+"/latest/meta-data/instance-id"); got != "" {
 		t.Fatalf("expected empty on 404, got %q", got)
 	}
-	if got := probeGCPAt(context.Background(), srv.URL); got != "" {
+	if got := probeGCP(context.Background(), c, srv.URL); got != "" {
 		t.Fatalf("expected empty on 404, got %q", got)
 	}
-	if got := probeAzureAt(context.Background(), srv.URL); got != "" {
+	if got := probeAzure(context.Background(), c, srv.URL); got != "" {
 		t.Fatalf("expected empty on 404, got %q", got)
 	}
 }
@@ -210,7 +160,30 @@ func TestAWSProbe_RejectsMissingHeader(t *testing.T) {
 	// probe (which sends an AWS token header) should NOT match.
 	srv := httptest.NewServer(fakeGCPHandler(t))
 	defer srv.Close()
-	if got := probeAWSAt(context.Background(), srv.URL); got != "" {
+	c := httpClient()
+	if got := probeAWS(context.Background(), c, srv.URL+"/latest/api/token", srv.URL+"/latest/meta-data/instance-id"); got != "" {
 		t.Fatalf("AWS probe must not match a GCP server; got %q", got)
+	}
+}
+
+func TestAWSProbe_RejectsWrongInstanceIDShape(t *testing.T) {
+	// v0.12.4 (Sys Arch ★2): a server that returns 200 to both the
+	// token PUT and the instance-id GET but responds with non-AWS
+	// shape (e.g. an Azure proxy) must NOT match AWS.
+	const tok = "AQAB-fake-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/latest/api/token"):
+			w.WriteHeader(200)
+			w.Write([]byte(tok))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/latest/meta-data/instance-id"):
+			w.WriteHeader(200)
+			w.Write([]byte("not-an-aws-id\n")) // Azure-shape impostor
+		}
+	}))
+	defer srv.Close()
+	c := httpClient()
+	if got := probeAWS(context.Background(), c, srv.URL+"/latest/api/token", srv.URL+"/latest/meta-data/instance-id"); got != "" {
+		t.Fatalf("AWS probe must reject non-i-<17hex> body; got %q", got)
 	}
 }

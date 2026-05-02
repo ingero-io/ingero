@@ -33,6 +33,32 @@ func TestParseContainerID_K8sContainerd(t *testing.T) {
 	}
 }
 
+func TestParseContainerID_PodNameSpoof_BlockedByPrefix(t *testing.T) {
+	// v0.12.4 (Sec audit ★3): a pod name with a 12-hex prefix that's
+	// also valid hex must NOT be returned as the container ID. The
+	// prefix-anchored regex requires "docker|containerd|cri-containerd|crio"
+	// before the hex. Real container ID below should still win.
+	realID := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	cgroup := "0::/kubepods.slice/kubepods-besteffort.slice/" +
+		"kubepods-besteffort-pod1234abcd_5678_efff_aaaa_bbbbccccdddd.slice/" +
+		"cri-containerd-" + realID + ".scope\n"
+	got := parseContainerID(cgroup)
+	if got != realID {
+		t.Fatalf("got %q want %q", got, realID)
+	}
+}
+
+func TestParseContainerID_ShortHexUnanchored_Refused(t *testing.T) {
+	// A pod name like "abc123def4567890" (12+ hex chars) on a
+	// no-runtime-prefix line must not be picked up. Without anchoring
+	// on the runtime token, the v0.12.3 fallback would have returned
+	// it; v0.12.4 refuses.
+	cgroup := "12:devices:/kubepods/pod-abc123def4567890\n"
+	if got := parseContainerID(cgroup); got != "" {
+		t.Fatalf("expected empty (no runtime prefix); got %q", got)
+	}
+}
+
 func TestParseContainerID_HostNoMatch(t *testing.T) {
 	// Bare host cgroup paths don't carry a container ID.
 	cgroup := `12:devices:/user.slice

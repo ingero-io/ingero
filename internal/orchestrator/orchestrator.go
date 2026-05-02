@@ -148,36 +148,57 @@ func containerIDFromCgroup() string {
 	return parseContainerID(string(data))
 }
 
+// v0.12.4 (Sec audit ★3): anchor on known runtime prefixes before
+// matching the 64-hex container ID. A pod name (length-capped at 63
+// chars by DNS-label rules, so it cannot itself contain 64
+// contiguous hex chars, but the 12-char fallback could be exploited)
+// can no longer spoof the container ID by being early on the cgroup
+// path.
 var (
+	cgroupAnchoredRE = regexp.MustCompile(`(?:docker|containerd|cri-containerd|crio)[-_/]([0-9a-fA-F]{64})`)
 	cgroupHexRE      = regexp.MustCompile(`[0-9a-fA-F]{64}`)
-	cgroupShortHexRE = regexp.MustCompile(`[0-9a-fA-F]{12,}`)
+	cgroupShortAnchoredRE = regexp.MustCompile(`(?:docker|containerd|cri-containerd|crio)[-_/]([0-9a-fA-F]{12,})`)
 )
 
 func parseContainerID(cgroupContent string) string {
+	// First pass: anchored 64-hex match (closes the pod-name spoof
+	// path). Modern Docker, containerd, and CRI-O all use one of these
+	// runtime prefixes ahead of the container ID in cgroup paths.
 	for _, line := range strings.Split(cgroupContent, "\n") {
 		if line == "" {
 			continue
 		}
-		// Take the path component (after the second colon for v1, or
-		// after the first colon for v2 unified hierarchy).
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) < 3 {
 			continue
 		}
-		path := parts[2]
-		if m := cgroupHexRE.FindString(path); m != "" {
-			return strings.ToLower(m)
+		if m := cgroupAnchoredRE.FindStringSubmatch(parts[2]); m != nil {
+			return strings.ToLower(m[1])
 		}
 	}
-	// Fallback: try a shorter hex match (some older Docker installs
-	// truncated the ID to 12 chars).
+	// Second pass: unanchored 64-hex match for legacy layouts that
+	// don't carry a runtime prefix. The 64-char invariant + lack of
+	// underscores in pod-UID segments still rules out the spoof at
+	// the realistic threat-model level.
 	for _, line := range strings.Split(cgroupContent, "\n") {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) < 3 {
 			continue
 		}
-		if m := cgroupShortHexRE.FindString(parts[2]); m != "" {
+		if m := cgroupHexRE.FindString(parts[2]); m != "" {
 			return strings.ToLower(m)
+		}
+	}
+	// Last resort: anchored short-hex (legacy 12-char Docker IDs).
+	// We REFUSE to use the unanchored short-hex match -- pod names
+	// can contain 12 hex chars and would spoof the ID otherwise.
+	for _, line := range strings.Split(cgroupContent, "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		if m := cgroupShortAnchoredRE.FindStringSubmatch(parts[2]); m != nil {
+			return strings.ToLower(m[1])
 		}
 	}
 	return ""
