@@ -63,7 +63,7 @@ func fakeAWSHandler(t *testing.T) http.Handler {
 			w.Write([]byte(tok))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/latest/meta-data/instance-id"):
 			if r.Header.Get("X-aws-ec2-metadata-token") != tok {
-				http.Error(w, "bad token", 401)
+				http.Error(w, "bad token", http.StatusUnauthorized)
 				return
 			}
 			w.WriteHeader(200)
@@ -78,7 +78,7 @@ func fakeGCPHandler(t *testing.T) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Metadata-Flavor") != "Google" {
-			http.Error(w, "missing flavor header", 403)
+			http.Error(w, "missing flavor header", http.StatusForbidden)
 			return
 		}
 		if !strings.HasSuffix(r.URL.Path, "/computeMetadata/v1/instance/id") {

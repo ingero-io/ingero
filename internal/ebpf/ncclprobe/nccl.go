@@ -31,14 +31,19 @@ import (
 //	4 = ALL_GATHER       5 = REDUCE_SCATTER  6 = BCAST
 //	7 = SEND             8 = RECV
 type Event struct {
-	TimestampNs  uint64
-	PID          uint32
-	TID          uint32
-	Source       uint8
-	Op           uint8
-	_pad         uint16
-	_pad2        uint32
-	CgroupID     uint64
+	TimestampNs uint64
+	PID         uint32
+	TID         uint32
+	Source      uint8
+	Op          uint8
+	// _pad / _pad2 are intentional ABI padding to align CgroupID to
+	// 8 bytes, mirroring the C struct ingero_event_hdr in
+	// bpf/common.bpf.h. binary.Read consumes them; do not remove.
+	//lint:ignore U1000 ABI padding for C struct nccl_event hdr
+	_pad uint16
+	//lint:ignore U1000 ABI padding for C struct nccl_event hdr
+	_pad2    uint32
+	CgroupID uint64
 	Comm         [16]byte
 	DurationNs   uint64
 	CommIDHash   uint64
