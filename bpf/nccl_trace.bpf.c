@@ -36,10 +36,12 @@ static __always_inline __u64 ingero_pt_regs_arg6(struct pt_regs *ctx)
 #if defined(__TARGET_ARCH_x86)
 	return BPF_CORE_READ(ctx, r9);
 #elif defined(__TARGET_ARCH_arm64)
-	struct user_pt_regs *r = (struct user_pt_regs *)ctx;
-	__u64 v = 0;
-	bpf_probe_read_kernel(&v, sizeof(v), &r->regs[5]);
-	return v;
+	/* CO-RE relocate against arm64 user_pt_regs.regs[5]. v0.12.1
+	 * upgrade from raw bpf_probe_read_kernel: matches the
+	 * BPF_CORE_READ pattern used everywhere else in the codebase
+	 * (e.g. cuda_trace.bpf.c) and gets relocation if user_pt_regs
+	 * gains fields in a future kernel. */
+	return BPF_CORE_READ((struct user_pt_regs *)ctx, regs[5]);
 #else
 	(void)ctx;
 	return 0;
@@ -59,10 +61,7 @@ static __always_inline __u64 ingero_pt_regs_arg7(struct pt_regs *ctx)
 	bpf_probe_read_user(&val, sizeof(val), (void *)(sp + sizeof(void *)));
 	return val;
 #elif defined(__TARGET_ARCH_arm64)
-	struct user_pt_regs *r = (struct user_pt_regs *)ctx;
-	__u64 v = 0;
-	bpf_probe_read_kernel(&v, sizeof(v), &r->regs[6]);
-	return v;
+	return BPF_CORE_READ((struct user_pt_regs *)ctx, regs[6]);
 #else
 	(void)ctx;
 	return 0;
@@ -104,7 +103,12 @@ struct nccl_entry_state {
 	__u32 reduce_op;
 	__u32 nranks_arg;   /* commInitRank: nranks PARM2 */
 	__u32 rank_arg;     /* commInitRank: rank PARM4 */
-	__u64 commid_first8; /* first 8 bytes of *commId, used as comm_id_hash */
+	/* v0.12.1 (LHF #15): hash all 128 bytes of ncclUniqueId, not
+	 * just the first 8. The first 8 bytes are mostly NCCL magic +
+	 * version and collide across distinct comms. We splitmix64-fold
+	 * the 16 64-bit chunks at uretprobe time; result is a 64-bit
+	 * hash collision-free for typical multi-comm workloads. */
+	__u64 commid_words[16];
 };
 
 struct {
@@ -147,6 +151,20 @@ static __always_inline __u64 splitmix64(__u64 x)
 	x *= 0x94d049bb133111ebULL;
 	x ^= x >> 31;
 	return x;
+}
+
+/* fold_commid_128: 64-bit hash of the full 128-byte ncclUniqueId.
+ * Verifier-friendly unrolled 16-iteration splitmix64 fold. v0.12.1
+ * (LHF #15) replacement for splitmix64(words[0]) which collided
+ * across distinct comms sharing the same NCCL magic+version header. */
+static __always_inline __u64 fold_commid_128(const __u64 words[16])
+{
+	__u64 h = 0x9e3779b97f4a7c15ULL; /* arbitrary non-zero seed */
+	#pragma unroll
+	for (int i = 0; i < 16; i++) {
+		h = splitmix64(h ^ words[i]);
+	}
+	return h;
 }
 
 /* save_entry: stash uprobe-time state for the current TID. */
@@ -248,23 +266,19 @@ int BPF_KPROBE(uprobe_nccl_comm_init_rank,
 	st.nranks_arg = nranks;
 	st.rank_arg = rank;
 
-	/* Read first 8 bytes of *commId. ncclUniqueId is 128 bytes; the
-	 * first 8 are typically the magic+version field, sufficient for
-	 * a stable hash so long as NCCL doesn't randomize the leading
-	 * field across ranks of the same communicator (it doesn't).
+	/* v0.12.1: read all 128 bytes of *commId in one bpf_probe_read_user
+	 * call. The first 8 are typically NCCL magic+version (collision
+	 * prone in v0.12.0); reading the full 128 bytes covers the unique
+	 * portion of the id. The uretprobe folds the 16 64-bit chunks
+	 * into a single 64-bit hash via repeated splitmix64.
 	 *
-	 * v0.12.0 hardening: on EFAULT (commId pointer invalid) leave
-	 * commid_first8 = 0 AND set a flag the uretprobe checks before
-	 * inserting into nccl_comm_map; this prevents a single attacker-
-	 * stable splitmix64(0) bucket that all bad-call captures would
-	 * funnel into.
+	 * On EFAULT (bad pointer): leave the buffer zeroed AND set op=0
+	 * so uretprobe skips the nccl_comm_map insert. Prevents a single
+	 * attacker-stable bucket all bad-call captures would funnel into.
 	 */
-	__u64 commid_first8 = 0;
-	long rc = bpf_probe_read_user(&commid_first8, sizeof(commid_first8), commId);
-	if (rc == 0) {
-		st.commid_first8 = commid_first8;
-	} else {
-		st.commid_first8 = 0;
+	long rc = bpf_probe_read_user(st.commid_words, sizeof(st.commid_words), commId);
+	if (rc != 0) {
+		__builtin_memset(st.commid_words, 0, sizeof(st.commid_words));
 		st.op = 0; /* signal to uretprobe: skip the map update */
 	}
 
@@ -299,7 +313,7 @@ int BPF_KRETPROBE(uretprobe_nccl_comm_init_rank, int retval)
 			k.comm_ptr = comm_ptr;
 
 			struct nccl_comm_value v = {};
-			v.comm_id_hash = splitmix64(entry->commid_first8);
+			v.comm_id_hash = fold_commid_128(entry->commid_words);
 			v.rank = entry->rank_arg;
 			v.nranks = entry->nranks_arg;
 			v.init_ts = bpf_ktime_get_ns();
@@ -324,7 +338,7 @@ int BPF_KRETPROBE(uretprobe_nccl_comm_init_rank, int retval)
 		bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
 
 		evt->duration_ns = now - entry->timestamp_ns;
-		evt->comm_id_hash = splitmix64(entry->commid_first8);
+		evt->comm_id_hash = fold_commid_128(entry->commid_words);
 		evt->stream_handle = 0;
 		evt->count_bytes = 0;
 		evt->rank = entry->rank_arg;
@@ -556,6 +570,76 @@ int BPF_KRETPROBE(uretprobe_nccl_bcast, int retval)
 	__u32 pid = pid_tid >> 32;
 	__u32 tid = (__u32)pid_tid;
 
+	struct nccl_entry_state *entry = bpf_map_lookup_elem(&nccl_entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_collective(ctx, pid, tid, entry, retval);
+	bpf_map_delete_elem(&nccl_entry_map, &tid);
+	return 0;
+}
+
+/* ---------------- ncclSend / ncclRecv (v0.12.1 LHF #17 long-tail) ---------------- *
+ * Both have 6 args (peer is PARM4, comm is PARM5, stream is PARM6).
+ * Signature: ncclResult_t ncclSend(const void* sendbuff, size_t count,
+ *                                   ncclDataType_t datatype, int peer,
+ *                                   ncclComm_t comm, cudaStream_t stream);
+ * For pipeline-parallel workloads (DeepSpeed, Megatron) ncclSend/Recv
+ * are the dominant traffic, not allreduce. Without these probes the
+ * agent shows zero NCCL activity on PP-heavy jobs.
+ */
+SEC("uprobe/ncclSend")
+int uprobe_nccl_send(struct pt_regs *ctx)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 tid = (__u32)pid_tid;
+	struct nccl_entry_state st = {};
+	st.op = NCCL_OP_SEND;
+	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
+	st.datatype = (__u32)PT_REGS_PARM3_CORE(ctx);
+	/* PARM4 = peer (int) — not currently emitted; reserved for future */
+	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
+	st.reduce_op = 0;
+	st.stream = ingero_pt_regs_arg6(ctx);
+	save_entry(tid, &st);
+	return 0;
+}
+
+SEC("uretprobe/ncclSend")
+int BPF_KRETPROBE(uretprobe_nccl_send, int retval)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = pid_tid >> 32;
+	__u32 tid = (__u32)pid_tid;
+	struct nccl_entry_state *entry = bpf_map_lookup_elem(&nccl_entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_collective(ctx, pid, tid, entry, retval);
+	bpf_map_delete_elem(&nccl_entry_map, &tid);
+	return 0;
+}
+
+SEC("uprobe/ncclRecv")
+int uprobe_nccl_recv(struct pt_regs *ctx)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 tid = (__u32)pid_tid;
+	struct nccl_entry_state st = {};
+	st.op = NCCL_OP_RECV;
+	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
+	st.datatype = (__u32)PT_REGS_PARM3_CORE(ctx);
+	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
+	st.reduce_op = 0;
+	st.stream = ingero_pt_regs_arg6(ctx);
+	save_entry(tid, &st);
+	return 0;
+}
+
+SEC("uretprobe/ncclRecv")
+int BPF_KRETPROBE(uretprobe_nccl_recv, int retval)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = pid_tid >> 32;
+	__u32 tid = (__u32)pid_tid;
 	struct nccl_entry_state *entry = bpf_map_lookup_elem(&nccl_entry_map, &tid);
 	if (!entry)
 		return 0;

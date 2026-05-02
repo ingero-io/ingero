@@ -113,6 +113,9 @@ func (t *Tracer) Attach() error {
 		{"ncclAllGather", t.objs.UprobeNcclAllGather, t.objs.UretprobeNcclAllGather},
 		{"ncclReduceScatter", t.objs.UprobeNcclReduceScatter, t.objs.UretprobeNcclReduceScatter},
 		{"ncclBcast", t.objs.UprobeNcclBcast, t.objs.UretprobeNcclBcast},
+		// v0.12.1 (LHF #17 long-tail): point-to-point primitives.
+		{"ncclSend", t.objs.UprobeNcclSend, t.objs.UretprobeNcclSend},
+		{"ncclRecv", t.objs.UprobeNcclRecv, t.objs.UretprobeNcclRecv},
 	}
 
 	attached := 0
@@ -384,6 +387,36 @@ func isSafeLibPath(path string) bool {
 		if strings.HasPrefix(abs, a) {
 			return true
 		}
+	}
+	return false
+}
+
+// HasCapBPF reports whether the current process has CAP_BPF in its
+// effective set. v0.12.1 helper for the --nccl friendly-failure check;
+// uprobe attach needs CAP_BPF + CAP_PERFMON on Linux >= 5.8.
+//
+// Conservative: returns false on read error or pre-5.8 kernels (where
+// CAP_BPF didn't exist yet); the caller treats false as "warn only,
+// continue and let attach fail with libbpf's real error".
+func HasCapBPF() bool {
+	const capBPF = 39 // CAP_BPF since Linux 5.8
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", os.Getpid()))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "CapEff:") {
+			continue
+		}
+		hex := strings.TrimSpace(strings.TrimPrefix(line, "CapEff:"))
+		// CapEff is a hex bitmap; bit at position capBPF is set when
+		// the capability is present.
+		var bits uint64
+		_, err := fmt.Sscanf(hex, "%x", &bits)
+		if err != nil {
+			return false
+		}
+		return bits&(1<<capBPF) != 0
 	}
 	return false
 }

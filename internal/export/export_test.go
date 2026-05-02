@@ -403,6 +403,47 @@ func TestOTLP_NCCLDataPoints(t *testing.T) {
 	}
 }
 
+// TestOTLP_NCCLDataPoints_BarrierWaitMetricName covers v0.12.1
+// (QA audit ★5 #4): a NCCLDataPoint with IsBarrier=true must emit
+// metric name `nccl.collective.barrier_wait_ms` (NOT duration_ms or
+// bytes), and the OpType attribute must be the bare op name without
+// the legacy "barrier_wait:" prefix scheme.
+func TestOTLP_NCCLDataPoints_BarrierWaitMetricName(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+	snap := &stats.Snapshot{
+		NCCLDataPoints: []stats.NCCLDataPoint{
+			{
+				TimestampUnixNano: 1700000000000000000,
+				OpType:            "ncclAllReduce",
+				CommIDHash:        "deadbeefcafebabe",
+				Rank:              0,
+				NRanks:             4,
+				DurationMs:         2.5,
+				IsBarrier:          true,
+			},
+		},
+	}
+	body, _ := json.Marshal(e.buildMetricsPayload(snap))
+	jsonStr := string(body)
+
+	if !strings.Contains(jsonStr, `"name":"nccl.collective.barrier_wait_ms"`) {
+		t.Errorf("expected nccl.collective.barrier_wait_ms metric, got: %s", jsonStr)
+	}
+	if strings.Contains(jsonStr, `"name":"nccl.collective.duration_ms"`) {
+		t.Errorf("barrier wait must NOT emit duration_ms; got: %s", jsonStr)
+	}
+	if strings.Contains(jsonStr, `"name":"nccl.collective.bytes"`) {
+		t.Errorf("barrier wait must NOT emit bytes; got: %s", jsonStr)
+	}
+	// op_type attribute is the bare name (no prefix).
+	if strings.Contains(jsonStr, "barrier_wait:ncclAllReduce") {
+		t.Errorf("legacy stringly-typed prefix leaked: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"stringValue":"ncclAllReduce"`) {
+		t.Errorf("op_type attr expected 'ncclAllReduce', not found: %s", jsonStr)
+	}
+}
+
 // TestOTLP_NCCLDataPoints_EmptyWhenNotProvided asserts that NCCL data
 // points are not emitted when the snapshot's NCCLDataPoints field is
 // nil or empty (e.g. agent ran without --nccl).

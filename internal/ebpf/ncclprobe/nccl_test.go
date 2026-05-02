@@ -199,6 +199,36 @@ func TestFindLibNCCL_OwnPid(t *testing.T) {
 	}
 }
 
+// TestFindLibNCCL_RejectsUserWritablePath covers v0.12.1 (QA #10):
+// integration boundary between FindLibNCCL's /proc/maps parser and
+// isSafeLibPath's allowlist. A non-root attacker mmaps libnccl.so
+// from a tmpfs-backed /tmp/.../ path; FindLibNCCL must reject it.
+//
+// We can't easily forge a real /proc/<pid>/maps line, so we test the
+// boundary by feeding isSafeLibPath the literal path /tmp/.../libnccl.so.2
+// (which FindLibNCCL would have called isSafeLibPath on). This is the
+// integration-side surface; the algorithm side is in TestIsSafeLibPath.
+func TestFindLibNCCL_RejectsUserWritablePath(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "libnccl.so.2")
+	// Create a fake (empty) ELF — FindLibNCCL's stat will succeed on this.
+	if err := os.WriteFile(tmpPath, []byte("not a real elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Even though the file exists, isSafeLibPath under TempDir
+	// (which is t.TempDir() == /tmp/... or %TEMP%) must reject it.
+	if isSafeLibPath(tmpPath) {
+		// On WSL t.TempDir() may not be under /tmp; this assertion
+		// only holds when TempDir IS under /tmp. Skip to avoid a
+		// false-positive flake.
+		if strings.HasPrefix(tmpPath, "/tmp/") {
+			t.Errorf("isSafeLibPath accepted user-writable %q (LHF #2 regression)", tmpPath)
+		} else {
+			t.Skipf("TempDir not under /tmp: %q (test inconclusive on this host)", tmpPath)
+		}
+	}
+}
+
 // TestFindLibNCCLSystemwide_Smoke: never panics; result is "" or a
 // path that exists.
 func TestFindLibNCCLSystemwide_Smoke(t *testing.T) {

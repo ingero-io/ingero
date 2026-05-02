@@ -187,15 +187,31 @@ fi
 
 echo
 echo "--- v0.11 C1: ingero check --support-bundle ---"
-sudo ./bin/ingero check --support-bundle "$VAL_DIR/05-support-bundle.tgz" >/dev/null 2>&1
-if [ -s "$VAL_DIR/05-support-bundle.tgz" ]; then
-    if tar tzf "$VAL_DIR/05-support-bundle.tgz" 2>&1 | grep -q "ingero-support/metadata.txt"; then
-        ok "v0.11 C1: support-bundle tarball valid + has metadata.txt"
-    else
-        bad "v0.11 C1: tarball missing metadata.txt"
+# v0.12.1: capture stderr to a file so a transient write failure is
+# visible in the artifacts; retry the tar listing twice with a small
+# sleep so a slow filesystem flush (observed once on aarch64 in the
+# v0.12.1 cycle) doesn't trip a false negative.
+SB_LOG="$VAL_DIR/05-support-bundle-cmd.log"
+sudo rm -f "$VAL_DIR/05-support-bundle.tgz"
+sudo ./bin/ingero check --support-bundle "$VAL_DIR/05-support-bundle.tgz" \
+    > "$SB_LOG" 2>&1
+SB_RC=$?
+sync
+C1_OK=0
+for attempt in 1 2 3; do
+    if [ -s "$VAL_DIR/05-support-bundle.tgz" ] && \
+       tar tzf "$VAL_DIR/05-support-bundle.tgz" 2>&1 | grep -q "ingero-support/metadata.txt"; then
+        C1_OK=1
+        break
     fi
+    sleep 1
+done
+if [ "$C1_OK" -eq 1 ]; then
+    ok "v0.11 C1: support-bundle tarball valid + has metadata.txt"
+elif [ ! -s "$VAL_DIR/05-support-bundle.tgz" ]; then
+    bad "v0.11 C1: tarball not produced (cmd rc=$SB_RC, see $SB_LOG)"
 else
-    bad "v0.11 C1: tarball not produced"
+    bad "v0.11 C1: tarball missing metadata.txt (cmd rc=$SB_RC, see $SB_LOG)"
 fi
 
 ############### v0.11 C6: migrate ##############################################
@@ -284,7 +300,14 @@ wait "$WL2" 2>/dev/null
 
 if grep -q "NCCL tracing: attached" "$VAL_DIR/08-nccl-trace.log"; then
     PROBES=$(grep -oE "attached [0-9]+ probes" "$VAL_DIR/08-nccl-trace.log" | head -1 | grep -oE "[0-9]+")
-    ok "v0.12 N4: NCCL probes attached on real kernel ($PROBES probes)"
+    # v0.12.1 (QA #2): lock probe count to the documented invariant.
+    # 8 collectives x (uprobe + uretprobe) = 16. A future regression
+    # to 12 (drop of Send/Recv) would otherwise pass silently.
+    if [ "$PROBES" = "16" ]; then
+        ok "v0.12 N4: NCCL probes attached on real kernel (16 probes)"
+    else
+        bad "v0.12 N4: probe count = $PROBES, want 16 (Send/Recv probe drop?)"
+    fi
 elif grep -q "no libnccl.so / libtorch_cuda.so found" "$VAL_DIR/08-nccl-trace.log"; then
     warn "v0.12 N4: NCCL flag honored but no libnccl.so on disk (test environment)"
 elif grep -qE "bad CO-RE relocation|invalid func unknown" "$VAL_DIR/08-nccl-trace.log"; then

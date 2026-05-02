@@ -115,6 +115,20 @@ const (
 )
 
 // NCCL collective attribute keys, present on every nccl.collective.* metric.
+//
+// Distinction from `ingero.world_size` (resource attribute, declared by
+// fleet config or auto-detected by `internal/discover/rankinfo`):
+//   - `ingero.world_size` is the OPERATOR-DECLARED total rank count for
+//     the JOB. It's the same number for every metric emitted by every
+//     node in that job.
+//   - `nccl.nranks` is the NCCL-REPORTED rank count for a single
+//     COMMUNICATOR. A FSDP+TP job has multiple communicators with
+//     different `nranks` (one TP-group at nranks=8 plus a DP-group
+//     at nranks=4 add up to a job at world_size=32).
+// Dashboards that group by `ingero.world_size` get one line per job;
+// dashboards that group by `nccl.nranks` get one line per communicator.
+// They equal each other for single-comm jobs (most training today)
+// and diverge for multi-comm (FSDP, MoE, advanced parallelism).
 const (
 	// AttrNCCLOpType is the collective name (allreduce / allgather /
 	// reducescatter / bcast / send / recv). Stable string from the BPF

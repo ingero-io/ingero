@@ -325,6 +325,13 @@ type NCCLDataPoint struct {
 	DurationMs        float64
 	CountBytes        uint64
 	ReturnCode        int32
+
+	// IsBarrier flips the OTLP encoder from emitting
+	// `nccl.collective.duration_ms` to `nccl.collective.barrier_wait_ms`.
+	// v0.12.1 hardening: replaces a stringly-typed "barrier_wait:" prefix
+	// on OpType that was vulnerable to in-band sentinel collisions if a
+	// future processor injected an op_type containing the prefix.
+	IsBarrier bool
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

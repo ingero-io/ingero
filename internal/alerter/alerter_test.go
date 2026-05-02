@@ -188,12 +188,16 @@ func TestRun_IntegrationHappyPath(t *testing.T) {
 	}
 	defer listener.Close()
 
-	var slackHits int
-	var slackMu sync.Mutex
+	// v0.12.1 (QA audit ★4 #3) flake fix: WaitGroup-driven
+	// synchronization replaces sleep+poll. Pre-fix the test slept
+	// 100ms then polled with a 500ms wall-clock deadline; on the new
+	// arm64 runner matrix that combination flakes.
+	var slackHits int32
+	var wg sync.WaitGroup
+	wg.Add(2)
 	slackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slackMu.Lock()
-		slackHits++
-		slackMu.Unlock()
+		atomic.AddInt32(&slackHits, 1)
+		wg.Done()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer slackSrv.Close()
@@ -214,33 +218,27 @@ func TestRun_IntegrationHappyPath(t *testing.T) {
 			bw.WriteByte('\n')
 			bw.Flush()
 		}
-		// Hold the conn open briefly so the alerter has time to read.
-		time.Sleep(100 * time.Millisecond)
+		// Hold the conn open until the alerter has read both events
+		// (signaled via WaitGroup or test timeout).
+		select {
+		case <-time.After(500 * time.Millisecond):
+		}
 	}()
 
 	cfg := &Config{
 		UDSPath: tmpSock,
 		Slack:   &SlackConfig{WebhookURL: slackSrv.URL},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = Run(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	go func() { _ = Run(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
 
-	// Allow the parallel fanout goroutines to complete.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		slackMu.Lock()
-		hits := slackHits
-		slackMu.Unlock()
-		if hits >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	slackMu.Lock()
-	defer slackMu.Unlock()
-	if slackHits < 2 {
-		t.Fatalf("slack hits=%d, want >= 2", slackHits)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("slack hits=%d, want >= 2", atomic.LoadInt32(&slackHits))
 	}
 }
 

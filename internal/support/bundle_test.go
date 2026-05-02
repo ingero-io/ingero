@@ -112,6 +112,16 @@ func TestIsSensitive(t *testing.T) {
 		{"HOME", false},
 		{"INGERO_NODE_ID", false},
 		{"NVIDIA_VISIBLE_DEVICES", false},
+		// v0.12.1 (QA audit ★3 #7): pin the conservative-substring
+		// behavior. KEY is a substring of MONKEY, so MONKEY_HOST is
+		// masked spuriously. This is intentional: false positives are
+		// safe (an env var ends up redacted in a support bundle); a
+		// false negative could leak OPENAI_API_KEY. Lock this contract
+		// so a future contributor doesn't "fix" it by switching to
+		// word-boundary matching and accidentally regressing the
+		// secret-detection.
+		{"MONKEY_HOST", true},
+		{"MONKEY_PATCH", true},
 	}
 	for _, c := range cases {
 		if got := isSensitive(c.key); got != c.want {

@@ -334,6 +334,14 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// NCCL collective data points (v0.12.0+). One nccl.collective.duration_ms
 	// gauge per captured event with the standard nccl.* attribute set.
 	// Fleet's ncclprocessor consumes these and derives peer_lag_ms.
+	//
+	// v0.12.1: data points with IsBarrier=true are emitted as
+	// `nccl.collective.barrier_wait_ms` instead of duration_ms. The
+	// agent-side correlator at internal/cli/nccl_barrier.go produces
+	// these by joining NCCL collective uretprobe events with the next
+	// cudaStreamSynchronize on the same (pid, stream). Pre-fix this
+	// dispatch used a stringly-typed "barrier_wait:" prefix on OpType
+	// which was vulnerable to in-band sentinel collisions.
 	for _, p := range snap.NCCLDataPoints {
 		ts := fmt.Sprintf("%d", p.TimestampUnixNano)
 		attrs := []otlpKeyValue{
@@ -344,12 +352,19 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: "nccl.datatype", Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
 			{Key: "nccl.reduce_op", Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
 		}
-		metrics = append(metrics,
-			gaugeMetric("nccl.collective.duration_ms", "Per-collective queue time (entry-to-exit of NCCL uprobe)", "ms",
-				ts, p.DurationMs, attrs),
-			gaugeMetricInt("nccl.collective.bytes", "Per-collective payload size", "By",
-				ts, int64(p.CountBytes), attrs),
-		)
+		if p.IsBarrier {
+			metrics = append(metrics,
+				gaugeMetric("nccl.collective.barrier_wait_ms", "Per-collective barrier wait (cudaStreamSynchronize duration after a NCCL collective)", "ms",
+					ts, p.DurationMs, attrs),
+			)
+		} else {
+			metrics = append(metrics,
+				gaugeMetric("nccl.collective.duration_ms", "Per-collective queue time (entry-to-exit of NCCL uprobe)", "ms",
+					ts, p.DurationMs, attrs),
+				gaugeMetricInt("nccl.collective.bytes", "Per-collective payload size", "By",
+					ts, int64(p.CountBytes), attrs),
+			)
+		}
 	}
 
 	return otlpPayload{

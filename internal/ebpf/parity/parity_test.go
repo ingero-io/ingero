@@ -202,3 +202,34 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// TestNCCLProbeRequiredPrograms asserts that the ncclprobe object
+// exports the v0.12.1 minimum probe set (8 collectives x 2 = 16
+// programs). v0.12.1 (QA audit ★2 #9): without this, a build-config
+// drift could silently drop ncclSend/ncclRecv across BOTH arches and
+// the structural-parity test would still pass. Locks the contract.
+func TestNCCLProbeRequiredPrograms(t *testing.T) {
+	required := []string{
+		"uprobe_nccl_comm_init_rank", "uretprobe_nccl_comm_init_rank",
+		"uprobe_nccl_comm_destroy", "uretprobe_nccl_comm_destroy",
+		"uprobe_nccl_all_reduce", "uretprobe_nccl_all_reduce",
+		"uprobe_nccl_all_gather", "uretprobe_nccl_all_gather",
+		"uprobe_nccl_reduce_scatter", "uretprobe_nccl_reduce_scatter",
+		"uprobe_nccl_bcast", "uretprobe_nccl_bcast",
+		"uprobe_nccl_send", "uretprobe_nccl_send",
+		"uprobe_nccl_recv", "uretprobe_nccl_recv",
+	}
+	if len(required) != 16 {
+		t.Fatalf("required list size %d, want 16 (8 collectives x 2)", len(required))
+	}
+	for _, a := range archPair {
+		t.Run(a.arch, func(t *testing.T) {
+			spec := loadSpec(t, "ncclprobe", "nccltrace", a.suffix)
+			for _, p := range required {
+				if _, ok := spec.Programs[p]; !ok {
+					t.Errorf("missing program %q on arch %s", p, a.arch)
+				}
+			}
+		})
+	}
+}

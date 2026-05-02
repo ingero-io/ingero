@@ -613,6 +613,15 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	var ncclTracer *ncclprobe.Tracer
 	ncclProbeCount := 0
 	if traceNCCL {
+		// L7: surface a friendly error when running unprivileged.
+		// uprobe attach needs CAP_BPF + CAP_PERFMON on Linux >= 5.8 or
+		// root on older kernels. Without this check users get a
+		// confusing libbpf "operation not permitted" deep in the
+		// attach path.
+		if os.Geteuid() != 0 && !ncclprobe.HasCapBPF() {
+			fmt.Fprintln(os.Stderr, "  Warning: --nccl requires root or CAP_BPF + CAP_PERFMON; attach will likely fail")
+			debugf("nccl: euid=%d, no CAP_BPF; continuing but expect failure", os.Geteuid())
+		}
 		libPath := traceNCCLLib
 		if libPath == "" {
 			for _, pid := range targetPIDs {
@@ -637,7 +646,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				debugf("nccl tracer: attach failed: %v", err)
 			} else {
 				ncclTracer = nt
-				ncclProbeCount = 12 // 6 collectives x (uprobe + uretprobe)
+				ncclProbeCount = 16 // 8 collectives (incl. Send/Recv from v0.12.1) x (uprobe + uretprobe)
 				fmt.Fprintf(os.Stderr, "  NCCL tracing: attached %d probes to %s\n", ncclProbeCount, libPath)
 				debugf("nccl tracer: %d probes attached at %s", ncclProbeCount, libPath)
 			}
@@ -866,6 +875,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 					CountBytes:        ev.CountBytes,
 					ReturnCode:        ev.ReturnCode,
 				})
+				// v0.12.1 (LHF #1 follow-on): record for later
+				// barrier-wait correlation against the next
+				// cudaStreamSynchronize on the same (pid, stream).
+				recordNCCLForBarrier(ev)
 			}
 			fmt.Fprintf(os.Stderr, "  NCCL tracing: %d events captured (%d dropped)\n", n, ncclTracer.Dropped())
 		}()
@@ -876,8 +889,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go eventStore.Run(ctx)
 	}
 
+	// v0.12.1 (LHF #1): tap the CUDA tracer channel for stream-sync
+	// events when --nccl is on, so the barrier-wait correlator gets
+	// every cudaStreamSynchronize. The forked channel still carries
+	// every CUDA event into the merged stream so existing
+	// downstream consumers (correlator, stats, store) are unaffected.
+	cudaCh := cudaTracer.Events()
+	if traceNCCL {
+		cudaCh = forkCUDAForBarrier(ctx, cudaCh)
+	}
+
 	// Fan-in: merge all event channels into one.
-	merged := mergeAllEventChannels(ctx, cudaTracer.Events(), hostTracer, driverTracer, extraChs...)
+	merged := mergeAllEventChannels(ctx, cudaCh, hostTracer, driverTracer, extraChs...)
 
 	// --- Begin remediate wiring ---
 	var tracker *memtrack.Tracker
