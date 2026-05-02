@@ -132,6 +132,12 @@ static const struct py_frame *_unused_py_frame __attribute__((unused));
  *                                    native_thread_id succeeded, across any
  *                                    interpreter; complements slot 9 when
  *                                    interpreter 0 has zero threads)
+ *   [20] walker_310_entered          (3.10 walker variant entered)
+ *   [21] walker_310_frame_nonzero    (tstate.frame read and != 0)
+ *   [22] walker_310_code_read_ok     (first-iter bpf_probe_read_user on
+ *                                    code_ptr succeeded)
+ *   [23] walker_310_code_nonzero     (first-iter code_ptr passed != 0 check)
+ *   [24] walker_310_emitted_frames   (walker_310 returned with depth > 0)
  *   [29] unicode_non_compact_skipped (read_compact_ascii returned 0 because
  *                                    the target PyUnicodeObject is not a
  *                                    compact-ASCII string; emitted py_frame
@@ -605,6 +611,8 @@ static __always_inline int walk_python_frames_310(
     const struct py_runtime_state *st,
     struct py_walk_result *result)
 {
+	py_debug_inc(20);  /* walker_310_entered */
+
 	__u64 tstate = find_thread_state(native_tid, st);
 	if (tstate == 0)
 		return 0;
@@ -614,6 +622,7 @@ static __always_inline int walk_python_frames_310(
 	if (bpf_probe_read_user(&frame, sizeof(frame),
 	    (const void *)(tstate + st->off_tstate_frame)) != 0)
 		return 0;
+	if (frame != 0) py_debug_inc(21);  /* walker_310_frame_nonzero */
 
 	#pragma unroll(16)
 	for (int i = 0; i < PY_MAX_FRAMES; i++) {
@@ -630,8 +639,10 @@ static __always_inline int walk_python_frames_310(
 		if (bpf_probe_read_user(&code_ptr, sizeof(code_ptr),
 		    (const void *)(frame + st->off_frame_code)) != 0)
 			break;
+		if (i == 0) py_debug_inc(22);  /* walker_310_code_read_ok */
 		if (code_ptr == 0)
 			break;
+		if (i == 0) py_debug_inc(23);  /* walker_310_code_nonzero */
 
 		__u64 fn_ptr = 0;
 		if (bpf_probe_read_user(&fn_ptr, sizeof(fn_ptr),
@@ -660,6 +671,8 @@ static __always_inline int walk_python_frames_310(
 
 	if (frame != 0)
 		result->truncated = 1;
+
+	if (result->depth > 0) py_debug_inc(24);  /* walker_310_emitted_frames */
 
 	return 0;
 }
