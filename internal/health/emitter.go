@@ -73,6 +73,12 @@ type EmitterConfig struct {
 	// nvidia-smi at startup.
 	GPUModel string `yaml:"gpu_model"`
 	GPUCount int    `yaml:"gpu_count"`
+	// Provider is the agent-side cloud-provider attribution emitted as
+	// the ingero.provider resource attribute (v0.12.3 attribution-(b)).
+	// Caller resolves it once at startup via internal/provider.DetectDefault
+	// (or operator override) and passes it in. Empty value suppresses
+	// the attribute, leaving Fleet's providerlookupprocessor in charge.
+	Provider string `yaml:"provider"`
 	// ThresholdCache, if non-nil, is updated with the `X-Ingero-Threshold`
 	// and `X-Ingero-Quorum-Met` response headers on every push (success
 	// or failure). Nil leaves response-header handling disabled.
@@ -510,6 +516,9 @@ func (e *httpEmitter) resourceAttrs() []otlpKV {
 			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
 			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
 		)
+	}
+	if e.cfg.Provider != "" {
+		attrs = append(attrs, otlpKV{Key: contract.AttrProvider, Value: otlpStr(e.cfg.Provider)})
 	}
 	return attrs
 }

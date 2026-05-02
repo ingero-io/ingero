@@ -300,13 +300,17 @@ wait "$WL2" 2>/dev/null
 
 if grep -q "NCCL tracing: attached" "$VAL_DIR/08-nccl-trace.log"; then
     PROBES=$(grep -oE "attached [0-9]+ probes" "$VAL_DIR/08-nccl-trace.log" | head -1 | grep -oE "[0-9]+")
-    # v0.12.1 (QA #2): lock probe count to the documented invariant.
-    # 8 collectives x (uprobe + uretprobe) = 16. A future regression
-    # to 12 (drop of Send/Recv) would otherwise pass silently.
-    if [ "$PROBES" = "16" ]; then
-        ok "v0.12 N4: NCCL probes attached on real kernel (16 probes)"
+    # v0.12.3 (Sys Arch ★1): floor + diagnostic. Probe count depends on
+    # which NCCL symbols the host's libnccl exports. Modern NCCL >= 2.x
+    # exports all 9 collectives we hook (16 + ncclCommInitAll = 18).
+    # Older builds without ncclCommInitAll attach 16. Below 16 is a
+    # regression worth blocking; 16-17 is informational; 18 is ideal.
+    if [ -z "$PROBES" ] || [ "$PROBES" -lt 16 ]; then
+        bad "v0.12 N4: probe count = $PROBES, want >= 16 (NCCL probe-set regression?)"
+    elif [ "$PROBES" = "18" ]; then
+        ok "v0.12 N4: NCCL probes attached on real kernel (18 probes; full set)"
     else
-        bad "v0.12 N4: probe count = $PROBES, want 16 (Send/Recv probe drop?)"
+        warn "v0.12 N4: NCCL probes attached ($PROBES probes; partial set, libnccl may predate ncclCommInitAll)"
     fi
 elif grep -q "no libnccl.so / libtorch_cuda.so found" "$VAL_DIR/08-nccl-trace.log"; then
     warn "v0.12 N4: NCCL flag honored but no libnccl.so on disk (test environment)"

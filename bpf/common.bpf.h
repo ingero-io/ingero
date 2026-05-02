@@ -51,6 +51,7 @@ struct user_pt_regs {
 #define NCCL_OP_BCAST            6
 #define NCCL_OP_SEND             7
 #define NCCL_OP_RECV             8
+#define NCCL_OP_COMM_INIT_ALL    9   /* v0.12.3: single-process multi-GPU init */
 
 /* Host kernel operation types */
 #define HOST_OP_SCHED_SWITCH   1
