@@ -35,7 +35,7 @@ Thumbs.db
 
 # VM state
 .tensordock-vm.json
-.lambdalabs-vm.json
+.lambdalabs-vm*.json
 .azure-vm.json
 
 # Logs (session logs, test output)
