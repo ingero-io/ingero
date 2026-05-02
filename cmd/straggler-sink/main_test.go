@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestHandleLine_CountsByType(t *testing.T) {
@@ -204,5 +206,82 @@ func TestMetricsOutput_DroppedCounter(t *testing.T) {
 	}
 	if !strings.Contains(body, `# TYPE ingero_sink_dropped_total counter`) {
 		t.Errorf("missing TYPE line for dropped counter:\n%s", body)
+	}
+}
+
+// TestReadyzStatus_ConnectedReturns200 covers the happy path:
+// while UDS is connected, /readyz must return 200 regardless of
+// last-event freshness. QA audit ★4 #5 / project_qa_test_audit_2026-05-02.md.
+func TestReadyzStatus_ConnectedReturns200(t *testing.T) {
+	m := newMetrics(1024)
+	m.setConnected(true)
+	code, body := readyzStatus(m, 60*time.Second, time.Now())
+	if code != http.StatusOK {
+		t.Errorf("connected: code=%d, want 200", code)
+	}
+	if !strings.Contains(body, "ready") {
+		t.Errorf("connected: body=%q, want 'ready'", body)
+	}
+}
+
+// TestReadyzStatus_DisconnectedReturns503AfterWindow asserts the K8s
+// readiness gate flips to 503 once the sink has been disconnected
+// AND the last event is older than the readiness window. K8s uses
+// this to stop routing traffic to a stale sidecar.
+func TestReadyzStatus_DisconnectedReturns503AfterWindow(t *testing.T) {
+	m := newMetrics(1024)
+	m.setConnected(false)
+	// Last event 90s ago, window is 60s -> stale -> 503.
+	now := time.Now()
+	atomic.StoreInt64(&m.lastEventUnixNano, now.Add(-90*time.Second).UnixNano())
+	code, body := readyzStatus(m, 60*time.Second, now)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("disconnected+stale: code=%d, want 503", code)
+	}
+	if !strings.Contains(body, "uds_disconnected") {
+		t.Errorf("disconnected+stale: body=%q, want 'uds_disconnected'", body)
+	}
+}
+
+// TestReadyzStatus_DisconnectedRecentEventReturns200 asserts the
+// grace period: even when UDS is disconnected, a recent event keeps
+// /readyz at 200 so a brief reconnect blip doesn't bounce traffic.
+func TestReadyzStatus_DisconnectedRecentEventReturns200(t *testing.T) {
+	m := newMetrics(1024)
+	m.setConnected(false)
+	now := time.Now()
+	atomic.StoreInt64(&m.lastEventUnixNano, now.Add(-10*time.Second).UnixNano())
+	code, body := readyzStatus(m, 60*time.Second, now)
+	if code != http.StatusOK {
+		t.Errorf("disconnected+recent: code=%d, want 200", code)
+	}
+	if !strings.Contains(body, "recent event") {
+		t.Errorf("disconnected+recent: body=%q, want 'recent event'", body)
+	}
+}
+
+// TestReadyzStatus_NeverConnectedReturns503 asserts the cold-start
+// path: /readyz on a freshly-started sink that has not yet seen
+// any UDS connection AND no event must return 503.
+func TestReadyzStatus_NeverConnectedReturns503(t *testing.T) {
+	m := newMetrics(1024)
+	code, _ := readyzStatus(m, 60*time.Second, time.Now())
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("cold-start: code=%d, want 503", code)
+	}
+}
+
+// TestSetConnectedToggle is a small companion test asserting the
+// atomic flag round-trips correctly. Defends against a bit-pattern
+// regression where setConnected(false) leaves connected != 0.
+func TestSetConnectedToggle(t *testing.T) {
+	m := newMetrics(1024)
+	m.setConnected(true)
+	if got := atomic.LoadUint32(&m.connected); got != 1 {
+		t.Errorf("after setConnected(true), connected=%d, want 1", got)
+	}
+	m.setConnected(false)
+	if got := atomic.LoadUint32(&m.connected); got != 0 {
+		t.Errorf("after setConnected(false), connected=%d, want 0", got)
 	}
 }

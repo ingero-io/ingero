@@ -70,22 +70,9 @@ func main() {
 		io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		// Return 503 when we have no current UDS connection AND
-		// haven't seen any event for longer than the configured window.
-		// Kubernetes uses this to stop sending traffic to a stale sidecar.
-		if atomic.LoadUint32(&m.connected) == 1 {
-			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, "ready\n")
-			return
-		}
-		last := atomic.LoadInt64(&m.lastEventUnixNano)
-		if last > 0 && time.Since(time.Unix(0, last)) < *readinessWindow {
-			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, "ready (recent event)\n")
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		io.WriteString(w, "not ready: uds_disconnected\n")
+		code, body := readyzStatus(m, *readinessWindow, time.Now())
+		w.WriteHeader(code)
+		io.WriteString(w, body)
 	})
 	httpSrv := &http.Server{
 		Addr:              *listenAddr,
@@ -246,6 +233,23 @@ func (m *metrics) bumpEvent(t string) {
 
 func (m *metrics) bumpParseError() {
 	atomic.AddUint64(&m.parseErrors, 1)
+}
+
+// readyzStatus computes the /readyz response: 200 when UDS connected,
+// 200 with "(recent event)" when disconnected but the last event is
+// inside `window`, 503 otherwise. Pure function over (m, window, now)
+// so the K8s readiness contract is unit-testable. v0.12.0 extraction
+// per QA audit ★4 #5; pre-extraction the only coverage was via curl
+// in scripts/k3s-test.sh which doesn't run in CI.
+func readyzStatus(m *metrics, window time.Duration, now time.Time) (int, string) {
+	if atomic.LoadUint32(&m.connected) == 1 {
+		return http.StatusOK, "ready\n"
+	}
+	last := atomic.LoadInt64(&m.lastEventUnixNano)
+	if last > 0 && now.Sub(time.Unix(0, last)) < window {
+		return http.StatusOK, "ready (recent event)\n"
+	}
+	return http.StatusServiceUnavailable, "not ready: uds_disconnected\n"
 }
 
 func (m *metrics) setConnected(v bool) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -240,5 +241,72 @@ func TestRun_IntegrationHappyPath(t *testing.T) {
 	defer slackMu.Unlock()
 	if slackHits < 2 {
 		t.Fatalf("slack hits=%d, want >= 2", slackHits)
+	}
+}
+
+// TestRun_ReconnectsOnUDSClose validates that when the agent's UDS
+// closes mid-stream, the alerter reconnects (via the documented
+// exponential backoff) and consumes events from the next agent
+// connection. Pre-fix a missed reconnect meant on-call got no page
+// during a straggler storm immediately after agent restart.
+//
+// QA audit ★5 #1 (project_qa_test_audit_2026-05-02.md).
+func TestRun_ReconnectsOnUDSClose(t *testing.T) {
+	tmpSock := filepath.Join(t.TempDir(), "reconn.sock")
+	listener, err := net.Listen("unix", tmpSock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	var slackHits int32
+	var wg sync.WaitGroup
+	wg.Add(2) // expect 2 events total: 1 before close, 1 after reconnect
+	slackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&slackHits, 1)
+		wg.Done()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackSrv.Close()
+
+	// First connection: emit one event, then close.
+	// Second connection: emit one event, then close.
+	go func() {
+		for i, ev := range []StragglerEvent{
+			{Type: "straggler_state", NodeID: "n1", EventID: "e1", Score: 0.4},
+			{Type: "straggler_state", NodeID: "n2", EventID: "e2", Score: 0.45},
+		} {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			bw := bufio.NewWriter(conn)
+			b, _ := json.Marshal(ev)
+			bw.Write(b)
+			bw.WriteByte('\n')
+			bw.Flush()
+			// Force EOF on the alerter side.
+			conn.Close()
+			_ = i
+		}
+	}()
+
+	cfg := &Config{
+		UDSPath: tmpSock,
+		Slack:   &SlackConfig{WebhookURL: slackSrv.URL},
+	}
+	// Generous timeout — first reconnect backoff is 1s.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	go func() {
+		_ = Run(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3500 * time.Millisecond):
+		t.Fatalf("did not reconnect; slack hits=%d (want 2)", atomic.LoadInt32(&slackHits))
 	}
 }
