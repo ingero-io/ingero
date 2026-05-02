@@ -103,6 +103,8 @@ struct nccl_entry_state {
 	__u32 reduce_op;
 	__u32 nranks_arg;   /* commInitRank: nranks PARM2 */
 	__u32 rank_arg;     /* commInitRank: rank PARM4 */
+	__u32 peer_rank;    /* v0.12.2: ncclSend/Recv: peer PARM4; 0 for collectives */
+	__u32 _pad2;        /* keep 8-byte alignment of commid_words below */
 	/* v0.12.1 (LHF #15): hash all 128 bytes of ncclUniqueId, not
 	 * just the first 8. The first 8 bytes are mostly NCCL magic +
 	 * version and collide across distinct comms. We splitmix64-fold
@@ -140,6 +142,53 @@ struct {
 	__type(key, struct nccl_comm_key);
 	__type(value, struct nccl_comm_value);
 } nccl_comm_map SEC(".maps");
+
+/* v0.12.2 (LHF #7): per-PID filter for the NCCL probe so multi-tenant
+ * workloads don't leak unrelated process events into the agent's
+ * ringbuf. Userspace populates this map via Tracer.SetTargetPID; when
+ * empty (no entries), the probe traces system-wide. When populated,
+ * only PIDs in the map produce events.
+ *
+ * Convention: the userspace caller inserts a sentinel at key=0 to mean
+ * "map is populated" (the kernel can't distinguish empty vs. only-pid-0
+ * because pid=0 is the swapper and never traced). nccl_pid_map_empty()
+ * checks the sentinel.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u32);
+	__type(value, __u8);
+} nccl_target_pids SEC(".maps");
+
+static __always_inline bool nccl_is_target(__u32 pid)
+{
+	return bpf_map_lookup_elem(&nccl_target_pids, &pid) != NULL;
+}
+
+static __always_inline bool nccl_pid_map_empty(void)
+{
+	__u32 zero = 0;
+	return bpf_map_lookup_elem(&nccl_target_pids, &zero) == NULL;
+}
+
+/* nccl_should_trace returns true when the current PID should produce a
+ * NCCL event. Either the filter is empty (system-wide tracing) OR the
+ * PID is explicitly in the target set. */
+static __always_inline bool nccl_should_trace(__u32 pid)
+{
+	return nccl_pid_map_empty() || nccl_is_target(pid);
+}
+
+/* nccl_should_trace_self is reserved for callers that haven't already
+ * computed the pid; the per-uprobe gate inlines the check directly,
+ * so this wrapper is currently unused but kept for symmetry with the
+ * net probe pattern. Marked __attribute__((unused)) so -Werror is happy. */
+static __always_inline __attribute__((unused)) bool nccl_should_trace_self(void)
+{
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	return nccl_should_trace(pid);
+}
 
 /* ---------------- Helpers ---------------- */
 
@@ -227,7 +276,7 @@ static __always_inline void emit_collective(struct pt_regs *ctx,
 	evt->datatype = entry->datatype;
 	evt->reduce_op = entry->reduce_op;
 	evt->return_code = return_code;
-	evt->_pad = 0;
+	evt->peer_rank = entry->peer_rank; /* v0.12.2: nonzero for ncclSend/Recv only */
 
 	__u32 rank = 0, nranks = 0;
 	__u64 comm_id_hash = 0;
@@ -282,6 +331,7 @@ int BPF_KPROBE(uprobe_nccl_comm_init_rank,
 		st.op = 0; /* signal to uretprobe: skip the map update */
 	}
 
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -346,7 +396,7 @@ int BPF_KRETPROBE(uretprobe_nccl_comm_init_rank, int retval)
 		evt->datatype = 0;
 		evt->reduce_op = 0;
 		evt->return_code = retval;
-		evt->_pad = 0;
+		evt->peer_rank = 0;
 		bpf_ringbuf_submit(evt, 0);
 	}
 
@@ -367,6 +417,7 @@ int BPF_KPROBE(uprobe_nccl_comm_destroy, void *comm)
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_COMM_DESTROY;
 	st.comm_ptr = (__u64)comm;
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -408,7 +459,7 @@ int BPF_KRETPROBE(uretprobe_nccl_comm_destroy, int retval)
 		evt->datatype = 0;
 		evt->reduce_op = 0;
 		evt->return_code = retval;
-		evt->_pad = 0;
+		evt->peer_rank = 0;
 		bpf_ringbuf_submit(evt, 0);
 	}
 
@@ -444,6 +495,7 @@ int uprobe_nccl_all_reduce(struct pt_regs *ctx)
 	st.comm_ptr = ingero_pt_regs_arg6(ctx);
 	st.stream = ingero_pt_regs_arg7(ctx);
 
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -485,6 +537,7 @@ int uprobe_nccl_all_gather(struct pt_regs *ctx)
 	st.reduce_op = 0;
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.stream = ingero_pt_regs_arg6(ctx);
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -520,6 +573,7 @@ int uprobe_nccl_reduce_scatter(struct pt_regs *ctx)
 	st.reduce_op = (__u32)PT_REGS_PARM5_CORE(ctx);
 	st.comm_ptr = ingero_pt_regs_arg6(ctx);
 	st.stream = ingero_pt_regs_arg7(ctx);
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -559,6 +613,7 @@ int uprobe_nccl_bcast(struct pt_regs *ctx)
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -596,10 +651,11 @@ int uprobe_nccl_send(struct pt_regs *ctx)
 	st.op = NCCL_OP_SEND;
 	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
 	st.datatype = (__u32)PT_REGS_PARM3_CORE(ctx);
-	/* PARM4 = peer (int) — not currently emitted; reserved for future */
+	st.peer_rank = (__u32)PT_REGS_PARM4_CORE(ctx); /* v0.12.2: peer rank */
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -627,9 +683,11 @@ int uprobe_nccl_recv(struct pt_regs *ctx)
 	st.op = NCCL_OP_RECV;
 	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
 	st.datatype = (__u32)PT_REGS_PARM3_CORE(ctx);
+	st.peer_rank = (__u32)PT_REGS_PARM4_CORE(ctx); /* v0.12.2: peer rank */
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }

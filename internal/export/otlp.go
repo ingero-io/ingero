@@ -352,6 +352,15 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: "nccl.datatype", Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
 			{Key: "nccl.reduce_op", Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
 		}
+		// v0.12.2: peer_rank attribute only on ncclSend/ncclRecv
+		// (collectives leave PeerRank=0). Topology-mapping for
+		// pipeline-parallel workloads.
+		if p.PeerRank != 0 {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   "nccl.peer_rank",
+				Value: otlpValue{IntValue: int64Ptr(int64(p.PeerRank))},
+			})
+		}
 		if p.IsBarrier {
 			metrics = append(metrics,
 				gaugeMetric("nccl.collective.barrier_wait_ms", "Per-collective barrier wait (cudaStreamSynchronize duration after a NCCL collective)", "ms",

@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 )
 
 // Event is the parsed userspace shape of struct nccl_event from
@@ -48,7 +49,7 @@ type Event struct {
 	Datatype     uint32
 	ReduceOp     uint32
 	ReturnCode   int32
-	_padTail     uint32
+	PeerRank     uint32 // v0.12.2: nonzero only for ncclSend/Recv
 }
 
 // EventSize is the on-the-wire size of one nccl_event record.
@@ -391,34 +392,73 @@ func isSafeLibPath(path string) bool {
 	return false
 }
 
+// SetTargetPID adds a PID to the NCCL probe's filter map. v0.12.2
+// (LHF #7): when the filter is non-empty, only listed PIDs produce
+// NCCL events; multi-tenant deployments call this for each GPU process
+// they own to avoid leaking other tenants' NCCL activity into their
+// agent's ringbuf.
+//
+// Sentinel: also inserts an entry at key=0 so the BPF-side
+// nccl_pid_map_empty() returns false. Without the sentinel an empty
+// map looks identical to "only pid=0", so the gate would be off.
+// Mirrors the net-probe pattern at internal/ebpf/net/net.go:117.
+func (t *Tracer) SetTargetPID(pid uint32) error {
+	one := uint8(1)
+	if err := t.objs.NcclTargetPids.Update(uint32(0), one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("nccl_target_pids sentinel: %w", err)
+	}
+	if pid == 0 {
+		return nil // sentinel only; no real PID to add
+	}
+	if err := t.objs.NcclTargetPids.Update(pid, one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("nccl_target_pids[%d]: %w", pid, err)
+	}
+	return nil
+}
+
+// ClearTargetPIDs empties the filter map, returning the probe to
+// system-wide tracing. Useful for tests and for `--nccl` invocations
+// without an explicit --pid.
+func (t *Tracer) ClearTargetPIDs() error {
+	// Iterate by lookup-and-delete. The map is small (max 256), so this
+	// is a couple-iteration linear pass.
+	var key uint32
+	var val uint8
+	iter := t.objs.NcclTargetPids.Iterate()
+	var keys []uint32
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		_ = t.objs.NcclTargetPids.Delete(k)
+	}
+	return nil
+}
+
 // HasCapBPF reports whether the current process has CAP_BPF in its
 // effective set. v0.12.1 helper for the --nccl friendly-failure check;
 // uprobe attach needs CAP_BPF + CAP_PERFMON on Linux >= 5.8.
 //
-// Conservative: returns false on read error or pre-5.8 kernels (where
-// CAP_BPF didn't exist yet); the caller treats false as "warn only,
-// continue and let attach fail with libbpf's real error".
+// v0.12.2 (Sec audit ★3 #5): use capget(2) directly via x/sys/unix
+// instead of parsing /proc/<pid>/status. Avoids the read+scan TOCTOU
+// window between /proc read and a sibling-thread CapBSet drop, and
+// uses the v3 capability format (handles >64 caps).
+//
+// Conservative: returns false on syscall error or pre-5.8 kernels
+// (where CAP_BPF didn't exist yet); the caller treats false as "warn
+// only, continue and let attach fail with libbpf's real error".
 func HasCapBPF() bool {
-	const capBPF = 39 // CAP_BPF since Linux 5.8
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", os.Getpid()))
-	if err != nil {
+	const (
+		capBPF           = 39 // CAP_BPF since Linux 5.8
+		linuxCapVersion3 = 0x20080522
+	)
+	hdr := unix.CapUserHeader{Version: linuxCapVersion3, Pid: 0} // 0 = self
+	var data [2]unix.CapUserData
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "CapEff:") {
-			continue
-		}
-		hex := strings.TrimSpace(strings.TrimPrefix(line, "CapEff:"))
-		// CapEff is a hex bitmap; bit at position capBPF is set when
-		// the capability is present.
-		var bits uint64
-		_, err := fmt.Sscanf(hex, "%x", &bits)
-		if err != nil {
-			return false
-		}
-		return bits&(1<<capBPF) != 0
-	}
-	return false
+	// CAP_BPF=39 lives in data[1] (capabilities 32..63).
+	return data[1].Effective&(1<<(capBPF-32)) != 0
 }
 
 // FindLibNCCLSystemwide is the no-target-PID variant: scans common

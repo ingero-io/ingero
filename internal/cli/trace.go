@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"math/bits"
@@ -218,6 +219,78 @@ func parseRingBufSize(s string) (uint32, error) {
 	}
 
 	return uint32(total), nil
+}
+
+// ncclSetupParams collects the inputs setupNCCLTracer needs. Function
+// fields make it injectable for tests (QA audit ★2 #10).
+type ncclSetupParams struct {
+	explicitLib       string
+	targetPIDs        []int
+	explicitPIDs      bool
+	geteuid           func() int
+	hasCapBPF         func() bool
+	findLibForPID     func(pid int) string
+	findLibSystemwide func() string
+	debugf            func(format string, args ...any)
+	stderr            io.Writer
+}
+
+// setupNCCLTracer resolves libnccl, attaches the NCCL uprobe set, and
+// installs the per-tenant PID filter when --pid is explicit. Returns
+// (nil, 0) on every soft-fail path (no libnccl, attach error). Warnings
+// go to p.stderr; the only hard error path is no caller — callers swallow
+// failures and proceed without NCCL tracing.
+func setupNCCLTracer(p ncclSetupParams) (*ncclprobe.Tracer, int) {
+	// L7: surface a friendly error when running unprivileged. Uprobe
+	// attach needs CAP_BPF + CAP_PERFMON on Linux >= 5.8 or root on
+	// older kernels. Without this check users get a confusing libbpf
+	// "operation not permitted" deep in the attach path.
+	if p.geteuid() != 0 && !p.hasCapBPF() {
+		fmt.Fprintln(p.stderr, "  Warning: --nccl requires root or CAP_BPF + CAP_PERFMON; attach will likely fail")
+		p.debugf("nccl: euid=%d, no CAP_BPF; continuing but expect failure", p.geteuid())
+	}
+	libPath := p.explicitLib
+	if libPath == "" {
+		for _, pid := range p.targetPIDs {
+			if pid > 0 {
+				if lib := p.findLibForPID(pid); lib != "" {
+					libPath = lib
+					break
+				}
+			}
+		}
+	}
+	if libPath == "" {
+		libPath = p.findLibSystemwide()
+	}
+	if libPath == "" {
+		fmt.Fprintln(p.stderr, "  Warning: --nccl set but no libnccl.so / libtorch_cuda.so found; NCCL tracing skipped")
+		p.debugf("nccl: no libnccl-bearing object found; skipping")
+		return nil, 0
+	}
+	nt := ncclprobe.New(libPath)
+	if err := nt.Attach(); err != nil {
+		fmt.Fprintf(p.stderr, "  Warning: NCCL tracing unavailable: %v\n", err)
+		p.debugf("nccl tracer: attach failed: %v", err)
+		return nil, 0
+	}
+	const probeCount = 16 // 8 collectives x (uprobe + uretprobe)
+	// v0.12.2 (LHF #7): when --pid is set, scope the NCCL probe to just
+	// those PIDs. Without an explicit --pid the probe traces system-wide
+	// (matching the other tracers). Multi-tenant deployments should
+	// always pass --pid.
+	if p.explicitPIDs {
+		for _, pid := range p.targetPIDs {
+			if pid > 0 {
+				if err := nt.SetTargetPID(uint32(pid)); err != nil {
+					fmt.Fprintf(p.stderr, "  Warning: NCCL PID filter (pid=%d): %v\n", pid, err)
+				}
+			}
+		}
+	}
+	fmt.Fprintf(p.stderr, "  NCCL tracing: attached %d probes to %s\n", probeCount, libPath)
+	p.debugf("nccl tracer: %d probes attached at %s", probeCount, libPath)
+	return nt, probeCount
 }
 
 // ---------------------------------------------------------------------------
@@ -611,46 +684,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Falls back to libtorch_cuda.so / libtorch_global_deps.so for PyTorch
 	// builds that statically link NCCL.
 	var ncclTracer *ncclprobe.Tracer
-	ncclProbeCount := 0
 	if traceNCCL {
-		// L7: surface a friendly error when running unprivileged.
-		// uprobe attach needs CAP_BPF + CAP_PERFMON on Linux >= 5.8 or
-		// root on older kernels. Without this check users get a
-		// confusing libbpf "operation not permitted" deep in the
-		// attach path.
-		if os.Geteuid() != 0 && !ncclprobe.HasCapBPF() {
-			fmt.Fprintln(os.Stderr, "  Warning: --nccl requires root or CAP_BPF + CAP_PERFMON; attach will likely fail")
-			debugf("nccl: euid=%d, no CAP_BPF; continuing but expect failure", os.Geteuid())
-		}
-		libPath := traceNCCLLib
-		if libPath == "" {
-			for _, pid := range targetPIDs {
-				if pid > 0 {
-					if p := ncclprobe.FindLibNCCL(pid); p != "" {
-						libPath = p
-						break
-					}
-				}
-			}
-		}
-		if libPath == "" {
-			libPath = ncclprobe.FindLibNCCLSystemwide()
-		}
-		if libPath == "" {
-			fmt.Fprintln(os.Stderr, "  Warning: --nccl set but no libnccl.so / libtorch_cuda.so found; NCCL tracing skipped")
-			debugf("nccl: no libnccl-bearing object found; skipping")
-		} else {
-			nt := ncclprobe.New(libPath)
-			if err := nt.Attach(); err != nil {
-				fmt.Fprintf(os.Stderr, "  Warning: NCCL tracing unavailable: %v\n", err)
-				debugf("nccl tracer: attach failed: %v", err)
-			} else {
-				ncclTracer = nt
-				ncclProbeCount = 16 // 8 collectives (incl. Send/Recv from v0.12.1) x (uprobe + uretprobe)
-				fmt.Fprintf(os.Stderr, "  NCCL tracing: attached %d probes to %s\n", ncclProbeCount, libPath)
-				debugf("nccl tracer: %d probes attached at %s", ncclProbeCount, libPath)
-			}
-		}
+		ncclTracer, _ = setupNCCLTracer(ncclSetupParams{
+			explicitLib:       traceNCCLLib,
+			targetPIDs:        targetPIDs,
+			explicitPIDs:      len(tracePIDs) > 0,
+			geteuid:           os.Geteuid,
+			hasCapBPF:         ncclprobe.HasCapBPF,
+			findLibForPID:     ncclprobe.FindLibNCCL,
+			findLibSystemwide: ncclprobe.FindLibNCCLSystemwide,
+			debugf:            debugf,
+			stderr:            os.Stderr,
+		})
 	}
 	if ncclTracer != nil {
 		defer ncclTracer.Close()
@@ -874,6 +919,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 					DurationMs:        float64(ev.DurationNs) / 1e6,
 					CountBytes:        ev.CountBytes,
 					ReturnCode:        ev.ReturnCode,
+					PeerRank:          ev.PeerRank,
 				})
 				// v0.12.1 (LHF #1 follow-on): record for later
 				// barrier-wait correlation against the next

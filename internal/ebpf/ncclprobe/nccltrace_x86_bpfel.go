@@ -49,6 +49,8 @@ type ncclTraceNcclEntryState struct {
 	ReduceOp    uint32
 	NranksArg   uint32
 	RankArg     uint32
+	PeerRank    uint32
+	Pad2        uint32
 	CommidWords [16]uint64
 }
 
@@ -75,7 +77,7 @@ type ncclTraceNcclEvent struct {
 	Datatype     uint32
 	ReduceOp     uint32
 	ReturnCode   int32
-	Pad          uint32
+	PeerRank     uint32
 }
 
 // loadNcclTrace returns the embedded CollectionSpec for ncclTrace.
@@ -147,6 +149,7 @@ type ncclTraceMapSpecs struct {
 	NcclCommMap    *ebpf.MapSpec `ebpf:"nccl_comm_map"`
 	NcclEntryMap   *ebpf.MapSpec `ebpf:"nccl_entry_map"`
 	NcclEvents     *ebpf.MapSpec `ebpf:"nccl_events"`
+	NcclTargetPids *ebpf.MapSpec `ebpf:"nccl_target_pids"`
 }
 
 // ncclTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -185,6 +188,7 @@ type ncclTraceMaps struct {
 	NcclCommMap    *ebpf.Map `ebpf:"nccl_comm_map"`
 	NcclEntryMap   *ebpf.Map `ebpf:"nccl_entry_map"`
 	NcclEvents     *ebpf.Map `ebpf:"nccl_events"`
+	NcclTargetPids *ebpf.Map `ebpf:"nccl_target_pids"`
 }
 
 func (m *ncclTraceMaps) Close() error {
@@ -194,6 +198,7 @@ func (m *ncclTraceMaps) Close() error {
 		m.NcclCommMap,
 		m.NcclEntryMap,
 		m.NcclEvents,
+		m.NcclTargetPids,
 	)
 }
 

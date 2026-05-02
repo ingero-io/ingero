@@ -248,7 +248,7 @@ struct nccl_event {
 	__u32 datatype;                    /* ncclDataType_t enum */
 	__u32 reduce_op;                   /* ncclRedOp_t enum (allreduce/reducescatter only) */
 	__s32 return_code;                 /* ncclResult_t */
-	__u32 _pad;
+	__u32 peer_rank;                   /* v0.12.2: PARM4 of ncclSend/Recv (peer); 0 for collectives */
 };
 /* Total: 48 + 8+8+8+8 + 4+4+4+4 + 4+4 = 104 bytes — keep on 8-byte boundary. */
 

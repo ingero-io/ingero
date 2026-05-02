@@ -148,6 +148,11 @@ const (
 	// AttrNCCLReduceOp is the ncclRedOp_t enum (SUM / PROD / MIN / MAX
 	// / AVG); only meaningful for AllReduce + ReduceScatter.
 	AttrNCCLReduceOp = "nccl.reduce_op"
+	// AttrNCCLPeerRank is the destination/source rank for ncclSend /
+	// ncclRecv point-to-point primitives. Zero/omitted for collectives.
+	// v0.12.2: enables topology-mapping for pipeline-parallel
+	// workloads (DeepSpeed, Megatron) where Send/Recv dominate.
+	AttrNCCLPeerRank = "nccl.peer_rank"
 )
 
 // Node states.

@@ -332,6 +332,11 @@ type NCCLDataPoint struct {
 	// on OpType that was vulnerable to in-band sentinel collisions if a
 	// future processor injected an op_type containing the prefix.
 	IsBarrier bool
+
+	// PeerRank is non-zero only for ncclSend / ncclRecv point-to-point
+	// primitives (PARM4 of those calls). Zero for collectives. v0.12.2:
+	// enables topology-mapping for pipeline-parallel workloads.
+	PeerRank uint32
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

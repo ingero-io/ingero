@@ -10,11 +10,12 @@ import (
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
-// resetBarrierState resets package-scope state for test isolation.
+// resetBarrierState resets the default correlator's state for test
+// isolation. v0.12.2 (Sec ★4 / Arch ★4): correlator is now an
+// instance method; tests can also construct an isolated
+// newBarrierCorrelator if they need parallel runs.
 func resetBarrierState() {
-	barrierStateMu.Lock()
-	barrierState = make(map[barrierKey]barrierEntry)
-	barrierStateMu.Unlock()
+	defaultBarrier.reset()
 	ncclBufMu.Lock()
 	ncclBuf = nil
 	ncclBufMu.Unlock()
@@ -89,7 +90,7 @@ func TestBarrierWait_NoMatchingNCCL(t *testing.T) {
 	}
 }
 
-// TestBarrierWait_NCCLEntriesExpire: barrierState entries past
+// TestBarrierWait_NCCLEntriesExpire: defaultBarrier.state entries past
 // barrierExpiry are gc'd; a stream sync arriving long after the NCCL
 // op was recorded must NOT emit (the correlation has timed out).
 func TestBarrierWait_NCCLEntriesExpire(t *testing.T) {
@@ -105,12 +106,12 @@ func TestBarrierWait_NCCLEntriesExpire(t *testing.T) {
 		Rank:         0,
 		NRanks:       4,
 	})
-	barrierStateMu.Lock()
-	for k, e := range barrierState {
+	defaultBarrier.mu.Lock()
+	for k, e := range defaultBarrier.state {
 		e.created = time.Now().Add(-2 * barrierExpiry)
-		barrierState[k] = e
+		defaultBarrier.state[k] = e
 	}
-	barrierStateMu.Unlock()
+	defaultBarrier.mu.Unlock()
 
 	// Trigger the gc by recording another entry.
 	recordNCCLForBarrier(ncclprobe.Event{
@@ -122,16 +123,16 @@ func TestBarrierWait_NCCLEntriesExpire(t *testing.T) {
 		NRanks:       4,
 	})
 
-	barrierStateMu.Lock()
-	_, expiredStillThere := barrierState[barrierKey{pid: 42, stream: 0xbeef}]
-	barrierStateMu.Unlock()
+	defaultBarrier.mu.Lock()
+	_, expiredStillThere := defaultBarrier.state[barrierKey{pid: 42, stream: 0xbeef}]
+	defaultBarrier.mu.Unlock()
 	if expiredStillThere {
-		t.Error("expired barrierState entry was not gc'd")
+		t.Error("expired defaultBarrier.state entry was not gc'd")
 	}
 }
 
 // TestBarrierWait_ZeroStreamSkipped: NCCL events without a stream
-// handle (e.g. ncclCommInitRank/Destroy) must not enter barrierState.
+// handle (e.g. ncclCommInitRank/Destroy) must not enter defaultBarrier.state.
 func TestBarrierWait_ZeroStreamSkipped(t *testing.T) {
 	resetBarrierState()
 	defer resetBarrierState()
@@ -142,10 +143,10 @@ func TestBarrierWait_ZeroStreamSkipped(t *testing.T) {
 		Op:           1, // ncclCommInitRank
 		StreamHandle: 0,
 	})
-	barrierStateMu.Lock()
-	defer barrierStateMu.Unlock()
-	if len(barrierState) != 0 {
-		t.Errorf("CommInitRank with stream=0 should not enter barrierState, got %d entries", len(barrierState))
+	defaultBarrier.mu.Lock()
+	defer defaultBarrier.mu.Unlock()
+	if len(defaultBarrier.state) != 0 {
+		t.Errorf("CommInitRank with stream=0 should not enter defaultBarrier.state, got %d entries", len(defaultBarrier.state))
 	}
 }
 
@@ -181,10 +182,10 @@ func TestBarrierWait_StaleSyncDropped(t *testing.T) {
 		t.Errorf("stale sync emitted %d data points; want 0 (Sec audit ★5 #1)", len(got))
 	}
 	// Pending entry should be cleared either way.
-	barrierStateMu.Lock()
-	defer barrierStateMu.Unlock()
-	if _, present := barrierState[barrierKey{pid: 42, stream: 0xbeef}]; present {
-		t.Error("stale entry not cleared from barrierState after sync miss")
+	defaultBarrier.mu.Lock()
+	defer defaultBarrier.mu.Unlock()
+	if _, present := defaultBarrier.state[barrierKey{pid: 42, stream: 0xbeef}]; present {
+		t.Error("stale entry not cleared from defaultBarrier.state after sync miss")
 	}
 }
 
@@ -265,3 +266,45 @@ func TestFormatCommIDHash(t *testing.T) {
 
 // _ keeps the stats import live.
 var _ = stats.NCCLDataPoint{}
+
+// TestBarrierCorrelator_Isolated covers v0.12.2 (Sec ★4 / Arch ★4):
+// each correlator instance owns independent state, so two parallel
+// `ingero trace` invocations (or unit-test calls running in parallel)
+// can't cross-contaminate.
+func TestBarrierCorrelator_Isolated(t *testing.T) {
+	var got1, got2 []stats.NCCLDataPoint
+	c1 := newBarrierCorrelator(func(p stats.NCCLDataPoint) { got1 = append(got1, p) })
+	c2 := newBarrierCorrelator(func(p stats.NCCLDataPoint) { got2 = append(got2, p) })
+
+	c1.recordNCCL(ncclprobe.Event{
+		TimestampNs: 1_000_000, PID: 42, Op: 3, StreamHandle: 0xA, NRanks: 4,
+	})
+	c2.onStreamSync(events.Event{
+		Source: events.SourceCUDA, Op: uint8(events.CUDAStreamSync),
+		PID: 42, Args: [2]uint64{0xA, 0},
+		Duration: 1 * time.Millisecond,
+		Timestamp: time.Unix(0, 5_000_000),
+	})
+
+	// c2 has no record for (42, 0xA) so emits nothing.
+	if len(got2) != 0 {
+		t.Errorf("c2 leaked from c1: got %d points", len(got2))
+	}
+	if len(got1) != 0 {
+		t.Errorf("c1 emitted without its own sync: got %d points", len(got1))
+	}
+
+	// Now drive c1 properly; it MUST emit, c2 still silent.
+	c1.onStreamSync(events.Event{
+		Source: events.SourceCUDA, Op: uint8(events.CUDAStreamSync),
+		PID: 42, Args: [2]uint64{0xA, 0},
+		Duration: 1 * time.Millisecond,
+		Timestamp: time.Unix(0, 5_000_000),
+	})
+	if len(got1) != 1 || !got1[0].IsBarrier {
+		t.Errorf("c1 missed its own emission: %+v", got1)
+	}
+	if len(got2) != 0 {
+		t.Errorf("c2 cross-contaminated: %d points", len(got2))
+	}
+}

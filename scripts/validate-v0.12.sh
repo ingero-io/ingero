@@ -318,6 +318,78 @@ else
     warn "v0.12 N4: NCCL trace ran but no clear attach signal (rc=$N4_TRACE_RC)"
 fi
 
+############### v0.12.2 N5: 2-rank torchrun NCCL emission shape ################
+# Validates the v0.12.0 contract that real NCCL collectives produce events
+# with nranks == world_size and a non-zero comm_id_hash. Skips cleanly when
+# the box has fewer than 2 GPUs or torchrun is unavailable.
+
+echo
+echo "--- v0.12.2 N5: 2-rank torchrun all-reduce emits nranks=2 + comm_id_hash ---"
+GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "$GPU_COUNT" -lt 2 ]; then
+    warn "v0.12.2 N5: only $GPU_COUNT GPU(s); single-GPU box, skipping multi-rank assertion"
+elif ! $PYTHON -c "import torch.distributed" 2>/dev/null; then
+    warn "v0.12.2 N5: torch.distributed not importable; skipping"
+elif ! command -v torchrun >/dev/null 2>&1 && ! $PYTHON -m torch.distributed.run --help >/dev/null 2>&1; then
+    warn "v0.12.2 N5: torchrun unavailable; skipping"
+else
+    cat > /tmp/nccl_2rank.py <<'PYEOF'
+import os, time, torch, torch.distributed as dist
+dist.init_process_group(backend='nccl')
+rank = dist.get_rank()
+ws = dist.get_world_size()
+torch.cuda.set_device(rank)
+end = time.time() + 30
+n = 0
+while time.time() < end:
+    t = torch.ones(1024, 1024, device=f'cuda:{rank}') * (rank + 1)
+    dist.all_reduce(t)
+    torch.cuda.synchronize()
+    n += 1
+print(f'rank {rank}/{ws} did {n} all-reduces', flush=True)
+dist.destroy_process_group()
+PYEOF
+    # Pick a free TCP port for c10d. Same trick as A1+A2 above.
+    C10D_PORT=$(comm -23 <(seq 29400 29999 | sort) <(ss -tan 2>/dev/null | awk '{print $4}' | grep -oE ':[0-9]+$' | sort -u) | shuf -n 1)
+    C10D_PORT=${C10D_PORT:-29500}
+    if command -v torchrun >/dev/null 2>&1; then
+        TORCHRUN="torchrun"
+    else
+        TORCHRUN="$PYTHON -m torch.distributed.run"
+    fi
+    $TORCHRUN --nproc_per_node=2 --master_port="$C10D_PORT" /tmp/nccl_2rank.py \
+        > /tmp/wl-2rank.out 2>&1 &
+    WL5=$!
+    sleep 4
+    # Trace either child rank — both share the same comm; either's NCCL events
+    # carry the same comm_id_hash and nranks=2.
+    RANK_PID=$(pgrep -P "$WL5" | head -1)
+    if [ -z "$RANK_PID" ]; then
+        warn "v0.12.2 N5: torchrun started but no child rank PID found"
+    else
+        sudo ./bin/ingero trace --nccl --debug --pid "$RANK_PID" --duration 10s --json \
+            > "$VAL_DIR/09-nccl-2rank.json" 2> "$VAL_DIR/09-nccl-2rank.log"
+        wait "$WL5" 2>/dev/null
+
+        # Pull NCCL events out of the JSON stream (one event per line).
+        # An "all_reduce" event's nranks comes from PARM5 of ncclAllReduce
+        # = the comm's nranks; comm_id_hash is the 16-hex-char sha of the
+        # commId blob.
+        NRANKS_2=$(grep -oE '"nranks":\s*2' "$VAL_DIR/09-nccl-2rank.json" 2>/dev/null | head -1)
+        NONZERO_HASH=$(grep -oE '"comm_id_hash":\s*"[0-9a-f]{16}"' "$VAL_DIR/09-nccl-2rank.json" 2>/dev/null \
+            | grep -v '"comm_id_hash":\s*"0000000000000000"' | head -1)
+        if [ -n "$NRANKS_2" ] && [ -n "$NONZERO_HASH" ]; then
+            ok "v0.12.2 N5: 2-rank NCCL events carry nranks=2 + non-zero comm_id_hash"
+        elif [ -n "$NRANKS_2" ]; then
+            bad "v0.12.2 N5: nranks=2 seen but comm_id_hash is zero/missing"
+        elif [ -n "$NONZERO_HASH" ]; then
+            bad "v0.12.2 N5: non-zero comm_id_hash seen but nranks != 2"
+        else
+            bad "v0.12.2 N5: no NCCL event with nranks=2 + non-zero comm_id_hash captured"
+        fi
+    fi
+fi
+
 ############### v0.11 D4: gpu-test.sh per-feature assertion lines #############
 
 echo

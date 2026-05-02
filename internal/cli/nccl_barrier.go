@@ -19,6 +19,11 @@ package cli
 //     the OTLP encoder produces metric `nccl.collective.barrier_wait_ms`.
 //   - Pending entries expire after barrierExpiry (5 min default) so a
 //     missed sync doesn't leak memory.
+//
+// v0.12.2 (Sec ★4 / Arch ★4): correlator state lives on a
+// barrierCorrelator struct instead of package-scope vars, so test
+// isolation is clean and a future long-running `ingero serve` mode can
+// instantiate one per Tracer.
 
 import (
 	"context"
@@ -29,6 +34,151 @@ import (
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/pkg/events"
 )
+
+const barrierExpiry = 5 * time.Minute
+
+// staleBarrierWindow bounds how long after the NCCL uretprobe a
+// cudaStreamSynchronize is allowed to claim ownership. Beyond this the
+// pending entry is treated as orphaned (the sync probably belongs to
+// non-NCCL work on the same stream). Defends against false attribution
+// when training scripts mix NCCL collectives with unrelated stream
+// syncs, e.g. PyTorch DDP + checkpoint flush. v0.12.1 (Sec audit ★5).
+const staleBarrierWindow = 1 * time.Second
+
+type barrierKey struct {
+	pid    uint32
+	stream uint64
+}
+
+type barrierEntry struct {
+	entryTs    int64
+	commIDHash uint64
+	opType     string
+	rank       uint32
+	nranks     uint32
+	datatype   uint32
+	reduceOp   uint32
+	countBytes uint64
+	created    time.Time
+}
+
+// barrierCorrelator owns the NCCL/CUDA-sync correlation map. One
+// instance per `ingero trace` invocation; no package-scope state.
+type barrierCorrelator struct {
+	mu    sync.Mutex
+	state map[barrierKey]barrierEntry
+	out   func(stats.NCCLDataPoint) // typically ncclBufferAdd
+}
+
+// newBarrierCorrelator creates a correlator that pushes derived
+// barrier_wait data points into out. out is required.
+func newBarrierCorrelator(out func(stats.NCCLDataPoint)) *barrierCorrelator {
+	return &barrierCorrelator{
+		state: make(map[barrierKey]barrierEntry),
+		out:   out,
+	}
+}
+
+// defaultBarrier is the singleton correlator used by the v0.12.0/v0.12.1
+// trace-command wiring. v0.12.2 keeps it as a default for the
+// agent-CLI use case while the new `barrierCorrelator` type lets tests
+// (and any future long-running mode) construct isolated correlators.
+var defaultBarrier = newBarrierCorrelator(func(p stats.NCCLDataPoint) { ncclBufferAdd(p) })
+
+// recordNCCLForBarrier records the NCCL entry side on the default
+// correlator. Called from the NCCL goroutine after each NCCL collective
+// uretprobe event. NCCL CommInitRank / CommDestroy events (op codes 1, 2)
+// are skipped: no stream involvement.
+func recordNCCLForBarrier(ev ncclprobe.Event) { defaultBarrier.recordNCCL(ev) }
+
+// onStreamSync handles a CUDAStreamSync event on the default correlator.
+func onStreamSync(ev events.Event) { defaultBarrier.onStreamSync(ev) }
+
+func (c *barrierCorrelator) recordNCCL(ev ncclprobe.Event) {
+	if ev.StreamHandle == 0 {
+		return
+	}
+	if ev.Op == 1 || ev.Op == 2 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gcLocked(time.Now())
+	c.state[barrierKey{pid: ev.PID, stream: ev.StreamHandle}] = barrierEntry{
+		entryTs:    int64(ev.TimestampNs),
+		commIDHash: ev.CommIDHash,
+		opType:     ev.OpName(),
+		rank:       ev.Rank,
+		nranks:     ev.NRanks,
+		datatype:   ev.Datatype,
+		reduceOp:   ev.ReduceOp,
+		countBytes: ev.CountBytes,
+		created:    time.Now(),
+	}
+}
+
+func (c *barrierCorrelator) onStreamSync(ev events.Event) {
+	if ev.Source != events.SourceCUDA {
+		return
+	}
+	if ev.Op != uint8(events.CUDAStreamSync) {
+		return
+	}
+	stream := ev.Args[0]
+	if stream == 0 {
+		return
+	}
+	syncEntryNs := ev.Timestamp.UnixNano() - ev.Duration.Nanoseconds()
+	key := barrierKey{pid: ev.PID, stream: stream}
+	c.mu.Lock()
+	entry, ok := c.state[key]
+	if ok {
+		if syncEntryNs-entry.entryTs > staleBarrierWindow.Nanoseconds() {
+			delete(c.state, key)
+			c.mu.Unlock()
+			return
+		}
+		delete(c.state, key)
+	}
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	syncExitNs := ev.Timestamp.UnixNano()
+	barrierNs := syncExitNs - entry.entryTs - ev.Duration.Nanoseconds()
+	if barrierNs < 0 {
+		barrierNs = 0
+	}
+	c.out(stats.NCCLDataPoint{
+		TimestampUnixNano: ev.Timestamp.UnixNano(),
+		OpType:            entry.opType,
+		CommIDHash:        formatCommIDHash(entry.commIDHash),
+		Rank:              entry.rank,
+		NRanks:            entry.nranks,
+		Datatype:          entry.datatype,
+		ReduceOp:          entry.reduceOp,
+		DurationMs:        float64(barrierNs) / 1e6,
+		CountBytes:        entry.countBytes,
+		IsBarrier:         true,
+	})
+}
+
+// gcLocked removes entries older than barrierExpiry. Caller must hold c.mu.
+func (c *barrierCorrelator) gcLocked(now time.Time) {
+	cutoff := now.Add(-barrierExpiry)
+	for k, v := range c.state {
+		if v.created.Before(cutoff) {
+			delete(c.state, k)
+		}
+	}
+}
+
+// reset is for tests — empties the correlator state.
+func (c *barrierCorrelator) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state = make(map[barrierKey]barrierEntry)
+}
 
 // forkCUDAForBarrier returns a new channel that forwards every CUDA
 // event from `in`. As a side effect, every CUDAStreamSync event is
@@ -61,141 +211,6 @@ func forkCUDAForBarrier(ctx context.Context, in <-chan events.Event) <-chan even
 		}
 	}()
 	return out
-}
-
-const barrierExpiry = 5 * time.Minute
-
-type barrierKey struct {
-	pid    uint32
-	stream uint64
-}
-
-type barrierEntry struct {
-	entryTs    int64
-	commIDHash uint64
-	opType     string
-	rank       uint32
-	nranks     uint32
-	datatype   uint32
-	reduceOp   uint32
-	countBytes uint64
-	created    time.Time
-}
-
-var (
-	barrierStateMu sync.Mutex
-	barrierState   = make(map[barrierKey]barrierEntry)
-)
-
-// recordNCCLForBarrier is called from the NCCL goroutine after each
-// NCCL collective uretprobe event. Records the entry side so a later
-// cudaStreamSynchronize on the same (pid, stream) can derive
-// barrier_wait. NCCL CommInitRank / CommDestroy events (op codes 1, 2)
-// are skipped: no stream involvement.
-func recordNCCLForBarrier(ev ncclprobe.Event) {
-	if ev.StreamHandle == 0 {
-		return
-	}
-	if ev.Op == 1 || ev.Op == 2 {
-		return
-	}
-	barrierStateMu.Lock()
-	defer barrierStateMu.Unlock()
-	gcBarrier(time.Now())
-	barrierState[barrierKey{pid: ev.PID, stream: ev.StreamHandle}] = barrierEntry{
-		entryTs:    int64(ev.TimestampNs),
-		commIDHash: ev.CommIDHash,
-		opType:     ev.OpName(),
-		rank:       ev.Rank,
-		nranks:     ev.NRanks,
-		datatype:   ev.Datatype,
-		reduceOp:   ev.ReduceOp,
-		countBytes: ev.CountBytes,
-		created:    time.Now(),
-	}
-}
-
-// staleBarrierWindow bounds how long after the NCCL uretprobe a
-// cudaStreamSynchronize is allowed to claim ownership. Beyond this the
-// pending entry is treated as orphaned (the sync probably belongs to
-// non-NCCL work on the same stream). Defends against false attribution
-// when training scripts mix NCCL collectives with unrelated stream
-// syncs, e.g. PyTorch DDP + checkpoint flush. v0.12.1 (Sec audit ★5).
-const staleBarrierWindow = 1 * time.Second
-
-// onStreamSync is called from the stream-sync tap goroutine for every
-// CUDAStreamSync event. If a pending NCCL collective exists for the
-// same (pid, stream) AND the sync entry is within staleBarrierWindow
-// of the NCCL exit, emit a barrier_wait_ms data point and clear the
-// entry. Older pending entries are dropped silently (correlation
-// timed out). v0.12.1 fixes a phantom-attribution bug where a sync
-// for unrelated work on the same stream would consume the pending NCCL
-// entry and emit a misleading barrier_wait_ms.
-func onStreamSync(ev events.Event) {
-	if ev.Source != events.SourceCUDA {
-		return
-	}
-	if ev.Op != uint8(events.CUDAStreamSync) {
-		return
-	}
-	stream := ev.Args[0]
-	if stream == 0 {
-		return
-	}
-	syncEntryNs := ev.Timestamp.UnixNano() - ev.Duration.Nanoseconds()
-	key := barrierKey{pid: ev.PID, stream: stream}
-	barrierStateMu.Lock()
-	entry, ok := barrierState[key]
-	if ok {
-		// Stale-entry check: only consume if the sync started within
-		// staleBarrierWindow of the NCCL uretprobe. Older entries are
-		// removed but NOT consumed (no barrier_wait emitted) so the
-		// metric stays uncontaminated.
-		if syncEntryNs-entry.entryTs > staleBarrierWindow.Nanoseconds() {
-			delete(barrierState, key)
-			barrierStateMu.Unlock()
-			return
-		}
-		delete(barrierState, key)
-	}
-	barrierStateMu.Unlock()
-	if !ok {
-		return
-	}
-	// barrier_wait_ms = sync.exit_ts - allreduce.entry_ts - sync.entry_ts
-	// (per roadmap §4.3 spec: time spent blocked AT the barrier).
-	// Pre-fix used `ev.Duration` (= sync.exit - sync.entry) directly,
-	// which under-reports when the user code does work between the
-	// collective and the sync. Compute the spec-correct expression
-	// here. For the typical PyTorch pattern (`dist.all_reduce(); torch.cuda.synchronize()`)
-	// the difference is the sync's own duration only and matches.
-	syncExitNs := ev.Timestamp.UnixNano()
-	barrierNs := syncExitNs - entry.entryTs - ev.Duration.Nanoseconds()
-	if barrierNs < 0 {
-		barrierNs = 0
-	}
-	barrierMs := float64(barrierNs) / 1e6
-	ncclBufferAdd(stats.NCCLDataPoint{
-		TimestampUnixNano: ev.Timestamp.UnixNano(),
-		OpType:            entry.opType,
-		CommIDHash:        formatCommIDHash(entry.commIDHash),
-		Rank:              entry.rank,
-		NRanks:            entry.nranks,
-		Datatype:           entry.datatype,
-		ReduceOp:           entry.reduceOp,
-		DurationMs:         barrierMs,
-		CountBytes:         entry.countBytes,
-		IsBarrier:          true,
-	})
-}
-
-func gcBarrier(now time.Time) {
-	cutoff := now.Add(-barrierExpiry)
-	for k, v := range barrierState {
-		if v.created.Before(cutoff) {
-			delete(barrierState, k)
-		}
-	}
 }
 
 func formatCommIDHash(h uint64) string {
