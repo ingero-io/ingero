@@ -3,8 +3,8 @@
 
 Rules enforced:
   1. Every anchor parses (id present, attribute syntax valid).
-  2. Required attributes: product (in {ingero, ingero-fleet, ingero-ee}),
-     channel (in {stable, dev}).
+  2. Required attributes: product (in {ingero, ingero-fleet}),
+     channel (in {stable}).
   3. Anchor id is unique within a file.
   4. The next non-blank line after the anchor contains a version-shaped
      substring (v?X.Y.Z[-suffix]).
@@ -27,8 +27,8 @@ import re
 import sys
 from pathlib import Path
 
-VALID_PRODUCTS = {"ingero", "ingero-fleet", "ingero-ee"}
-VALID_CHANNELS = {"stable", "dev"}
+VALID_PRODUCTS = {"ingero", "ingero-fleet"}
+VALID_CHANNELS = {"stable"}
 
 ANCHOR_MD = re.compile(
     r"<!--\s*ingero-version:(?P<id>[\w.-]+)\s+(?P<attrs>.*?)\s*-->"

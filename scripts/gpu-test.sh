@@ -363,6 +363,46 @@ else
     record "WARN" "T07d: driver API: cuMemAlloc" "0 events (some workloads may not trigger)"
 fi
 
+# T07e-h: Per-feature integration assertions (v0.11 D4) — every probe
+# group has a "passed if events recorded" line. Closes the gap where
+# host kernel events, block I/O, net, and TCP probes loaded but no
+# integration test asserted they actually emitted events on the GH200
+# / H100 smoke.
+HOST_COUNT=$(grep -cE '"sched_switch"|"sched_wakeup"|"page_alloc"' logs/trace-clean.json 2>/dev/null || echo "0")
+HOST_COUNT=$(echo "$HOST_COUNT" | head -1)
+if [[ "$HOST_COUNT" -gt 0 ]]; then
+    record "PASS" "T07e: host kernel events" "$HOST_COUNT events (sched/page_alloc)"
+else
+    record "FAIL" "T07e: host kernel events" "0 events — host probe attached but did not emit"
+fi
+
+BIO_COUNT=$(grep -cE '"bio_read"|"bio_write"|"block_rq"' logs/trace-clean.json 2>/dev/null || echo "0")
+BIO_COUNT=$(echo "$BIO_COUNT" | head -1)
+if [[ "$BIO_COUNT" -gt 0 ]]; then
+    record "PASS" "T07f: block I/O" "$BIO_COUNT events"
+else
+    # Workload above does not exercise disk; emit WARN, not FAIL.
+    record "WARN" "T07f: block I/O" "0 events (workload did not exercise disk)"
+fi
+
+NET_COUNT=$(grep -cE '"sendto"|"recvfrom"|"sendmsg"|"recvmsg"' logs/trace-clean.json 2>/dev/null || echo "0")
+NET_COUNT=$(echo "$NET_COUNT" | head -1)
+if [[ "$NET_COUNT" -gt 0 ]]; then
+    record "PASS" "T07g: net syscalls" "$NET_COUNT events"
+else
+    record "WARN" "T07g: net syscalls" "0 events (workload did not exercise network)"
+fi
+
+# TCP retransmit is best-effort: clean networks may produce zero
+# retransmits in 18 s. Always WARN on zero, never FAIL.
+TCP_RX_COUNT=$(grep -cE '"tcp_retransmit"|"tcp_retrans_skb"' logs/trace-clean.json 2>/dev/null || echo "0")
+TCP_RX_COUNT=$(echo "$TCP_RX_COUNT" | head -1)
+if [[ "$TCP_RX_COUNT" -gt 0 ]]; then
+    record "PASS" "T07h: tcp retransmit" "$TCP_RX_COUNT events"
+else
+    record "WARN" "T07h: tcp retransmit" "0 events (clean network is normal)"
+fi
+
 # Test 4: trace --debug
 log "Test 4: trace --debug --duration 15s"
 WL_PID=$(start_workload 18)

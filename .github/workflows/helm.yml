@@ -2,12 +2,12 @@ name: Helm
 
 on:
   push:
-    branches: [main, fleet]
+    branches: [main]
     paths:
       - 'deploy/helm/**'
       - '.github/workflows/helm.yml'
   pull_request:
-    branches: [main, fleet]
+    branches: [main]
     paths:
       - 'deploy/helm/**'
       - '.github/workflows/helm.yml'

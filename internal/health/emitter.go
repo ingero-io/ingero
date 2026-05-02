@@ -66,6 +66,13 @@ type EmitterConfig struct {
 	// zero WorldSize suppresses both attributes.
 	WorldSize int `yaml:"world_size"`
 	NodeRank  int `yaml:"node_rank"`
+	// GPUModel and GPUCount drive the v0.11 ingero.node.info gauge,
+	// which the cost-of-problem recording-rule layer joins against
+	// gpu_rates.yaml. Empty model or zero count suppresses the gauge.
+	// Caller (cmd/ingero/main.go fleet-push entry) populates from
+	// nvidia-smi at startup.
+	GPUModel string `yaml:"gpu_model"`
+	GPUCount int    `yaml:"gpu_count"`
 	// ThresholdCache, if non-nil, is updated with the `X-Ingero-Threshold`
 	// and `X-Ingero-Quorum-Met` response headers on every push (success
 	// or failure). Nil leaves response-header handling disabled.
@@ -369,13 +376,23 @@ func (e *httpEmitter) buildStragglerEventPayload(ev StragglerEvent, isStraggler 
 		{Key: contract.AttrScore, Value: otlpDbl(ev.Score)},
 		{Key: contract.AttrDominantSignal, Value: otlpStr(ev.DominantSignal)},
 	}
+	if ev.EventID != "" {
+		attrs = append(attrs, otlpKV{Key: contract.AttrEventID, Value: otlpStr(ev.EventID)})
+	}
+	resAttrs := []otlpKV{
+		{Key: contract.AttrNodeID, Value: otlpStr(ev.NodeID)},
+		{Key: contract.AttrClusterID, Value: otlpStr(ev.ClusterID)},
+	}
+	if e.cfg.WorldSize > 0 {
+		resAttrs = append(resAttrs,
+			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
+			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
+		)
+	}
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{
 			Resource: otlpResourceBlock{
-				Attributes: []otlpKV{
-					{Key: contract.AttrNodeID, Value: otlpStr(ev.NodeID)},
-					{Key: contract.AttrClusterID, Value: otlpStr(ev.ClusterID)},
-				},
+				Attributes: resAttrs,
 			},
 			ScopeMetrics: []otlpScopeMetricsBlock{{
 				Scope:   otlpScopeBlock{Name: "ingero.health", Version: "0.10.0"},
@@ -414,16 +431,13 @@ func (e *httpEmitter) recordFailure() {
 func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode string, degradation bool) otlpPayload {
 	timeNano := fmt.Sprintf("%d", now.UnixNano())
 
-	// Per-data-point attributes (per-metric, can vary).
+	// Per-data-point attributes (per-metric, can vary). world_size/node_rank
+	// are stable per-agent identity and live on the resource block instead
+	// (see below); placing them only on the resource avoids duplication and
+	// matches OTEL convention for identity-shaped attributes.
 	dpAttrs := []otlpKV{
 		{Key: contract.AttrNodeState, Value: otlpStr(string(state))},
 		{Key: contract.AttrWorkloadType, Value: otlpStr(e.cfg.WorkloadType)},
-	}
-	if e.cfg.WorldSize > 0 {
-		dpAttrs = append(dpAttrs,
-			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
-			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
-		)
 	}
 
 	// Score + per-signal gauges.
@@ -454,13 +468,24 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 	}
 	metrics = append(metrics, intGauge(contract.MetricFleetReachable, timeNano, reachable, nil))
 
+	// v0.11 cost-of-problem support gauges. ingero.node.info lights up
+	// only when the operator has supplied gpu_model / gpu_count (caller
+	// reads them from nvidia-smi at startup); ingero.node.world_size
+	// always emits with the configured value (zero is meaningful — it
+	// signals a non-distributed deployment).
+	if e.cfg.GPUModel != "" && e.cfg.GPUCount > 0 {
+		nodeInfoAttrs := []otlpKV{
+			{Key: contract.AttrGPUModel, Value: otlpStr(e.cfg.GPUModel)},
+			{Key: contract.AttrGPUCount, Value: otlpInt(int64(e.cfg.GPUCount))},
+		}
+		metrics = append(metrics, intGauge(contract.MetricNodeInfo, timeNano, 1, nodeInfoAttrs))
+	}
+	metrics = append(metrics, intGauge(contract.MetricNodeWorldSize, timeNano, int64(e.cfg.WorldSize), nil))
+
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{
 			Resource: otlpResourceBlock{
-				Attributes: []otlpKV{
-					{Key: contract.AttrNodeID, Value: otlpStr(e.cfg.NodeID)},
-					{Key: contract.AttrClusterID, Value: otlpStr(e.cfg.ClusterID)},
-				},
+				Attributes: e.resourceAttrs(),
 			},
 			ScopeMetrics: []otlpScopeMetricsBlock{{
 				Scope:   otlpScopeBlock{Name: "ingero.health", Version: "0.10.0"},
@@ -468,6 +493,25 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 			}},
 		}},
 	}
+}
+
+// resourceAttrs builds the OTLP resource-attribute set carried on every
+// push. Includes the stable per-agent identity (node_id, cluster_id) and
+// optionally world_size + node_rank when configured. The whole list is
+// stable for the lifetime of the emitter; callers may rely on it being
+// identical across consecutive pushes.
+func (e *httpEmitter) resourceAttrs() []otlpKV {
+	attrs := []otlpKV{
+		{Key: contract.AttrNodeID, Value: otlpStr(e.cfg.NodeID)},
+		{Key: contract.AttrClusterID, Value: otlpStr(e.cfg.ClusterID)},
+	}
+	if e.cfg.WorldSize > 0 {
+		attrs = append(attrs,
+			otlpKV{Key: contract.AttrWorldSize, Value: otlpInt(int64(e.cfg.WorldSize))},
+			otlpKV{Key: contract.AttrNodeRank, Value: otlpInt(int64(e.cfg.NodeRank))},
+		)
+	}
+	return attrs
 }
 
 // buildURL normalizes endpoint into a full OTLP/HTTP metrics URL. Accepts:

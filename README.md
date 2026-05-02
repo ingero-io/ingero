@@ -9,19 +9,20 @@
 **Featured in:**
 [awesome-ebpf](https://github.com/qmonnet/awesome-ebpf) ·
 [awesome-observability](https://github.com/adriannovegil/awesome-observability) ·
+[awesome-opentelemetry](https://github.com/magsther/awesome-opentelemetry) ·
 [awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
 [awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
 [awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
 [Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
+[awesome-gpu-engineering](https://github.com/goabiaryan/awesome-gpu-engineering) ·
+[awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) ·
 [awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
 [MCP Registry](https://registry.modelcontextprotocol.io) ·
 [Glama](https://glama.ai/mcp/servers/ingero-io/ingero) ·
 [mcpservers.org](https://mcpservers.org)
 
 <!-- ingero-version:install-header product=ingero channel=stable -->
-**Version: 0.9.2**
-
-**v0.9.2 improvements:** multi-library libcudart discovery, `_Py_DebugOffsets` support for CPython 3.12, configurable ring buffers (`--ringbuf-size`), adaptive sampling (`--sampling-rate`), in-kernel aggregation of `mm_page_alloc`/`sched_switch`, a dedicated critical-events ring buffer (OOM/exec/exit/fork never drop), and an optional in-kernel CPython 3.10/3.11/3.12 frame walker (`--py-walker=ebpf`) that works at `ptrace_scope=3`.
+**Version: 0.11.0**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -31,12 +32,18 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 
 <img src="docs/assets/readme-demo-incident.gif" width="800" alt="ingero demo incident — CPU contention causes GPU latency spike, full causal chain diagnosis with root cause and fix recommendation">
 
-## Quick Start
+## Architecture
+
+<img src="docs/assets/architecture.svg" width="800" alt="Ingero architecture: per-node agent emits OTLP to Fleet collector; Fleet aggregates via ingeroprocessor + providerprocessor; backends are Prometheus, Grafana, MCP clients, and UDS sinks">
+
+The agent runs per-GPU-node and emits OTLP to a single Fleet collector replica (or HA fleet behind a consistent-hash LB). Fleet handles peer-relative threshold + the cost-of-problem enrichment; Prometheus / Grafana / MCP read from Fleet, never the agent. UDS straggler events flow to local sinks (`straggler-sink`, `ingero-alerter`) for remediation.
+
+## Quick Start (Single-node)
 
 ```bash
 # Install (Linux amd64 — see below for arm64/Docker)
 # ingero-version:install-curl product=ingero channel=stable
-VERSION=0.9.2
+VERSION=0.11.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
@@ -54,6 +61,16 @@ ingero explain --since 5m
 No ClickHouse, no PostgreSQL, no MinIO  -  just one statically linked Go binary and embedded SQLite.
 
 See a [real AI investigation session](docs/ml_eng_sample_investigation_session.md)  -  an AI assistant diagnosing GPU training issues on A100 and GH200 using only Ingero's MCP tools. No shell access, no manual SQL  -  just questions and answers.
+
+## Quick Start (Multi-node GPU cluster)
+
+Three multi-node quickstart guides take you from zero to a detected straggler on three GPU hosts in about 20 minutes. Pick the deployment style that matches your environment:
+
+- [Kubernetes (Helm)](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-k8s.md)
+- [Bare-metal binary](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-binary.md)
+- [Docker](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart-docker.md)
+
+See [`docs/quickstart.md`](https://github.com/ingero-io/ingero-fleet/blob/main/docs/quickstart.md) for a one-page comparison if you are not sure which to pick. The cluster-side service that backs these guides is the [Ingero Fleet Collector](#ingero-fleet-collector-cross-node-straggler-detection)  -  see that section below for the architecture.
 
 ## What It Does
 
@@ -190,18 +207,18 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.9.1`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.10.0`):
 
 ```bash
 # Linux amd64
 # ingero-version:install-archive-amd64 product=ingero channel=stable
-VERSION=0.9.2
+VERSION=0.11.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
 # ingero-version:install-archive-arm64 product=ingero channel=stable
-VERSION=0.9.2
+VERSION=0.11.0
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -216,7 +233,7 @@ docker pull ghcr.io/ingero-io/ingero:latest
 
 # Or pin to a specific version
 # ingero-version:docker-pull-example product=ingero channel=stable
-docker pull ghcr.io/ingero-io/ingero:v0.9.2
+docker pull ghcr.io/ingero-io/ingero:v0.11.0
 
 # Quick test (no root, no GPU needed)
 docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
@@ -268,7 +285,7 @@ The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building t
 ```bash
 # ingero-version:docker-build-arg product=ingero channel=stable
 docker build -f deploy/docker/Dockerfile \
-  --build-arg VERSION=0.9.2 \
+  --build-arg VERSION=0.11.0 \
   --build-arg COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
   -t ingero:local .
@@ -354,7 +371,7 @@ sudo ingero trace --sampling-rate 0        # adaptive sampling (default: 1 = emi
 sudo ingero trace --py-walker ebpf         # in-kernel CPython walker (works at ptrace_scope=3)
 ```
 
-**Flag reference (post-v0.9.1 additions):**
+**Flag reference:**
 
 - `--cuda-lib PATH` — Explicit path to `libcudart.so`. Skips auto-discovery. Useful for venv workloads where multiple `libcudart` copies exist.
 - `--ringbuf-size SIZE` — Override ring buffer size for high-throughput probes (cuda, driver, host). Accepts `k`/`m`/`g` suffix. Must be a power of 2, minimum 4096. Default: compiled sizes (8MB cuda/driver, 1MB host).
@@ -610,7 +627,7 @@ ingero demo --no-gpu         # synthetic mode
 
 ```bash
 $ ingero version
-ingero v0.9.1 (commit: 01af280, built: 2026-04-06)
+ingero v0.10.0 (commit: <sha>, built: <date>)
 ```
 
 ## Stack Tracing
@@ -737,6 +754,12 @@ OTLP uses the HTTP JSON transport (`POST /v1/metrics`). Compatible with: OpenTel
 Metrics use OTEL semantic conventions: `gpu.cuda.operation.duration`, `gpu.cuda.operation.count`, `system.cpu.utilization`, `system.memory.utilization`, `ingero.anomaly.count`. Per-operation, per-source granularity.
 
 Zero external dependencies  -  no OTEL SDK import. The JSON payload is constructed directly using Go's standard library.
+
+## Ingero Fleet Collector (Cross-Node Straggler Detection)
+
+Separate from Ingero's built-in multi-node `query --nodes` fan-out (see [`ingero query`](#ingero-query) above), the [Ingero Fleet Collector](https://github.com/ingero-io/ingero-fleet) is a custom OpenTelemetry Collector distribution that computes a cluster-wide straggler threshold from agent-reported health scores and returns it to agents over OTLP response headers.
+
+Use Fleet when you want the cluster itself to classify stragglers in real time, rather than querying ad hoc across nodes after the fact. Agents run the `ingero fleet-push` subcommand alongside `ingero trace --record`; see [`docs/fleet-push.md`](docs/fleet-push.md) for the command reference. To get started, jump to [Quick Start (Multi-node GPU cluster)](#quick-start-multi-node-gpu-cluster) at the top.
 
 ## How It Works
 
@@ -973,7 +996,7 @@ Reference material for power users. The defaults are tuned for typical training 
 
 ## License
 
-**Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home, no paid tiers required.
+**Ingero is 100% free and open source.** Use it for anything  -  personal, commercial, enterprise, embed it in your product, modify it, redistribute it. No usage restrictions, no phone-home.
 
 Dual-licensed following the standard eBPF split-licensing model (same as Cilium, Falco, and most eBPF projects):
 

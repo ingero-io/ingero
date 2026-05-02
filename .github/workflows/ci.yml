@@ -15,9 +15,14 @@ jobs:
     name: Test (Go ${{ matrix.go-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         go-version: ['1.25', '1.26.2']
-        os: [ubuntu-22.04, ubuntu-24.04]
+        # ubuntu-*-arm runners exercise the arm64 _arm64_bpfel.go shims
+        # and the per-arch CO-RE parity test on real aarch64 hardware,
+        # closing the structural test-coverage gap that produced issue
+        # #35 (arm64 release binary shipped x86 CO-RE relocations).
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm]
 
     steps:
       - uses: actions/checkout@v4
@@ -82,3 +87,29 @@ jobs:
 
       - name: Validate ingero-version anchors
         run: python .github/scripts/validate_anchors.py --root .
+
+  bpf-freshness:
+    name: BPF artifacts are fresh
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-14 llvm-14 libbpf-dev libelf-dev linux-tools-generic
+
+      - name: Re-generate BPF artifacts
+        run: make generate
+
+      - name: Assert no drift in internal/ebpf/
+        run: |
+          if ! git diff --exit-code internal/ebpf/; then
+            echo "::error::BPF artifacts in internal/ebpf/ are out of sync with the BPF C sources. Run 'make generate' locally and commit the regenerated *_x86_bpfel.{go,o} and *_arm64_bpfel.{go,o} files."
+            exit 1
+          fi

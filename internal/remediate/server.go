@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/ingero-io/ingero/internal/memtrack"
 	"github.com/ingero-io/ingero/internal/straggler"
 )
@@ -33,6 +35,11 @@ type Server struct {
 	// Per-reason drop counters. Writers hold s.mu while bumping
 	// so readers snapshotting via DroppedByReason don't race.
 	droppedByReason map[DropReason]uint64
+	// rank, worldSize stamp every UDS straggler message with the agent's
+	// distributed-training identity when SetRankWorldSize has been called
+	// (worldSize > 0). Default zero suppresses the fields via omitempty.
+	rank      int
+	worldSize int
 }
 
 // DropReason classifies why a Send* call did not deliver its payload.
@@ -93,6 +100,17 @@ func NewServer(socketPath string) *Server {
 // to 0o770 instead of 0o700. Must be called before Start().
 func (s *Server) SetSocketGid(gid int) {
 	s.socketGid = gid
+}
+
+// SetRankWorldSize stamps every outgoing UDS straggler message with the
+// agent's distributed-training identity. worldSize > 0 enables the
+// stamping (rank must be in [0, worldSize)); worldSize == 0 (the default)
+// leaves the rank/world_size JSON fields absent via omitempty. Should be
+// called before Start, but is safe to call later as long as the caller
+// is single-threaded with respect to Send*.
+func (s *Server) SetRankWorldSize(rank, worldSize int) {
+	s.rank = rank
+	s.worldSize = worldSize
 }
 
 // Start binds the Unix domain socket and begins accepting connections.
@@ -173,8 +191,7 @@ func isClosedError(err error) bool {
 // The "type" field enables the orchestrator to dispatch by message type.
 //
 // v0.10: comm carries the kernel-captured process name. Older orchestrator
-// builds silently ignore unknown JSON fields (Rust serde default behavior,
-// verified — no #[serde(deny_unknown_fields)] in ingero-ee/orchestrator/src/),
+// builds silently ignore unknown JSON fields (Rust serde default behavior),
 // so adding comm is non-breaking on the wire.
 type typedMessage struct {
 	Type           string  `json:"type"`
@@ -232,6 +249,16 @@ type straggleMessage struct {
 	// while sched_switch pressure remains elevated (true). Consumers use
 	// this to gate remediation that only applies once per episode.
 	Sustained bool `json:"sustained"`
+	// EventID is a UUIDv4 generated at SendStraggle time. The cross-layer
+	// detector has no parallel OTLP push today, so the id is local to
+	// the UDS message; consumers that bridge to OTLP downstream can copy
+	// it as `ingero.event.id`.
+	EventID string `json:"event_id,omitempty"`
+	// Rank, WorldSize identify the agent's distributed-training position.
+	// Populated when the Server has been configured via SetRankWorldSize
+	// (worldSize > 0). Absent (omitempty) for non-distributed deployments.
+	Rank      int `json:"rank,omitempty"`
+	WorldSize int `json:"world_size,omitempty"`
 }
 
 // SendStraggle serializes a StraggleState as NDJSON with type "straggle" and
@@ -256,6 +283,11 @@ func (s *Server) SendStraggle(ss straggler.StraggleState) error {
 		PreemptingPIDs:    ss.PreemptingPIDs,
 		TimestampNs:       ss.TimestampNs,
 		Sustained:         ss.Sustained,
+		EventID:           uuid.NewString(),
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
 	}
 	return s.writeLocked(msg)
 }
@@ -272,6 +304,14 @@ type fleetStragglerStateMessage struct {
 	DetectionMode  string    `json:"detection_mode"`
 	DominantSignal string    `json:"dominant_signal"`
 	Timestamp      time.Time `json:"timestamp"`
+	// EventID is the agent-generated UUIDv4 for this detection event;
+	// the same value appears on the matching OTLP push as the
+	// `ingero.event.id` data-point attribute. Consumers correlate the
+	// two channels by this id.
+	EventID string `json:"event_id,omitempty"`
+	// Rank, WorldSize: see straggleMessage.
+	Rank      int `json:"rank,omitempty"`
+	WorldSize int `json:"world_size,omitempty"`
 }
 
 // fleetStragglerResolvedMessage marks the straggler->healthy transition.
@@ -280,14 +320,20 @@ type fleetStragglerResolvedMessage struct {
 	NodeID    string    `json:"node_id"`
 	ClusterID string    `json:"cluster_id"`
 	Timestamp time.Time `json:"timestamp"`
+	// EventID, Rank, WorldSize: see fleetStragglerStateMessage.
+	EventID   string `json:"event_id,omitempty"`
+	Rank      int    `json:"rank,omitempty"`
+	WorldSize int    `json:"world_size,omitempty"`
 }
 
 // SendFleetStragglerState writes a peer-relative straggler notification
 // to the UDS consumer. Non-blocking: drops silently if no consumer is
 // connected or the write exceeds 50ms. Wire format follows the existing
 // typed-message convention ("type" field first for cheap discrimination
-// on the consumer side).
-func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detectionMode, dominantSignal string, score, threshold float64) error {
+// on the consumer side). eventID, when non-empty, is written as the
+// `event_id` JSON field and matches the `ingero.event.id` attribute on
+// the parallel OTLP push for the same detection event.
+func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detectionMode, dominantSignal, eventID string, score, threshold float64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -305,13 +351,20 @@ func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detect
 		DetectionMode:  detectionMode,
 		DominantSignal: dominantSignal,
 		Timestamp:      ts,
+		EventID:        eventID,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
 	}
 	return s.writeLocked(msg)
 }
 
 // SendFleetStragglerResolved writes a straggler->healthy edge
 // notification. Same non-blocking semantics as SendFleetStragglerState.
-func (s *Server) SendFleetStragglerResolved(ts time.Time, nodeID, clusterID string) error {
+// eventID is per-recovery-edge; consumers may correlate it with the OTLP
+// data-point attribute on the matching push.
+func (s *Server) SendFleetStragglerResolved(ts time.Time, nodeID, clusterID, eventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -325,6 +378,11 @@ func (s *Server) SendFleetStragglerResolved(ts time.Time, nodeID, clusterID stri
 		NodeID:    nodeID,
 		ClusterID: clusterID,
 		Timestamp: ts,
+		EventID:   eventID,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
 	}
 	return s.writeLocked(msg)
 }

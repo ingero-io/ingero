@@ -1,0 +1,44 @@
+[Unit]
+Description=Ingero Alerter - dispatches straggler events to Slack/PagerDuty
+After=network-online.target ingero.service
+Wants=network-online.target
+# Only start once the agent has had a chance to bind the UDS socket;
+# the alerter's own retry loop handles late-binding cases.
+PartOf=ingero.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ingero-alerter --config /etc/ingero-alerter/config.json
+Restart=always
+RestartSec=5s
+# Run as the same group that the agent's UDS socket is chowned to
+# (chmod 0770). Default 65532 matches the agent's `--remediate-gid`
+# default (distroless 'nonroot').
+User=ingero-alerter
+Group=65532
+SupplementaryGroups=65532
+
+# Hardening: alerter is a userland HTTP client + UDS reader; it
+# does not need bind capabilities, raw sockets, or privileged
+# filesystem access.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+
+# Read-write access to the alerter's config dir only.
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

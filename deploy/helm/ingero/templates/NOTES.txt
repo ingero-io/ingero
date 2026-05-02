@@ -37,8 +37,7 @@ Remediation sink sidecar is ENABLED.
 
 WARNING: fleetPush.remediation.tmpVolumeType=hostPath mounts the node's
 real /tmp into this DaemonSet. Only use this mode when a separately-
-deployed orchestrator pod (e.g. the ingero-ee chart) needs to see the
-same socket file. The node's /tmp is then shared with every other
-container that also mounts it.
+deployed orchestrator pod needs to see the same socket file. The node's
+/tmp is then shared with every other container that also mounts it.
 {{- end }}
 {{- end }}

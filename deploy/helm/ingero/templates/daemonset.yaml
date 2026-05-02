@@ -221,9 +221,9 @@ spec:
         - name: remediate-sock
         {{- if eq .Values.fleetPush.remediation.tmpVolumeType "hostPath" }}
           # Pod-external volume so a separately-deployed orchestrator
-          # (e.g. ingero-ee chart) running in a different pod on the same
-          # node sees the same socket file. NOTE: this exposes the node's
-          # real /tmp to every container that mounts it.
+          # running in a different pod on the same node sees the same
+          # socket file. NOTE: this exposes the node's real /tmp to every
+          # container that mounts it.
           hostPath:
             path: /tmp
             type: Directory

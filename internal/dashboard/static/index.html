@@ -647,33 +647,6 @@
       }
       s += '</div>'; // sub-panel
 
-      // Right: Cluster Map (grayed)
-      s += '<div class="sub-panel">';
-      s += wrapGrayed('cluster_map', function() {
-        var cm = '';
-        cm += '<div class="section-hdr" style="margin-bottom:10px;">CLUSTER &mdash; MULTI-NODE GPU MAP</div>';
-        // Fake node tabs
-        cm += '<div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:8px;">';
-        for (var n = 0; n < 4; n++) {
-          cm += '<div style="flex:1;padding:6px 4px;text-align:center;font-family:var(--font-mono);">';
-          cm += '<div style="font-size:8px;color:var(--text-muted);">N' + n + '</div>';
-          cm += '<div style="font-size:12px;font-weight:700;color:var(--text-muted);">-</div>';
-          cm += '</div>';
-        }
-        cm += '</div>';
-        // Fake GPU grid
-        cm += '<div class="cluster-gpus">';
-        for (var g = 0; g < 8; g++) {
-          cm += '<div class="cluster-gpu">';
-          cm += '<div class="cluster-gpu-bar" style="height:20px;background:rgba(85,93,116,0.1);border:1px solid rgba(85,93,116,0.3);color:var(--text-muted);">-</div>';
-          cm += '<span class="cluster-gpu-lbl">GPU:' + g + '</span>';
-          cm += '</div>';
-        }
-        cm += '</div>';
-        return cm;
-      }());
-      s += '</div>'; // sub-panel
-
       s += '</div>'; // grid-resp-2-3
 
       // Infra sensors row

@@ -6,19 +6,17 @@ version token on the line following each matching anchor.
 
 Anchor format:
     Markdown HTML (outside code blocks, truly invisible):
-        <!-- ingero-version:<id> product=<name> channel=<stable|dev> -->
+        <!-- ingero-version:<id> product=<name> channel=<stable> -->
     Markdown shell-comment (inside ```bash code blocks, valid bash comment):
-        # ingero-version:<id> product=<name> channel=<stable|dev>
+        # ingero-version:<id> product=<name> channel=<stable>
     YAML (same syntax as shell-comment):
-        # ingero-version:<id> product=<name> channel=<stable|dev>
+        # ingero-version:<id> product=<name> channel=<stable>
 
 The first line within MAX_LOOKAHEAD lines after the anchor that contains
 a version-shaped substring (v?X.Y.Z or v?X.Y.Z-suffix) is the target.
 The first such substring on that line is replaced with the target version.
-The leading 'v' prefix is preserved from the existing pin.
-
-For channel=dev, target gets -dev appended (e.g. 0.10.0 -> 0.10.0-dev).
-For channel=stable, any -suffix is stripped.
+The leading 'v' prefix is preserved from the existing pin. Any -suffix
+on the supplied tag is stripped before rewriting.
 
 Only anchors whose product= matches --product AND whose channel= matches
 --channel are rewritten. Other anchors are left untouched.
@@ -33,8 +31,8 @@ import re
 import sys
 from pathlib import Path
 
-VALID_PRODUCTS = {"ingero", "ingero-fleet", "ingero-ee"}
-VALID_CHANNELS = {"stable", "dev"}
+VALID_PRODUCTS = {"ingero", "ingero-fleet"}
+VALID_CHANNELS = {"stable"}
 
 ANCHOR_MD = re.compile(
     r"<!--\s*ingero-version:(?P<id>[\w.-]+)\s+(?P<attrs>.*?)\s*-->"
@@ -103,8 +101,7 @@ def iter_files(root: Path):
 def target_version(channel: str, tag: str) -> str:
     """Normalize tag to the version string written into files."""
     ver = tag.lstrip("v")
-    base = ver.split("-", 1)[0]
-    return f"{base}-dev" if channel == "dev" else base
+    return ver.split("-", 1)[0]
 
 
 def rewrite_file(

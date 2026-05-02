@@ -3,11 +3,14 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -309,7 +312,11 @@ func TestPush_DetectionModeAttribute(t *testing.T) {
 	}
 }
 
-// AC3: world_size and node_rank attach when WorldSize > 0.
+// AC3: world_size and node_rank attach as RESOURCE attributes (stable
+// per-agent identity, not per-data-point) when WorldSize > 0. v0.11
+// moves these from data-point attrs to resource attrs to follow OTEL
+// convention for identity-shaped attributes; consumers that read
+// resource scope inherit them on every metric automatically.
 func TestPush_OptionalWorldSizeAttrs(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)
 	cfg := baseEmitterCfg(rs.server.URL)
@@ -318,10 +325,169 @@ func TestPush_OptionalWorldSizeAttrs(t *testing.T) {
 	e, _ := NewEmitter(cfg, nil)
 	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
 	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) != 1 {
+		t.Fatalf("want 1 resourceMetrics block, got %d", len(p.ResourceMetrics))
+	}
+	rm := p.ResourceMetrics[0]
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrWorldSize, 8)
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrNodeRank, 3)
+
+	// Verify they're NOT on data-points (the old, deprecated location).
 	m := findMetric(t, p, contract.MetricHealthScore)
 	dp := m.Gauge.DataPoints[0]
-	assertAttrInt(t, dp.Attributes, contract.AttrWorldSize, 8)
-	assertAttrInt(t, dp.Attributes, contract.AttrNodeRank, 3)
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrWorldSize || kv.Key == contract.AttrNodeRank {
+			t.Errorf("attr %q must not appear on data-point in v0.11 (resource-only)", kv.Key)
+		}
+	}
+}
+
+// world_size/node_rank must be ABSENT from the resource block when
+// WorldSize is 0 (the default for non-distributed deployments).
+func TestPush_NoWorldSizeAttrsWhenZero(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	// cfg.WorldSize stays 0
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+	rm := p.ResourceMetrics[0]
+	for _, kv := range rm.Resource.Attributes {
+		if kv.Key == contract.AttrWorldSize || kv.Key == contract.AttrNodeRank {
+			t.Errorf("attr %q must not appear when WorldSize=0", kv.Key)
+		}
+	}
+}
+
+// EmitStragglerEvent must also carry world_size/node_rank on the
+// resource block when configured (per-agent identity is consistent
+// across the regular push and the straggler-edge push).
+func TestEmitStragglerEvent_ResourceCarriesRankWorldSize(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	cfg.WorldSize = 4
+	cfg.NodeRank = 1
+	e, _ := NewEmitter(cfg, nil)
+	ev := StragglerEvent{
+		NodeID:         "test-node",
+		ClusterID:      "test-cluster",
+		Score:          0.42,
+		Threshold:      0.6,
+		DetectionMode:  "fleet",
+		DominantSignal: "throughput",
+		Timestamp:      emitterNow,
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) != 1 {
+		t.Fatalf("want 1 resourceMetrics block, got %d", len(p.ResourceMetrics))
+	}
+	rm := p.ResourceMetrics[0]
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrWorldSize, 4)
+	assertAttrInt(t, rm.Resource.Attributes, contract.AttrNodeRank, 1)
+}
+
+// v0.11 cost-of-problem support gauges: ingero.node.info (gpu_model +
+// gpu_count attrs) appears when both fields are configured;
+// ingero.node.world_size always emits with the configured value.
+func TestPush_CostGaugesEmittedWhenConfigured(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	cfg.GPUModel = "NVIDIA GH200 480GB"
+	cfg.GPUCount = 1
+	cfg.WorldSize = 8
+	cfg.NodeRank = 3
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+
+	info := findMetric(t, p, contract.MetricNodeInfo)
+	if info.Gauge == nil || len(info.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeInfo missing or has wrong shape")
+	}
+	if info.Gauge.DataPoints[0].AsInt == nil || *info.Gauge.DataPoints[0].AsInt != 1 {
+		t.Errorf("MetricNodeInfo value should be 1; got %+v", info.Gauge.DataPoints[0])
+	}
+	assertAttr(t, info.Gauge.DataPoints[0].Attributes, contract.AttrGPUModel, "NVIDIA GH200 480GB")
+	assertAttrInt(t, info.Gauge.DataPoints[0].Attributes, contract.AttrGPUCount, 1)
+
+	ws := findMetric(t, p, contract.MetricNodeWorldSize)
+	if ws.Gauge == nil || len(ws.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeWorldSize missing or has wrong shape")
+	}
+	if ws.Gauge.DataPoints[0].AsInt == nil || *ws.Gauge.DataPoints[0].AsInt != 8 {
+		t.Errorf("MetricNodeWorldSize value should be 8; got %+v", ws.Gauge.DataPoints[0])
+	}
+}
+
+// ingero.node.info is suppressed when the operator does not pass
+// gpu_model / gpu_count (e.g. no nvidia-smi in the environment).
+// ingero.node.world_size still emits with value=0 to make the absence
+// of distributed-training affirmative on the wire.
+func TestPush_CostGauges_NodeInfoOmittedWithoutGPU(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	// GPUModel + GPUCount left zero
+	e, _ := NewEmitter(cfg, nil)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	p := rs.decodeLast(t)
+	if len(p.ResourceMetrics) == 0 {
+		t.Fatal("no resource metrics")
+	}
+	for _, m := range p.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if m.Name == contract.MetricNodeInfo {
+			t.Errorf("MetricNodeInfo must be omitted when GPUModel/GPUCount are unset")
+		}
+	}
+	// world_size always emits, even at zero.
+	ws := findMetric(t, p, contract.MetricNodeWorldSize)
+	if ws.Gauge == nil || len(ws.Gauge.DataPoints) != 1 {
+		t.Fatalf("MetricNodeWorldSize missing")
+	}
+	if ws.Gauge.DataPoints[0].AsInt == nil || *ws.Gauge.DataPoints[0].AsInt != 0 {
+		t.Errorf("MetricNodeWorldSize value should be 0 when not distributed; got %+v", ws.Gauge.DataPoints[0])
+	}
+}
+
+// EmitStragglerEvent attaches the per-event UUID as the
+// `ingero.event.id` data-point attribute so consumers correlate the
+// OTLP push with the parallel UDS message.
+func TestEmitStragglerEvent_AttachesEventID(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	ev := StragglerEvent{
+		NodeID:    "test-node",
+		ClusterID: "test-cluster",
+		Score:     0.42,
+		Threshold: 0.6,
+		Timestamp: emitterNow,
+		EventID:   "00000000-0000-0000-0000-000000000abc",
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricStragglerEvent)
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrEventID, ev.EventID)
+}
+
+// EventID attribute is omitted when StragglerEvent.EventID is empty.
+func TestEmitStragglerEvent_OmitsEmptyEventID(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
+	ev := StragglerEvent{
+		NodeID:    "test-node",
+		ClusterID: "test-cluster",
+		Timestamp: emitterNow,
+	}
+	_ = e.EmitStragglerEvent(context.Background(), ev, true)
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricStragglerEvent)
+	dp := m.Gauge.DataPoints[0]
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrEventID {
+			t.Errorf("AttrEventID must be absent when EventID is empty")
+		}
+	}
 }
 
 // AC7: consecutive failures flip FleetReachable to false at threshold,
@@ -774,5 +940,175 @@ func TestPush_BlackholeDialRespectsTimeout(t *testing.T) {
 	// (retry) + 500ms slack.
 	if elapsed > 5*time.Second {
 		t.Errorf("push elapsed %s > 5s budget; dialer timeout drift?", elapsed)
+	}
+}
+
+// ============================================================================
+// Multi-replica failover tests (added 2026-04-26)
+// ============================================================================
+//
+// These tests cover Fleet pod selection / failover behavior in multi-replica
+// deployments. They use a test-only http.RoundTripper injected into the
+// emitter's http.Client to simulate multi-backend routing without depending
+// on a custom net.Resolver. See `ingero-fleet/docs/ARCHITECTURE.md`
+// "Multi-replica behavior" section for the public design context.
+
+// failoverRT is a test RoundTripper: fails the first request (simulating a
+// dead Fleet pod) and forwards every subsequent request to the fallback URL.
+type failoverRT struct {
+	fallbackURL string
+	callCount   int32
+}
+
+func (r *failoverRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	n := atomic.AddInt32(&r.callCount, 1)
+	if n == 1 {
+		return nil, &net.OpError{Op: "dial", Err: errors.New("connection refused (simulated)")}
+	}
+	u, err := url.Parse(r.fallbackURL)
+	if err != nil {
+		return nil, err
+	}
+	newReq := req.Clone(req.Context())
+	newReq.URL.Scheme = u.Scheme
+	newReq.URL.Host = u.Host
+	return http.DefaultTransport.RoundTrip(newReq)
+}
+
+// randomBackendRT is a test RoundTripper: picks one of two backends at
+// random for each request and tracks per-backend hit counts.
+type randomBackendRT struct {
+	serverA, serverB *httptest.Server
+	mu               sync.Mutex
+	rng              *rand.Rand
+	countA, countB   int32
+}
+
+func (r *randomBackendRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	pick := r.rng.Intn(2)
+	r.mu.Unlock()
+
+	var target string
+	if pick == 0 {
+		target = r.serverA.URL
+		atomic.AddInt32(&r.countA, 1)
+	} else {
+		target = r.serverB.URL
+		atomic.AddInt32(&r.countB, 1)
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	newReq := req.Clone(req.Context())
+	newReq.URL.Scheme = u.Scheme
+	newReq.URL.Host = u.Host
+	return http.DefaultTransport.RoundTrip(newReq)
+}
+
+// TestPush_RedialAfterFailure_PicksFreshBackend verifies that on a network
+// error to one backend, the emitter's retry triggers a fresh RoundTrip
+// (which a real http.Transport would back with a fresh DNS lookup), and
+// the second attempt succeeds against the fallback backend.
+func TestPush_RedialAfterFailure_PicksFreshBackend(t *testing.T) {
+	var fallbackHits int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fallbackHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fallback.Close()
+
+	rt := &failoverRT{fallbackURL: fallback.URL}
+
+	cfg := baseEmitterCfg(fallback.URL)
+	cfg.Timeout = 500 * time.Millisecond
+	e, err := NewEmitter(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	e.(*httpEmitter).client.Transport = rt
+
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+		t.Fatalf("push should have succeeded after retry: %v", err)
+	}
+	if calls := atomic.LoadInt32(&rt.callCount); calls != 2 {
+		t.Errorf("expected 2 RoundTrip calls (initial fail + retry succeed), got %d", calls)
+	}
+	if hits := atomic.LoadInt32(&fallbackHits); hits != 1 {
+		t.Errorf("expected fallback to receive 1 successful request, got %d", hits)
+	}
+}
+
+// TestPush_ManyAgentInstances_DistributeAcrossBackends verifies that when
+// N emitter instances each push once via a randomly-routing RoundTripper,
+// hits distribute roughly uniformly across backends. Models the "50 agents,
+// 2 Fleet pods, ~25/25 split" property.
+//
+// Tolerance: with N=50 and p=0.5, stddev is ~3.5; we accept any split
+// within [10, 40] (well outside any plausible variance).
+func TestPush_ManyAgentInstances_DistributeAcrossBackends(t *testing.T) {
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer serverB.Close()
+
+	rt := &randomBackendRT{
+		serverA: serverA,
+		serverB: serverB,
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+
+	cfg := baseEmitterCfg(serverA.URL)
+
+	const N = 50
+	for i := 0; i < N; i++ {
+		e, err := NewEmitter(cfg, nil)
+		if err != nil {
+			t.Fatalf("NewEmitter %d: %v", i, err)
+		}
+		e.(*httpEmitter).client.Transport = rt
+		if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+			t.Errorf("push %d: %v", i, err)
+		}
+	}
+
+	a := atomic.LoadInt32(&rt.countA)
+	b := atomic.LoadInt32(&rt.countB)
+	if a+b != N {
+		t.Errorf("expected %d total pushes across backends, got A=%d B=%d (sum %d)", N, a, b, a+b)
+	}
+	if a < 10 || a > 40 {
+		t.Errorf("distribution skewed: A=%d B=%d (expected ~25/25, accepting [10,40] each)", a, b)
+	}
+}
+
+// TestEmitterTransport_HasStickyConnectionConfig verifies that the emitter's
+// HTTP transport is configured for connection-pool stickiness: one idle
+// connection per host with a 30s idle timeout. With 10s push intervals these
+// settings keep the agent bound to one Fleet pod in steady state, which is
+// the design intent for multi-replica HA without an L7 LB. Connection-level
+// stickiness itself can't be exercised through a custom RoundTripper (it
+// lives in *http.Transport's pool), so this is a configuration-validation
+// test.
+func TestEmitterTransport_HasStickyConnectionConfig(t *testing.T) {
+	cfg := baseEmitterCfg("http://127.0.0.1:9999")
+	e, err := NewEmitter(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	transport, ok := e.(*httpEmitter).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", e.(*httpEmitter).client.Transport)
+	}
+	if transport.MaxIdleConnsPerHost != 1 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 1 (sticky pool behavior)", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 30s", transport.IdleConnTimeout)
 	}
 }

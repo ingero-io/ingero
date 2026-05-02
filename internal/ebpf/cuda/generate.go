@@ -1,6 +1,8 @@
 // Package cuda manages eBPF uprobes for CUDA Runtime API tracing.
 package cuda
 
-// BPF_TARGET_ARCH is set by the Makefile (x86 or arm64) via: make generate
-// Do not run 'go generate' directly — use 'make generate' which auto-detects the architecture.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-14 -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_$BPF_TARGET_ARCH -I../../../bpf/headers -I../../../bpf" -target bpfel -type cuda_event cudaTrace ../../../bpf/cuda_trace.bpf.c
+// bpf2go compiles once per target arch (amd64, arm64) and injects the
+// matching -D__TARGET_ARCH_<arch> automatically; the per-arch .o files
+// are selected at Go build time via build constraints in the generated
+// _<arch>_bpfel.go shims.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-14 -cflags "-O2 -g -Wall -Werror -I../../../bpf/headers -I../../../bpf" -target amd64,arm64 -type cuda_event cudaTrace ../../../bpf/cuda_trace.bpf.c

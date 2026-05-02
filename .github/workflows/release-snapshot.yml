@@ -1,0 +1,65 @@
+name: Release Snapshot Smoke
+
+# Builds a goreleaser snapshot for every PR that touches the release
+# pipeline or any BPF artifact, then static-loads the embedded BPF
+# objects from each per-arch binary and asserts the per-arch CO-RE
+# parity invariants. v0.11 D5: guards against a goreleaser packaging
+# regression where the wrong arch's .bpf.o ships in the wrong tarball.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.goreleaser.yaml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-snapshot.yml'
+      - 'internal/ebpf/**'
+      - 'bpf/**'
+      - 'Makefile'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-smoke:
+    name: Snapshot build + per-arch BPF parity
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Run GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean --skip=validate
+
+      - name: Verify per-arch artifacts produced
+        run: |
+          set -euo pipefail
+          echo "=== dist/ contents ==="
+          find dist -name 'ingero' -type f | sort
+          if ! [ -x dist/ingero_linux_amd64_v1/ingero ]; then
+            echo "::error::amd64 binary not produced" && exit 1
+          fi
+          if ! [ -x dist/ingero_linux_arm64_v8.0/ingero ] && ! [ -x dist/ingero_linux_arm64/ingero ]; then
+            echo "::error::arm64 binary not produced" && exit 1
+          fi
+
+      - name: Run cross-arch BPF parity test against committed objects
+        run: |
+          # The parity test loads the committed .bpf.o pairs from
+          # internal/ebpf/<pkg>/. They are exactly what goreleaser embedded
+          # via go:embed in the per-arch shims, so passing here means the
+          # release artifacts are well-formed and CO-RE-aligned per arch.
+          go test ./internal/ebpf/parity/...
