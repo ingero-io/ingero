@@ -74,7 +74,7 @@ PYEOF
 
 echo
 echo "--- v0.10.1 T2-T3: trace --debug --duration 30s ---"
-$PYTHON /tmp/long_workload.py > /tmp/wl.out 2>&1 &
+"$PYTHON" /tmp/long_workload.py > /tmp/wl.out 2>&1 &
 WL=$!
 sleep 3
 sudo ./bin/ingero trace --debug --pid "$WL" --duration 30s --json \
@@ -123,7 +123,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('127.0.0.1', $PORT), H).serve_forever()
 PYEOF
 
-$PYTHON /tmp/otlp_capture.py > "$VAL_DIR/04-otlp-bodies.ndjson" 2>&1 &
+"$PYTHON" /tmp/otlp_capture.py > "$VAL_DIR/04-otlp-bodies.ndjson" 2>&1 &
 CAP_PID=$!
 sleep 1
 
@@ -290,7 +290,7 @@ fi
 
 echo
 echo "--- v0.12 N4: ingero trace --nccl probe attach ---"
-$PYTHON /tmp/long_workload.py > /tmp/wl-nccl.out 2>&1 &
+"$PYTHON" /tmp/long_workload.py > /tmp/wl-nccl.out 2>&1 &
 WL2=$!
 sleep 3
 sudo ./bin/ingero trace --nccl --debug --pid "$WL2" --duration 5s --json \
@@ -328,9 +328,9 @@ echo "--- v0.12.2 N5: 2-rank torchrun all-reduce emits nranks=2 + comm_id_hash -
 GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "$GPU_COUNT" -lt 2 ]; then
     warn "v0.12.2 N5: only $GPU_COUNT GPU(s); single-GPU box, skipping multi-rank assertion"
-elif ! $PYTHON -c "import torch.distributed" 2>/dev/null; then
+elif ! "$PYTHON" -c "import torch.distributed" 2>/dev/null; then
     warn "v0.12.2 N5: torch.distributed not importable; skipping"
-elif ! command -v torchrun >/dev/null 2>&1 && ! $PYTHON -m torch.distributed.run --help >/dev/null 2>&1; then
+elif ! command -v torchrun >/dev/null 2>&1 && ! "$PYTHON" -m torch.distributed.run --help >/dev/null 2>&1; then
     warn "v0.12.2 N5: torchrun unavailable; skipping"
 else
     cat > /tmp/nccl_2rank.py <<'PYEOF'

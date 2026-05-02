@@ -268,28 +268,29 @@ func setupNCCLTracer(p ncclSetupParams) (*ncclprobe.Tracer, int) {
 		p.debugf("nccl: no libnccl-bearing object found; skipping")
 		return nil, 0
 	}
+	// v0.12.2 (LHF #7 + Arch ★3 attach race): when --pid is set, scope
+	// the NCCL probe to just those PIDs. The filter is passed *into*
+	// Attach so that the BPF map is populated BEFORE the first uprobe
+	// goes live; otherwise there is a window where a sibling tenant's
+	// NCCL events would leak into our ringbuf. Without explicit --pid
+	// the probe traces system-wide (matching the other tracers).
+	var filterPIDs []uint32
+	if p.explicitPIDs {
+		for _, pid := range p.targetPIDs {
+			if pid > 0 {
+				filterPIDs = append(filterPIDs, uint32(pid))
+			}
+		}
+	}
 	nt := ncclprobe.New(libPath)
-	if err := nt.Attach(); err != nil {
+	if err := nt.Attach(filterPIDs...); err != nil {
 		fmt.Fprintf(p.stderr, "  Warning: NCCL tracing unavailable: %v\n", err)
 		p.debugf("nccl tracer: attach failed: %v", err)
 		return nil, 0
 	}
 	const probeCount = 16 // 8 collectives x (uprobe + uretprobe)
-	// v0.12.2 (LHF #7): when --pid is set, scope the NCCL probe to just
-	// those PIDs. Without an explicit --pid the probe traces system-wide
-	// (matching the other tracers). Multi-tenant deployments should
-	// always pass --pid.
-	if p.explicitPIDs {
-		for _, pid := range p.targetPIDs {
-			if pid > 0 {
-				if err := nt.SetTargetPID(uint32(pid)); err != nil {
-					fmt.Fprintf(p.stderr, "  Warning: NCCL PID filter (pid=%d): %v\n", pid, err)
-				}
-			}
-		}
-	}
 	fmt.Fprintf(p.stderr, "  NCCL tracing: attached %d probes to %s\n", probeCount, libPath)
-	p.debugf("nccl tracer: %d probes attached at %s", probeCount, libPath)
+	p.debugf("nccl tracer: %d probes attached at %s (filter pids=%v)", probeCount, libPath, filterPIDs)
 	return nt, probeCount
 }
 

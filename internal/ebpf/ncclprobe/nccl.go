@@ -86,14 +86,29 @@ func (t *Tracer) Events() <-chan Event { return t.eventCh }
 func (t *Tracer) Dropped() uint64 { return t.dropped.Load() }
 
 // Attach loads the BPF program and wires uprobe / uretprobe pairs onto
-// each NCCL symbol. Caller must Close() to detach.
-func (t *Tracer) Attach() error {
+// each NCCL symbol. If targetPIDs is non-empty, the per-PID filter is
+// installed BEFORE the first uprobe attaches, eliminating the race
+// window where probes would briefly trace system-wide. Pass nil for
+// system-wide tracing. Caller must Close() to detach.
+//
+// v0.12.2 (Arch audit ★3 attach race): pre-population is the only way
+// to guarantee the first NCCL event seen by the kernel respects the
+// filter; runtime SetTargetPID still works but cannot retroactively
+// drop events fired during the gap between uprobe attach and map write.
+func (t *Tracer) Attach(targetPIDs ...uint32) error {
 	spec, err := loadNcclTrace()
 	if err != nil {
 		return fmt.Errorf("loading eBPF spec: %w", err)
 	}
 	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("LoadAndAssign: %w", err)
+	}
+
+	if len(targetPIDs) > 0 {
+		if err := t.installPIDFilterLocked(targetPIDs); err != nil {
+			t.objs.Close()
+			return fmt.Errorf("install PID filter: %w", err)
+		}
 	}
 
 	exec, err := link.OpenExecutable(t.libPath)
@@ -419,6 +434,12 @@ func (t *Tracer) SetTargetPID(pid uint32) error {
 // ClearTargetPIDs empties the filter map, returning the probe to
 // system-wide tracing. Useful for tests and for `--nccl` invocations
 // without an explicit --pid.
+//
+// v0.12.2 (Sec audit ★3): propagate Delete errors. A partial clear
+// (sentinel deleted, but a real PID stuck) leaves the map in a
+// "filter on, allowed-PID set wrong" state; ENOENT-style races are
+// rare here because we iterated to collect the keys, but a returned
+// error tells the caller the filter state is inconsistent.
 func (t *Tracer) ClearTargetPIDs() error {
 	// Iterate by lookup-and-delete. The map is small (max 256), so this
 	// is a couple-iteration linear pass.
@@ -430,7 +451,29 @@ func (t *Tracer) ClearTargetPIDs() error {
 		keys = append(keys, key)
 	}
 	for _, k := range keys {
-		_ = t.objs.NcclTargetPids.Delete(k)
+		if err := t.objs.NcclTargetPids.Delete(k); err != nil {
+			return fmt.Errorf("nccl_target_pids delete[%d]: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// installPIDFilterLocked writes the sentinel + every non-zero PID into
+// the filter map. Must be called BEFORE Attach wires uprobes; that's
+// the only race-free moment to seed the filter. Helper for the Attach
+// pre-population path.
+func (t *Tracer) installPIDFilterLocked(pids []uint32) error {
+	one := uint8(1)
+	if err := t.objs.NcclTargetPids.Update(uint32(0), one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("nccl_target_pids sentinel: %w", err)
+	}
+	for _, pid := range pids {
+		if pid == 0 {
+			continue
+		}
+		if err := t.objs.NcclTargetPids.Update(pid, one, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("nccl_target_pids[%d]: %w", pid, err)
+		}
 	}
 	return nil
 }
