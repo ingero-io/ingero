@@ -59,14 +59,15 @@ const EventSize = 104
 // Tracer attaches uprobes/uretprobes to NCCL collective functions and
 // streams parsed Events on its output channel.
 type Tracer struct {
-	libPath  string
-	objs     ncclTraceObjects
-	links    []link.Link
-	reader   *ringbuf.Reader
-	eventCh  chan Event
-	dropped  atomic.Uint64
-	parseErr atomic.Uint64
-	closed   atomic.Bool
+	libPath      string
+	objs         ncclTraceObjects
+	links        []link.Link
+	reader       *ringbuf.Reader
+	eventCh      chan Event
+	dropped      atomic.Uint64
+	parseErr     atomic.Uint64
+	closed       atomic.Bool
+	attachedSyms int // populated by Attach: count of NCCL symbols that resolved + attached
 }
 
 // New constructs a tracer for the given libnccl-bearing shared object.
@@ -82,20 +83,32 @@ func New(libPath string) *Tracer {
 // Events returns the read-side channel.
 func (t *Tracer) Events() <-chan Event { return t.eventCh }
 
+// AttachedProbeCount returns the number of uprobe/uretprobe links the
+// tracer has live. Each NCCL symbol that resolves contributes 2 probes
+// (entry + return). v0.12.3 (Sys Arch ★1): callers (CLI banner,
+// hardware validation) need the truth value rather than a hardcoded
+// constant, because older NCCL builds may not export every symbol the
+// agent looks for and silently attach fewer probes.
+func (t *Tracer) AttachedProbeCount() int { return t.attachedSyms * 2 }
+
 // Dropped returns the count of events dropped due to a full Go-side channel.
 func (t *Tracer) Dropped() uint64 { return t.dropped.Load() }
 
 // Attach loads the BPF program and wires uprobe / uretprobe pairs onto
-// each NCCL symbol. If targetPIDs is non-empty, the per-PID filter is
-// installed BEFORE the first uprobe attaches, eliminating the race
-// window where probes would briefly trace system-wide. Pass nil for
-// system-wide tracing. Caller must Close() to detach.
+// each NCCL symbol. Pass nil for system-wide tracing or a non-nil
+// slice (even empty) to install the per-tenant PID filter; the filter
+// goes in BEFORE the first uprobe attaches, eliminating the race where
+// probes would briefly trace system-wide. Caller must Close() to detach.
 //
 // v0.12.2 (Arch audit ★3 attach race): pre-population is the only way
 // to guarantee the first NCCL event seen by the kernel respects the
 // filter; runtime SetTargetPID still works but cannot retroactively
 // drop events fired during the gap between uprobe attach and map write.
-func (t *Tracer) Attach(targetPIDs ...uint32) error {
+//
+// v0.12.3 (Sys Arch ★4): explicit slice parameter replaces the variadic
+// signature so callers can't accidentally Attach() with no args and get
+// system-wide tracing when they meant filtered.
+func (t *Tracer) Attach(targetPIDs []uint32) error {
 	spec, err := loadNcclTrace()
 	if err != nil {
 		return fmt.Errorf("loading eBPF spec: %w", err)
@@ -105,7 +118,7 @@ func (t *Tracer) Attach(targetPIDs ...uint32) error {
 	}
 
 	if len(targetPIDs) > 0 {
-		if err := t.installPIDFilterLocked(targetPIDs); err != nil {
+		if err := t.installPIDFilter(targetPIDs); err != nil {
 			t.objs.Close()
 			return fmt.Errorf("install PID filter: %w", err)
 		}
@@ -124,6 +137,8 @@ func (t *Tracer) Attach(targetPIDs ...uint32) error {
 	}
 	probes := []probeDef{
 		{"ncclCommInitRank", t.objs.UprobeNcclCommInitRank, t.objs.UretprobeNcclCommInitRank},
+		// v0.12.3 (deferred from v0.12.1): single-process multi-GPU init.
+		{"ncclCommInitAll", t.objs.UprobeNcclCommInitAll, t.objs.UretprobeNcclCommInitAll},
 		{"ncclCommDestroy", t.objs.UprobeNcclCommDestroy, t.objs.UretprobeNcclCommDestroy},
 		{"ncclAllReduce", t.objs.UprobeNcclAllReduce, t.objs.UretprobeNcclAllReduce},
 		{"ncclAllGather", t.objs.UprobeNcclAllGather, t.objs.UretprobeNcclAllGather},
@@ -159,6 +174,7 @@ func (t *Tracer) Attach(targetPIDs ...uint32) error {
 		t.detach()
 		return fmt.Errorf("no NCCL symbols resolved in %s", t.libPath)
 	}
+	t.attachedSyms = attached
 
 	r, err := ringbuf.NewReader(t.objs.NcclEvents)
 	if err != nil {
@@ -417,6 +433,19 @@ func isSafeLibPath(path string) bool {
 // nccl_pid_map_empty() returns false. Without the sentinel an empty
 // map looks identical to "only pid=0", so the gate would be off.
 // Mirrors the net-probe pattern at internal/ebpf/net/net.go:117.
+//
+// Concurrency: BPF map Update is atomic at the kernel level, so
+// concurrent SetTargetPID / ClearTargetPIDs calls from multiple
+// goroutines won't corrupt the map. Userspace state (the BPF objects
+// themselves) isn't mutated here; all serialization happens kernel-side.
+//
+// v0.12.2 attach-race note: prefer passing PIDs to Attach() rather than
+// calling SetTargetPID after Attach returns. The pre-Attach path
+// installs the filter before the first uprobe is wired and is the only
+// race-free way to seed it; SetTargetPID after Attach lets a small
+// window of system-wide events slip through before the filter takes
+// effect. v0.12.3 hardware validation (validate-v0.12.sh N4) exercises
+// the pre-Attach path with --pid set.
 func (t *Tracer) SetTargetPID(pid uint32) error {
 	one := uint8(1)
 	if err := t.objs.NcclTargetPids.Update(uint32(0), one, ebpf.UpdateAny); err != nil {
@@ -458,11 +487,11 @@ func (t *Tracer) ClearTargetPIDs() error {
 	return nil
 }
 
-// installPIDFilterLocked writes the sentinel + every non-zero PID into
+// installPIDFilter writes the sentinel + every non-zero PID into
 // the filter map. Must be called BEFORE Attach wires uprobes; that's
 // the only race-free moment to seed the filter. Helper for the Attach
 // pre-population path.
-func (t *Tracer) installPIDFilterLocked(pids []uint32) error {
+func (t *Tracer) installPIDFilter(pids []uint32) error {
 	one := uint8(1)
 	if err := t.objs.NcclTargetPids.Update(uint32(0), one, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("nccl_target_pids sentinel: %w", err)
@@ -564,6 +593,8 @@ func (e Event) OpName() string {
 		return "ncclSend"
 	case 8:
 		return "ncclRecv"
+	case 9:
+		return "ncclCommInitAll"
 	default:
 		return fmt.Sprintf("nccl_op_%d", e.Op)
 	}

@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/provider"
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/store"
@@ -265,6 +266,11 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	// Empty / zero results disable the ingero.node.info gauge cleanly,
 	// so an environment without nvidia-smi behaves like v0.10.
 	emCfg.GPUModel, emCfg.GPUCount = discover.GPUInfo()
+	// v0.12.3 attribution-(b): probe IMDS for the cloud provider once at
+	// startup. Empty result (non-cloud host) suppresses the attribute,
+	// leaving Fleet's providerlookupprocessor in charge for the YAML /
+	// node-label paths.
+	emCfg.Provider = string(provider.DetectDefault())
 	emCfg.ThresholdCache = thresholdCache
 	if fleetPushTLSCA != "" || fleetPushTLSCert != "" || fleetPushTLSKey != "" {
 		emCfg.TLS = health.TLSConfig{
