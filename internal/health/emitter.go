@@ -43,6 +43,19 @@ func defaultCgroupPathHash() (string, error) {
 	return hashCGroupPath(path), nil
 }
 
+// ResolveCgroupPathHash exposes the agent's own cgroup_path_hash for
+// callers that need to attribute non-emitter telemetry (notably the
+// detection-event tracer) to the same cgroup the metrics emitter uses.
+// Returns "" on any resolution failure — the same fallback behavior as
+// the emitter.
+func ResolveCgroupPathHash() string {
+	h, err := cgroupPathHashResolver()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
 // minPushInterval and minTimeout are conservative lower bounds enforced by
 // EmitterConfig.Validate. They prevent pathological configurations that
 // would flood Fleet or guarantee every push times out.

@@ -96,7 +96,14 @@ health:
     path: /var/lib/ingero/health-baseline.json
     stale_age: 10m
 
-# OTLP export (optional, disabled by default)
+# OTLP traces export for detection events (optional, disabled by default).
+# Drives one root span per detection-event rising edge (straggler classifier
+# rising edge, baseliner DegradationWarning rising edge); the falling edge
+# ends the span with outcome=resolved. Independent from the metrics path,
+# which still flows through the `fleet:` block below — the same agent
+# emits both. The BatchSpanProcessor uses default OTel parameters
+# (max queue 2048, batch 512, scheduled flush every 5s). v0.13 ships
+# HTTP/protobuf only; gRPC defers (the `protocol` key is reserved).
 otlp:
   enabled: false
   endpoint: ""

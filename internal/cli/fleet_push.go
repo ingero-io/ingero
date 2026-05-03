@@ -14,10 +14,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/ingero-io/ingero/internal/discover"
-	"github.com/ingero-io/ingero/internal/provider"
 	"github.com/ingero-io/ingero/internal/health"
+	"github.com/ingero-io/ingero/internal/provider"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/store"
+	"github.com/ingero-io/ingero/internal/tracing"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -58,6 +60,9 @@ var (
 	fleetPushSignalWindow  time.Duration
 	fleetPushSignalNumGPUs int
 	fleetPushWarmupSamples int
+	fleetPushOTLPEnabled   bool
+	fleetPushOTLPEndpoint  string
+	fleetPushOTLPInsecure  bool
 )
 
 var fleetPushCmd = &cobra.Command{
@@ -136,6 +141,12 @@ func init() {
 		"GPU count for normalizing compute signal. 0 = autodetect (defaults to 1).")
 	fleetPushCmd.Flags().IntVar(&fleetPushWarmupSamples, "warmup-samples", health.DefaultBaselineConfig().WarmupSamples,
 		"Samples observed before first non-calibrating push (warmup = samples × push-interval). Default 30 × 5s = 150s.")
+	fleetPushCmd.Flags().BoolVar(&fleetPushOTLPEnabled, "otlp-enabled", false,
+		"Enable OTLP/HTTP traces export for detection events (mirrors otlp.enabled in configs/ingero.yaml).")
+	fleetPushCmd.Flags().StringVar(&fleetPushOTLPEndpoint, "otlp-endpoint", "",
+		"OTLP/HTTP endpoint for traces export, e.g. fleet.example:4318 (required when --otlp-enabled).")
+	fleetPushCmd.Flags().BoolVar(&fleetPushOTLPInsecure, "otlp-insecure", true,
+		"Use HTTP instead of HTTPS when --otlp-endpoint is bare host:port.")
 
 	_ = fleetPushCmd.MarkFlagRequired("fleet-endpoint")
 	_ = fleetPushCmd.MarkFlagRequired("fleet-cluster-id")
@@ -367,28 +378,55 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		_ = poller // actual start happens after ctx
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Detection-event traces (Slice C). Disabled by default — the noop
+	// tracer makes Loop.handleDegradationSpan/startDetectionSpan zero-cost
+	// on the hot path. The BatchSpanProcessor uses default OTel parameters
+	// (max queue 2048, batch 512, schedule 5s); span export is decoupled
+	// from the metrics push tick.
+	tracer, tracerShutdown, err := tracing.Init(ctx, tracing.Config{
+		Enabled:        fleetPushOTLPEnabled,
+		Endpoint:       fleetPushOTLPEndpoint,
+		Insecure:       fleetPushOTLPInsecure,
+		NodeID:         fleetPushNodeID,
+		ClusterID:      fleetPushClusterID,
+		ServiceVersion: version.Version(),
+	})
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := tracerShutdown(shutdownCtx); serr != nil {
+			log.Warn("tracer shutdown error", "err", serr.Error())
+		}
+	}()
+
 	loop, err := health.NewLoop(health.LoopConfig{
-		Baseliner:     baseliner,
-		StateMachine:  sm,
-		Emitter:       em,
-		Collector:     collector,
-		ModeEvaluator: modeEvaluator,
-		Classifier:    classifier,
-		StragglerSink: sink,
-		NodeID:        fleetPushNodeID,
-		ClusterID:     fleetPushClusterID,
-		ScoreConfig:   health.DefaultConfig(),
-		PushInterval:  fleetPushInterval,
-		DetectionMode: fleetPushDetectionMode,
-		WorkloadType:  fleetPushWorkloadType,
-		Log:           log,
+		Baseliner:      baseliner,
+		StateMachine:   sm,
+		Emitter:        em,
+		Collector:      collector,
+		ModeEvaluator:  modeEvaluator,
+		Classifier:     classifier,
+		StragglerSink:  sink,
+		NodeID:         fleetPushNodeID,
+		ClusterID:      fleetPushClusterID,
+		ScoreConfig:    health.DefaultConfig(),
+		PushInterval:   fleetPushInterval,
+		DetectionMode:  fleetPushDetectionMode,
+		WorkloadType:   fleetPushWorkloadType,
+		Log:            log,
+		Tracer:         tracer,
+		CgroupPathHash: health.ResolveCgroupPathHash(),
+		GPUModel:       emCfg.GPUModel,
 	})
 	if err != nil {
 		return fmt.Errorf("loop: %w", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Now that ctx exists, start the poller (if configured) on a goroutine.
 	if strings.TrimSpace(fleetPushThresholdURL) != "" {

@@ -10,8 +10,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ingero-io/ingero/internal/sampling"
+	"github.com/ingero-io/ingero/pkg/contract"
+)
+
+const (
+	spanClassStraggler   = "straggler"
+	spanClassDegradation = "degradation"
 )
 
 // Collector is the source of raw inputs for one tick of the push loop. Real
@@ -93,6 +101,18 @@ type LoopConfig struct {
 	// every tick. The sampler does its own edge detection so calling on
 	// every tick is safe and idempotent within a state.
 	Sampler *sampling.Sampler
+	// Tracer, when non-nil, receives one root span per detection-event
+	// rising edge (straggler, degradation) and ends it on the falling
+	// edge. Nil tracer = trace operations are skipped entirely; the hot
+	// path makes zero OTel allocations.
+	Tracer trace.Tracer
+	// CgroupPathHash and GPUModel populate detection-span attributes.
+	// Caller (cli.fleet_push) sources them from the same nvidia-smi /
+	// /proc/self/cgroup probes that feed the metrics emitter, so a span
+	// and the metric for the same event carry identical hardware-attribution
+	// tags.
+	CgroupPathHash string
+	GPUModel       string
 }
 
 // Loop drives one push per interval: collect -> state transition -> update
@@ -109,6 +129,12 @@ type Loop struct {
 	// (not package-global) so multiple Loops in the same process draw
 	// independent sequences.
 	rng *rand.Rand
+	// openSpans tracks the currently-recording detection spans keyed by
+	// event class. Single-goroutine state (only mutated from tick) but
+	// guarded by mu so tests calling TickOnce concurrently with shutdown
+	// are race-free.
+	openSpans   map[string]trace.Span
+	degradedPrev bool
 }
 
 // NewLoop validates the config and returns a runnable Loop.
@@ -161,7 +187,8 @@ func NewLoop(cfg LoopConfig) (*Loop, error) {
 		// now().UnixNano() seed gives per-agent spread at process start
 		// so N agents launched by the same Helm rollout don't synchronize
 		// their push ticks.
-		rng: rand.New(rand.NewSource(now().UnixNano())),
+		rng:       rand.New(rand.NewSource(now().UnixNano())),
+		openSpans: make(map[string]trace.Span),
 	}, nil
 }
 
@@ -282,6 +309,7 @@ func (l *Loop) tick(parentCtx context.Context) time.Duration {
 	if l.cfg.Sampler != nil {
 		l.cfg.Sampler.SetDegraded(degraded)
 	}
+	l.handleDegradationSpan(ctx, degraded)
 
 	var perCGroup []PerCGroupStats
 	if pcc, ok := l.cfg.Collector.(PerCGroupCollector); ok {
@@ -353,6 +381,14 @@ func (l *Loop) classifyAndEmit(ctx context.Context, now time.Time, score Score, 
 		EventID:        uuid.NewString(),
 	}
 
+	if changed {
+		if isStraggler {
+			l.startDetectionSpan(ctx, spanClassStraggler, ev.EventID)
+		} else {
+			l.endDetectionSpan(spanClassStraggler)
+		}
+	}
+
 	if err := l.cfg.Emitter.EmitStragglerEvent(ctx, ev, isStraggler); err != nil {
 		l.log.Debug("fleet loop: straggler emit error", "err", err.Error())
 	}
@@ -385,6 +421,76 @@ func dominantFromScore(score Score, baseline Baselines) string {
 		CPU:        score.CPU,
 	}
 	return DominantSignal(current, baseline)
+}
+
+// handleDegradationSpan opens a span on the rising edge of
+// DegradationWarning and closes it on the falling edge. No-op when no
+// tracer is configured.
+//
+// Tracking edges with l.degradedPrev (rather than the Baseliner's
+// internal edge log) keeps the span lifecycle owned by the loop: the
+// loop is the single observer of the warning, so a stale prev value
+// cannot occur.
+func (l *Loop) handleDegradationSpan(ctx context.Context, degraded bool) {
+	if l.cfg.Tracer == nil {
+		return
+	}
+	prev := l.degradedPrev
+	l.degradedPrev = degraded
+	switch {
+	case degraded && !prev:
+		l.startDetectionSpan(ctx, spanClassDegradation, uuid.NewString())
+	case !degraded && prev:
+		l.endDetectionSpan(spanClassDegradation)
+	}
+}
+
+// startDetectionSpan opens a root span keyed by class. Safe to call when
+// Tracer is nil (no-op) and when a span for the same class is already
+// open (replaces the existing one — the previous span is dropped without
+// End, which only matters under contrived race conditions; tick is
+// single-goroutine so this never fires in practice).
+//
+// TODO(v0.14, internal/health/loop.go): attach correlator chain children.
+// Requires plumbing through the per-PID *correlate.Engine and the
+// active cudaOps slice (see internal/correlate/correlate.go:565
+// SnapshotCausalChains). The loop today does not own those handles —
+// they live on the trace recorder, which is in a separate process when
+// the agent is configured for the SQLite-shared-DB topology used by
+// Helm. Deferred for the v0.13 first cut.
+func (l *Loop) startDetectionSpan(ctx context.Context, class, eventID string) {
+	if l.cfg.Tracer == nil {
+		return
+	}
+	_, span := l.cfg.Tracer.Start(ctx, "ingero.detection."+class,
+		trace.WithAttributes(
+			attribute.String(contract.AttrCgroupPathHash, l.cfg.CgroupPathHash),
+			attribute.String(contract.AttrWorkloadType, l.cfg.WorkloadType),
+			attribute.String(contract.AttrGPUModel, l.cfg.GPUModel),
+			attribute.String(contract.AttrEventID, eventID),
+		),
+	)
+	l.mu.Lock()
+	l.openSpans[class] = span
+	l.mu.Unlock()
+}
+
+// endDetectionSpan attaches outcome=resolved and ends the span, if open.
+func (l *Loop) endDetectionSpan(class string) {
+	if l.cfg.Tracer == nil {
+		return
+	}
+	l.mu.Lock()
+	span, ok := l.openSpans[class]
+	if ok {
+		delete(l.openSpans, class)
+	}
+	l.mu.Unlock()
+	if !ok {
+		return
+	}
+	span.AddEvent("outcome", trace.WithAttributes(attribute.String("status", "resolved")))
+	span.End()
 }
 
 // maybeLogAnomaly rate-limits per-signal anomaly logs to once per
