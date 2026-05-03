@@ -8,6 +8,25 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+### Changed
+
+- **`/investigate` prompt aware of Echo federation.** The agent's MCP
+  `/investigate` prompt now opens with a one-paragraph note for cases
+  where it was reached via Ingero Echo's federated cluster-investigate
+  flow: Echo has already ranked the node, so this prompt's job is the
+  per-node "WHY" half (root cause + recommendation) while Echo handled
+  the cluster-side "WHERE" half. Standalone usage is unchanged.
+  v0.12.9 in-tandem release alignment with Fleet's new Echo-side
+  `/investigate` orchestration.
+
+### Deferred
+
+- **W1 memfrag BPF tracer** and **W2 power/thermal probes** carry into
+  v0.12.10 rather than landing here. Both need a dedicated arm64
+  validation cycle (W1 needs NVIDIA driver IOCTL hooks for fragmentation
+  attribution; W2 needs throttle-event hooks). Tracking remains in the
+  internal v0.12.9 plan as deferred work.
+
 ### Fixed
 
 - **arm64 release binaries now load BPF probes correctly.** The v0.10.0
