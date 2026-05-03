@@ -59,7 +59,7 @@ type TypeContract struct {
 // TestWireContract_FieldsDeclared. Changes to this slice are the
 // code-review seam for "are we about to break downstream consumers?".
 //
-// The human-readable counterpart is docs/remediation-protocol.md — keep
+// The human-readable counterpart is docs/remediation-protocol_fleet.md — keep
 // them in sync.
 var Contract = []TypeContract{
 	{
