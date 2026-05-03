@@ -404,6 +404,116 @@ int BPF_KRETPROBE(uretprobe_nccl_comm_init_rank, int retval)
 	return 0;
 }
 
+/* ---------------- ncclCommInitAll ---------------- *
+ * Signature: ncclResult_t ncclCommInitAll(ncclComm_t* comms,
+ *                                         int nranks,
+ *                                         const int* devlist);
+ * Single-process multi-GPU init pattern. On success, comms[0..nranks-1]
+ * are valid pointers and each corresponds to rank i. Less common than
+ * ncclCommInitRank (the MPI-style multi-process pattern) but used in
+ * some HPC and inference deployments.
+ *
+ * v0.12.3 (deferred from v0.12.1): iteration capped at NCCL_INIT_ALL_MAX_RANKS
+ * to keep BPF stack usage and verifier complexity bounded. Same-host
+ * workloads with more than 8 GPUs are rare; if encountered, only the
+ * first 8 ranks get nccl_comm_map entries.
+ */
+#define NCCL_INIT_ALL_MAX_RANKS 8
+
+SEC("uprobe/ncclCommInitAll")
+int BPF_KPROBE(uprobe_nccl_comm_init_all, void *comms_array, int nranks, void *devlist)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 tid = (__u32)pid_tid;
+
+	struct nccl_entry_state st = {};
+	st.op = NCCL_OP_COMM_INIT_ALL;
+	st.comm_out_ptr = (__u64)comms_array;
+	st.nranks_arg = nranks;
+
+	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
+	save_entry(tid, &st);
+	return 0;
+}
+
+SEC("uretprobe/ncclCommInitAll")
+int BPF_KRETPROBE(uretprobe_nccl_comm_init_all, int retval)
+{
+	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = pid_tid >> 32;
+	__u32 tid = (__u32)pid_tid;
+
+	struct nccl_entry_state *entry = bpf_map_lookup_elem(&nccl_entry_map, &tid);
+	if (!entry)
+		return 0;
+
+	if (retval == 0 && entry->op == NCCL_OP_COMM_INIT_ALL && entry->comm_out_ptr != 0) {
+		__u32 nranks = entry->nranks_arg;
+		if (nranks > NCCL_INIT_ALL_MAX_RANKS)
+			nranks = NCCL_INIT_ALL_MAX_RANKS;
+
+		/* Bounded loop: read each comms[i] and insert into nccl_comm_map. */
+		#pragma unroll
+		for (__u32 i = 0; i < NCCL_INIT_ALL_MAX_RANKS; i++) {
+			if (i >= nranks)
+				break;
+			__u64 comm_ptr = 0;
+			void *slot = (void *)(entry->comm_out_ptr + (__u64)i * sizeof(__u64));
+			long rc2 = bpf_probe_read_user(&comm_ptr, sizeof(comm_ptr), slot);
+			if (rc2 == 0 && comm_ptr != 0) {
+				struct nccl_comm_key k = {};
+				k.pid = pid;
+				k.comm_ptr = comm_ptr;
+
+				struct nccl_comm_value v = {};
+				/* commId is generated internally by ncclCommInitAll;
+				 * we don't have a unique id to hash, so leave it 0.
+				 * Cross-rank correlation still works at (pid, comm_ptr)
+				 * granularity.
+				 */
+				v.comm_id_hash = 0;
+				v.rank = i;
+				v.nranks = entry->nranks_arg;
+				v.init_ts = bpf_ktime_get_ns();
+				bpf_map_update_elem(&nccl_comm_map, &k, &v, BPF_ANY);
+			}
+		}
+	}
+
+	/* One event per InitAll call (rank=0, nranks=nranks_arg). Per-comm
+	 * tracking happens via collective uprobes later that resolve each
+	 * comm_ptr in nccl_comm_map.
+	 */
+	__u64 now = bpf_ktime_get_ns();
+	struct nccl_event *evt = bpf_ringbuf_reserve(&nccl_events, sizeof(*evt), 0);
+	if (evt) {
+		evt->hdr.timestamp_ns = entry->timestamp_ns;
+		evt->hdr.pid = pid;
+		evt->hdr.tid = tid;
+		evt->hdr.source = EVENT_SRC_NCCL;
+		evt->hdr.op = NCCL_OP_COMM_INIT_ALL;
+		evt->hdr._pad = 0;
+		evt->hdr._pad2 = 0;
+		evt->hdr.cgroup_id = bpf_get_current_cgroup_id();
+		bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
+
+		evt->duration_ns = now - entry->timestamp_ns;
+		evt->comm_id_hash = 0;
+		evt->stream_handle = 0;
+		evt->count_bytes = 0;
+		evt->rank = 0;
+		evt->nranks = entry->nranks_arg;
+		evt->datatype = 0;
+		evt->reduce_op = 0;
+		evt->return_code = retval;
+		evt->peer_rank = 0;
+		bpf_ringbuf_submit(evt, 0);
+	}
+
+	bpf_map_delete_elem(&nccl_entry_map, &tid);
+	return 0;
+}
+
 /* ---------------- ncclCommDestroy ---------------- *
  * Signature: ncclResult_t ncclCommDestroy(ncclComm_t comm);
  * Removes the (pid, comm_ptr) mapping at uretprobe time.

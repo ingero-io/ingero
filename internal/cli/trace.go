@@ -286,12 +286,15 @@ func setupNCCLTracer(p ncclSetupParams) (*ncclprobe.Tracer, int) {
 		}
 	}
 	nt := ncclprobe.New(libPath)
-	if err := nt.Attach(filterPIDs...); err != nil {
+	if err := nt.Attach(filterPIDs); err != nil {
 		fmt.Fprintf(p.stderr, "  Warning: NCCL tracing unavailable: %v\n", err)
 		p.debugf("nccl tracer: attach failed: %v", err)
 		return nil, 0
 	}
-	const probeCount = 16 // 8 collectives x (uprobe + uretprobe)
+	// v0.12.3 (Sys Arch ★1): real attached count, not a hardcoded
+	// constant. Older NCCL builds without ncclCommInitAll attach 16,
+	// not 18; the banner must reflect what actually happened.
+	probeCount := nt.AttachedProbeCount()
 	fmt.Fprintf(p.stderr, "  NCCL tracing: attached %d probes to %s\n", probeCount, libPath)
 	p.debugf("nccl tracer: %d probes attached at %s (filter pids=%v)", probeCount, libPath, filterPIDs)
 	return nt, probeCount

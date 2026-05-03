@@ -126,6 +126,7 @@ type ncclTraceProgramSpecs struct {
 	UprobeNcclAllReduce        *ebpf.ProgramSpec `ebpf:"uprobe_nccl_all_reduce"`
 	UprobeNcclBcast            *ebpf.ProgramSpec `ebpf:"uprobe_nccl_bcast"`
 	UprobeNcclCommDestroy      *ebpf.ProgramSpec `ebpf:"uprobe_nccl_comm_destroy"`
+	UprobeNcclCommInitAll      *ebpf.ProgramSpec `ebpf:"uprobe_nccl_comm_init_all"`
 	UprobeNcclCommInitRank     *ebpf.ProgramSpec `ebpf:"uprobe_nccl_comm_init_rank"`
 	UprobeNcclRecv             *ebpf.ProgramSpec `ebpf:"uprobe_nccl_recv"`
 	UprobeNcclReduceScatter    *ebpf.ProgramSpec `ebpf:"uprobe_nccl_reduce_scatter"`
@@ -134,6 +135,7 @@ type ncclTraceProgramSpecs struct {
 	UretprobeNcclAllReduce     *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_all_reduce"`
 	UretprobeNcclBcast         *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_bcast"`
 	UretprobeNcclCommDestroy   *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_comm_destroy"`
+	UretprobeNcclCommInitAll   *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_comm_init_all"`
 	UretprobeNcclCommInitRank  *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_comm_init_rank"`
 	UretprobeNcclRecv          *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_recv"`
 	UretprobeNcclReduceScatter *ebpf.ProgramSpec `ebpf:"uretprobe_nccl_reduce_scatter"`
@@ -221,6 +223,7 @@ type ncclTracePrograms struct {
 	UprobeNcclAllReduce        *ebpf.Program `ebpf:"uprobe_nccl_all_reduce"`
 	UprobeNcclBcast            *ebpf.Program `ebpf:"uprobe_nccl_bcast"`
 	UprobeNcclCommDestroy      *ebpf.Program `ebpf:"uprobe_nccl_comm_destroy"`
+	UprobeNcclCommInitAll      *ebpf.Program `ebpf:"uprobe_nccl_comm_init_all"`
 	UprobeNcclCommInitRank     *ebpf.Program `ebpf:"uprobe_nccl_comm_init_rank"`
 	UprobeNcclRecv             *ebpf.Program `ebpf:"uprobe_nccl_recv"`
 	UprobeNcclReduceScatter    *ebpf.Program `ebpf:"uprobe_nccl_reduce_scatter"`
@@ -229,6 +232,7 @@ type ncclTracePrograms struct {
 	UretprobeNcclAllReduce     *ebpf.Program `ebpf:"uretprobe_nccl_all_reduce"`
 	UretprobeNcclBcast         *ebpf.Program `ebpf:"uretprobe_nccl_bcast"`
 	UretprobeNcclCommDestroy   *ebpf.Program `ebpf:"uretprobe_nccl_comm_destroy"`
+	UretprobeNcclCommInitAll   *ebpf.Program `ebpf:"uretprobe_nccl_comm_init_all"`
 	UretprobeNcclCommInitRank  *ebpf.Program `ebpf:"uretprobe_nccl_comm_init_rank"`
 	UretprobeNcclRecv          *ebpf.Program `ebpf:"uretprobe_nccl_recv"`
 	UretprobeNcclReduceScatter *ebpf.Program `ebpf:"uretprobe_nccl_reduce_scatter"`
@@ -241,6 +245,7 @@ func (p *ncclTracePrograms) Close() error {
 		p.UprobeNcclAllReduce,
 		p.UprobeNcclBcast,
 		p.UprobeNcclCommDestroy,
+		p.UprobeNcclCommInitAll,
 		p.UprobeNcclCommInitRank,
 		p.UprobeNcclRecv,
 		p.UprobeNcclReduceScatter,
@@ -249,6 +254,7 @@ func (p *ncclTracePrograms) Close() error {
 		p.UretprobeNcclAllReduce,
 		p.UretprobeNcclBcast,
 		p.UretprobeNcclCommDestroy,
+		p.UretprobeNcclCommInitAll,
 		p.UretprobeNcclCommInitRank,
 		p.UretprobeNcclRecv,
 		p.UretprobeNcclReduceScatter,

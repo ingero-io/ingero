@@ -220,9 +220,7 @@ func TestRun_IntegrationHappyPath(t *testing.T) {
 		}
 		// Hold the conn open until the alerter has read both events
 		// (signaled via WaitGroup or test timeout).
-		select {
-		case <-time.After(500 * time.Millisecond):
-		}
+		time.Sleep(500 * time.Millisecond)
 	}()
 
 	cfg := &Config{

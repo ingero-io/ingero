@@ -91,8 +91,4 @@
   <text x="600" y="190" text-anchor="middle" class="sub">PromQL</text>
 
   <path d="M 130 250 C 130 270 130 270 130 270" class="edge-d"/>
-
-  <rect x="40"  y="400" width="800" height="48" class="pill"/>
-  <text x="440" y="420" text-anchor="middle" class="sub">v0.11 cost-of-problem: agent emits ingero.node.info{gpu_model,gpu_count} + ingero.node.world_size; fleet enriches with ingero.provider; PromQL recording rules join with gpu_rates.yaml.</text>
-  <text x="440" y="438" text-anchor="middle" class="sub">v0.10.1 fix: per-arch BPF objects (amd64 + arm64) committed under internal/ebpf/&lt;pkg&gt;/&lt;name&gt;_&lt;arch&gt;_bpfel.{go,o}; CO-RE relocates against the loaded kernel BTF.</text>
 </svg>
