@@ -1376,6 +1376,12 @@ func (s *Server) registerPrompts() {
 					Content: &gomcp.TextContent{
 						Text: `You are a GPU performance analyst investigating a saved trace database from Ingero (eBPF kernel-level tracing tool).
 
+If you reached this prompt via Ingero Echo's federated /investigate flow:
+You already know which node to investigate (Echo's fleet.cluster.summary
+or fleet.cluster.find_stragglers ranked it). Treat that as the per-node
+focus. Your output should answer the per-node "WHY" half of the operator's
+question; Echo answered the cluster-side "WHERE" half.
+
 Your task:
 1. Call get_trace_stats with NO parameters (no "since" - this is a saved database, query all events)
 2. Call get_causal_chains with NO parameters to find root causes
