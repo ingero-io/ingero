@@ -1,6 +1,6 @@
 // Package mcp provides an MCP (Model Context Protocol) server for Ingero.
 //
-// The MCP server exposes ten tools and one prompt to AI agents:
+// The MCP server exposes eleven tools and one prompt to AI agents:
 //
 // Tools:
 //   - get_check: Run system diagnostics (kernel, BTF, NVIDIA, CUDA)
@@ -13,6 +13,7 @@
 //   - graph_lifecycle: CUDA Graph lifecycle timeline for a PID
 //   - graph_frequency: Graph launch frequency and hot/cold classification
 //   - query_fleet: Fan-out query across multiple Ingero nodes (chains, ops, overview, sql)
+//   - pagerduty_trigger: Create a PagerDuty incident with AI-supplied context
 //
 // Prompts:
 //   - /investigate: Guided investigation workflow for diagnosing GPU issues
@@ -47,6 +48,7 @@ import (
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/ingero-io/ingero/internal/alerter"
 	"github.com/ingero-io/ingero/internal/fleet"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
@@ -61,10 +63,11 @@ import (
 type Server struct {
 	mcpServer   *gomcp.Server
 	store       *store.Store
-	fleetNodes  []string          // fleet.nodes from config (nil = fleet disabled)
-	fleetClient *fleet.Client     // lazily created on first query_fleet call
-	fleetOnce   sync.Once         // guards lazy fleetClient init
-	fleetErr    error             // error from lazy init (if any)
+	fleetNodes  []string           // fleet.nodes from config (nil = fleet disabled)
+	fleetClient *fleet.Client      // lazily created on first query_fleet call
+	fleetOnce   sync.Once          // guards lazy fleetClient init
+	fleetErr    error              // error from lazy init (if any)
+	pagerduty   *alerter.PagerDuty // nil-safe; tool reports "not configured" when nil
 }
 
 // New creates an MCP server backed by the given SQLite store.
@@ -88,6 +91,12 @@ func New(s *store.Store) *Server {
 // SetFleetNodes configures the MCP server with fleet node addresses for query_fleet.
 func (s *Server) SetFleetNodes(nodes []string) {
 	s.fleetNodes = nodes
+}
+
+// SetPagerDuty wires a configured PagerDuty backend into the MCP server.
+// Pass nil to leave the pagerduty_trigger tool returning "not configured".
+func (s *Server) SetPagerDuty(pd *alerter.PagerDuty) {
+	s.pagerduty = pd
 }
 
 // getFleetClient returns the fleet client, creating it lazily on first use.
@@ -1110,6 +1119,9 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input queryFleetInput) (*gomcp.CallToolResult, any, error) {
 		return s.handleQueryFleet(ctx, input)
 	})
+
+	// Tool 11: pagerduty_trigger — AI-driven incident escalation.
+	RegisterPagerDutyTool(s.mcpServer, func() *alerter.PagerDuty { return s.pagerduty })
 }
 
 func (s *Server) handleQueryFleet(ctx context.Context, input queryFleetInput) (*gomcp.CallToolResult, any, error) {

@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ingero-io/ingero/internal/alerter"
 	ingmcp "github.com/ingero-io/ingero/internal/mcp"
 	"github.com/ingero-io/ingero/internal/store"
 )
@@ -70,6 +73,7 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted with --http, a self-signed cert is generated")
 	mcpCmd.Flags().StringVar(&mcpTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
 	mcpCmd.Flags().StringVar(&mcpLogPath, "log", "", "write log output to file (append, no rotation)")
+	mcpCmd.Flags().String("pagerduty-routing-key", "", "PagerDuty Events v2 routing key (enables pagerduty_trigger MCP tool)")
 	rootCmd.AddCommand(mcpCmd)
 }
 
@@ -116,6 +120,18 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 	if fleetNodes := ReadFleetNodes(); len(fleetNodes) > 0 {
 		srv.SetFleetNodes(fleetNodes)
 		debugf("mcp: fleet nodes configured: %v", fleetNodes)
+	}
+
+	// Wire PagerDuty backend for pagerduty_trigger tool. Routing key is
+	// a secret; never log it. Read once into a local, hand to the
+	// alerter, then drop the local. The alerter scrubs the key from
+	// any error it returns.
+	pdKey, _ := cmd.Flags().GetString("pagerduty-routing-key")
+	if pdKey != "" {
+		pd := alerter.NewPagerDuty(&alerter.PagerDutyConfig{RoutingKey: pdKey}, 5*time.Second, slog.Default())
+		srv.SetPagerDuty(pd)
+		pdKey = ""
+		debugf("mcp: pagerduty backend configured")
 	}
 
 	if mcpHTTPAddr != "" {
