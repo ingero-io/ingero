@@ -51,12 +51,13 @@ const (
 	// d2h / d2d / unknown). Emitted as an OTel Sum (monotonic,
 	// cumulative).
 	MetricCUDAMemcpyBytesTotal = "ingero.node.cuda_memcpy_bytes_total"
-	// MetricCPUStallSecondsTotal is the cumulative off-CPU duration
-	// summed from sched_switch events attributed to a cgroup. Emitted
+	// MetricCPUStallNanosTotal is the cumulative off-CPU duration
+	// summed from sched_switch events attributed to a cgroup, in
+	// nanoseconds (matches the unit attribute "ns" on the Sum). Emitted
 	// as an OTel Sum (monotonic, cumulative). Customer dashboards
 	// correlate against MetricCUDAKernelLaunchTotal to see "high CPU
 	// stall + flat kernel launches = blocked".
-	MetricCPUStallSecondsTotal = "ingero.node.cpu_stall_seconds_total"
+	MetricCPUStallNanosTotal = "ingero.node.cpu_stall_nanos_total"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -102,8 +103,9 @@ const (
 	AttrCgroupPathHash = "ingero.cgroup_path_hash"
 	// AttrMemcpyDirection labels MetricCUDAMemcpyBytesTotal data points
 	// with the cudaMemcpyKind direction. Allowed values are the
-	// MemcpyDirection* constants below.
-	AttrMemcpyDirection = "direction"
+	// MemcpyDirection* constants below. Namespaced to align with the
+	// other Attr* constants in this package.
+	AttrMemcpyDirection = "ingero.memcpy.direction"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:

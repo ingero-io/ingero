@@ -29,6 +29,36 @@ func TestInit_DisabledReturnsNoop(t *testing.T) {
 	}
 }
 
+func TestInit_DisabledWithMalformedEndpointReturnsError(t *testing.T) {
+	// Even when Enabled=false, a non-empty malformed endpoint must surface
+	// at Init time so the typo is caught at startup. An empty endpoint is
+	// the legitimate disabled-and-unconfigured case and stays a no-op.
+	cases := []struct {
+		name string
+		ep   string
+	}{
+		{"no_port", "fleet.example"},
+		{"bad_scheme", "ftp://fleet.example:4318"},
+		{"missing_host", "http://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := Init(context.Background(), Config{
+				Enabled:  false,
+				Endpoint: tc.ep,
+			})
+			if err == nil {
+				t.Fatalf("expected error for disabled+%q endpoint", tc.ep)
+			}
+		})
+	}
+	// Empty endpoint with Enabled=false stays a no-op (no error).
+	_, _, err := Init(context.Background(), Config{Enabled: false, Endpoint: ""})
+	if err != nil {
+		t.Fatalf("disabled+empty endpoint must not error: %v", err)
+	}
+}
+
 func TestInit_BadEndpointReturnsError(t *testing.T) {
 	cases := []struct {
 		name string

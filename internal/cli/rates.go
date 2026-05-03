@@ -130,7 +130,10 @@ func loadRatesBody(ctx context.Context, src string, timeout time.Duration, allow
 func extractYAMLFromMarkdown(md []byte) ([]byte, error) {
 	const open = "\n```yaml\n"
 	const close = "\n```"
-	s := string(md)
+	// Normalize CRLF -> LF so a Windows checkout (or one produced by a
+	// tool that ignores .gitattributes) still matches the LF-anchored
+	// fence patterns above.
+	s := strings.ReplaceAll(string(md), "\r\n", "\n")
 	i := strings.Index(s, open)
 	if i < 0 {
 		return nil, errors.New("no ```yaml block found in fallback md")

@@ -44,6 +44,14 @@ func Init(ctx context.Context, cfg Config) (trace.Tracer, func(context.Context) 
 // is false.
 func initWithProvider(ctx context.Context, cfg Config) (trace.Tracer, *sdktrace.TracerProvider, func(context.Context) error, error) {
 	if !cfg.Enabled {
+		// Even when tracing is disabled, validate any non-empty endpoint
+		// at startup so a typo is caught here rather than discovered the
+		// first time an operator flips Enabled=true in production.
+		if strings.TrimSpace(cfg.Endpoint) != "" {
+			if _, _, err := parseEndpoint(cfg.Endpoint, cfg.Insecure); err != nil {
+				return nil, nil, nil, fmt.Errorf("tracing: endpoint: %w", err)
+			}
+		}
 		return noop.NewTracerProvider().Tracer(tracerName), nil, func(context.Context) error { return nil }, nil
 	}
 

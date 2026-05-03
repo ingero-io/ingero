@@ -1250,7 +1250,7 @@ func TestPush_PerCGroupMetricsEmitted(t *testing.T) {
 		t.Errorf("kernel launch series = %+v, want hash-a:100 hash-b:50", gotHashes)
 	}
 
-	stall := findSumMetric(t, p, contract.MetricCPUStallSecondsTotal)
+	stall := findSumMetric(t, p, contract.MetricCPUStallNanosTotal)
 	if got := dpAsIntForHash(t, stall, "hash-a"); got != 5_000_000 {
 		t.Errorf("cpu_stall hash-a = %d, want 5_000_000", got)
 	}
@@ -1320,7 +1320,7 @@ func TestPush_PerCGroupNilProducesNoMetrics(t *testing.T) {
 			for _, m := range sm.Metrics {
 				switch m.Name {
 				case contract.MetricCUDAKernelLaunchTotal,
-					contract.MetricCPUStallSecondsTotal,
+					contract.MetricCPUStallNanosTotal,
 					contract.MetricCUDAMemcpyBytesTotal:
 					t.Errorf("nil perCGroup leaked metric %q into payload", m.Name)
 				}

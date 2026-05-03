@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,6 +129,58 @@ func TestPagerDutyTool_NetworkFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on 500")
 	}
+}
+
+// TestServer_SetPagerDutyConcurrent exercises the data race that exists
+// when SetPagerDuty writes s.pagerduty without synchronization while
+// the pagerduty_trigger handler reads it via the registered closure.
+// Must pass under -race.
+func TestServer_SetPagerDutyConcurrent(t *testing.T) {
+	srv := New(nil) // nil store: pagerduty path doesn't touch it
+	pd := alerter.NewPagerDuty(&alerter.PagerDutyConfig{RoutingKey: "rk"}, time.Second, nil)
+
+	var wg sync.WaitGroup
+	const writers = 16
+	const readers = 16
+	const iters = 200
+
+	stop := make(chan struct{})
+
+	// Writers flip the backend between nil and a real PagerDuty.
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				if id%2 == 0 {
+					srv.SetPagerDuty(pd)
+				} else {
+					srv.SetPagerDuty(nil)
+				}
+			}
+		}(i)
+	}
+
+	// Readers exercise the same accessor used by the registered tool
+	// closure. handlePagerDutyTrigger is intentionally avoided here so
+	// the test stays a pure read/write race check on the field.
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = srv.pagerDutyBackend()
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(stop)
 }
 
 func TestPagerDutyTool_DedupKeyPassthrough(t *testing.T) {

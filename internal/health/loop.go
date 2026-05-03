@@ -133,7 +133,11 @@ type Loop struct {
 	// event class. Single-goroutine state (only mutated from tick) but
 	// guarded by mu so tests calling TickOnce concurrently with shutdown
 	// are race-free.
-	openSpans   map[string]trace.Span
+	openSpans map[string]trace.Span
+	// degradedPrev tracks the prior tick's DegradationWarning so the loop
+	// can detect rising/falling edges. The zero value (false) is intentional:
+	// the first tick observing DegradationWarning()=true is correctly
+	// treated as a rising edge against this initial false.
 	degradedPrev bool
 }
 
@@ -446,15 +450,15 @@ func (l *Loop) handleDegradationSpan(ctx context.Context, degraded bool) {
 }
 
 // startDetectionSpan opens a root span keyed by class. Safe to call when
-// Tracer is nil (no-op) and when a span for the same class is already
-// open (replaces the existing one — the previous span is dropped without
-// End, which only matters under contrived race conditions; tick is
-// single-goroutine so this never fires in practice).
+// Tracer is nil (no-op). If a span for the same class is already open
+// (rapid rising->falling->rising flap, or a logic bug) the prior span is
+// ended cleanly before being replaced so the trace backend isn't left
+// holding a never-closed span.
 //
 // TODO(v0.14, internal/health/loop.go): attach correlator chain children.
 // Requires plumbing through the per-PID *correlate.Engine and the
 // active cudaOps slice (see internal/correlate/correlate.go:565
-// SnapshotCausalChains). The loop today does not own those handles —
+// SnapshotCausalChains). The loop today does not own those handles -
 // they live on the trace recorder, which is in a separate process when
 // the agent is configured for the SQLite-shared-DB topology used by
 // Helm. Deferred for the v0.13 first cut.
@@ -467,12 +471,18 @@ func (l *Loop) startDetectionSpan(ctx context.Context, class, eventID string) {
 			attribute.String(contract.AttrCgroupPathHash, l.cfg.CgroupPathHash),
 			attribute.String(contract.AttrWorkloadType, l.cfg.WorkloadType),
 			attribute.String(contract.AttrGPUModel, l.cfg.GPUModel),
+			attribute.String(contract.AttrClusterID, l.cfg.ClusterID),
 			attribute.String(contract.AttrEventID, eventID),
 		),
 	)
 	l.mu.Lock()
+	prior, hadPrior := l.openSpans[class]
 	l.openSpans[class] = span
 	l.mu.Unlock()
+	if hadPrior {
+		l.log.Warn("unexpected detection-span overwrite; ending prior span", "class", class)
+		prior.End()
+	}
 }
 
 // endDetectionSpan attaches outcome=resolved and ends the span, if open.

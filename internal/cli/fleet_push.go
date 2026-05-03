@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ingero-io/ingero/internal/config"
 	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/provider"
@@ -142,11 +143,11 @@ func init() {
 	fleetPushCmd.Flags().IntVar(&fleetPushWarmupSamples, "warmup-samples", health.DefaultBaselineConfig().WarmupSamples,
 		"Samples observed before first non-calibrating push (warmup = samples × push-interval). Default 30 × 5s = 150s.")
 	fleetPushCmd.Flags().BoolVar(&fleetPushOTLPEnabled, "otlp-enabled", false,
-		"Enable OTLP/HTTP traces export for detection events (mirrors otlp.enabled in configs/ingero.yaml).")
+		"Enable OTLP/HTTP traces export for detection events. Overrides otlp.enabled in --config when explicitly set.")
 	fleetPushCmd.Flags().StringVar(&fleetPushOTLPEndpoint, "otlp-endpoint", "",
-		"OTLP/HTTP endpoint for traces export, e.g. fleet.example:4318 (required when --otlp-enabled).")
+		"OTLP/HTTP endpoint for traces export, e.g. fleet.example:4318. Overrides otlp.endpoint in --config when explicitly set.")
 	fleetPushCmd.Flags().BoolVar(&fleetPushOTLPInsecure, "otlp-insecure", true,
-		"Use HTTP instead of HTTPS when --otlp-endpoint is bare host:port.")
+		"Use HTTP instead of HTTPS when --otlp-endpoint is bare host:port. Overrides otlp.insecure in --config when explicitly set.")
 
 	_ = fleetPushCmd.MarkFlagRequired("fleet-endpoint")
 	_ = fleetPushCmd.MarkFlagRequired("fleet-cluster-id")
@@ -176,6 +177,46 @@ func (r *remediateSink) SendStragglerState(ev health.StragglerEvent) error {
 
 func (r *remediateSink) SendStragglerResolved(ev health.StragglerEvent) error {
 	return r.server.SendFleetStragglerResolved(ev.Timestamp, ev.NodeID, ev.ClusterID, ev.EventID)
+}
+
+// resolvedOTLP is the composed OTLP config after layering CLI flags over
+// the on-disk YAML. Returned as a value (not three out-params) so the
+// resolution logic is unit-testable in isolation.
+type resolvedOTLP struct {
+	Enabled  bool
+	Endpoint string
+	Insecure bool
+}
+
+// resolveOTLPConfig composes the OTLP runtime values from a parsed YAML
+// config and the CLI flags. CLI flags override YAML only when explicitly
+// set on the command line (cmd.Flags().Changed); flags left at default
+// inherit the YAML value. Source path is included for the error message.
+//
+// Validation: if otlp.enabled is true but otlp.endpoint is empty after the
+// override pass, surface a hard error rather than silently no-op.
+func resolveOTLPConfig(cfg *config.AgentConfig, cmd *cobra.Command, cfgPath string) (resolvedOTLP, error) {
+	out := resolvedOTLP{
+		Enabled:  cfg.OTLP.Enabled,
+		Endpoint: cfg.OTLP.Endpoint,
+		Insecure: cfg.OTLP.Insecure,
+	}
+	if cmd.Flags().Changed("otlp-enabled") {
+		out.Enabled = fleetPushOTLPEnabled
+	}
+	if cmd.Flags().Changed("otlp-endpoint") {
+		out.Endpoint = fleetPushOTLPEndpoint
+	}
+	if cmd.Flags().Changed("otlp-insecure") {
+		out.Insecure = fleetPushOTLPInsecure
+	}
+	if out.Enabled && strings.TrimSpace(out.Endpoint) == "" {
+		// "Disabled-but-empty-endpoint" is fine (no-op tracer); the bad
+		// state is enabled-with-no-endpoint, which silently swallows
+		// every span. Refuse to start.
+		return resolvedOTLP{}, fmt.Errorf("otlp.enabled true but otlp.endpoint empty in %s (set otlp.endpoint or pass --otlp-endpoint)", cfgPath)
+	}
+	return out, nil
 }
 
 func runFleetPush(cmd *cobra.Command, args []string) error {
@@ -381,15 +422,29 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// v0.13: load otlp: from YAML, then layer CLI flags on top. Missing
+	// file is non-fatal (zero AgentConfig); operators can still drive
+	// everything via flags. Resolution (override + validation) lives in
+	// resolveOTLPConfig so it's testable without spinning up the agent.
+	cfgPath, _ := cmd.Flags().GetString("config")
+	agentCfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config %s: %w", cfgPath, err)
+	}
+	otlp, err := resolveOTLPConfig(agentCfg, cmd, cfgPath)
+	if err != nil {
+		return err
+	}
+
 	// Detection-event traces (Slice C). Disabled by default — the noop
 	// tracer makes Loop.handleDegradationSpan/startDetectionSpan zero-cost
 	// on the hot path. The BatchSpanProcessor uses default OTel parameters
 	// (max queue 2048, batch 512, schedule 5s); span export is decoupled
 	// from the metrics push tick.
 	tracer, tracerShutdown, err := tracing.Init(ctx, tracing.Config{
-		Enabled:        fleetPushOTLPEnabled,
-		Endpoint:       fleetPushOTLPEndpoint,
-		Insecure:       fleetPushOTLPInsecure,
+		Enabled:        otlp.Enabled,
+		Endpoint:       otlp.Endpoint,
+		Insecure:       otlp.Insecure,
 		NodeID:         fleetPushNodeID,
 		ClusterID:      fleetPushClusterID,
 		ServiceVersion: version.Version(),
@@ -401,7 +456,11 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if serr := tracerShutdown(shutdownCtx); serr != nil {
-			log.Warn("tracer shutdown error", "err", serr.Error())
+			// Error (not Warn): the BatchSpanProcessor flushes pending
+			// spans on Shutdown; failure here means in-flight detection
+			// spans may be lost, so operators need it surfaced loudly.
+			log.Error("tracer shutdown failed; spans may be lost",
+				slog.String("error", serr.Error()))
 		}
 	}()
 

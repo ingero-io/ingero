@@ -83,36 +83,43 @@ func newWithClock(mode string, healthyRate float64, cooldownDur time.Duration, n
 }
 
 // SetDegraded informs the sampler of degradation-state edge transitions.
-// Idempotent within a state — only the rising and falling edges matter,
+// Idempotent within a state - only the rising and falling edges matter,
 // so callers can invoke it on every tick without filtering. No-op in
 // non-inference modes.
 func (s *Sampler) SetDegraded(degraded bool) {
 	if s.bypass {
 		return
 	}
+	// Capture the post-transition state under the lock and log AFTER unlock
+	// using the captured value. Logging while still holding the lock would
+	// keep the critical section longer than necessary; logging without
+	// capturing would let a concurrent SetDegraded race in between unlock
+	// and log, mis-attributing this transition's state name.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	var transitioned bool
+	var loggedState string
 	if degraded {
 		// Rising edge from healthy or cooldown. Already-degraded is a no-op
 		// so we don't re-log a transition that hasn't actually happened.
-		if s.state == stateDegraded {
-			return
+		if s.state != stateDegraded {
+			s.state = stateDegraded
+			s.cooldownEnd = time.Time{}
+			transitioned = true
+			loggedState = s.state.String()
 		}
-		s.state = stateDegraded
-		s.cooldownEnd = time.Time{}
-		slog.Info("sampling: state transition", "state", s.state.String())
-		return
+	} else if s.state == stateDegraded {
+		// Falling edge: only meaningful from degraded. Healthy->healthy and
+		// cooldown->cooldown are no-ops (don't restart cooldown on every tick).
+		s.state = stateCooldown
+		s.cooldownEnd = s.nowFn().Add(s.cooldownDur)
+		transitioned = true
+		loggedState = s.state.String()
 	}
+	s.mu.Unlock()
 
-	// Falling edge: only meaningful from degraded. Healthy→healthy and
-	// cooldown→cooldown are no-ops (don't restart cooldown on every tick).
-	if s.state != stateDegraded {
-		return
+	if transitioned {
+		slog.Info("sampling: state transition", "state", loggedState)
 	}
-	s.state = stateCooldown
-	s.cooldownEnd = s.nowFn().Add(s.cooldownDur)
-	slog.Info("sampling: state transition", "state", s.state.String())
 }
 
 // ShouldEmit returns true when an event should be admitted to the store.
@@ -128,16 +135,26 @@ func (s *Sampler) ShouldEmit() bool {
 	}
 
 	s.mu.Lock()
+	var transitioned bool
+	var loggedState string
 	if s.state == stateCooldown && !s.nowFn().Before(s.cooldownEnd) {
 		s.state = stateHealthy
 		s.cooldownEnd = time.Time{}
-		slog.Info("sampling: state transition", "state", s.state.String())
+		transitioned = true
+		loggedState = s.state.String()
 	}
 	rate := s.healthyRate
 	if s.state != stateHealthy {
 		rate = 1.0
 	}
 	s.mu.Unlock()
+	// Log the cooldown->healthy transition AFTER releasing the lock with the
+	// captured state name. Otherwise a concurrent SetDegraded(true) racing
+	// between unlock and log would observe state==degraded and emit a log
+	// line that misreports this transition.
+	if transitioned {
+		slog.Info("sampling: state transition", "state", loggedState)
+	}
 
 	if rate >= 1.0 {
 		return true

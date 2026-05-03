@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ingero-io/ingero/internal/alerter"
+	"github.com/ingero-io/ingero/internal/config"
 	ingmcp "github.com/ingero-io/ingero/internal/mcp"
 	"github.com/ingero-io/ingero/internal/store"
 )
@@ -73,8 +74,28 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted with --http, a self-signed cert is generated")
 	mcpCmd.Flags().StringVar(&mcpTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
 	mcpCmd.Flags().StringVar(&mcpLogPath, "log", "", "write log output to file (append, no rotation)")
-	mcpCmd.Flags().String("pagerduty-routing-key", "", "PagerDuty Events v2 routing key (enables pagerduty_trigger MCP tool)")
+	mcpCmd.Flags().String("pagerduty-routing-key", "", "PagerDuty Events v2 routing key (enables pagerduty_trigger MCP tool). Overrides alerter.pagerduty.routing_key in --config when explicitly set.")
 	rootCmd.AddCommand(mcpCmd)
+}
+
+// resolvePagerDutyRoutingKey composes the PagerDuty routing key from the
+// parsed YAML and the CLI flag. The CLI flag overrides only when explicitly
+// set on the command line; an unset flag inherits the YAML value. Empty
+// string return means PagerDuty is not configured (the MCP tool stays
+// registered but returns "not configured" at call time).
+//
+// Returned as a standalone function so the override-resolution logic is
+// unit-testable without spinning up the MCP server.
+func resolvePagerDutyRoutingKey(cfg *config.AgentConfig, cmd *cobra.Command) string {
+	routingKey := ""
+	if cfg != nil && cfg.Alerter.PagerDuty != nil {
+		routingKey = cfg.Alerter.PagerDuty.RoutingKey
+	}
+	if cmd.Flags().Changed("pagerduty-routing-key") {
+		flagVal, _ := cmd.Flags().GetString("pagerduty-routing-key")
+		routingKey = flagVal
+	}
+	return routingKey
 }
 
 func mcpRunE(cmd *cobra.Command, args []string) error {
@@ -122,11 +143,18 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 		debugf("mcp: fleet nodes configured: %v", fleetNodes)
 	}
 
-	// Wire PagerDuty backend for pagerduty_trigger tool. Routing key is
+	// Wire PagerDuty backend for pagerduty_trigger tool. v0.13: routing
+	// key resolves from alerter.pagerduty.routing_key in the YAML, with
+	// --pagerduty-routing-key as an explicit override. Routing key is
 	// a secret; never log it. Read once into a local, hand to the
 	// alerter, then drop the local. The alerter scrubs the key from
 	// any error it returns.
-	pdKey, _ := cmd.Flags().GetString("pagerduty-routing-key")
+	cfgPath, _ := cmd.Flags().GetString("config")
+	agentCfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config %s: %w", cfgPath, err)
+	}
+	pdKey := resolvePagerDutyRoutingKey(agentCfg, cmd)
 	if pdKey != "" {
 		pd := alerter.NewPagerDuty(&alerter.PagerDutyConfig{RoutingKey: pdKey}, 5*time.Second, slog.Default())
 		srv.SetPagerDuty(pd)

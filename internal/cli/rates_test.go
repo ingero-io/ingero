@@ -385,6 +385,11 @@ func TestExtractYAMLFromMarkdown(t *testing.T) {
 			md:   "```python\nx=1\n```\n```yaml\nfoo: bar\n```\n",
 			want: "foo: bar\n",
 		},
+		{
+			name: "CRLF line endings",
+			md:   "prefix\r\n```yaml\r\ncurrency_name: USD\r\nproviders:\r\n  ec2: {}\r\n```\r\nsuffix\r\n",
+			want: "currency_name: USD\nproviders:\n  ec2: {}\n",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

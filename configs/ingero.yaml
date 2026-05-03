@@ -97,19 +97,39 @@ health:
     stale_age: 10m
 
 # OTLP traces export for detection events (optional, disabled by default).
+# Wired into `ingero fleet-push` since v0.13: this block drives the runtime
+# tracer setup. The --otlp-enabled / --otlp-endpoint / --otlp-insecure CLI
+# flags override the corresponding YAML fields when explicitly set.
+#
 # Drives one root span per detection-event rising edge (straggler classifier
 # rising edge, baseliner DegradationWarning rising edge); the falling edge
 # ends the span with outcome=resolved. Independent from the metrics path,
-# which still flows through the `fleet:` block below — the same agent
+# which still flows through the `fleet:` block below - the same agent
 # emits both. The BatchSpanProcessor uses default OTel parameters
 # (max queue 2048, batch 512, scheduled flush every 5s). v0.13 ships
-# HTTP/protobuf only; gRPC defers (the `protocol` key is reserved).
+# HTTP/protobuf only; gRPC defers (the `protocol` key is reserved, and
+# export_interval is reserved for future use - the BatchSpanProcessor
+# default schedule applies today).
 otlp:
   enabled: false
   endpoint: ""
   protocol: grpc
   insecure: true
   export_interval: 10s
+
+# Alerter integration (optional). Wired into `ingero mcp` since v0.13: the
+# pagerduty.routing_key field enables the pagerduty_trigger MCP tool.
+# The --pagerduty-routing-key CLI flag overrides routing_key when explicitly
+# set. Leaving routing_key empty (or omitting the block) keeps the tool
+# registered but returns "not configured" at call time.
+#
+# This is the agent-side PagerDuty wiring - distinct from the alerter
+# sidecar (which has its own JSON config and consumes the same Events v2
+# API). The agent uses PagerDuty for AI-driven escalation via MCP; the
+# sidecar uses it for autonomous straggler events from the UDS socket.
+alerter:
+  pagerduty:
+    routing_key: ""
 
 # Prometheus /metrics endpoint (optional, disabled by default)
 prometheus:

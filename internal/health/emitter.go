@@ -842,6 +842,7 @@ func (e *httpEmitter) buildPerCGroupMetrics(timeNano string, perCGroup []PerCGro
 	}
 
 	launchDP := make([]otlpDP, 0, len(e.counters.kernelLaunch))
+	// Per-iteration scoping (Go 1.22+) makes &v safe across distinct cgroups.
 	for hash, total := range e.counters.kernelLaunch {
 		v := total
 		launchDP = append(launchDP, otlpDP{
@@ -878,7 +879,7 @@ func (e *httpEmitter) buildPerCGroupMetrics(timeNano string, perCGroup []PerCGro
 		out = append(out, intSum(contract.MetricCUDAKernelLaunchTotal, "1", launchDP))
 	}
 	if len(stallDP) > 0 {
-		out = append(out, intSum(contract.MetricCPUStallSecondsTotal, "ns", stallDP))
+		out = append(out, intSum(contract.MetricCPUStallNanosTotal, "ns", stallDP))
 	}
 	if len(memcpyDP) > 0 {
 		out = append(out, intSum(contract.MetricCUDAMemcpyBytesTotal, "By", memcpyDP))

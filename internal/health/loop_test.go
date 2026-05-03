@@ -742,7 +742,7 @@ func TestLoop_TracerStragglerEdges(t *testing.T) {
 	if got.Name() != "ingero.detection.straggler" {
 		t.Fatalf("span name = %q", got.Name())
 	}
-	var sawHash, sawWorkload, sawGPU, sawEventID bool
+	var sawHash, sawWorkload, sawGPU, sawEventID, sawCluster bool
 	for _, kv := range got.Attributes() {
 		switch string(kv.Key) {
 		case "ingero.cgroup_path_hash":
@@ -753,11 +753,13 @@ func TestLoop_TracerStragglerEdges(t *testing.T) {
 			sawGPU = kv.Value.AsString() == "h100-80gb"
 		case "ingero.event.id":
 			sawEventID = kv.Value.AsString() != ""
+		case "ingero.cluster.id":
+			sawCluster = kv.Value.AsString() == "prod"
 		}
 	}
-	if !sawHash || !sawWorkload || !sawGPU || !sawEventID {
-		t.Fatalf("missing expected attributes: hash=%v workload=%v gpu=%v event=%v",
-			sawHash, sawWorkload, sawGPU, sawEventID)
+	if !sawHash || !sawWorkload || !sawGPU || !sawEventID || !sawCluster {
+		t.Fatalf("missing expected attributes: hash=%v workload=%v gpu=%v event=%v cluster=%v",
+			sawHash, sawWorkload, sawGPU, sawEventID, sawCluster)
 	}
 	var sawResolved bool
 	for _, ev := range got.Events() {

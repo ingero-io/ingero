@@ -60,7 +60,7 @@ func RegisterPagerDutyTool(server *gomcp.Server, getPD func() *alerter.PagerDuty
 
 func handlePagerDutyTrigger(ctx context.Context, pd *alerter.PagerDuty, input PagerDutyTriggerInput) (*PagerDutyTriggerOutput, error) {
 	if pd == nil {
-		return nil, errors.New("pagerduty not configured: set --pagerduty-routing-key on the mcp command (or alerter.pagerduty.routing_key in configs/ingero.yaml)")
+		return nil, errors.New("pagerduty not configured: set alerter.pagerduty.routing_key in your configs/ingero.yaml or pass --pagerduty-routing-key to the mcp command")
 	}
 	switch input.Severity {
 	case "info", "warning", "error", "critical":
