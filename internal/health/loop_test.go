@@ -63,7 +63,7 @@ type stragglerCall struct {
 	isStraggler bool
 }
 
-func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
+func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool, perCGroup []PerCGroupStats) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, emitCall{score, state, mode, degradation, now})
@@ -662,7 +662,7 @@ func (benchCollector) Collect(ctx context.Context, now time.Time) (RawObservatio
 // benchEmitter captures nothing, allocates nothing.
 type benchEmitter struct{}
 
-func (benchEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
+func (benchEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool, perCGroup []PerCGroupStats) error {
 	return nil
 }
 func (benchEmitter) EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error {

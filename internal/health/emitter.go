@@ -3,10 +3,8 @@ package health
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,8 +40,7 @@ func defaultCgroupPathHash() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(path))
-	return hex.EncodeToString(sum[:])[:16], nil
+	return hashCGroupPath(path), nil
 }
 
 // minPushInterval and minTimeout are conservative lower bounds enforced by
@@ -193,8 +190,11 @@ func (c EmitterConfig) Validate() error {
 type Emitter interface {
 	// Push emits one OTLP payload carrying the score, state, and per-signal
 	// metrics. Returns nil on 2xx, a wrapped error otherwise. Does not
-	// block or panic; callers must still respect ctx cancellation.
-	Push(ctx context.Context, now time.Time, score Score, state State, detectionMode string, degradation bool) error
+	// block or panic; callers must still respect ctx cancellation. The
+	// perCGroup slice carries this push's window deltas for the per-cgroup
+	// CUDA + CPU-stall metric families; passing nil or empty means "no
+	// per-cgroup data this tick" and the cumulative counters do not move.
+	Push(ctx context.Context, now time.Time, score Score, state State, detectionMode string, degradation bool, perCGroup []PerCGroupStats) error
 	// EmitStragglerEvent pushes a single `ingero.node.straggler_event`
 	// metric with value=1 (isStraggler=true) or value=0 (recovery edge,
 	// isStraggler=false). Attributes on the data point carry threshold,
@@ -229,6 +229,26 @@ type httpEmitter struct {
 
 	pushes atomic.Int64
 	errors atomic.Int64
+
+	// counters holds the running cumulative totals for the per-cgroup
+	// Sum metrics. Each Push adds the window delta to the appropriate
+	// map and emits the resulting cumulative value, matching OTLP's
+	// AGGREGATION_TEMPORALITY_CUMULATIVE contract.
+	counters counterState
+}
+
+// counterState carries cumulative per-series totals across pushes.
+// Guarded by counters.mu so concurrent Push() callers do not race.
+type counterState struct {
+	mu           sync.Mutex
+	kernelLaunch map[string]int64       // cgroup_path_hash -> total launches
+	cpuStall     map[string]int64       // cgroup_path_hash -> total off-CPU nanos
+	memcpyBytes  map[memcpyCounterKey]int64
+}
+
+type memcpyCounterKey struct {
+	Hash      string
+	Direction string
 }
 
 // NewEmitter constructs an httpEmitter. Returns an error if cfg is invalid
@@ -283,6 +303,11 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 		log:            log,
 		cgroupPathHash: cgroupHash,
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
+		counters: counterState{
+			kernelLaunch: make(map[string]int64),
+			cpuStall:     make(map[string]int64),
+			memcpyBytes:  make(map[memcpyCounterKey]int64),
+		},
 	}, nil
 }
 
@@ -295,8 +320,8 @@ func NewEmitter(cfg EmitterConfig, log *slog.Logger) (Emitter, error) {
 // so spamming isn't useful. Only the SECOND failure (if any) increments
 // the consecutive-failure counter, so a brief network blip does not
 // falsely trip FleetReachable.
-func (e *httpEmitter) Push(ctx context.Context, now time.Time, score Score, state State, detectionMode string, degradation bool) error {
-	payload := e.buildPayload(now, score, state, detectionMode, degradation)
+func (e *httpEmitter) Push(ctx context.Context, now time.Time, score Score, state State, detectionMode string, degradation bool, perCGroup []PerCGroupStats) error {
+	payload := e.buildPayload(now, score, state, detectionMode, degradation, perCGroup)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		e.recordFailure()
@@ -476,7 +501,7 @@ func (e *httpEmitter) recordFailure() {
 
 // buildPayload constructs the full OTLP/HTTP JSON body for one push. The
 // shape and attribute keys are driven by pkg/contract.
-func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode string, degradation bool) otlpPayload {
+func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode string, degradation bool, perCGroup []PerCGroupStats) otlpPayload {
 	timeNano := fmt.Sprintf("%d", now.UnixNano())
 
 	// Per-data-point attributes (per-metric, can vary). world_size/node_rank
@@ -539,6 +564,10 @@ func (e *httpEmitter) buildPayload(now time.Time, score Score, state State, mode
 		metrics = append(metrics, intGauge(contract.MetricNodeInfo, timeNano, 1, nodeInfoAttrs))
 	}
 	metrics = append(metrics, intGauge(contract.MetricNodeWorldSize, timeNano, int64(e.cfg.WorldSize), nil))
+
+	if len(perCGroup) > 0 {
+		metrics = append(metrics, e.buildPerCGroupMetrics(timeNano, perCGroup)...)
+	}
 
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetricsBlock{{
@@ -693,13 +722,23 @@ type otlpScopeBlock struct {
 }
 
 type otlpMetric struct {
-	Name  string    `json:"name"`
-	Unit  string    `json:"unit,omitempty"`
-	Gauge *otlpData `json:"gauge,omitempty"`
+	Name  string       `json:"name"`
+	Unit  string       `json:"unit,omitempty"`
+	Gauge *otlpData    `json:"gauge,omitempty"`
+	Sum   *otlpSumData `json:"sum,omitempty"`
 }
 
 type otlpData struct {
 	DataPoints []otlpDP `json:"dataPoints"`
+}
+
+// otlpSumData is the OTLP Sum metric carrier. The agent emits cumulative
+// monotonic counters: aggregationTemporality=2 (CUMULATIVE),
+// isMonotonic=true. Consumers (Prometheus, Datadog) compute rates.
+type otlpSumData struct {
+	DataPoints             []otlpDP `json:"dataPoints"`
+	AggregationTemporality int      `json:"aggregationTemporality"`
+	IsMonotonic            bool     `json:"isMonotonic"`
 }
 
 type otlpDP struct {
@@ -742,4 +781,94 @@ func intGauge(name, timeNano string, v int64, attrs []otlpKV) otlpMetric {
 			DataPoints: []otlpDP{{Attributes: attrs, TimeUnixNano: timeNano, AsInt: &v}},
 		},
 	}
+}
+
+// intSum constructs a cumulative monotonic int64 Sum metric with the
+// given data points. AggregationTemporality=2 is CUMULATIVE per the
+// OTLP proto (1 = DELTA). Empty unit lets Fleet / Prometheus pick a
+// rendering default; specific units may be added when a downstream
+// dashboard demands them.
+func intSum(name, unit string, dps []otlpDP) otlpMetric {
+	return otlpMetric{
+		Name: name,
+		Unit: unit,
+		Sum: &otlpSumData{
+			DataPoints:             dps,
+			AggregationTemporality: 2,
+			IsMonotonic:            true,
+		},
+	}
+}
+
+// buildPerCGroupMetrics adds the window deltas in perCGroup to the
+// emitter's cumulative counter state and returns one Sum data point per
+// (cgroup_path_hash, op) for kernel-launch + cpu-stall, and per
+// (cgroup_path_hash, direction) for memcpy. Series are emitted only
+// when the cumulative total is non-zero, so a zero-workload cgroup that
+// never had a launch does not pollute the metric stream.
+func (e *httpEmitter) buildPerCGroupMetrics(timeNano string, perCGroup []PerCGroupStats) []otlpMetric {
+	e.counters.mu.Lock()
+	for _, s := range perCGroup {
+		if s.KernelLaunchCount > 0 {
+			e.counters.kernelLaunch[s.CgroupPathHash] += s.KernelLaunchCount
+		} else if _, ok := e.counters.kernelLaunch[s.CgroupPathHash]; !ok {
+			// Touch the hash so a series exists at zero on the first
+			// tick for a freshly-discovered cgroup; downstream rate()
+			// queries do not need to wait for a non-zero increment.
+			e.counters.kernelLaunch[s.CgroupPathHash] = 0
+		}
+		if s.CPUStallNanos > 0 {
+			e.counters.cpuStall[s.CgroupPathHash] += s.CPUStallNanos
+		} else if _, ok := e.counters.cpuStall[s.CgroupPathHash]; !ok {
+			e.counters.cpuStall[s.CgroupPathHash] = 0
+		}
+		for dir, bytes := range s.MemcpyBytesByDir {
+			key := memcpyCounterKey{Hash: s.CgroupPathHash, Direction: dir}
+			e.counters.memcpyBytes[key] += bytes
+		}
+	}
+
+	launchDP := make([]otlpDP, 0, len(e.counters.kernelLaunch))
+	for hash, total := range e.counters.kernelLaunch {
+		v := total
+		launchDP = append(launchDP, otlpDP{
+			Attributes:   []otlpKV{{Key: contract.AttrCgroupPathHash, Value: otlpStr(hash)}},
+			TimeUnixNano: timeNano,
+			AsInt:        &v,
+		})
+	}
+	stallDP := make([]otlpDP, 0, len(e.counters.cpuStall))
+	for hash, total := range e.counters.cpuStall {
+		v := total
+		stallDP = append(stallDP, otlpDP{
+			Attributes:   []otlpKV{{Key: contract.AttrCgroupPathHash, Value: otlpStr(hash)}},
+			TimeUnixNano: timeNano,
+			AsInt:        &v,
+		})
+	}
+	memcpyDP := make([]otlpDP, 0, len(e.counters.memcpyBytes))
+	for key, total := range e.counters.memcpyBytes {
+		v := total
+		memcpyDP = append(memcpyDP, otlpDP{
+			Attributes: []otlpKV{
+				{Key: contract.AttrCgroupPathHash, Value: otlpStr(key.Hash)},
+				{Key: contract.AttrMemcpyDirection, Value: otlpStr(key.Direction)},
+			},
+			TimeUnixNano: timeNano,
+			AsInt:        &v,
+		})
+	}
+	e.counters.mu.Unlock()
+
+	out := make([]otlpMetric, 0, 3)
+	if len(launchDP) > 0 {
+		out = append(out, intSum(contract.MetricCUDAKernelLaunchTotal, "1", launchDP))
+	}
+	if len(stallDP) > 0 {
+		out = append(out, intSum(contract.MetricCPUStallSecondsTotal, "ns", stallDP))
+	}
+	if len(memcpyDP) > 0 {
+		out = append(out, intSum(contract.MetricCUDAMemcpyBytesTotal, "By", memcpyDP))
+	}
+	return out
 }

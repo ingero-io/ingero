@@ -2538,6 +2538,158 @@ func (s *Store) QueryAggregatePerProcess(q QueryParams) ([]ProcessOpStats, error
 	return result, rows.Err()
 }
 
+// PerPIDStat is one (pid, source, op) row of aggregate counters used by
+// the per-cgroup metric collector. The collector resolves PIDs to
+// cgroup_path_hash values out-of-band so the SQL layer stays decoupled
+// from /proc reads.
+type PerPIDStat struct {
+	PID     uint32
+	Source  uint8
+	Op      uint8
+	Count   int64
+	SumDur  int64 // nanos
+	SumArg0 int64
+}
+
+// QueryAggregatePerPID returns per-(pid, source, op) aggregate counters
+// over the requested time range. Reads from event_aggregates_5s when
+// the window is sub-minute, otherwise from event_aggregates, mirroring
+// QueryAggregatePerOp / QueryAggregatePerOp5s. Used by the per-cgroup
+// metric collector to attribute kernel-launch counts and sched_switch
+// off-CPU time to cgroups via a PID->cgroup_path_hash cache.
+func (s *Store) QueryAggregatePerPID(q QueryParams) ([]PerPIDStat, error) {
+	table := "event_aggregates"
+	if windowFromParams(q) <= FiveSecondAggregateRetention {
+		// Same selection rule the signal collector uses: short windows
+		// read the 5s table for sub-minute reactivity.
+		if windowFromParams(q) <= 60*time.Second {
+			table = "event_aggregates_5s"
+		}
+	}
+	query := `SELECT pid, source, op, SUM(count), SUM(sum_dur), SUM(sum_arg0)
+		FROM ` + table + ` WHERE 1=1`
+	var args []interface{}
+
+	if !q.From.IsZero() {
+		query += " AND bucket >= ?"
+		args = append(args, q.From.UnixNano())
+	} else if q.Since > 0 {
+		query += " AND bucket >= ?"
+		args = append(args, time.Now().Add(-q.Since).UnixNano())
+	}
+	if !q.To.IsZero() {
+		query += " AND bucket <= ?"
+		args = append(args, q.To.UnixNano())
+	}
+	if q.Source > 0 {
+		query += " AND source = ?"
+		args = append(args, q.Source)
+	}
+	if q.Source > 0 && q.Op > 0 {
+		query += " AND op = ?"
+		args = append(args, q.Op)
+	}
+	query, args = appendPIDFilter(query, args, q, "")
+
+	query += " GROUP BY pid, source, op"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying aggregate per-pid (%s): %w", table, err)
+	}
+	defer rows.Close()
+
+	var result []PerPIDStat
+	for rows.Next() {
+		var p PerPIDStat
+		if err := rows.Scan(&p.PID, &p.Source, &p.Op, &p.Count, &p.SumDur, &p.SumArg0); err != nil {
+			return nil, fmt.Errorf("scanning aggregate per-pid row: %w", err)
+		}
+		result = append(result, p)
+	}
+	return result, rows.Err()
+}
+
+// MemcpyDirStat is one (pid, direction-byte) row of cudaMemcpy /
+// cudaMemcpyAsync byte totals over the requested window. The direction
+// byte is the raw cudaMemcpyKind value from arg1; the per-cgroup
+// emitter translates it into the contract.MemcpyDirection* string.
+type MemcpyDirStat struct {
+	PID           uint32
+	DirectionByte uint8
+	BytesSum      int64
+	Count         int64
+}
+
+// QueryMemcpyByDirectionPerPID returns cudaMemcpy / cudaMemcpyAsync
+// byte totals grouped by (pid, arg1). Reads the events table directly
+// because the aggregates path strips arg1: the
+// (bucket, source, op, pid) primary key collapses every direction onto
+// a single row. The trade-off is only individually-stored memcpy events
+// contribute, which matches how the per-cgroup metric is meant to be
+// scaled (the selective storage layer keeps memcpy events for chain
+// analysis already).
+func (s *Store) QueryMemcpyByDirectionPerPID(q QueryParams) ([]MemcpyDirStat, error) {
+	query := `SELECT pid, arg1, COUNT(*), COALESCE(SUM(arg0), 0)
+		FROM events
+		WHERE source = ?
+		  AND op IN (?, ?)`
+	args := []interface{}{
+		uint8(events.SourceCUDA),
+		uint8(events.CUDAMemcpy),
+		uint8(events.CUDAMemcpyAsync),
+	}
+
+	if !q.From.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, q.From.UnixNano())
+	} else if q.Since > 0 {
+		query += " AND timestamp >= ?"
+		args = append(args, time.Now().Add(-q.Since).UnixNano())
+	}
+	if !q.To.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, q.To.UnixNano())
+	}
+	query, args = appendPIDFilter(query, args, q, "")
+
+	query += " GROUP BY pid, arg1"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying memcpy by direction per-pid: %w", err)
+	}
+	defer rows.Close()
+
+	var result []MemcpyDirStat
+	for rows.Next() {
+		var m MemcpyDirStat
+		var dir uint64
+		if err := rows.Scan(&m.PID, &dir, &m.Count, &m.BytesSum); err != nil {
+			return nil, fmt.Errorf("scanning memcpy direction row: %w", err)
+		}
+		m.DirectionByte = uint8(dir)
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
+// windowFromParams approximates the QueryParams' time span. Used by
+// QueryAggregatePerPID to pick between the 5s and 1m aggregate tables
+// without duplicating the selection logic the signal collector uses.
+func windowFromParams(q QueryParams) time.Duration {
+	if !q.From.IsZero() && !q.To.IsZero() {
+		return q.To.Sub(q.From)
+	}
+	if !q.From.IsZero() {
+		return time.Since(q.From)
+	}
+	if q.Since > 0 {
+		return q.Since
+	}
+	return 0
+}
+
 // QuerySessions retrieves sessions, optionally filtered by time range.
 func (s *Store) QuerySessions(since time.Duration) ([]Session, error) {
 	query := `SELECT id, started_at, stopped_at, gpu_model, gpu_driver,

@@ -33,6 +33,15 @@ type Collector interface {
 	Collect(ctx context.Context, now time.Time) (obs RawObservation, kernelLaunches int, err error)
 }
 
+// PerCGroupCollector is an optional capability surface: collectors that
+// can attribute per-window event totals to cgroup_path_hash implement
+// it so the loop can emit the per-cgroup CUDA + CPU-stall counter
+// metrics. The signal collector backed by the SQLite event store
+// implements this; lighter-weight test collectors typically do not.
+type PerCGroupCollector interface {
+	CollectPerCGroup(ctx context.Context, now time.Time) ([]PerCGroupStats, error)
+}
+
 // LoopConfig wires the cross-cutting pieces together. All four primary
 // interface dependencies (Baseliner, StateMachine, Emitter, Collector)
 // must be non-nil; NewLoop validates this. ModeEvaluator, Classifier,
@@ -274,8 +283,18 @@ func (l *Loop) tick(parentCtx context.Context) time.Duration {
 		l.cfg.Sampler.SetDegraded(degraded)
 	}
 
+	var perCGroup []PerCGroupStats
+	if pcc, ok := l.cfg.Collector.(PerCGroupCollector); ok {
+		stats, perr := pcc.CollectPerCGroup(ctx, now)
+		if perr != nil {
+			l.log.Debug("fleet loop: per-cgroup collect error", "err", perr.Error())
+		} else {
+			perCGroup = stats
+		}
+	}
+
 	var retryAfter time.Duration
-	if err := l.cfg.Emitter.Push(ctx, now, score, next, mode, degraded); err != nil {
+	if err := l.cfg.Emitter.Push(ctx, now, score, next, mode, degraded, perCGroup); err != nil {
 		l.log.Debug("fleet loop: push error", "err", err.Error())
 		if ra := AsRetryAfter(err); ra != nil {
 			retryAfter = ra.Delay
