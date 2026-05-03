@@ -23,8 +23,8 @@
 
   <rect x="40"  y="100" width="180" height="80" class="node-em"/>
   <text x="130" y="124" text-anchor="middle" class="label">Ingero agent</text>
-  <text x="130" y="142" text-anchor="middle" class="sub">eBPF probes (47): CUDA / Graph /</text>
-  <text x="130" y="158" text-anchor="middle" class="sub">Driver / Host / I/O / TCP / Net</text>
+  <text x="130" y="142" text-anchor="middle" class="sub">eBPF probes: CUDA / Graph / Driver /</text>
+  <text x="130" y="158" text-anchor="middle" class="sub">Host / I/O / TCP / Net / NCCL</text>
   <text x="130" y="172" text-anchor="middle" class="sub">+ Python frame walker</text>
 
   <rect x="40"  y="200" width="180" height="50" class="node"/>
@@ -46,17 +46,25 @@
   <text x="440" y="140" text-anchor="middle" class="sub">ingero-fleet OCB binary</text>
   <text x="440" y="155" text-anchor="middle" class="sub">OTLP/gRPC + OTLP/HTTP receivers</text>
 
-  <rect x="340" y="180" width="200" height="50" class="node"/>
-  <text x="440" y="199" text-anchor="middle" class="label">ingeroprocessor</text>
-  <text x="440" y="216" text-anchor="middle" class="sub">peer-relative threshold + score map</text>
+  <rect x="340" y="170" width="200" height="44" class="node"/>
+  <text x="440" y="188" text-anchor="middle" class="label">ingeroprocessor</text>
+  <text x="440" y="203" text-anchor="middle" class="sub">peer-relative threshold + score map</text>
 
-  <rect x="340" y="250" width="200" height="50" class="node"/>
-  <text x="440" y="269" text-anchor="middle" class="label">providerprocessor (v0.11)</text>
-  <text x="440" y="286" text-anchor="middle" class="sub">node_providers.yaml → ingero.provider</text>
+  <rect x="340" y="220" width="200" height="44" class="node"/>
+  <text x="440" y="238" text-anchor="middle" class="label">ncclprocessor</text>
+  <text x="440" y="253" text-anchor="middle" class="sub">cross-rank barrier-wait + peer-lag</text>
 
-  <rect x="340" y="320" width="200" height="50" class="node"/>
-  <text x="440" y="339" text-anchor="middle" class="label">Threshold extension</text>
-  <text x="440" y="356" text-anchor="middle" class="sub">GET /api/v1/threshold</text>
+  <rect x="340" y="270" width="200" height="44" class="node"/>
+  <text x="440" y="288" text-anchor="middle" class="label">providerlookupprocessor</text>
+  <text x="440" y="303" text-anchor="middle" class="sub">node_providers.yaml → ingero.provider</text>
+
+  <rect x="340" y="320" width="95" height="50" class="node"/>
+  <text x="387" y="339" text-anchor="middle" class="label">Threshold ext.</text>
+  <text x="387" y="356" text-anchor="middle" class="sub">/api/v1/threshold</text>
+
+  <rect x="445" y="320" width="95" height="50" class="node"/>
+  <text x="492" y="339" text-anchor="middle" class="label">Healthee ext.</text>
+  <text x="492" y="356" text-anchor="middle" class="sub">/healthz/ee + state</text>
 
   <rect x="640" y="60"  width="220" height="320" class="group"/>
   <text x="750" y="80"  text-anchor="middle" class="group-l">BACKENDS</text>
@@ -85,8 +93,8 @@
   <text x="285" y="278" text-anchor="middle" class="sub">(GET fallback)</text>
 
   <path d="M 540 130 C 590 130 590 130 660 130" class="edge"/>
-  <path d="M 540 200 C 590 200 590 200 660 200" class="edge"/>
-  <path d="M 540 275 C 590 275 590 275 660 270" class="edge-d"/>
+  <path d="M 540 192 C 590 192 590 200 660 200" class="edge"/>
+  <path d="M 540 285 C 590 285 590 275 660 270" class="edge-d"/>
   <text x="600" y="120" text-anchor="middle" class="sub">scrape</text>
   <text x="600" y="190" text-anchor="middle" class="sub">PromQL</text>
 
