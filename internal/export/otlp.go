@@ -376,6 +376,30 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		}
 	}
 
+	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
+	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
+	// 0 when it is not. Polling-based, so a throttle event shorter than
+	// the poll interval may be missed; see CHANGELOG for the floor caveat.
+	for _, r := range snap.ThrottleReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+		}
+		metrics = append(metrics,
+			gaugeMetric("gpu.throttle.power_active",
+				"GPU clock throttling for power reasons (1=active)", "1",
+				nowNano, boolToFloat(r.PowerActive), attrs),
+			gaugeMetric("gpu.throttle.thermal_active",
+				"GPU clock throttling for thermal reasons (1=active)", "1",
+				nowNano, boolToFloat(r.ThermalActive), attrs),
+			gaugeMetric("gpu.throttle.sw_active",
+				"GPU clock throttling for software-imposed reasons (1=active)", "1",
+				nowNano, boolToFloat(r.SWActive), attrs),
+			gaugeMetric("gpu.throttle.hw_active",
+				"GPU clock throttling for hardware reasons, umbrella (1=active)", "1",
+				nowNano, boolToFloat(r.HWActive), attrs),
+		)
+	}
+
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetrics{{
 			Resource: otlpResource{
@@ -393,6 +417,13 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			}},
 		}},
 	}
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func gaugeMetric(name, desc, unit, timeNano string, value float64, attrs []otlpKeyValue) otlpMetric {
