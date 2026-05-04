@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"sort"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -228,9 +227,10 @@ func TestPoller_VerifiesNvmlSubprocessRunnerCanBeNil(t *testing.T) {
 }
 
 // infoCountingHandler counts slog.Info-level Handle calls. Used to assert
-// the "log once per UUID" property of the [Not Supported] path.
+// the "log once per UUID" property of the [Not Supported] path. The
+// counter is atomic so multiple goroutines (or a single goroutine across
+// repeated test runs) cannot race on it.
 type infoCountingHandler struct {
-	mu    sync.Mutex
 	count *atomic.Int64
 }
 
