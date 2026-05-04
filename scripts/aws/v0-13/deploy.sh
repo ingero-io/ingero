@@ -88,19 +88,19 @@ sync_repos() {
 
     if [[ "$include_agent" == "1" ]]; then
         rsync -az --delete \
-            --exclude='.git/objects' --exclude='target/' --exclude='bin/' \
+            --exclude='target/' --exclude='bin/' \
             -e "ssh ${SSH_OPTS[*]}" \
             "$REPO_ROOT/ingero/" "$SSH_USER@$ip:~/repos/ingero/"
     fi
     if [[ "$include_fleet" == "1" ]]; then
         rsync -az --delete \
-            --exclude='.git/objects' --exclude='target/' --exclude='bin/' \
+            --exclude='target/' --exclude='bin/' \
             -e "ssh ${SSH_OPTS[*]}" \
             "$REPO_ROOT/ingero-fleet/" "$SSH_USER@$ip:~/repos/ingero-fleet/"
     fi
     if [[ "$include_orchestrator" == "1" ]]; then
         rsync -az --delete \
-            --exclude='.git/objects' --exclude='target/' \
+            --exclude='target/' \
             -e "ssh ${SSH_OPTS[*]}" \
             "$REPO_ROOT/ingero-ee/" "$SSH_USER@$ip:~/repos/ingero-ee/"
     fi
@@ -116,9 +116,13 @@ build_g4dn_node() {
     {
         sync_repos "$ip" 1 1 1
         ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
-            'set -e; cd ~/repos/ingero && make vmlinux && make generate && make build'
+            'set -e; cd ~/repos/ingero && bash scripts/install-deps.sh'
         ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
-            'set -e; cd ~/repos/ingero-ee/orchestrator && cargo build --release'
+            'export PATH=/usr/local/go/bin:$PATH; set -e; git config --global --add safe.directory "*"; cd ~/repos/ingero && make vmlinux && make generate && make build'
+        if [[ "${INGERO_EE_SKIP:-0}" != "1" ]]; then
+            ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
+                'export PATH=$HOME/.cargo/bin:$PATH; set -e; cd ~/repos/ingero-ee/orchestrator && cargo build --release'
+        fi
     } >"$log" 2>&1
 }
 
@@ -126,9 +130,12 @@ build_fleet_node() {
     local ip="$1"
     local log="$2"
     {
-        sync_repos "$ip" 0 1 0
+        # ingero-fleet's cmd/fleet/go.mod has `replace github.com/ingero-io/ingero
+        # => ../../../ingero`, so the ingero source has to sit beside the fleet
+        # repo on the box for OCB to resolve it. Sync both even on the fleet node.
+        sync_repos "$ip" 0 1 1
         ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
-            'set -e; cd ~/repos/ingero-fleet && make generate && make build'
+            'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH; set -e; git config --global --add safe.directory "*"; cd ~/repos/ingero-fleet && make generate && make build'
     } >"$log" 2>&1
 }
 

@@ -189,13 +189,22 @@ wait_ssh_ready() {
 
 ###############################################################################
 # Confirm GPU is up via nvidia-smi. NVIDIA driver init via cloud-init can
-# trail SSH-readiness by 3-5 minutes on this AMI's cold boot, observed
-# empirically on the 2026-05-03 dry run. 360s window covers typical worst
-# case; per-attempt progress log so operators see we are not hung.
+# trail SSH-readiness by 5-7 minutes on the bare Ubuntu 24.04 AMI we use,
+# observed empirically across two dry runs (2026-05-03, 2026-05-04). 600s
+# window covers the worst case we have seen; per-attempt progress log so
+# operators see we are not hung. Wait for cloud-init to finish first --
+# that is the strongest readiness signal AWS gives us, and it bounds the
+# tail of driver init far better than polling nvidia-smi alone.
 ###############################################################################
 verify_gpu() {
     local public_ip="$1"
-    local deadline=$((SECONDS + 360))
+    # cloud-init status --wait blocks until cloud-init drains; bounds the
+    # outer wait significantly. If cloud-init itself hangs we still bail
+    # at the outer 600s deadline.
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+        "ubuntu@$public_ip" 'sudo cloud-init status --wait' >/dev/null 2>&1 || true
+
+    local deadline=$((SECONDS + 600))
     local attempt=0
     while (( SECONDS < deadline )); do
         attempt=$((attempt + 1))
