@@ -38,16 +38,16 @@ type Reading struct {
 	Err error
 }
 
-// runner is the injectable subprocess closure. nil means nvidia-smi is not
+// Runner is the injectable subprocess closure. nil means nvidia-smi is not
 // on PATH; callers treat that as "no NVML readings".
-type runner func(ctx context.Context) ([]byte, error)
+type Runner func(ctx context.Context) ([]byte, error)
 
 // GetCurrentClocksThrottleReasons returns one Reading per visible GPU.
 //
 // Mirrors the cgo signature `nvmlDeviceGetCurrentClocksThrottleReasons` for
 // every GPU in one call. Implementation uses `nvidia-smi`; tests stub the
 // invocation via the runner closure so no real GPU is required.
-func GetCurrentClocksThrottleReasons(ctx context.Context, run runner) ([]Reading, error) {
+func GetCurrentClocksThrottleReasons(ctx context.Context, run Runner) ([]Reading, error) {
 	if run == nil {
 		return nil, fmt.Errorf("nvml: nvidia-smi not available")
 	}
@@ -124,7 +124,7 @@ func parseThrottleCSV(out []byte) ([]Reading, error) {
 // NewSubprocessRunner returns a runner backed by `nvidia-smi`. Returns nil
 // when nvidia-smi is not on PATH; callers should treat that as "no NVML".
 // The 2 s timeout matches gpuMemReader (internal/health/gpu_memory.go).
-func NewSubprocessRunner() runner {
+func NewSubprocessRunner() Runner {
 	path, err := exec.LookPath("nvidia-smi")
 	if err != nil || path == "" {
 		return nil
