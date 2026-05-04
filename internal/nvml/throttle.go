@@ -25,12 +25,13 @@ import (
 // this; callers log once and skip the device without panicking.
 var ErrNotSupported = errors.New("clocks_throttle_reasons not supported on this device")
 
-// Reading is one raw throttle sample for one GPU. The Bitmask field carries
-// the unaltered NVML clock-throttle reason mask; the bit-to-bucket decoder
-// is applied by callers (see DecodeReasons in the same package).
+// Reading is one decoded throttle sample for one GPU. Bitmask carries the
+// unaltered NVML clock-throttle reason mask; Buckets is the bit-to-bucket
+// decode produced by DecodeReasons (see decoder.go for the mapping table).
 type Reading struct {
 	UUID    string
 	Bitmask uint64
+	Buckets ThrottleBuckets
 	// Err is non-nil only for "skip this device" cases (ErrNotSupported).
 	// A wholly-failed nvidia-smi invocation is reported via the wrapper's
 	// returned error, not via per-Reading Err.
@@ -108,7 +109,11 @@ func parseThrottleCSV(out []byte) ([]Reading, error) {
 		if err != nil {
 			return nil, fmt.Errorf("nvml: parse bitmask %q: %w", raw, err)
 		}
-		readings = append(readings, Reading{UUID: uuid, Bitmask: v})
+		readings = append(readings, Reading{
+			UUID:    uuid,
+			Bitmask: v,
+			Buckets: DecodeReasons(v),
+		})
 	}
 	if len(readings) == 0 {
 		return nil, fmt.Errorf("nvml: no GPU rows parsed")

@@ -34,6 +34,14 @@ func TestParseThrottleCSV_TwoGPUs(t *testing.T) {
 	if rs[0].Bitmask != 0x4 || rs[1].Bitmask != 0x40 {
 		t.Fatalf("bitmasks wrong: %+v", rs)
 	}
+	// SwPowerCap on GPU 1 -> Power+SW true.
+	if !rs[0].Buckets.Power || !rs[0].Buckets.SW {
+		t.Fatalf("GPU1 expected Power+SW, got %+v", rs[0].Buckets)
+	}
+	// HwThermalSlowdown on GPU 2 -> Thermal+HW true.
+	if !rs[1].Buckets.Thermal || !rs[1].Buckets.HW {
+		t.Fatalf("GPU2 expected Thermal+HW, got %+v", rs[1].Buckets)
+	}
 }
 
 // TestParseThrottleCSV_NotSupported covers the consumer-GPU error path
