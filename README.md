@@ -22,7 +22,7 @@
 [mcpservers.org](https://mcpservers.org)
 
 <!-- ingero-version:install-header product=ingero channel=stable -->
-**Version: 0.12.8**
+**Version: 0.12.9**
 
 **The only GPU observability tool your AI assistant can talk to.**
 
@@ -37,7 +37,7 @@ Ingero is a production-grade eBPF agent that traces the full chain  -  from Linu
 ```bash
 # Install (Linux amd64; arm64 / Docker / source variants are below)
 # ingero-version:install-curl product=ingero channel=stable
-VERSION=0.12.8
+VERSION=0.12.9
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
@@ -177,13 +177,13 @@ Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. R
 ```bash
 # Linux amd64
 # ingero-version:install-archive-amd64 product=ingero channel=stable
-VERSION=0.12.8
+VERSION=0.12.9
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_amd64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 
 # Linux arm64 (GH200, Grace Hopper, Graviton)
 # ingero-version:install-archive-arm64 product=ingero channel=stable
-VERSION=0.12.8
+VERSION=0.12.9
 curl -fsSL "https://github.com/ingero-io/ingero/releases/download/v${VERSION}/ingero_${VERSION}_linux_arm64.tar.gz" | tar xz
 sudo mv ingero /usr/local/bin/
 ```
@@ -198,7 +198,7 @@ docker pull ghcr.io/ingero-io/ingero:latest
 
 # Or pin to a specific version
 # ingero-version:docker-pull-example product=ingero channel=stable
-docker pull ghcr.io/ingero-io/ingero:v0.12.8
+docker pull ghcr.io/ingero-io/ingero:v0.12.9
 
 # Quick test (no root, no GPU needed)
 docker run --rm ghcr.io/ingero-io/ingero demo --no-gpu
@@ -250,7 +250,7 @@ The image is ~10 MB (Alpine 3.20 + statically linked Go binary). When building t
 ```bash
 # ingero-version:docker-build-arg product=ingero channel=stable
 docker build -f deploy/docker/Dockerfile \
-  --build-arg VERSION=0.12.8 \
+  --build-arg VERSION=0.12.9 \
   --build-arg COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
   -t ingero:local .
