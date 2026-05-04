@@ -11,7 +11,7 @@ import (
 )
 
 // MemoryState represents the current VRAM allocation state for a single PID on a single GPU.
-// JSON field names are the cross-language contract with external consumers (see docs/remediation-protocol.md).
+// JSON field names are the cross-language contract with external consumers (see docs/remediation-protocol_fleet.md).
 //
 // v0.10: Comm carries the kernel-captured process name from bpf_get_current_comm()
 // for human-readable orchestrator logs and PID-reuse detection. May be empty when

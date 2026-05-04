@@ -86,7 +86,7 @@ Fleet-side changes (the OTel Collector distribution) live in the
   `loadTLSConfig`). Callers that need a `*tls.Config` for a secondary
   client (poller, custom consumer) now use the same loader as the
   emitter.
-- **`docs/fleet-push.md`.** Command reference, signal sources, flag
+- **`docs/push_fleet.md`.** Command reference, signal sources, flag
   table, warmup behavior, detection modes, straggler classification,
   UDS stream format.
 - **eBPF Python walker support for CPython 3.9, 3.13, and 3.14.** The

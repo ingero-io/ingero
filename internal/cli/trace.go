@@ -135,8 +135,8 @@ func init() {
 	traceCmd.Flags().DurationVarP(&traceDuration, "duration", "d", 0, "stop after duration (e.g., 30s, 5m). 0 = run until Ctrl+C")
 	traceCmd.Flags().BoolVar(&traceJSON, "json", false, "output events as JSON lines (for piping to jq, scripts, MCP)")
 	traceCmd.Flags().BoolVarP(&traceVerbose, "verbose", "v", false, "show verbose table output (extra columns in TUI mode)")
-	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (e.g., localhost:4317). Disabled by default.")
-	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default.")
+	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (HTTP JSON, POST /v1/metrics; default port 4318, e.g., localhost:4318). Disabled by default. Compatible with OpenTelemetry Collector, Grafana Alloy/Cloud, Datadog Agent, New Relic, and any OTLP-HTTP receiver. Metrics: gpu.cuda.operation.{duration,count}, system.{cpu,memory}.utilization, ingero.anomaly.count. See docs/otlp.md.")
+	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default. Same metric names as --otlp. See docs/otlp.md.")
 	traceCmd.Flags().BoolVar(&traceRecord, "record", true, "record events to SQLite (default true, use --record=false to disable)")
 	traceCmd.Flags().BoolVar(&traceRecordAll, "record-all", false, "store every event individually (disables selective storage, larger DB)")
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
@@ -151,7 +151,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceNoNet, "no-net", false, "disable network socket tracing")
 	traceCmd.Flags().BoolVar(&traceNCCL, "nccl", false, "experimental: attach NCCL collective uprobes (v0.12.0; opt-in until v0.13)")
 	traceCmd.Flags().StringVar(&traceNCCLLib, "nccl-lib", "", "explicit libnccl.so path (skip /proc/<pid>/maps discovery)")
-	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol.md)")
+	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol_fleet.md)")
 	traceCmd.Flags().IntVar(&traceRemediateGid, "remediate-gid", 65532,
 		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
@@ -959,7 +959,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	var tracker *memtrack.Tracker
 	var remediateSrv *remediate.Server
 	if traceRemediate {
-		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol.md)")
+		log.Printf("INFO: remediate: starting -- connect an external consumer to /tmp/ingero-remediate.sock (see docs/remediation-protocol_fleet.md)")
 		gpuVRAM, err := memtrack.DetectGPUVRAM()
 		if err != nil {
 			log.Printf("ERROR: remediate: vram_detection_failed error=%v", err)
