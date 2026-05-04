@@ -27,7 +27,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STATE_FILE=""
 SSH_USER="${SSH_USER:-ubuntu}"
+# Local SSH private key file. When unset, ssh falls back to ssh-agent or
+# ~/.ssh defaults; with BatchMode=yes that will fail silently if neither
+# is configured. Setting this env var threads -i into every ssh / scp /
+# rsync call so the harness works without ssh-agent priming.
+SSH_KEY_FILE="${INGERO_AWS_SSH_KEY_FILE:-}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10)
+if [[ -n "$SSH_KEY_FILE" && -f "$SSH_KEY_FILE" ]]; then
+    SSH_OPTS=(-i "$SSH_KEY_FILE" "${SSH_OPTS[@]}")
+fi
 # Repo root layout: ingero-ee-2/ingero, ingero-ee-2/ingero-fleet, ingero-ee-2/ingero-ee.
 # scripts/aws/v0-13 -> ../../.. lands in ingero/, then one more ../ lands in
 # ingero-ee-2/. We want the parent of ingero/.
@@ -93,8 +101,11 @@ sync_repos() {
             "$REPO_ROOT/ingero/" "$SSH_USER@$ip:~/repos/ingero/"
     fi
     if [[ "$include_fleet" == "1" ]]; then
+        # cmd/fleet/ is OCB-generated locally; gitignored in the source repo.
+        # Skipping it on rsync avoids shipping a stale local build artifact
+        # to a node that will regenerate it via `make generate` anyway.
         rsync -az --delete \
-            --exclude='target/' --exclude='bin/' \
+            --exclude='target/' --exclude='bin/' --exclude='cmd/fleet/' \
             -e "ssh ${SSH_OPTS[*]}" \
             "$REPO_ROOT/ingero-fleet/" "$SSH_USER@$ip:~/repos/ingero-fleet/"
     fi
@@ -134,6 +145,17 @@ build_fleet_node() {
         # => ../../../ingero`, so the ingero source has to sit beside the fleet
         # repo on the box for OCB to resolve it. Sync both even on the fleet node.
         sync_repos "$ip" 0 1 1
+        # Bootstrap Go on the fleet node. install-deps.sh (which provides
+        # Go on the g4dn nodes) is ingero-specific and pulls in eBPF / clang
+        # tooling we do not need on a t3.medium. Install just Go via the
+        # canonical tarball; idempotent (skips when 1.26+ already present).
+        ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
+            'sudo bash -c "if ! /usr/local/go/bin/go version 2>/dev/null | grep -q go1.26; then
+                cd /tmp && curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz -o go.tgz
+                rm -rf /usr/local/go
+                tar -C /usr/local -xzf go.tgz
+                rm go.tgz
+            fi"'
         ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
             'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH; set -e; git config --global --add safe.directory "*"; cd ~/repos/ingero-fleet && make generate && make build'
     } >"$log" 2>&1

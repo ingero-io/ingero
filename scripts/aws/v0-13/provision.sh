@@ -28,10 +28,17 @@ source "$SCRIPT_DIR/preflight.sh"
 # Inputs (env-driven so the run-validation driver can wire them).
 ###############################################################################
 SSH_KEY_NAME="${SSH_KEY_NAME:-${INGERO_AWS_SSH_KEY_NAME:-ingero-key}}"
+# Local SSH private key file used by verify_gpu / wait_ssh_ready.
+# When unset, ssh falls back to ssh-agent or ~/.ssh defaults; with
+# BatchMode=yes that fails silently if neither is configured (observed
+# 2026-05-04, where the GPU was healthy but verify_gpu spun for the
+# full deadline because no auth path was available).
+SSH_KEY_FILE="${INGERO_AWS_SSH_KEY_FILE:-}"
 REGION="${REGION:-us-east-1}"
 TAG_RUN_ID="${TAG_RUN_ID:-v0-13-$(date +%s)}"
 AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-ingero}"
 AMI_ID="${EXPECTED_AMI:-ami-0aad28499825d76c3}"
+
 
 # Output state file lives in _bmad-output so teardown.sh + run-validation.sh
 # can read it. Path resolution: scripts/aws/v0-13 -> repo root -> sibling
@@ -198,17 +205,22 @@ wait_ssh_ready() {
 ###############################################################################
 verify_gpu() {
     local public_ip="$1"
+    # shellcheck disable=SC2207  # word-splitting on ssh_args is intentional
+    local ssh_key_args=()
+    if [[ -n "$SSH_KEY_FILE" && -f "$SSH_KEY_FILE" ]]; then
+        ssh_key_args=(-i "$SSH_KEY_FILE")
+    fi
     # cloud-init status --wait blocks until cloud-init drains; bounds the
     # outer wait significantly. If cloud-init itself hangs we still bail
     # at the outer 600s deadline.
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+    ssh "${ssh_key_args[@]}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
         "ubuntu@$public_ip" 'sudo cloud-init status --wait' >/dev/null 2>&1 || true
 
     local deadline=$((SECONDS + 600))
     local attempt=0
     while (( SECONDS < deadline )); do
         attempt=$((attempt + 1))
-        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+        if ssh "${ssh_key_args[@]}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
                 "ubuntu@$public_ip" 'nvidia-smi -L' >/dev/null 2>&1; then
             stderr_log "info" "GPU ready on $public_ip after attempt $attempt"
             return 0
