@@ -684,8 +684,7 @@ func TestOTLP_ThrottleReadings_BucketValuesAreOneOrZero(t *testing.T) {
 
 	// Walk the metrics slice and check each gauge data point's asDouble.
 	// We can't easily index into the JSON, so verify by metric name.
-	var got map[string]float64
-	got = make(map[string]float64)
+	got := make(map[string]float64)
 	for _, rm := range payload.ResourceMetrics {
 		for _, sm := range rm.ScopeMetrics {
 			for _, m := range sm.Metrics {
