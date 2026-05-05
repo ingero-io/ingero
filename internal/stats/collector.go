@@ -309,6 +309,36 @@ type Snapshot struct {
 	// emitters; nil when --nccl is off. Each element becomes one
 	// nccl.collective.duration_ms + nccl.collective.bytes data point.
 	NCCLDataPoints []NCCLDataPoint
+
+	// ThrottleReadings carries the latest NVML clock-throttle reason
+	// decode for every visible GPU. v0.12.10 (W2-poller). Populated by
+	// the cli/trace.go onSnapshot closure from the throttle poller's
+	// last-value-wins buffer; nil when nvidia-smi is not on PATH or the
+	// poller has not yet completed its first read. Each element becomes
+	// four gauge data points (power/thermal/sw/hw active) labelled with
+	// gpu.uuid in the OTLP exporter.
+	ThrottleReadings []ThrottleReading
+}
+
+// ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
+// plain-field for OTLP emission. Mirrors internal/nvml.Reading + buckets
+// without importing the nvml package (would create an import cycle).
+//
+// The four `*Active` flags map 1:1 to OTel gauge metrics:
+//
+//	PowerActive   -> gpu.throttle.power_active
+//	ThermalActive -> gpu.throttle.thermal_active
+//	SWActive      -> gpu.throttle.sw_active
+//	HWActive      -> gpu.throttle.hw_active
+//
+// Each metric's value is 1 when the flag is true, 0 otherwise.
+type ThrottleReading struct {
+	UUID          string
+	Bitmask       uint64
+	PowerActive   bool
+	ThermalActive bool
+	SWActive      bool
+	HWActive      bool
 }
 
 // NCCLDataPoint is one captured NCCL collective ready for OTLP emission.

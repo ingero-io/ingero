@@ -589,3 +589,128 @@ func TestOTLP_PushWithHeaders(t *testing.T) {
 		t.Errorf("Authorization header = %q, want 'Bearer test-token'", receivedAuth)
 	}
 }
+
+// TestOTLP_ThrottleReadings_FourMetricsPerGPU asserts the v0.12.10
+// W2-poller contract: each ThrottleReading produces exactly four gauge
+// metric entries (power, thermal, sw, hw) labelled with gpu.uuid. The
+// values are 1 when the bucket is active and 0 when it is not.
+func TestOTLP_ThrottleReadings_FourMetricsPerGPU(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+
+	snap := &stats.Snapshot{
+		ThrottleReadings: []stats.ThrottleReading{
+			{
+				UUID:        "GPU-aaaaaaaa",
+				Bitmask:     0x4,
+				PowerActive: true,
+				SWActive:    true,
+			},
+			{
+				UUID:          "GPU-bbbbbbbb",
+				Bitmask:       0x40,
+				ThermalActive: true,
+				HWActive:      true,
+			},
+		},
+	}
+
+	body, err := json.Marshal(e.buildMetricsPayload(snap))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	jsonStr := string(body)
+
+	// One entry per metric per GPU: 4 metrics x 2 GPUs = 8 series.
+	for _, name := range []string{
+		`"name":"gpu.throttle.power_active"`,
+		`"name":"gpu.throttle.thermal_active"`,
+		`"name":"gpu.throttle.sw_active"`,
+		`"name":"gpu.throttle.hw_active"`,
+	} {
+		got := strings.Count(jsonStr, name)
+		if got != 2 {
+			t.Errorf("%s: expected 2 emissions (one per GPU), got %d", name, got)
+		}
+	}
+
+	// Both UUIDs must appear in the payload as gpu.uuid attributes.
+	for _, uuid := range []string{"GPU-aaaaaaaa", "GPU-bbbbbbbb"} {
+		if !strings.Contains(jsonStr, uuid) {
+			t.Errorf("expected gpu.uuid %q in payload, missing from %s", uuid, jsonStr)
+		}
+	}
+	if !strings.Contains(jsonStr, `"key":"gpu.uuid"`) {
+		t.Errorf("expected gpu.uuid attribute key in payload: %s", jsonStr)
+	}
+}
+
+// TestOTLP_ThrottleReadings_EmptyWhenNotProvided asserts that no
+// gpu.throttle.* series leak into the payload when the snapshot has no
+// readings (e.g. no nvidia-smi on the host, or the poller is disabled).
+func TestOTLP_ThrottleReadings_EmptyWhenNotProvided(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+	for _, snap := range []*stats.Snapshot{
+		{},
+		{ThrottleReadings: nil},
+		{ThrottleReadings: []stats.ThrottleReading{}},
+	} {
+		body, _ := json.Marshal(e.buildMetricsPayload(snap))
+		if strings.Contains(string(body), "gpu.throttle.") {
+			t.Errorf("gpu.throttle.* present in payload with no readings")
+		}
+	}
+}
+
+// TestOTLP_ThrottleReadings_BucketValuesAreOneOrZero asserts the gauge
+// value semantics: an active bucket emits 1.0, an inactive bucket emits 0.0.
+// Dashboards bind to this contract.
+func TestOTLP_ThrottleReadings_BucketValuesAreOneOrZero(t *testing.T) {
+	e := NewOTLP(OTLPConfig{Endpoint: "localhost:4318"})
+	snap := &stats.Snapshot{
+		ThrottleReadings: []stats.ThrottleReading{
+			{
+				UUID:          "GPU-x",
+				PowerActive:   true,
+				ThermalActive: false,
+				SWActive:      true,
+				HWActive:      false,
+			},
+		},
+	}
+
+	payload := e.buildMetricsPayload(snap)
+	body, _ := json.Marshal(payload)
+	jsonStr := string(body)
+
+	// Walk the metrics slice and check each gauge data point's asDouble.
+	// We can't easily index into the JSON, so verify by metric name.
+	got := make(map[string]float64)
+	for _, rm := range payload.ResourceMetrics {
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if !strings.HasPrefix(m.Name, "gpu.throttle.") {
+					continue
+				}
+				if m.Gauge == nil || len(m.Gauge.DataPoints) == 0 {
+					t.Fatalf("metric %s missing gauge data points", m.Name)
+				}
+				if m.Gauge.DataPoints[0].AsDouble == nil {
+					t.Fatalf("metric %s missing asDouble", m.Name)
+				}
+				got[m.Name] = *m.Gauge.DataPoints[0].AsDouble
+			}
+		}
+	}
+
+	want := map[string]float64{
+		"gpu.throttle.power_active":   1,
+		"gpu.throttle.thermal_active": 0,
+		"gpu.throttle.sw_active":      1,
+		"gpu.throttle.hw_active":      0,
+	}
+	for name, v := range want {
+		if got[name] != v {
+			t.Errorf("%s = %v, want %v (payload: %s)", name, got[name], v, jsonStr)
+		}
+	}
+}

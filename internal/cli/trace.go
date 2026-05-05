@@ -36,6 +36,7 @@ import (
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/nvml"
 	"github.com/ingero-io/ingero/internal/procpath"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/straggler"
@@ -88,6 +89,7 @@ var (
 	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
 	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
 	traceWorkloadType string        // Mirrors fleet.workload_type from configs/ingero.yaml; gates correlator window.
+	traceThrottlePoll time.Duration // NVML clock-throttle reason poll interval (default 5s; 0 = disabled).
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -162,6 +164,8 @@ func init() {
 		"Python frame walker: auto (userspace, default), ebpf (kernel-side, requires Python 3.12), userspace (force userspace)")
 	traceCmd.Flags().StringVar(&traceWorkloadType, "fleet-workload-type", "unknown",
 		"Workload type from fleet.workload_type (training | inference | unknown). Selects correlator window: training/unknown=10s, inference=500ms.")
+	traceCmd.Flags().DurationVar(&traceThrottlePoll, "throttle-poll-interval", 5*time.Second,
+		"interval between NVML clock-throttle reason polls (gpu.throttle.*_active metrics). 0 = disable. Floor: bursts shorter than this are missed by design.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -1006,6 +1010,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go otlpExporter.Start(ctx)
 	}
 
+	// Start NVML clock-throttle reason poller (v0.12.10 W2-poller). Only
+	// useful when an exporter is configured; otherwise the buffer would
+	// fill and never be drained. The poller is no-op when nvidia-smi is
+	// not on PATH (e.g. in dev containers without GPU drivers).
+	if (otlpExporter != nil || promSrv != nil) && traceThrottlePoll > 0 {
+		startThrottlePoller(ctx, traceThrottlePoll, nvml.NewSubprocessRunner(), slog.Default())
+	}
+
 	// Snapshot callback for exporters (OTLP, Prometheus).
 	// Called every 1s from the table/JSON mode tickers.
 	// OTLP push is rate-limited: only every ExportInterval seconds (default 10s).
@@ -1043,6 +1055,12 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// snapshot so the OTLP exporter emits them as
 			// nccl.collective.* metrics. Empty when --nccl is off.
 			snap.NCCLDataPoints = ncclBufferDrain()
+			// Drain the latest NVML clock-throttle reading per GPU
+			// (v0.12.10 W2-poller). Last-value-wins semantics: a gauge
+			// is "current state", not a time series of distinct events,
+			// so the poller's per-UUID map flushes here. Nil when
+			// nvidia-smi is missing or the poller is disabled.
+			snap.ThrottleReadings = drainThrottleBuf()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}

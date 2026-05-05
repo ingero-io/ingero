@@ -8,6 +8,71 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+### Added
+
+- **NVML clock-throttle reason metrics** (W2-poller). `ingero trace`
+  now polls `nvmlDeviceGetCurrentClocksThrottleReasons` for every
+  visible GPU at a configurable interval (default 5 s, override via
+  `--throttle-poll-interval`; `0` disables) and emits four OTel
+  gauges per device, labelled with `gpu.uuid`:
+  - `gpu.throttle.power_active`
+  - `gpu.throttle.thermal_active`
+  - `gpu.throttle.sw_active`
+  - `gpu.throttle.hw_active` (umbrella for any HW reason; future NVML
+    bits not yet in the bucket table funnel here so dashboards do not
+    silently lose visibility on a newer driver)
+
+  Value is `1` when the bucket is active and `0` otherwise. The
+  metric names are a stable contract: dashboards may pin to them.
+
+  This is the polling-based variant of W2; the event-driven BPF
+  version tracked in #133 remains for a future release alongside W1.
+
+  Poll interval is the bursting floor: a throttle event shorter than
+  the interval may be missed by design. Choose the interval based on
+  the workload (5 s is a reasonable default for steady-state training;
+  shorter intervals catch more bursty inference patterns at the cost
+  of one extra `nvidia-smi` call per tick).
+
+  The bit-to-bucket mapping is documented in
+  `internal/nvml/decoder.go` and reproduced here so dashboard authors
+  can reason about the four series without reading the code:
+
+  | NVML bit                                       | bucket(s)        |
+  |------------------------------------------------|------------------|
+  | `nvmlClocksThrottleReasonGpuIdle`              | (suppressed)     |
+  | `nvmlClocksThrottleReasonApplicationsClocksSetting` | sw          |
+  | `nvmlClocksThrottleReasonSwPowerCap`           | power, sw        |
+  | `nvmlClocksThrottleReasonHwSlowdown`           | hw               |
+  | `nvmlClocksThrottleReasonSyncBoost`            | sw               |
+  | `nvmlClocksThrottleReasonSwThermalSlowdown`    | thermal, sw      |
+  | `nvmlClocksThrottleReasonHwThermalSlowdown`    | thermal, hw      |
+  | `nvmlClocksThrottleReasonHwPowerBrakeSlowdown` | power, hw        |
+  | `nvmlClocksThrottleReasonDisplayClockSetting`  | sw               |
+
+  Consumer GPUs that return `[Not Supported]` for the throttle field
+  are skipped per device; the agent logs the skip once per GPU at
+  info level instead of every tick.
+
+### Changed
+
+- **`/investigate` prompt aware of Echo federation.** The agent's MCP
+  `/investigate` prompt now opens with a one-paragraph note for cases
+  where it was reached via Ingero Echo's federated cluster-investigate
+  flow: Echo has already ranked the node, so this prompt's job is the
+  per-node "WHY" half (root cause + recommendation) while Echo handled
+  the cluster-side "WHERE" half. Standalone usage is unchanged.
+  v0.12.9 in-tandem release alignment with Fleet's new Echo-side
+  `/investigate` orchestration.
+
+### Deferred
+
+- **W1 memfrag BPF tracer** and **W2 power/thermal probes** carry into
+  v0.12.10 rather than landing here. Both need a dedicated arm64
+  validation cycle (W1 needs NVIDIA driver IOCTL hooks for fragmentation
+  attribution; W2 needs throttle-event hooks). Tracking remains in the
+  internal v0.12.9 plan as deferred work.
+
 ### Fixed
 
 - **arm64 release binaries now load BPF probes correctly.** The v0.10.0
