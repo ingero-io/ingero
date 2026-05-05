@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/pkg/contract"
 )
 
 // OTLPConfig configures the OTLP exporter.
@@ -391,13 +392,13 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
 			}
 			metrics = append(metrics,
-				gaugeMetricInt("gpu.nccl.process_loaded",
+				gaugeMetricInt(contract.MetricGPUNCCLProcessLoaded,
 					"NCCL-loaded process discovered on this node (1=present)",
 					"1", nowNano, 1, attrs),
 			)
 		}
 		metrics = append(metrics,
-			gaugeMetricInt("gpu.nccl.processes_total",
+			gaugeMetricInt(contract.MetricGPUNCCLProcessesTotal,
 				"Count of NCCL-loaded processes on this node", "1",
 				nowNano, int64(len(snap.NCCLProcessReadings)), nil),
 		)
@@ -417,7 +418,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 				nowNano, r.FreeBytes, attrs),
 			gaugeMetricInt("gpu.memory.total", "Total GPU memory (NVML poll)", "By",
 				nowNano, r.TotalBytes, attrs),
-			gaugeMetric("gpu.memory.fragmentation_estimate",
+			gaugeMetric(contract.MetricGPUMemoryFragmentation,
 				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]; v0.15 will replace with IOCTL-level event-driven tracking",
 				"1", nowNano, r.FragmentationEstimate, attrs),
 		)
@@ -428,7 +429,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
 		}
 		metrics = append(metrics,
-			gaugeMetricInt("gpu.memory.process.allocated_bytes",
+			gaugeMetricInt(contract.MetricGPUMemoryProcessAllocated,
 				"Per-process GPU memory allocation (NVML compute-apps poll)", "By",
 				nowNano, p.UsedBytes, attrs),
 		)
@@ -443,10 +444,10 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: "direction", Value: stringVal(m.Direction)},
 		}
 		metrics = append(metrics,
-			sumMetric("gpu.memcpy.bytes_total",
+			sumMetric(contract.MetricGPUMemcpyBytesTotal,
 				"Cumulative CUDA memcpy bytes by direction (v0.14 item C)",
 				"By", nowNano, m.BytesTotal, attrs),
-			gaugeMetric("gpu.memcpy.duration_ms",
+			gaugeMetric(contract.MetricGPUMemcpyDurationMS,
 				"Average per-event CUDA memcpy duration by direction over the last export window",
 				"ms", nowNano, m.AverageDurationMs, attrs),
 		)
