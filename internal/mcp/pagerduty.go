@@ -35,11 +35,28 @@ type PagerDutyTriggerOutput struct {
 // a setter. The closure may return nil; in that case the handler returns an
 // actionable "not configured" error. Tool is always registered so the
 // inventory is stable across nodes regardless of config.
-func RegisterPagerDutyTool(server *gomcp.Server, getPD func() *alerter.PagerDuty) {
+//
+// v0.14 R3 ★4: this tool emits an outbound webhook at operator cost.
+// When the agent's MCP listener has no caller-identity check (the v0.14
+// default; bearer auth on the agent MCP is Sec ★2 #2 in the deferred
+// pile), any local user or compromised on-host process could trigger
+// PagerDuty pages at operator cost. The handler gates on `enabledFn()`;
+// when it returns false the handler returns an actionable error
+// instructing the operator to enable via `--enable-mcp-pagerduty` and
+// pair with `--mcp-bearer-token` on the agent MCP listener. Registration
+// stays so AI callers introspecting the inventory see the tool exists
+// (and the disabled-state error explains the path forward).
+func RegisterPagerDutyTool(server *gomcp.Server, getPD func() *alerter.PagerDuty, enabledFn func() bool) {
 	gomcp.AddTool(server, &gomcp.Tool{
 		Name:        "pagerduty_trigger",
 		Description: "Create a PagerDuty incident with rich context. For AI-driven escalation during investigations.",
 	}, func(ctx context.Context, req *gomcp.CallToolRequest, input PagerDutyTriggerInput) (*gomcp.CallToolResult, any, error) {
+		if enabledFn != nil && !enabledFn() {
+			return &gomcp.CallToolResult{
+				Content: []gomcp.Content{&gomcp.TextContent{Text: "pagerduty_trigger is disabled on this agent MCP listener (v0.14 default). Enable with --enable-mcp-pagerduty AND --mcp-bearer-token to gate access. See agent docs/commands.md."}},
+				IsError: true,
+			}, nil, nil
+		}
 		var pd *alerter.PagerDuty
 		if getPD != nil {
 			pd = getPD()
