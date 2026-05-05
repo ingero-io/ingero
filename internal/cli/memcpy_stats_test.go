@@ -22,12 +22,12 @@ func TestRecordMemcpyEventDirectionLabels(t *testing.T) {
 	defer resetMemcpyStats()
 
 	// One H2D (1KiB), one D2H (2KiB), one D2D (3KiB), one Peer (4KiB,
-	// pinned to D2D), one 2D-async (5KiB, unknown direction).
+	// pinned to D2D), one 2D-async (5KiB, direction=5/unknown).
 	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 1<<10, 100*time.Microsecond))
 	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpyAsync, 2, 2<<10, 200*time.Microsecond))
 	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 3, 3<<10, 300*time.Microsecond))
 	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpyPeer, 3, 4<<10, 400*time.Microsecond))
-	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy2DAsync, 0, 5<<10, 500*time.Microsecond))
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy2DAsync, 5, 5<<10, 500*time.Microsecond))
 
 	got := drainMemcpyStats()
 	if len(got) == 0 {
@@ -49,14 +49,13 @@ func TestRecordMemcpyEventDirectionLabels(t *testing.T) {
 	if byDir["d2d"] != (3<<10)+(4<<10) {
 		t.Errorf("d2d bytes = %d, want %d (cudaMemcpy + cudaMemcpyPeer)", byDir["d2d"], (3<<10)+(4<<10))
 	}
-	// h2h is direction=0; the 2D-async event uses direction=0 because
-	// the BPF probe couldn't read PARM7. So h2h gets 5<<10 here. The
-	// label is technically a mis-classification at the metric level
-	// but the OTLP label stays consistent with the BPF-side encoding;
-	// userspace dashboards interpret direction=h2h on a 2D-flavored
-	// op as "direction unknown" by convention.
-	if byDir["h2h"] != 5<<10 {
-		t.Errorf("h2h (== unknown for 2D variants) = %d", byDir["h2h"])
+	// 2D variants encode direction=5 (unknown) since cudaMemcpyKind is
+	// PARM7 and unreadable via libbpf macros on amd64+arm64.
+	if byDir["unknown"] != 5<<10 {
+		t.Errorf("unknown (2D variants) bytes = %d, want %d", byDir["unknown"], 5<<10)
+	}
+	if byDir["h2h"] != 0 {
+		t.Errorf("h2h bytes should be 0 after the v0.14 R2 ★5 fix, got %d", byDir["h2h"])
 	}
 }
 

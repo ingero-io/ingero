@@ -573,7 +573,7 @@ int uprobe_cuda_memcpy_2d(struct pt_regs *ctx)
 	 * variants (CUDA_OP_MEMCPY / _ASYNC) remain the precise path.
 	 */
 	__u64 count = (__u64)PT_REGS_PARM5(ctx); /* width: lower bound */
-	__u64 kind  = 0; /* unknown direction; see comment above */
+	__u64 kind  = 5; /* unknown; cudaMemcpyKind is PARM7 (stack), unreadable */
 	save_entry(tid, CUDA_OP_MEMCPY_2D, count, kind);
 	return 0;
 }
@@ -599,7 +599,7 @@ int uprobe_cuda_memcpy_2d_async(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 count = (__u64)PT_REGS_PARM5(ctx); /* width approximation; see cudaMemcpy2D */
-	__u64 kind  = 0;
+	__u64 kind  = 5; /* unknown; cudaMemcpyKind is PARM7 (stack), unreadable */
 	save_entry(tid, CUDA_OP_MEMCPY_2D_ASYNC, count, kind);
 	return 0;
 }
