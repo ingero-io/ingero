@@ -318,6 +318,36 @@ type Snapshot struct {
 	// four gauge data points (power/thermal/sw/hw active) labelled with
 	// gpu.uuid in the OTLP exporter.
 	ThrottleReadings []ThrottleReading
+
+	// NCCLProcessReadings carries the latest snapshot of NCCL-loaded
+	// processes from the libnccl discovery scanner (v0.14 item A).
+	// Each element becomes one gpu.nccl.process_loaded gauge=1 data
+	// point with pid/comm/libnccl_path/libnccl_version labels; the
+	// length of the slice becomes the gpu.nccl.processes_total gauge.
+	// Nil when --libnccl-discovery-interval is 0 or the scanner has
+	// not yet completed its first pass.
+	NCCLProcessReadings []NCCLProcessReading
+
+	// MemFragReadings carries the latest NVML-poll memory-usage
+	// snapshot per GPU (v0.14 item D, W1 baseline). Each element
+	// becomes four gauges (used/free/total/fragmentation_estimate)
+	// labelled with gpu.uuid. Nil when --memfrag-poll-interval is 0
+	// or the poller has not yet completed its first read.
+	MemFragReadings []MemFragReading
+
+	// MemFragProcessReadings carries per-process GPU memory usage
+	// from `nvidia-smi --query-compute-apps`. Each element becomes
+	// one gpu.memory.process.allocated_bytes gauge labelled with
+	// gpu.uuid + pid. Nil under the same conditions as
+	// MemFragReadings.
+	MemFragProcessReadings []MemFragProcessReading
+
+	// MemcpyDirReadings carries per-direction memcpy aggregates
+	// (v0.14 item C). Each element becomes one
+	// gpu.memcpy.bytes_total counter and one
+	// gpu.memcpy.duration_ms gauge labelled with `direction`.
+	// Empty when no memcpy events have been seen this run.
+	MemcpyDirReadings []MemcpyDirStats
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -367,6 +397,56 @@ type NCCLDataPoint struct {
 	// primitives (PARM4 of those calls). Zero for collectives. v0.12.2:
 	// enables topology-mapping for pipeline-parallel workloads.
 	PeerRank uint32
+}
+
+// NCCLProcessReading is one discovered NCCL-loaded process surfaced
+// by the libnccl discovery scanner (v0.14 item A). Plain fields so
+// the export package emits without importing ncclprobe (avoids an
+// import cycle).
+//
+// Each reading produces one gpu.nccl.process_loaded gauge=1 data
+// point with the four-label set (pid, comm, libnccl_path,
+// libnccl_version); the slice length feeds gpu.nccl.processes_total.
+type NCCLProcessReading struct {
+	PID        uint32
+	Comm       string
+	LibPath    string
+	LibVersion string
+}
+
+// MemFragReading is one polled NVML memory snapshot per GPU
+// (v0.14 item D). The fragmentation estimate is a coarse heuristic
+// computed from used/free/total: it is NOT the IOCTL-level memfrag
+// tracking that v0.15 W1 ships; the comment in the OTLP encoder
+// surfaces this caveat in the metric description.
+type MemFragReading struct {
+	UUID                  string
+	UsedBytes             int64
+	FreeBytes             int64
+	TotalBytes            int64
+	FragmentationEstimate float64 // [0,1]: 0 = unfragmented, 1 = fully fragmented
+}
+
+// MemcpyDirStats is one per-direction aggregate of CUDA memcpy
+// events (v0.14 item C). BytesTotal is monotonically growing
+// across the agent process lifetime so the OTLP exporter emits it
+// as a Sum (cumulative) metric. AverageDurationMs is per-window
+// (reset each drain) since cumulative percentiles need a real
+// histogram encoder, deferred to v0.15.
+type MemcpyDirStats struct {
+	Direction         string  // "h2h", "h2d", "d2h", "d2d", "default", "unknown"
+	BytesTotal        int64
+	AverageDurationMs float64
+	EventsInWindow    int64
+}
+
+// MemFragProcessReading is one per-process GPU-memory data point
+// from `nvidia-smi --query-compute-apps`. UUID is the GPU UUID the
+// process is using; PID is the host PID.
+type MemFragProcessReading struct {
+	UUID      string
+	PID       uint32
+	UsedBytes int64
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

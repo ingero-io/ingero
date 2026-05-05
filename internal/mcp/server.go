@@ -72,6 +72,12 @@ type Server struct {
 	// closure may be invoked from any MCP request goroutine).
 	pdMu      sync.RWMutex
 	pagerduty *alerter.PagerDuty // nil-safe; tool reports "not configured" when nil
+
+	// enablePagerDutyMCP gates registration of the pagerduty_trigger MCP
+	// tool. v0.14 R3 ★4: tool emits an outbound webhook at operator cost.
+	// Default false; explicit opt-in via `--enable-mcp-pagerduty`. Pair
+	// with `--mcp-bearer-token` so callers must authenticate.
+	enablePagerDutyMCP bool
 }
 
 // New creates an MCP server backed by the given SQLite store.
@@ -95,6 +101,15 @@ func New(s *store.Store) *Server {
 // SetFleetNodes configures the MCP server with fleet node addresses for query_fleet.
 func (s *Server) SetFleetNodes(nodes []string) {
 	s.fleetNodes = nodes
+}
+
+// SetPagerDutyMCPEnabled gates the pagerduty_trigger tool registration.
+// Pass true ONLY when the agent's MCP listener has caller-identity
+// enforcement (bearer auth via --mcp-bearer-token) or runs on a trusted
+// loopback. Default off so an unauthenticated MCP cannot be used to
+// trigger PagerDuty pages at operator cost. v0.14 R3 ★4 fix.
+func (s *Server) SetPagerDutyMCPEnabled(enabled bool) {
+	s.enablePagerDutyMCP = enabled
 }
 
 // SetPagerDuty wires a configured PagerDuty backend into the MCP server.
@@ -1138,7 +1153,12 @@ Performance: events can have millions of rows. For large DBs, query event_aggreg
 	})
 
 	// Tool 11: pagerduty_trigger — AI-driven incident escalation.
-	RegisterPagerDutyTool(s.mcpServer, s.pagerDutyBackend)
+	// Tool registration always happens (inventory stability); the
+	// handler gates on s.enablePagerDutyMCP at call time and returns
+	// an actionable error when disabled. v0.14 R3 ★4: outbound
+	// webhook at operator cost on a no-auth MCP listener is too easy
+	// to abuse without explicit opt-in.
+	RegisterPagerDutyTool(s.mcpServer, s.pagerDutyBackend, func() bool { return s.enablePagerDutyMCP })
 }
 
 func (s *Server) handleQueryFleet(ctx context.Context, input queryFleetInput) (*gomcp.CallToolResult, any, error) {

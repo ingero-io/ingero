@@ -22,6 +22,19 @@ import (
 // Today this points at the example file in the ingero-fleet repo;
 // when a dedicated catalog repo lands the URL will move and the
 // embedded fallback in docs/gpu_rates.md will be retired.
+//
+// TRUST BOUNDARY (v0.14 R3 ★4): the URL points at `main` on a public
+// repo. Anyone with merge rights to `ingero-fleet:main` can change
+// the rate values, and every operator running `ingero rates update`
+// will silently pick up the new file. The schema is validated; the
+// content (USD/sec values) is NOT. A bad-faith or buggy PR landing
+// `fallback_rate: 0.0001` flows into operator dashboards as silently-
+// wrong cost telemetry. Operators who need stronger supply-chain
+// integrity should pin --url to a specific commit SHA (paste the
+// commit-pinned raw.githubusercontent URL) and review the diff
+// before each update. v0.15 will move the catalog to a dedicated,
+// release-signed repository (github.com/ingero-io/gpu-rates) and
+// update this default; the trust posture will tighten then.
 const defaultRatesURL = "https://raw.githubusercontent.com/ingero-io/ingero-fleet/main/examples/gpu_rates.yaml"
 
 var (

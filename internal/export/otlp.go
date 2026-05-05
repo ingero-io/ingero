@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/pkg/contract"
 )
 
 // OTLPConfig configures the OTLP exporter.
@@ -374,6 +375,82 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 					ts, int64(p.CountBytes), attrs),
 			)
 		}
+	}
+
+	// libnccl process discovery (v0.14 item A). One gpu.nccl.process_loaded
+	// gauge=1 per discovered PID, plus gpu.nccl.processes_total per node.
+	// The scanner emits an empty slice (not nil) when it has run but
+	// found no NCCL processes; the per-node total still emits with
+	// value=0 in that case so dashboards can plot "this node has no
+	// NCCL workloads right now" alongside positive readings.
+	if snap.NCCLProcessReadings != nil {
+		for _, r := range snap.NCCLProcessReadings {
+			attrs := []otlpKeyValue{
+				{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
+				{Key: "comm", Value: stringVal(r.Comm)},
+				{Key: "libnccl_path", Value: stringVal(r.LibPath)},
+				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
+			}
+			metrics = append(metrics,
+				gaugeMetricInt(contract.MetricGPUNCCLProcessLoaded,
+					"NCCL-loaded process discovered on this node (1=present)",
+					"1", nowNano, 1, attrs),
+			)
+		}
+		metrics = append(metrics,
+			gaugeMetricInt(contract.MetricGPUNCCLProcessesTotal,
+				"Count of NCCL-loaded processes on this node", "1",
+				nowNano, int64(len(snap.NCCLProcessReadings)), nil),
+		)
+	}
+
+	// NVML-poll memfrag heuristic (v0.14 item D, W1 baseline).
+	// Polling-based; not the IOCTL-level memfrag tracking that v0.15
+	// W1 brings. Four gauges per GPU labelled with gpu.uuid.
+	for _, r := range snap.MemFragReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt("gpu.memory.used", "GPU memory currently allocated (NVML poll)", "By",
+				nowNano, r.UsedBytes, attrs),
+			gaugeMetricInt("gpu.memory.free", "GPU memory free (NVML poll)", "By",
+				nowNano, r.FreeBytes, attrs),
+			gaugeMetricInt("gpu.memory.total", "Total GPU memory (NVML poll)", "By",
+				nowNano, r.TotalBytes, attrs),
+			gaugeMetric(contract.MetricGPUMemoryFragmentation,
+				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]; v0.15 will replace with IOCTL-level event-driven tracking",
+				"1", nowNano, r.FragmentationEstimate, attrs),
+		)
+	}
+	for _, p := range snap.MemFragProcessReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(p.UUID)},
+			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt(contract.MetricGPUMemoryProcessAllocated,
+				"Per-process GPU memory allocation (NVML compute-apps poll)", "By",
+				nowNano, p.UsedBytes, attrs),
+		)
+	}
+
+	// Per-direction CUDA memcpy aggregates (v0.14 item C). Two
+	// metrics per direction: a cumulative counter for byte totals
+	// and a per-window gauge for average duration. Direction labels
+	// are h2h / h2d / d2h / d2d / default / unknown.
+	for _, m := range snap.MemcpyDirReadings {
+		attrs := []otlpKeyValue{
+			{Key: "direction", Value: stringVal(m.Direction)},
+		}
+		metrics = append(metrics,
+			sumMetric(contract.MetricGPUMemcpyBytesTotal,
+				"Cumulative CUDA memcpy bytes by direction (v0.14 item C)",
+				"By", nowNano, m.BytesTotal, attrs),
+			gaugeMetric(contract.MetricGPUMemcpyDurationMS,
+				"Average per-event CUDA memcpy duration by direction over the last export window",
+				"ms", nowNano, m.AverageDurationMs, attrs),
+		)
 	}
 
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per

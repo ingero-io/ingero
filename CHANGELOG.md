@@ -8,6 +8,80 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-05
+
+Skips v0.13.
+
+### Added
+
+- **libnccl process discovery**: periodic `/proc/PID/maps` scanner
+  emits `gpu.nccl.process_loaded` (gauge=1 per discovered PID,
+  labelled with `pid`, `comm`, `libnccl_path`, `libnccl_version`)
+  and `gpu.nccl.processes_total`. New flag
+  `--libnccl-discovery-interval` (default 10s; 0 disables).
+- **Memcpy uprobes** for `cudaMemcpy2D`, `cudaMemcpy2DAsync`,
+  `cudaMemcpyPeer`, `cudaMemcpyPeerAsync`. Per-direction labels
+  (`h2h`, `h2d`, `d2h`, `d2d`, `default`, `unknown`). New gauges
+  `gpu.memcpy.bytes_total{direction}` (cumulative counter) and
+  `gpu.memcpy.duration_ms{direction}` (per-window average). 2D
+  variants encode `direction=unknown` because the kind argument
+  lives where libbpf's `PT_REGS_PARMn` macros cannot read it; the
+  1D variants remain the precise direction-and-bytes signal.
+- **W1 NVML-poll memfrag heuristic**: `gpu.memory.fragmentation_estimate`
+  (gauge 0..1, derived from nvidia-smi memory.{used,free,total}) and
+  per-PID `gpu.memory.process.allocated_bytes`. New flag
+  `--memfrag-poll-interval` (default 10s; 0 disables). Polling-based;
+  v0.15 will replace with an event-driven IOCTL kprobe variant.
+- Per-cgroup CUDA + CPU-stall metric variants alongside existing
+  per-process series. New `internal/health/cgroup_cache.go` builds
+  the cgroup-path-hash identity.
+- OTLP traces emission for detection events
+  (`internal/tracing/tracer.go`).
+- `ingero rates update` CLI subcommand. Live update with embedded
+  Markdown fallback.
+- `pagerduty_trigger` MCP tool. PagerDuty Events v2 trigger from
+  the agent's detection-event shape. Off by default; opt in via
+  `SetPagerDutyMCPEnabled(true)` after pairing the agent MCP with
+  bearer auth.
+- AWS validation harness: `scripts/aws/v0-13/{deploy,preflight,
+  provision,teardown}.sh`.
+- YAML config loader (`internal/config/config.go`).
+- Trace-sampling policy (`internal/sampling/sampler.go`).
+- Six new metric-name constants in `pkg/contract/contract.go`
+  (`MetricGPUNCCLProcessLoaded`, `MetricGPUNCCLProcessesTotal`,
+  `MetricGPUMemoryFragmentation`, `MetricGPUMemoryProcessAllocated`,
+  `MetricGPUMemcpyBytesTotal`, `MetricGPUMemcpyDurationMS`); plus
+  `ingero.cgroup.path_hash` attribute constant.
+- `docs/troubleshooting.md`: patterns Ingero detects, operational
+  cheat sheet, advanced configuration.
+
+### Changed
+
+- CHANGELOG backfilled with versioned sections for v0.10.1,
+  v0.11.0, v0.12.1, v0.12.2, v0.12.4, v0.12.6, v0.12.7, v0.12.8,
+  v0.12.9, and v0.12.10.
+- `docs/otlp.md` adds the W2-poller bit-to-bucket mapping and the
+  four `gpu.throttle.*_active` series; NCCL collective metrics also
+  documented.
+- `docs/commands.md` documents `--throttle-poll-interval`.
+- README trimmed; technical reference content moved to
+  `docs/troubleshooting.md`.
+- `internal/store/store.go` schema extended with per-cgroup
+  attribution columns (additive; older readers unaffected).
+- PagerDuty client response body bounded by `io.LimitReader(64KiB)`
+  before close.
+
+### Fixed
+
+- `cudaMemcpy2D` / `cudaMemcpy2DAsync` BPF probes encode
+  `direction=5` (`unknown`) instead of `direction=0` (`h2h`).
+  Earlier code relied on a userspace convention to interpret
+  direction=h2h on a 2D op as unknown; that convention was not in
+  the contract. The fix makes the metric label honest and prevents
+  silent mixing of true H2H copies with 2D-with-unknown-direction.
+
+## [0.12.10] - 2026-05-04
+
 ### Added
 
 - **NVML clock-throttle reason metrics** (W2-poller). `ingero trace`
@@ -24,35 +98,16 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
   Value is `1` when the bucket is active and `0` otherwise. The
   metric names are a stable contract: dashboards may pin to them.
-
   This is the polling-based variant of W2; the event-driven BPF
   version tracked in #133 remains for a future release alongside W1.
-
   Poll interval is the bursting floor: a throttle event shorter than
-  the interval may be missed by design. Choose the interval based on
-  the workload (5 s is a reasonable default for steady-state training;
-  shorter intervals catch more bursty inference patterns at the cost
-  of one extra `nvidia-smi` call per tick).
+  the interval may be missed by design. Consumer GPUs that return
+  `[Not Supported]` for the throttle field are skipped per device;
+  the agent logs the skip once per GPU at info level instead of
+  every tick. Full bit-to-bucket mapping documented in
+  [`docs/otlp.md`](docs/otlp.md).
 
-  The bit-to-bucket mapping is documented in
-  `internal/nvml/decoder.go` and reproduced here so dashboard authors
-  can reason about the four series without reading the code:
-
-  | NVML bit                                       | bucket(s)        |
-  |------------------------------------------------|------------------|
-  | `nvmlClocksThrottleReasonGpuIdle`              | (suppressed)     |
-  | `nvmlClocksThrottleReasonApplicationsClocksSetting` | sw          |
-  | `nvmlClocksThrottleReasonSwPowerCap`           | power, sw        |
-  | `nvmlClocksThrottleReasonHwSlowdown`           | hw               |
-  | `nvmlClocksThrottleReasonSyncBoost`            | sw               |
-  | `nvmlClocksThrottleReasonSwThermalSlowdown`    | thermal, sw      |
-  | `nvmlClocksThrottleReasonHwThermalSlowdown`    | thermal, hw      |
-  | `nvmlClocksThrottleReasonHwPowerBrakeSlowdown` | power, hw        |
-  | `nvmlClocksThrottleReasonDisplayClockSetting`  | sw               |
-
-  Consumer GPUs that return `[Not Supported]` for the throttle field
-  are skipped per device; the agent logs the skip once per GPU at
-  info level instead of every tick.
+## [0.12.9] - 2026-05-04
 
 ### Changed
 
@@ -60,47 +115,165 @@ Fleet-side changes (the OTel Collector distribution) live in the
   `/investigate` prompt now opens with a one-paragraph note for cases
   where it was reached via Ingero Echo's federated cluster-investigate
   flow: Echo has already ranked the node, so this prompt's job is the
-  per-node "WHY" half (root cause + recommendation) while Echo handled
-  the cluster-side "WHERE" half. Standalone usage is unchanged.
-  v0.12.9 in-tandem release alignment with Fleet's new Echo-side
+  per-node "WHY" half (root cause + recommendation) while Echo
+  handles the cluster-side "WHERE" half. Standalone usage is
+  unchanged. In-tandem release alignment with Fleet's new Echo-side
   `/investigate` orchestration.
 
-### Deferred
+## [0.12.8] - 2026-05-03
 
-- **W1 memfrag BPF tracer** and **W2 power/thermal probes** carry into
-  v0.12.10 rather than landing here. Both need a dedicated arm64
-  validation cycle (W1 needs NVIDIA driver IOCTL hooks for fragmentation
-  attribution; W2 needs throttle-event hooks). Tracking remains in the
-  internal v0.12.9 plan as deferred work.
+In-tandem release with Fleet v0.12.8 (no agent code changes; tag
+maintained for sync per the in-tandem release rule). Fleet shipped
+the healthee OTel Collector extension and the quanthealth library.
 
-### Fixed
+## [0.12.7] - 2026-05-02
 
-- **arm64 release binaries now load BPF probes correctly.** The v0.10.0
-  release archives shipped a single set of pre-compiled BPF objects
-  built for x86_64 and embedded that set into both the linux_amd64 and
-  linux_arm64 binaries. On any aarch64 kernel the `pt_regs` CO-RE
-  relocations resolved against the wrong struct layout and the verifier
-  rejected the load with `bad CO-RE relocation: invalid func unknown`.
-  bpf2go is now invoked with `-target amd64,arm64`; per-arch `.bpf.o`
-  files are committed under
-  `internal/ebpf/<pkg>/<name>_<arch>_bpfel.{go,o}` and selected at Go
-  build time via build constraints. A new `internal/ebpf/parity` test
-  package guards the per-arch output so the same regression cannot
-  reach a release again. Reported by @saiyam1814 against DGX Spark
-  (issue #35); affects every arm64 release-binary user, not only Spark.
-- **MCP server reports build-time version.** `ingero mcp` now reports
-  the version embedded at build time (e.g. `v0.10.0`) in the MCP
-  `Implementation.Version` field, instead of the previously hardcoded
-  `"0.9.0"` string. Affects how MCP clients (Claude Desktop, IDE
-  plugins, glama.ai) identify the server. The hardcode shipped in
-  v0.10.0; binaries built from main HEAD or from any v0.10.1+ tag
-  carry the fix.
+Doc-sync release synchronizing version pins to v0.12.6. No agent
+code changes.
+
+## [0.12.6] - 2026-05-02
+
+Release-pipeline hotfix on top of v0.12.5. Same agent scope as
+v0.12.5; the goreleaser pipeline fix landed at the fleet repo so
+fleet artifacts could publish.
+
+## [0.12.4] - 2026-05-02
+
+### Changed
+
+- **AWS provider detection hardened.** Instance-id shape validation
+  added; the metadata URL is now injectable for tests.
 
 ### Internal
 
-- New `bpf-freshness` CI job re-runs `make generate` on every PR and
-  asserts no drift in `internal/ebpf/`, catching the original failure
-  mode where committed BPF artifacts diverged from BPF C sources.
+- Lint cleanup: silenced staticcheck S1000 / S1037 / U1000 / ST1013
+  warnings in pre-existing code paths.
+
+## [0.12.2] - 2026-05-02
+
+### Added
+
+- **NCCL probe per-tenant PID filter.** New BPF hash map
+  `nccl_target_pids` (max 256 entries; sentinel at key 0 enables
+  the filter; empty map = trace all PIDs). Userspace API:
+  `Tracer.SetTargetPID(uint32)` / `Tracer.ClearTargetPIDs()`.
+  `setupNCCLTracer` wires `--pid` through to the filter when set.
+- **NCCL Send/Recv peer rank.** `ncclSend` / `ncclRecv` uprobes
+  capture PARM4 as `peer_rank`; emitted as OTLP attribute
+  `nccl.peer_rank` (only when non-zero). New contract constant
+  `pkg/contract/contract.AttrNCCLPeerRank`.
+- **Barrier-correlator refactor.** Package-scope state lifted to a
+  `barrierCorrelator{mu, state, out}` struct so tests can construct
+  isolated correlators. Default singleton preserves the agent-CLI
+  wiring.
+- **`HasCapBPF()` rewrite.** Replaces shell-out / capability-mask
+  parsing with a direct `unix.Capget` syscall (capability v3
+  header). Adds `capget` to the seccomp allowlist.
+- **`setupNCCLTracer` factory.** Extracted from `traceRunE` with an
+  injectable `ncclSetupParams` struct (geteuid, hasCapBPF,
+  findLibForPID, findLibSystemwide, debugf, stderr) so paths can be
+  unit-tested without spinning up cobra or real BPF.
+
+### Fixed
+
+- **NCCL probe attach-vs-PID-filter race.** Closed the window where
+  target PIDs could change between `Attach()` and
+  `SetTargetPIDs()`. `ClearTargetPIDs` errors now propagate to the
+  caller instead of being silently swallowed.
+
+## [0.12.1] - 2026-05-02
+
+### Added
+
+- **NCCL collective uprobe instrumentation.** 16 uprobes against
+  libnccl.so (or libtorch_cuda.so for statically-linked PyTorch):
+  `ncclCommInitRank`, `ncclCommDestroy`, `ncclAllReduce`,
+  `ncclAllGather`, `ncclReduceScatter`, `ncclBcast`, `ncclSend`,
+  `ncclRecv` (each with uprobe+uretprobe). Auto-discovers libnccl
+  via `/proc/<pid>/maps`; falls back to libtorch_cuda.so or
+  libtorch_global_deps.so.
+- **`nccl.collective.duration_ms`, `barrier_wait_ms`, `bytes`**
+  emitted per-collective with `op_type`, `comm_id_hash`, `rank`,
+  `nranks`, `datatype`, `reduce_op`.
+- **Agent-side barrier correlator** joins NCCL collective uretprobes
+  with the next `cudaStreamSynchronize` on the same `(pid, stream)`
+  and emits `nccl.collective.barrier_wait_ms`. 5-min correlation
+  window with GC.
+- **`--nccl` privilege gate**: surfaces a clear "requires root or
+  CAP_BPF + CAP_PERFMON" warning instead of the libbpf attach error
+  deep in the stack.
+- **Stream-sync tap on the CUDA tracer channel** forks every
+  `CUDAStreamSync` event into the barrier correlator without
+  disturbing the merged event stream.
+- **Contract docs**: `pkg/contract/contract.go` documents
+  `world_size` (resource-level, job-wide) vs `nranks` (per-comm).
+  Same number for single-comm jobs; diverge for FSDP+TP / MoE.
+
+### Fixed
+
+- **Reliability gaps from automated audit.** Hardening pass on
+  agent paths flagged in v0.11.0's automated testing review.
+
+## [0.11.0] - 2026-05-01
+
+### Added
+
+- **`ingero-alerter` sidecar.** Slack + PagerDuty backends for
+  per-node straggler alerts. Reads NDJSON events from the agent's
+  `--remediate` UDS; renders configurable templates.
+- **`ingero check --support-bundle` flag.** Writes a diagnostic
+  tarball (config, recent log, BPF program names, kernel/driver
+  info) for support cases.
+- **`ingero migrate` subcommand + framework.** First-class schema
+  migrations for the trace DB; introduces a versioned migration
+  registry so v0.11+ schema changes can apply forward without
+  manual operator action.
+- **Cost-of-problem gauges**: `ingero.node.info` (descriptor
+  labels) and `ingero.node.world_size` (rank-count gauge per
+  training job).
+- **Per-feature integration assertion lines** in `gpu-test.sh`
+  covering host kernel, block I/O, net syscalls, TCP retransmit.
+- **CI matrix**: adds `ubuntu-22.04-arm` and `ubuntu-24.04-arm`
+  runners.
+- **Lambda GH200 hardware smoke** as an on-demand CI workflow.
+- **Architecture diagram** added to README.
+
+## [0.10.1] - 2026-05-01
+
+### Fixed
+
+- **arm64 release binaries now load BPF probes correctly.** The
+  v0.10.0 release archives shipped a single set of pre-compiled
+  BPF objects built for x86_64 and embedded that set into both the
+  linux_amd64 and linux_arm64 binaries. On any aarch64 kernel the
+  `pt_regs` CO-RE relocations resolved against the wrong struct
+  layout and the verifier rejected the load with `bad CO-RE
+  relocation: invalid func unknown`. bpf2go is now invoked with
+  `-target amd64,arm64`; per-arch `.bpf.o` files are committed
+  under `internal/ebpf/<pkg>/<name>_<arch>_bpfel.{go,o}` and
+  selected at Go build time via build constraints. A new
+  `internal/ebpf/parity` test package guards the per-arch output
+  so the same regression cannot reach a release again. Reported by
+  @saiyam1814 against DGX Spark (issue #35); affects every arm64
+  release-binary user, not only Spark.
+- **MCP server reports build-time version.** `ingero mcp` now
+  reports the version embedded at build time (e.g. `v0.10.0`) in
+  the MCP `Implementation.Version` field, instead of the
+  previously hardcoded `"0.9.0"` string. Affects how MCP clients
+  (Claude Desktop, IDE plugins, glama.ai) identify the server.
+  The hardcode shipped in v0.10.0; binaries built from main HEAD
+  or from any v0.10.1+ tag carry the fix.
+
+### Internal
+
+- New `bpf-freshness` CI job re-runs `make generate` on every PR
+  and asserts no drift in `internal/ebpf/`, catching the original
+  failure mode where committed BPF artifacts diverged from BPF C
+  sources.
+- `bpf/vmlinux.h` committed as canonical type catalog; Makefile
+  vmlinux auto-regen dropped (`vmlinux.h` is now version-
+  controlled). `user_pt_regs` shim added in `bpf/common.bpf.h` for
+  arm64 register access.
 
 ## [0.10.0] - 2026-04-21
 

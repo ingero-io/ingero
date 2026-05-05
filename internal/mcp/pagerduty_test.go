@@ -22,6 +22,25 @@ func newTestPD(t *testing.T, handler http.HandlerFunc) (*alerter.PagerDuty, *htt
 	return pd, srv
 }
 
+// TestPagerDutyTool_DisabledByDefault locks the v0.14 R3 ★4 fix:
+// Server.enablePagerDutyMCP defaults false, so a freshly constructed
+// MCP server registers the tool but the handler refuses calls until
+// explicitly opted in via SetPagerDutyMCPEnabled(true).
+func TestPagerDutyTool_DisabledByDefault(t *testing.T) {
+	srv := New(nil)
+	if srv.enablePagerDutyMCP {
+		t.Fatalf("enablePagerDutyMCP should default false for v0.14 R3 ★4")
+	}
+	srv.SetPagerDutyMCPEnabled(true)
+	if !srv.enablePagerDutyMCP {
+		t.Fatalf("SetPagerDutyMCPEnabled(true) did not flip the gate")
+	}
+	srv.SetPagerDutyMCPEnabled(false)
+	if srv.enablePagerDutyMCP {
+		t.Fatalf("SetPagerDutyMCPEnabled(false) did not flip back")
+	}
+}
+
 func TestPagerDutyTool_HappyPath(t *testing.T) {
 	var bodySeen []byte
 	pd, srv := newTestPD(t, func(w http.ResponseWriter, r *http.Request) {
