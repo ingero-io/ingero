@@ -341,6 +341,13 @@ type Snapshot struct {
 	// gpu.uuid + pid. Nil under the same conditions as
 	// MemFragReadings.
 	MemFragProcessReadings []MemFragProcessReading
+
+	// MemcpyDirReadings carries per-direction memcpy aggregates
+	// (v0.14 item C). Each element becomes one
+	// gpu.memcpy.bytes_total counter and one
+	// gpu.memcpy.duration_ms gauge labelled with `direction`.
+	// Empty when no memcpy events have been seen this run.
+	MemcpyDirReadings []MemcpyDirStats
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -418,6 +425,19 @@ type MemFragReading struct {
 	FreeBytes             int64
 	TotalBytes            int64
 	FragmentationEstimate float64 // [0,1]: 0 = unfragmented, 1 = fully fragmented
+}
+
+// MemcpyDirStats is one per-direction aggregate of CUDA memcpy
+// events (v0.14 item C). BytesTotal is monotonically growing
+// across the agent process lifetime so the OTLP exporter emits it
+// as a Sum (cumulative) metric. AverageDurationMs is per-window
+// (reset each drain) since cumulative percentiles need a real
+// histogram encoder, deferred to v0.15.
+type MemcpyDirStats struct {
+	Direction         string  // "h2h", "h2d", "d2h", "d2d", "default", "unknown"
+	BytesTotal        int64
+	AverageDurationMs float64
+	EventsInWindow    int64
 }
 
 // MemFragProcessReading is one per-process GPU-memory data point

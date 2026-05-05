@@ -2630,14 +2630,24 @@ type MemcpyDirStat struct {
 // scaled (the selective storage layer keeps memcpy events for chain
 // analysis already).
 func (s *Store) QueryMemcpyByDirectionPerPID(q QueryParams) ([]MemcpyDirStat, error) {
+	// v0.14 item C: include 2D + Peer variants. The Peer variants
+	// pin direction to D2D in the BPF program (peer copies are
+	// always device-to-device); the 2D variants emit kind=0
+	// ("unknown") because the kind argument is the 7th parameter,
+	// which lives on the stack rather than in a register on both
+	// amd64 SysV and arm64 AAPCS.
 	query := `SELECT pid, arg1, COUNT(*), COALESCE(SUM(arg0), 0)
 		FROM events
 		WHERE source = ?
-		  AND op IN (?, ?)`
+		  AND op IN (?, ?, ?, ?, ?, ?)`
 	args := []interface{}{
 		uint8(events.SourceCUDA),
 		uint8(events.CUDAMemcpy),
 		uint8(events.CUDAMemcpyAsync),
+		uint8(events.CUDAMemcpy2D),
+		uint8(events.CUDAMemcpy2DAsync),
+		uint8(events.CUDAMemcpyPeer),
+		uint8(events.CUDAMemcpyPeerAsync),
 	}
 
 	if !q.From.IsZero() {

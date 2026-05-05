@@ -434,6 +434,24 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	// Per-direction CUDA memcpy aggregates (v0.14 item C). Two
+	// metrics per direction: a cumulative counter for byte totals
+	// and a per-window gauge for average duration. Direction labels
+	// are h2h / h2d / d2h / d2d / default / unknown.
+	for _, m := range snap.MemcpyDirReadings {
+		attrs := []otlpKeyValue{
+			{Key: "direction", Value: stringVal(m.Direction)},
+		}
+		metrics = append(metrics,
+			sumMetric("gpu.memcpy.bytes_total",
+				"Cumulative CUDA memcpy bytes by direction (v0.14 item C)",
+				"By", nowNano, m.BytesTotal, attrs),
+			gaugeMetric("gpu.memcpy.duration_ms",
+				"Average per-event CUDA memcpy duration by direction over the last export window",
+				"ms", nowNano, m.AverageDurationMs, attrs),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than

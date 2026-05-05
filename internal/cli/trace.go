@@ -1092,6 +1092,8 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			snap.NCCLProcessReadings = drainNCCLDiscoveryBuf()
 			// v0.14 item D: latest NVML memfrag poll snapshot.
 			snap.MemFragReadings, snap.MemFragProcessReadings = drainMemFragBuf()
+			// v0.14 item C: per-direction memcpy aggregates.
+			snap.MemcpyDirReadings = drainMemcpyStats()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}
@@ -2681,6 +2683,10 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			// Stats and correlator see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
+			// v0.14 item C: per-direction memcpy aggregator. Cheap
+			// (two map writes); only the cudaMemcpy* family of op
+			// codes exercises the work path.
+			recordMemcpyEvent(evt)
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
@@ -3308,6 +3314,8 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 			// Stats see ALL events (full accuracy).
 			collector.Record(evt)
 			debugEventCount++
+			// v0.14 item C: per-direction memcpy aggregator.
+			recordMemcpyEvent(evt)
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
