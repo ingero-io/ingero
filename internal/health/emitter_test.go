@@ -222,7 +222,7 @@ func TestPush_EmitsAllContractMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEmitter: %v", err)
 	}
-	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", true); err != nil {
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", true, nil); err != nil {
 		t.Fatalf("Push: %v", err)
 	}
 	p := rs.decodeLast(t)
@@ -269,7 +269,7 @@ func TestPush_HealthScoreShape(t *testing.T) {
 	cfg := baseEmitterCfg(rs.server.URL)
 	e, _ := NewEmitter(cfg, nil)
 	sc := sampleScore()
-	if err := e.Push(context.Background(), emitterNow, sc, StateIdle, "fleet-cached", false); err != nil {
+	if err := e.Push(context.Background(), emitterNow, sc, StateIdle, "fleet-cached", false, nil); err != nil {
 		t.Fatalf("Push: %v", err)
 	}
 	p := rs.decodeLast(t)
@@ -289,7 +289,7 @@ func TestPush_HealthScoreShape(t *testing.T) {
 func TestPush_DegradationWarningInt(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", true)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", true, nil)
 	p := rs.decodeLast(t)
 	m := findMetric(t, p, contract.MetricDegradationWarning)
 	dp := m.Gauge.DataPoints[0]
@@ -302,7 +302,7 @@ func TestPush_DegradationWarningInt(t *testing.T) {
 func TestPush_DetectionModeAttribute(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "local-baseline", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "local-baseline", false, nil)
 	p := rs.decodeLast(t)
 	m := findMetric(t, p, contract.MetricDetectionMode)
 	dp := m.Gauge.DataPoints[0]
@@ -323,7 +323,7 @@ func TestPush_OptionalWorldSizeAttrs(t *testing.T) {
 	cfg.WorldSize = 8
 	cfg.NodeRank = 3
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	p := rs.decodeLast(t)
 	if len(p.ResourceMetrics) != 1 {
 		t.Fatalf("want 1 resourceMetrics block, got %d", len(p.ResourceMetrics))
@@ -349,7 +349,7 @@ func TestPush_NoWorldSizeAttrsWhenZero(t *testing.T) {
 	cfg := baseEmitterCfg(rs.server.URL)
 	// cfg.WorldSize stays 0
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	p := rs.decodeLast(t)
 	rm := p.ResourceMetrics[0]
 	for _, kv := range rm.Resource.Attributes {
@@ -398,7 +398,7 @@ func TestPush_CostGaugesEmittedWhenConfigured(t *testing.T) {
 	cfg.WorldSize = 8
 	cfg.NodeRank = 3
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	p := rs.decodeLast(t)
 
 	info := findMetric(t, p, contract.MetricNodeInfo)
@@ -429,7 +429,7 @@ func TestPush_CostGauges_NodeInfoOmittedWithoutGPU(t *testing.T) {
 	cfg := baseEmitterCfg(rs.server.URL)
 	// GPUModel + GPUCount left zero
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	p := rs.decodeLast(t)
 	if len(p.ResourceMetrics) == 0 {
 		t.Fatal("no resource metrics")
@@ -470,6 +470,75 @@ func TestEmitStragglerEvent_AttachesEventID(t *testing.T) {
 	assertAttr(t, dp.Attributes, contract.AttrEventID, ev.EventID)
 }
 
+// v0.13 Slice A: cgroup_path_hash is emitted on the health_score data
+// point, resolved once at NewEmitter via the package-level resolver.
+// Fleet groups MAD thresholds by this attribute; absence folds into the
+// legacy cluster-wide bucket. The resolver is stubbed here so the test
+// does not depend on the real /proc/self/cgroup contents (which differ
+// between Linux CI, WSL, macOS, and Windows).
+func TestPush_HealthScoreCarriesCgroupPathHash(t *testing.T) {
+	const stubHash = "abc123def4567890"
+	prev := cgroupPathHashResolver
+	cgroupPathHashResolver = func() (string, error) { return stubHash, nil }
+	t.Cleanup(func() { cgroupPathHashResolver = prev })
+
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricHealthScore)
+	if m.Gauge == nil || len(m.Gauge.DataPoints) != 1 {
+		t.Fatalf("health_score gauge missing or wrong dp count")
+	}
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrCgroupPathHash, stubHash)
+
+	// Hash is fixed-width 16 hex chars per the contract definition on
+	// contract.AttrCgroupPathHash. Assert the stub honored that shape so
+	// future drift in the production resolver is caught by the same test.
+	for _, kv := range dp.Attributes {
+		if kv.Key == contract.AttrCgroupPathHash {
+			if kv.Value.StringValue == nil {
+				t.Fatalf("cgroup_path_hash value is nil")
+			}
+			if got := len(*kv.Value.StringValue); got != 16 {
+				t.Fatalf("cgroup_path_hash length = %d, want 16", got)
+			}
+		}
+	}
+}
+
+// Resolver failure path: emitter must not panic, must emit empty string
+// for the attribute, and must continue pushing normally. Mirrors the
+// "no /proc available" case (macOS dev, hostile sandbox).
+func TestPush_HealthScoreCgroupPathHashEmptyOnResolverError(t *testing.T) {
+	prev := cgroupPathHashResolver
+	cgroupPathHashResolver = func() (string, error) {
+		return "", errors.New("simulated /proc unavailable")
+	}
+	t.Cleanup(func() { cgroupPathHashResolver = prev })
+
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+	m := findMetric(t, p, contract.MetricHealthScore)
+	dp := m.Gauge.DataPoints[0]
+	assertAttr(t, dp.Attributes, contract.AttrCgroupPathHash, "")
+}
+
 // EventID attribute is omitted when StragglerEvent.EventID is empty.
 func TestEmitStragglerEvent_OmitsEmptyEventID(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusOK)
@@ -504,19 +573,19 @@ func TestPush_FailureCountersTripFleetReachable(t *testing.T) {
 		t.Fatal("initially should be reachable")
 	}
 	for i := 0; i < 2; i++ {
-		_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+		_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 		if !e.FleetReachable() {
 			t.Fatalf("reachable flipped early at failure %d", i+1)
 		}
 	}
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if e.FleetReachable() {
 		t.Fatal("reachable should be false after 3 consecutive failures")
 	}
 
 	// A successful push resets the counter to zero.
 	rs.setStatus(http.StatusOK)
-	if err := e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+	if err := e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
 		t.Fatalf("push after recovery: %v", err)
 	}
 	if !e.FleetReachable() {
@@ -526,12 +595,12 @@ func TestPush_FailureCountersTripFleetReachable(t *testing.T) {
 	// After recovery: 2 more failures must NOT trip reachable (counter
 	// should be 2, not threshold).
 	rs.setStatus(http.StatusInternalServerError)
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if !e.FleetReachable() {
 		t.Fatal("counter did not fully reset — 2 post-recovery failures tripped reachable")
 	}
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if e.FleetReachable() {
 		t.Fatal("reachable should trip after 3rd failure")
 	}
@@ -542,7 +611,7 @@ func TestPush_FailureCountersTripFleetReachable(t *testing.T) {
 func TestPush_5xxNotRetried(t *testing.T) {
 	rs := newRecordingServer(t, http.StatusInternalServerError)
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if got := rs.count(); got != 1 {
 		t.Fatalf("server saw %d requests, want 1 (no retry on 5xx)", got)
 	}
@@ -557,7 +626,7 @@ func TestPush_NetworkErrorRetriedOnce(t *testing.T) {
 	// return in a few ms.
 	e, _ := NewEmitter(baseEmitterCfg("http://127.0.0.1:1/"), nil)
 	start := time.Now()
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error")
@@ -570,7 +639,7 @@ func TestPush_NetworkErrorRetriedOnce(t *testing.T) {
 // AC7: a push failure does not panic and returns a wrapped error.
 func TestPush_ErrorDoesNotCrash(t *testing.T) {
 	e, _ := NewEmitter(baseEmitterCfg("http://127.0.0.1:1/"), nil) // port 1 = reserved
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if err == nil {
 		t.Fatal("expected error for unreachable endpoint")
 	}
@@ -589,7 +658,7 @@ func TestPush_ReachableMetricReflectsState(t *testing.T) {
 	ctx := context.Background()
 
 	// First push — reachable = 1.
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	m := findMetric(t, rs.decodeLast(t), contract.MetricFleetReachable)
 	if m.Gauge.DataPoints[0].AsInt == nil || *m.Gauge.DataPoints[0].AsInt != 1 {
 		t.Fatalf("reachable = %v, want 1", m.Gauge.DataPoints[0].AsInt)
@@ -597,8 +666,8 @@ func TestPush_ReachableMetricReflectsState(t *testing.T) {
 
 	// Now fail twice — reachable flips.
 	rs.setStatus(http.StatusInternalServerError)
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if e.FleetReachable() {
 		t.Fatal("should be unreachable")
 	}
@@ -606,7 +675,7 @@ func TestPush_ReachableMetricReflectsState(t *testing.T) {
 	// Next push still happens; the server records it but the payload
 	// reflects fleet_reachable=0.
 	rs.setStatus(http.StatusOK)
-	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet-cached", false)
+	_ = e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet-cached", false, nil)
 	// After this successful push the counter resets; the emitter's
 	// FleetReachable view at the moment of this push is still "false"
 	// until the success is recorded, so the payload we just sent should
@@ -628,7 +697,7 @@ func TestPush_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 20; i++ {
-				if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err == nil {
+				if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err == nil {
 					total.Add(1)
 				}
 			}
@@ -653,7 +722,7 @@ func TestPush_RespectsContextCancel(t *testing.T) {
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(ctx, emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if err == nil {
 		t.Fatal("expected error for cancelled ctx")
 	}
@@ -674,7 +743,7 @@ func TestPush_PiggybackHeadersFlowToCache(t *testing.T) {
 	cfg := baseEmitterCfg(srv.URL)
 	cfg.ThresholdCache = cache
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 
 	snap, ok := cache.Get()
 	if !ok {
@@ -704,7 +773,7 @@ func TestPush_PiggybackHeadersOnErrorResponse(t *testing.T) {
 	cfg := baseEmitterCfg(srv.URL)
 	cfg.ThresholdCache = cache
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 
 	snap, ok := cache.Get()
 	if !ok || snap.Value != 0.77 {
@@ -719,7 +788,7 @@ func TestPush_NoHeadersFlagsPiggybackUnavailable(t *testing.T) {
 	cfg := baseEmitterCfg(rs.server.URL)
 	cfg.ThresholdCache = cache
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if cache.PiggybackAvailable() {
 		t.Fatal("piggyback should be unavailable when headers absent")
 	}
@@ -739,7 +808,7 @@ func TestPush_CustomHeaders(t *testing.T) {
 	cfg := baseEmitterCfg(srv.URL)
 	cfg.Headers = map[string]string{"Authorization": "Bearer secret"}
 	e, _ := NewEmitter(cfg, nil)
-	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	_ = e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if captured.Get("Authorization") != "Bearer secret" {
 		t.Fatalf("header missing: %v", captured)
 	}
@@ -796,7 +865,7 @@ func assertAttrInt(t *testing.T, attrs []otlpKV, key string, want int64) {
 func TestPush_429RetryAfterSeconds(t *testing.T) {
 	rs := newRetryAfterServer(t, http.StatusTooManyRequests, "7")
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if err == nil {
 		t.Fatal("expected RetryAfterError, got nil")
 	}
@@ -817,7 +886,7 @@ func TestPush_503RetryAfterHTTPDate(t *testing.T) {
 	future := time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat)
 	rs := newRetryAfterServer(t, http.StatusServiceUnavailable, future)
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	ra := AsRetryAfter(err)
 	if ra == nil {
 		t.Fatalf("expected RetryAfterError, got %v", err)
@@ -834,7 +903,7 @@ func TestPush_503RetryAfterHTTPDate(t *testing.T) {
 func TestPush_429NoRetryAfterIsPlainError(t *testing.T) {
 	rs := newRetryAfterServer(t, http.StatusTooManyRequests, "")
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -848,7 +917,7 @@ func TestPush_429NoRetryAfterIsPlainError(t *testing.T) {
 func TestPush_400RetryAfterIsPlainError(t *testing.T) {
 	rs := newRetryAfterServer(t, http.StatusBadRequest, "30")
 	e, _ := NewEmitter(baseEmitterCfg(rs.server.URL), nil)
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	if AsRetryAfter(err) != nil {
 		t.Errorf("400 with Retry-After should NOT produce RetryAfterError; got %v", err)
 	}
@@ -898,7 +967,7 @@ func TestPush_TCPResetIsRetriedAsNetworkError(t *testing.T) {
 
 	e, _ := NewEmitter(baseEmitterCfg(srv.URL), nil)
 	start := time.Now()
-	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -930,7 +999,7 @@ func TestPush_BlackholeDialRespectsTimeout(t *testing.T) {
 	e, _ := NewEmitter(cfg, nil)
 
 	start := time.Now()
-	perr := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false)
+	perr := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil)
 	elapsed := time.Since(start)
 
 	if perr == nil {
@@ -1029,7 +1098,7 @@ func TestPush_RedialAfterFailure_PicksFreshBackend(t *testing.T) {
 	}
 	e.(*httpEmitter).client.Transport = rt
 
-	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
 		t.Fatalf("push should have succeeded after retry: %v", err)
 	}
 	if calls := atomic.LoadInt32(&rt.callCount); calls != 2 {
@@ -1072,7 +1141,7 @@ func TestPush_ManyAgentInstances_DistributeAcrossBackends(t *testing.T) {
 			t.Fatalf("NewEmitter %d: %v", i, err)
 		}
 		e.(*httpEmitter).client.Transport = rt
-		if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false); err != nil {
+		if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
 			t.Errorf("push %d: %v", i, err)
 		}
 	}
@@ -1111,4 +1180,172 @@ func TestEmitterTransport_HasStickyConnectionConfig(t *testing.T) {
 	if transport.IdleConnTimeout != 30*time.Second {
 		t.Errorf("IdleConnTimeout = %v, want 30s", transport.IdleConnTimeout)
 	}
+}
+
+// findSumMetric is the Sum-shaped sibling of findMetric. Per-cgroup
+// metrics are emitted as OTLP Sum (cumulative monotonic), not Gauge.
+func findSumMetric(t *testing.T, p otlpPayload, name string) otlpMetric {
+	t.Helper()
+	for _, rm := range p.ResourceMetrics {
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name == name && m.Sum != nil {
+					return m
+				}
+			}
+		}
+	}
+	t.Fatalf("Sum metric %q not found in payload", name)
+	return otlpMetric{}
+}
+
+func samplePerCGroup(hashA, hashB string) []PerCGroupStats {
+	return []PerCGroupStats{
+		{
+			CgroupPathHash:    hashA,
+			KernelLaunchCount: 100,
+			CPUStallNanos:     5_000_000,
+			MemcpyBytesByDir: map[string]int64{
+				contract.MemcpyDirectionH2D: 8192,
+				contract.MemcpyDirectionD2H: 4096,
+			},
+		},
+		{
+			CgroupPathHash:    hashB,
+			KernelLaunchCount: 50,
+		},
+	}
+}
+
+// v0.13 Slice B: when perCGroup is non-empty, the emitter emits all
+// three per-cgroup metric families as OTel Sum data points labeled by
+// cgroup_path_hash. The memcpy metric also carries the direction
+// attribute.
+func TestPush_PerCGroupMetricsEmitted(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	stats := samplePerCGroup("hash-a", "hash-b")
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, stats); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+
+	launch := findSumMetric(t, p, contract.MetricCUDAKernelLaunchTotal)
+	if launch.Sum == nil || !launch.Sum.IsMonotonic || launch.Sum.AggregationTemporality != 2 {
+		t.Errorf("kernel launch metric shape wrong: %+v", launch.Sum)
+	}
+	gotHashes := make(map[string]int64)
+	for _, dp := range launch.Sum.DataPoints {
+		for _, kv := range dp.Attributes {
+			if kv.Key == contract.AttrCgroupPathHash && dp.AsInt != nil {
+				gotHashes[*kv.Value.StringValue] = *dp.AsInt
+			}
+		}
+	}
+	if gotHashes["hash-a"] != 100 || gotHashes["hash-b"] != 50 {
+		t.Errorf("kernel launch series = %+v, want hash-a:100 hash-b:50", gotHashes)
+	}
+
+	stall := findSumMetric(t, p, contract.MetricCPUStallNanosTotal)
+	if got := dpAsIntForHash(t, stall, "hash-a"); got != 5_000_000 {
+		t.Errorf("cpu_stall hash-a = %d, want 5_000_000", got)
+	}
+
+	memcpy := findSumMetric(t, p, contract.MetricCUDAMemcpyBytesTotal)
+	memDir := make(map[string]int64)
+	for _, dp := range memcpy.Sum.DataPoints {
+		var hash, dir string
+		for _, kv := range dp.Attributes {
+			if kv.Key == contract.AttrCgroupPathHash {
+				hash = *kv.Value.StringValue
+			}
+			if kv.Key == contract.AttrMemcpyDirection {
+				dir = *kv.Value.StringValue
+			}
+		}
+		if dp.AsInt != nil {
+			memDir[hash+"|"+dir] = *dp.AsInt
+		}
+	}
+	if memDir["hash-a|h2d"] != 8192 || memDir["hash-a|d2h"] != 4096 {
+		t.Errorf("memcpy series = %+v, want hash-a|h2d:8192 hash-a|d2h:4096", memDir)
+	}
+}
+
+// Cumulative semantics: the second push adds its window delta to the
+// running total. Pushing 10 then 5 should emit 15 on the second tick.
+func TestPush_PerCGroupCountersCumulative(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+
+	first := []PerCGroupStats{{CgroupPathHash: "x", KernelLaunchCount: 10}}
+	second := []PerCGroupStats{{CgroupPathHash: "x", KernelLaunchCount: 5}}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, first); err != nil {
+		t.Fatalf("Push 1: %v", err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, second); err != nil {
+		t.Fatalf("Push 2: %v", err)
+	}
+	p := rs.decodeLast(t)
+	launch := findSumMetric(t, p, contract.MetricCUDAKernelLaunchTotal)
+	if got := dpAsIntForHash(t, launch, "x"); got != 15 {
+		t.Errorf("cumulative kernel_launch = %d, want 15 (10 + 5)", got)
+	}
+}
+
+// A nil / empty perCGroup slice must not produce any per-cgroup metric
+// families. This protects existing pre-Slice-B test invariants: the
+// payload should look identical to v0.12 when no cgroup data is fed.
+func TestPush_PerCGroupNilProducesNoMetrics(t *testing.T) {
+	rs := newRecordingServer(t, http.StatusOK)
+	cfg := baseEmitterCfg(rs.server.URL)
+	e, err := NewEmitter(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Push(context.Background(), emitterNow, sampleScore(), StateActive, "fleet", false, nil); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	p := rs.decodeLast(t)
+	for _, rm := range p.ResourceMetrics {
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				switch m.Name {
+				case contract.MetricCUDAKernelLaunchTotal,
+					contract.MetricCPUStallNanosTotal,
+					contract.MetricCUDAMemcpyBytesTotal:
+					t.Errorf("nil perCGroup leaked metric %q into payload", m.Name)
+				}
+			}
+		}
+	}
+}
+
+// dpAsIntForHash extracts the AsInt value for a Sum data point whose
+// cgroup_path_hash matches. Returns -1 when missing so the caller can
+// distinguish "found 0" from "absent" in assertions.
+func dpAsIntForHash(t *testing.T, m otlpMetric, hash string) int64 {
+	t.Helper()
+	if m.Sum == nil {
+		return -1
+	}
+	for _, dp := range m.Sum.DataPoints {
+		for _, kv := range dp.Attributes {
+			if kv.Key == contract.AttrCgroupPathHash && kv.Value.StringValue != nil && *kv.Value.StringValue == hash {
+				if dp.AsInt == nil {
+					return -1
+				}
+				return *dp.AsInt
+			}
+		}
+	}
+	return -1
 }

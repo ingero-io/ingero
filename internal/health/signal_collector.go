@@ -8,6 +8,7 @@ import (
 
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/sysinfo"
+	"github.com/ingero-io/ingero/pkg/contract"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -51,6 +52,11 @@ type sqliteCollector struct {
 	// transitions (OK->err, err->OK) are logged exactly once per change.
 	// Accessed only from Collect, which runs in a single goroutine.
 	gpuMemOK bool
+
+	// cache resolves PIDs to cgroup_path_hash for CollectPerCGroup. One
+	// cache lives for the whole collector lifetime so the steady-state
+	// PID set on a node converges to a near-zero /proc-read rate.
+	cache *cgroupCache
 }
 
 // NewSQLiteCollector constructs a Collector backed by a SQLite DB and
@@ -87,6 +93,7 @@ func NewSQLiteCollector(cfg SQLiteCollectorConfig) (Collector, error) {
 		numGPUs:  cfg.NumGPUs,
 		log:      cfg.Log,
 		gpuMemOK: gpu.Available(),
+		cache:    newCGroupCache(defaultCacheCapacity),
 	}, nil
 }
 
@@ -223,4 +230,103 @@ func (c *sqliteCollector) readMemorySignal(ctx context.Context, snap sysinfo.Sys
 // Close releases the DB handle.
 func (c *sqliteCollector) Close() error {
 	return c.store.Close()
+}
+
+// PerCGroupStats is the per-cgroup window total emitted by
+// CollectPerCGroup. The emitter consumes this slice and accumulates the
+// per-window deltas into cumulative OTel Sum data points per
+// (cgroup, op) and (cgroup, direction). An empty CgroupPathHash is the
+// "unattributable" bucket (kernel threads, /proc-resolution failures);
+// it is still emitted so totals reconcile with node-wide counters.
+type PerCGroupStats struct {
+	CgroupPathHash    string
+	KernelLaunchCount int64
+	CPUStallNanos     int64
+	MemcpyBytesByDir  map[string]int64
+}
+
+// memcpyDirectionLabel translates a raw cudaMemcpyKind byte (arg1) into
+// the contract.MemcpyDirection* string. Encoding per
+// bpf/cuda_trace.bpf.c: 0=h2h, 1=h2d, 2=d2h, 3=d2d, 4=cudaMemcpyDefault
+// (treat as unknown — the runtime resolves it from pointer attributes
+// the agent cannot observe), anything else=unknown.
+func memcpyDirectionLabel(b uint8) string {
+	switch b {
+	case 0:
+		return contract.MemcpyDirectionH2H
+	case 1:
+		return contract.MemcpyDirectionH2D
+	case 2:
+		return contract.MemcpyDirectionD2H
+	case 3:
+		return contract.MemcpyDirectionD2D
+	default:
+		return contract.MemcpyDirectionUnknown
+	}
+}
+
+// CollectPerCGroup reads the last Window of per-PID aggregates plus
+// per-PID memcpy events, attributes each PID to its cgroup_path_hash
+// via the LRU cache, and returns one PerCGroupStats per distinct
+// hash. Shared map allocation is bounded by the cache size (default
+// 1024) so this routine does not blow up on high-cardinality nodes.
+func (c *sqliteCollector) CollectPerCGroup(ctx context.Context, now time.Time) ([]PerCGroupStats, error) {
+	q := store.QueryParams{
+		From: now.Add(-c.window),
+		To:   now,
+	}
+
+	perPID, err := c.store.QueryAggregatePerPID(q)
+	if err != nil {
+		return nil, fmt.Errorf("query per-pid aggregates: %w", err)
+	}
+
+	memcpy, err := c.store.QueryMemcpyByDirectionPerPID(q)
+	if err != nil {
+		return nil, fmt.Errorf("query memcpy directions: %w", err)
+	}
+
+	byHash := make(map[string]*PerCGroupStats)
+	bucket := func(hash string) *PerCGroupStats {
+		s, ok := byHash[hash]
+		if ok {
+			return s
+		}
+		s = &PerCGroupStats{
+			CgroupPathHash:   hash,
+			MemcpyBytesByDir: make(map[string]int64),
+		}
+		byHash[hash] = s
+		return s
+	}
+
+	for _, p := range perPID {
+		hash := c.cache.Resolve(p.PID)
+		stats := bucket(hash)
+		switch {
+		case p.Source == uint8(events.SourceCUDA) && p.Op == uint8(events.CUDALaunchKernel):
+			stats.KernelLaunchCount += p.Count
+		case p.Source == uint8(events.SourceHost) && p.Op == uint8(events.HostSchedSwitch):
+			stats.CPUStallNanos += p.SumDur
+		}
+	}
+
+	for _, m := range memcpy {
+		hash := c.cache.Resolve(m.PID)
+		stats := bucket(hash)
+		dir := memcpyDirectionLabel(m.DirectionByte)
+		stats.MemcpyBytesByDir[dir] += m.BytesSum
+	}
+
+	if c.cache.EvictedSinceLastClear() {
+		c.log.Warn("cgroup cache LRU evicting; consider increasing capacity if churn is steady",
+			"cap", defaultCacheCapacity)
+		c.cache.ClearEvictionFlag()
+	}
+
+	out := make([]PerCGroupStats, 0, len(byHash))
+	for _, s := range byHash {
+		out = append(out, *s)
+	}
+	return out, nil
 }

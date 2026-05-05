@@ -7,6 +7,11 @@
 *.sh text eol=lf
 *.bash text eol=lf
 
+# The embedded fallback YAML in docs/gpu_rates.md is parsed by the rates
+# CLI at runtime; CRLF would break the fenced-block extractor used in the
+# embedded-fallback path. Lock LF explicitly.
+docs/gpu_rates.md text eol=lf
+
 # Binary files — do not convert
 *.o binary
 *.so binary

@@ -2356,3 +2356,169 @@ func TestUserVersion_RefusesNewerBinary(t *testing.T) {
 func strconvI(n int) string {
 	return strconv.Itoa(n)
 }
+
+// TestQueryAggregatePerPID_Basic verifies that the per-pid aggregate
+// reader groups by (pid, source, op) and returns count + sum_dur +
+// sum_arg0 over the requested window. The 5s table is used because
+// the QueryParams window is sub-minute.
+func TestQueryAggregatePerPID_Basic(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	bucket := now.Truncate(5 * time.Second).UnixNano()
+	cudaSrc := uint8(events.SourceCUDA)
+	hostSrc := uint8(events.SourceHost)
+	launch := uint8(events.CUDALaunchKernel)
+	sched := uint8(events.HostSchedSwitch)
+
+	s.RecordAggregates5s([]Aggregate{
+		{Bucket: bucket, Source: cudaSrc, Op: launch, PID: 100, Count: 50, SumDur: 100_000},
+		{Bucket: bucket, Source: cudaSrc, Op: launch, PID: 200, Count: 30, SumDur: 60_000},
+		{Bucket: bucket, Source: hostSrc, Op: sched, PID: 100, Count: 5, SumDur: 5_000_000},
+	})
+
+	got, err := s.QueryAggregatePerPID(QueryParams{Since: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("QueryAggregatePerPID: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3: %+v", len(got), got)
+	}
+
+	// Index for stable assertions regardless of row order.
+	type key struct {
+		pid    uint32
+		source uint8
+		op     uint8
+	}
+	idx := make(map[key]PerPIDStat, len(got))
+	for _, r := range got {
+		idx[key{r.PID, r.Source, r.Op}] = r
+	}
+	if r, ok := idx[key{100, cudaSrc, launch}]; !ok || r.Count != 50 || r.SumDur != 100_000 {
+		t.Errorf("PID=100 launch row wrong: %+v ok=%v", r, ok)
+	}
+	if r, ok := idx[key{200, cudaSrc, launch}]; !ok || r.Count != 30 {
+		t.Errorf("PID=200 launch row wrong: %+v ok=%v", r, ok)
+	}
+	if r, ok := idx[key{100, hostSrc, sched}]; !ok || r.SumDur != 5_000_000 {
+		t.Errorf("PID=100 sched row wrong: %+v ok=%v", r, ok)
+	}
+}
+
+// TestQueryAggregatePerPID_EmptyWindow returns zero rows when no
+// aggregates fall inside the time range. Asserts the iterator does not
+// error when the result set is empty.
+func TestQueryAggregatePerPID_EmptyWindow(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+	got, err := s.QueryAggregatePerPID(QueryParams{Since: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("QueryAggregatePerPID: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty DB should yield 0 rows, got %d", len(got))
+	}
+}
+
+// TestQueryMemcpyByDirectionPerPID_GroupedByDirection verifies the
+// memcpy reader walks the events table (not the aggregates table) and
+// groups by (pid, arg1=direction). Aggregates would collapse all
+// directions onto a single row — the reader must not regress to that
+// path even after future aggregator changes.
+func TestQueryMemcpyByDirectionPerPID_GroupedByDirection(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+
+	mk := func(pid uint32, dir uint8, bytes uint64) events.Event {
+		return events.Event{
+			Timestamp: time.Now(),
+			PID:       pid,
+			TID:       pid,
+			Source:    events.SourceCUDA,
+			Op:        uint8(events.CUDAMemcpy),
+			Duration:  10 * time.Microsecond,
+			Args:      [2]uint64{bytes, uint64(dir)},
+		}
+	}
+	asyncEvt := func(pid uint32, dir uint8, bytes uint64) events.Event {
+		e := mk(pid, dir, bytes)
+		e.Op = uint8(events.CUDAMemcpyAsync)
+		return e
+	}
+
+	s.Record(mk(100, 1, 1024))             // h2d
+	s.Record(mk(100, 1, 2048))             // h2d (same pid + dir)
+	s.Record(mk(100, 2, 4096))             // d2h
+	s.Record(asyncEvt(100, 3, 8192))       // d2d via async op
+	s.Record(mk(200, 1, 16384))            // PID 200 h2d
+
+	time.Sleep(300 * time.Millisecond)
+
+	got, err := s.QueryMemcpyByDirectionPerPID(QueryParams{Since: 1 * time.Minute})
+	if err != nil {
+		t.Fatalf("QueryMemcpyByDirectionPerPID: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("got %d rows, want 4: %+v", len(got), got)
+	}
+
+	type key struct {
+		pid uint32
+		dir uint8
+	}
+	idx := make(map[key]MemcpyDirStat, len(got))
+	for _, r := range got {
+		idx[key{r.PID, r.DirectionByte}] = r
+	}
+	if r, ok := idx[key{100, 1}]; !ok || r.BytesSum != 1024+2048 || r.Count != 2 {
+		t.Errorf("PID=100 h2d row wrong: %+v ok=%v", r, ok)
+	}
+	if r, ok := idx[key{100, 2}]; !ok || r.BytesSum != 4096 {
+		t.Errorf("PID=100 d2h row wrong: %+v ok=%v", r, ok)
+	}
+	if r, ok := idx[key{100, 3}]; !ok || r.BytesSum != 8192 {
+		t.Errorf("PID=100 d2d row wrong: %+v ok=%v", r, ok)
+	}
+	if r, ok := idx[key{200, 1}]; !ok || r.BytesSum != 16384 {
+		t.Errorf("PID=200 h2d row wrong: %+v ok=%v", r, ok)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestQueryMemcpyByDirectionPerPID_EmptyWindow returns zero rows when
+// no memcpy events fall inside the time range. Asserts the empty path
+// does not error.
+func TestQueryMemcpyByDirectionPerPID_EmptyWindow(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close()
+	got, err := s.QueryMemcpyByDirectionPerPID(QueryParams{Since: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("QueryMemcpyByDirectionPerPID: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty DB should yield 0 rows, got %d", len(got))
+	}
+}

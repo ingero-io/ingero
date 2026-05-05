@@ -4,6 +4,7 @@ package cli
 import (
 	"log"
 
+	"github.com/ingero-io/ingero/internal/config"
 	"github.com/ingero-io/ingero/internal/update"
 	"github.com/ingero-io/ingero/internal/version"
 	"github.com/spf13/cobra"
@@ -62,6 +63,13 @@ func Execute() error {
 func init() {
 	// --debug flag: available on all subcommands via PersistentFlags.
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "enable diagnostic output on stderr")
+
+	// --config: path to the agent's YAML config. Used by subcommands that
+	// have YAML-driven blocks (fleet-push for otlp:, mcp for
+	// alerter.pagerduty:). Subcommands that don't consume the YAML still
+	// inherit the flag silently. Missing file is non-fatal: each consumer
+	// falls back to a zero-value config so CLI flags alone can drive the run.
+	rootCmd.PersistentFlags().String("config", config.DefaultConfigPath, "path to ingero.yaml config file")
 
 	// Set version string — cobra handles "ingero version" and "--version" for us.
 	rootCmd.Version = version.String()

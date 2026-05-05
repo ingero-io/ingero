@@ -3,7 +3,9 @@ package alerter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -24,6 +26,17 @@ type PagerDuty struct {
 	url    string // overridden in tests
 }
 
+// TriggerParams is the payload shape an MCP-driven incident creation
+// caller supplies. Severity must be one of: info, warning, error, critical.
+// DedupKey is optional; when empty, Trigger generates a UUIDv4.
+type TriggerParams struct {
+	Summary       string
+	Severity      string
+	Source        string
+	DedupKey      string
+	CustomDetails map[string]any
+}
+
 // NewPagerDuty constructs a PagerDuty backend.
 func NewPagerDuty(cfg *PagerDutyConfig, timeout time.Duration, log *slog.Logger) *PagerDuty {
 	return &PagerDuty{
@@ -41,7 +54,61 @@ func (p *PagerDuty) Name() string { return "pagerduty" }
 // node_id+timestamp_ns so PD does not collapse distinct stragglers
 // into one incident.
 func (p *PagerDuty) Send(ctx context.Context, ev StragglerEvent) error {
-	payload := pagerdutyPayload(ev, p.cfg)
+	return p.post(ctx, pagerdutyPayload(ev, p.cfg))
+}
+
+// Trigger posts a PD Events v2 trigger event with caller-supplied content.
+// Returns the resolved DedupKey (the supplied one or a freshly generated UUID).
+func (p *PagerDuty) Trigger(ctx context.Context, params TriggerParams) (string, error) {
+	if p.cfg == nil || p.cfg.RoutingKey == "" {
+		return "", errors.New("pagerduty not configured: set alerter.pagerduty.routing_key")
+	}
+	if params.Summary == "" {
+		return "", errors.New("pagerduty trigger: summary is required")
+	}
+	switch params.Severity {
+	case "info", "warning", "error", "critical":
+	default:
+		return "", fmt.Errorf("pagerduty trigger: invalid severity %q (want info|warning|error|critical)", params.Severity)
+	}
+
+	dedup := params.DedupKey
+	if dedup == "" {
+		u, err := uuidV4()
+		if err != nil {
+			return "", fmt.Errorf("pagerduty trigger: generate dedup_key: %w", err)
+		}
+		dedup = u
+	}
+
+	source := params.Source
+	if source == "" {
+		source = "ingero"
+	}
+
+	payload := map[string]any{
+		"routing_key":  p.cfg.RoutingKey,
+		"event_action": "trigger",
+		"dedup_key":    dedup,
+		"payload": map[string]any{
+			"summary":        params.Summary,
+			"severity":       params.Severity,
+			"source":         source,
+			"component":      "ingero",
+			"class":          "ai_investigation",
+			"custom_details": params.CustomDetails,
+		},
+	}
+	if err := p.post(ctx, payload); err != nil {
+		return "", err
+	}
+	return dedup, nil
+}
+
+// post serializes payload and POSTs it to the PD Events v2 endpoint.
+// Errors deliberately omit the routing_key — it is a secret and must
+// never appear in logs or wrapped errors.
+func (p *PagerDuty) post(ctx context.Context, payload map[string]any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("pagerduty marshal: %w", err)
@@ -56,9 +123,6 @@ func (p *PagerDuty) Send(ctx context.Context, ev StragglerEvent) error {
 		return fmt.Errorf("pagerduty POST: %w", err)
 	}
 	defer resp.Body.Close()
-	// PD returns 202 Accepted on success. 4xx = invalid payload;
-	// 5xx = transient; we surface both as errors so the caller can
-	// log them.
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("pagerduty POST: status %d", resp.StatusCode)
 	}
@@ -105,4 +169,23 @@ func pagerdutyPayload(ev StragglerEvent, cfg *PagerDutyConfig) map[string]any {
 			},
 		},
 	}
+}
+
+// SetPagerDutyURLForTest overrides the destination URL on a PagerDuty
+// backend. Exported so tests in sibling packages (e.g. internal/mcp)
+// can point a real *PagerDuty at an httptest server without a parallel
+// fake.
+func SetPagerDutyURLForTest(p *PagerDuty, url string) { p.url = url }
+
+// uuidV4 returns an RFC 4122 v4 UUID. Inlined to avoid a transitive
+// dep just for one call site.
+func uuidV4() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }

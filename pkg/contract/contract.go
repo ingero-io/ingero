@@ -39,6 +39,25 @@ const (
 	// data-point attributes. Equals zero when the agent is not part
 	// of a distributed-training group.
 	MetricNodeWorldSize = "ingero.node.world_size"
+	// MetricCUDAKernelLaunchTotal is the cumulative count of
+	// cudaLaunchKernel events attributed to a cgroup over the agent's
+	// lifetime. Emitted as an OTel Sum (monotonic, cumulative) labeled
+	// by ingero.cgroup_path_hash so per-pod attribution is preserved
+	// across the per-window bucketization done at the agent.
+	MetricCUDAKernelLaunchTotal = "ingero.node.cuda_kernel_launch_total"
+	// MetricCUDAMemcpyBytesTotal is the cumulative byte count of
+	// cudaMemcpy / cudaMemcpyAsync calls attributed to a cgroup,
+	// labeled by ingero.cgroup_path_hash and direction (h2h / h2d /
+	// d2h / d2d / unknown). Emitted as an OTel Sum (monotonic,
+	// cumulative).
+	MetricCUDAMemcpyBytesTotal = "ingero.node.cuda_memcpy_bytes_total"
+	// MetricCPUStallNanosTotal is the cumulative off-CPU duration
+	// summed from sched_switch events attributed to a cgroup, in
+	// nanoseconds (matches the unit attribute "ns" on the Sum). Emitted
+	// as an OTel Sum (monotonic, cumulative). Customer dashboards
+	// correlate against MetricCUDAKernelLaunchTotal to see "high CPU
+	// stall + flat kernel launches = blocked".
+	MetricCPUStallNanosTotal = "ingero.node.cpu_stall_nanos_total"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -82,6 +101,23 @@ const (
 	// leaking the raw path. The hash is SHA256 of the cgroup path,
 	// truncated to 16 hex characters.
 	AttrCgroupPathHash = "ingero.cgroup_path_hash"
+	// AttrMemcpyDirection labels MetricCUDAMemcpyBytesTotal data points
+	// with the cudaMemcpyKind direction. Allowed values are the
+	// MemcpyDirection* constants below. Namespaced to align with the
+	// other Attr* constants in this package.
+	AttrMemcpyDirection = "ingero.memcpy.direction"
+)
+
+// cudaMemcpyKind direction values, mapped from the BPF arg1 byte:
+// 1=h2d, 2=d2h, 3=d2d, 4=cudaMemcpyDefault (treated as unknown
+// because the runtime resolves it from pointer attributes the agent
+// cannot observe), 0=h2h, anything else=unknown.
+const (
+	MemcpyDirectionH2H     = "h2h"
+	MemcpyDirectionH2D     = "h2d"
+	MemcpyDirectionD2H     = "d2h"
+	MemcpyDirectionD2D     = "d2d"
+	MemcpyDirectionUnknown = "unknown"
 )
 
 // OTLP data point attribute keys (per-push, can change).

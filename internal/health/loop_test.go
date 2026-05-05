@@ -8,6 +8,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // fakeCollector returns a pre-programmed sequence of observations and
@@ -63,7 +67,7 @@ type stragglerCall struct {
 	isStraggler bool
 }
 
-func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
+func (f *fakeEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool, perCGroup []PerCGroupStats) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, emitCall{score, state, mode, degradation, now})
@@ -662,7 +666,7 @@ func (benchCollector) Collect(ctx context.Context, now time.Time) (RawObservatio
 // benchEmitter captures nothing, allocates nothing.
 type benchEmitter struct{}
 
-func (benchEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool) error {
+func (benchEmitter) Push(ctx context.Context, now time.Time, score Score, state State, mode string, degradation bool, perCGroup []PerCGroupStats) error {
 	return nil
 }
 func (benchEmitter) EmitStragglerEvent(ctx context.Context, ev StragglerEvent, isStraggler bool) error {
@@ -673,4 +677,208 @@ func (benchEmitter) Stats() (int64, int64) { return 0, 0 }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// recordingTracer returns an in-memory recorder plus the tracer it backs.
+// Tests use this to verify span lifecycle without a real OTLP exporter.
+func recordingTracer() (*tracetest.SpanRecorder, trace.Tracer) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	return rec, tp.Tracer("ingero-test")
+}
+
+// Rising edge of the classifier opens a span, falling edge ends it with
+// outcome=resolved.
+func TestLoop_TracerStragglerEdges(t *testing.T) {
+	col := &fakeCollector{
+		obs: []RawObservation{
+			{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5},
+			{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5},
+			{Throughput: 100, Compute: 0.95, Memory: 0.95, CPU: 0.95},
+		},
+		launches: []int{10, 10, 10},
+	}
+	em := &fakeEmitter{reachable: true}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 0, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeFleet, threshold: 0.80, ok: true}
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+	rec, tracer := recordingTracer()
+
+	l, err := NewLoop(LoopConfig{
+		Baseliner:      bl,
+		StateMachine:   sm,
+		Emitter:        em,
+		Collector:      col,
+		ModeEvaluator:  mode,
+		Classifier:     clf,
+		NodeID:         "node-0",
+		ClusterID:      "prod",
+		ScoreConfig:    DefaultConfig(),
+		PushInterval:   10 * time.Millisecond,
+		Log:            discardLogger(),
+		Clock:          func() time.Time { return testTS },
+		Tracer:         tracer,
+		CgroupPathHash: "abc123def456",
+		WorkloadType:   "training",
+		GPUModel:       "h100-80gb",
+	})
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	l.TickOnce(context.Background()) // rising edge
+	l.TickOnce(context.Background()) // still straggler
+	l.TickOnce(context.Background()) // recovery edge
+
+	ended := rec.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended spans = %d, want 1", len(ended))
+	}
+	got := ended[0]
+	if got.Name() != "ingero.detection.straggler" {
+		t.Fatalf("span name = %q", got.Name())
+	}
+	var sawHash, sawWorkload, sawGPU, sawEventID, sawCluster bool
+	for _, kv := range got.Attributes() {
+		switch string(kv.Key) {
+		case "ingero.cgroup_path_hash":
+			sawHash = kv.Value.AsString() == "abc123def456"
+		case "ingero.workload_type":
+			sawWorkload = kv.Value.AsString() == "training"
+		case "ingero.gpu_model":
+			sawGPU = kv.Value.AsString() == "h100-80gb"
+		case "ingero.event.id":
+			sawEventID = kv.Value.AsString() != ""
+		case "ingero.cluster.id":
+			sawCluster = kv.Value.AsString() == "prod"
+		}
+	}
+	if !sawHash || !sawWorkload || !sawGPU || !sawEventID || !sawCluster {
+		t.Fatalf("missing expected attributes: hash=%v workload=%v gpu=%v event=%v cluster=%v",
+			sawHash, sawWorkload, sawGPU, sawEventID, sawCluster)
+	}
+	var sawResolved bool
+	for _, ev := range got.Events() {
+		if ev.Name == "outcome" {
+			for _, kv := range ev.Attributes {
+				if string(kv.Key) == "status" && kv.Value.AsString() == "resolved" {
+					sawResolved = true
+				}
+			}
+		}
+	}
+	if !sawResolved {
+		t.Fatal("falling edge did not record outcome=resolved event")
+	}
+}
+
+// fakeDegradeBaseliner wraps a real baseliner but lets the test toggle
+// DegradationWarning explicitly. The tick reads it once via the
+// Baseliner interface.
+type fakeDegradeBaseliner struct {
+	Baseliner
+	warning bool
+}
+
+func (f *fakeDegradeBaseliner) DegradationWarning() bool { return f.warning }
+
+// Rising / falling edge of DegradationWarning opens and closes a span.
+func TestLoop_TracerDegradationEdges(t *testing.T) {
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	wrapped := &fakeDegradeBaseliner{Baseliner: bl}
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 0, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	col := &fakeCollector{
+		obs: []RawObservation{
+			{Throughput: 100, Compute: 0.9, Memory: 0.9, CPU: 0.9},
+			{Throughput: 100, Compute: 0.9, Memory: 0.9, CPU: 0.9},
+			{Throughput: 100, Compute: 0.9, Memory: 0.9, CPU: 0.9},
+		},
+		launches: []int{10, 10, 10},
+	}
+	em := &fakeEmitter{reachable: true}
+	rec, tracer := recordingTracer()
+
+	l, err := NewLoop(LoopConfig{
+		Baseliner:      wrapped,
+		StateMachine:   sm,
+		Emitter:        em,
+		Collector:      col,
+		ScoreConfig:    DefaultConfig(),
+		PushInterval:   10 * time.Millisecond,
+		DetectionMode:  "fleet",
+		Log:            discardLogger(),
+		Clock:          func() time.Time { return testTS },
+		Tracer:         tracer,
+		CgroupPathHash: "hash",
+		WorkloadType:   "inference",
+		GPUModel:       "a100-40gb",
+	})
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	wrapped.warning = false
+	l.TickOnce(context.Background())
+	if got := len(rec.Ended()); got != 0 {
+		t.Fatalf("ended spans before degradation = %d", got)
+	}
+	wrapped.warning = true
+	l.TickOnce(context.Background()) // rising edge
+	if got := len(rec.Ended()); got != 0 {
+		t.Fatalf("rising edge prematurely ended span: %d", got)
+	}
+	wrapped.warning = false
+	l.TickOnce(context.Background()) // falling edge
+
+	ended := rec.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended spans = %d, want 1", len(ended))
+	}
+	if ended[0].Name() != "ingero.detection.degradation" {
+		t.Fatalf("span name = %q", ended[0].Name())
+	}
+}
+
+// Nil tracer leaves all detection paths a no-op, no span starts.
+func TestLoop_NilTracerNoSpans(t *testing.T) {
+	col := &fakeCollector{
+		obs:      []RawObservation{{Throughput: 50, Compute: 0.5, Memory: 0.5, CPU: 0.5}},
+		launches: []int{10},
+	}
+	em := &fakeEmitter{reachable: true}
+	bl, _ := NewBaseliner(DefaultBaselineConfig(), discardLogger())
+	sm, _ := NewStateMachine(
+		StateConfig{IdleIntervals: 5, WarmupSamples: 0, StaleReadFailures: 5},
+		discardLogger(),
+	)
+	mode := &fakeMode{mode: ModeFleet, threshold: 0.80, ok: true}
+	clf, _ := NewClassifier(DefaultClassifierConfig())
+
+	l, err := NewLoop(LoopConfig{
+		Baseliner:     bl,
+		StateMachine:  sm,
+		Emitter:       em,
+		Collector:     col,
+		ModeEvaluator: mode,
+		Classifier:    clf,
+		NodeID:        "n",
+		ClusterID:     "c",
+		ScoreConfig:   DefaultConfig(),
+		PushInterval:  10 * time.Millisecond,
+		Log:           discardLogger(),
+		Clock:         func() time.Time { return testTS },
+		// Tracer intentionally left nil
+	})
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+	// Should not panic.
+	l.TickOnce(context.Background())
 }
