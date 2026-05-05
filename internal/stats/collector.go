@@ -327,6 +327,20 @@ type Snapshot struct {
 	// Nil when --libnccl-discovery-interval is 0 or the scanner has
 	// not yet completed its first pass.
 	NCCLProcessReadings []NCCLProcessReading
+
+	// MemFragReadings carries the latest NVML-poll memory-usage
+	// snapshot per GPU (v0.14 item D, W1 baseline). Each element
+	// becomes four gauges (used/free/total/fragmentation_estimate)
+	// labelled with gpu.uuid. Nil when --memfrag-poll-interval is 0
+	// or the poller has not yet completed its first read.
+	MemFragReadings []MemFragReading
+
+	// MemFragProcessReadings carries per-process GPU memory usage
+	// from `nvidia-smi --query-compute-apps`. Each element becomes
+	// one gpu.memory.process.allocated_bytes gauge labelled with
+	// gpu.uuid + pid. Nil under the same conditions as
+	// MemFragReadings.
+	MemFragProcessReadings []MemFragProcessReading
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -391,6 +405,28 @@ type NCCLProcessReading struct {
 	Comm       string
 	LibPath    string
 	LibVersion string
+}
+
+// MemFragReading is one polled NVML memory snapshot per GPU
+// (v0.14 item D). The fragmentation estimate is a coarse heuristic
+// computed from used/free/total: it is NOT the IOCTL-level memfrag
+// tracking that v0.15 W1 ships; the comment in the OTLP encoder
+// surfaces this caveat in the metric description.
+type MemFragReading struct {
+	UUID                  string
+	UsedBytes             int64
+	FreeBytes             int64
+	TotalBytes            int64
+	FragmentationEstimate float64 // [0,1]: 0 = unfragmented, 1 = fully fragmented
+}
+
+// MemFragProcessReading is one per-process GPU-memory data point
+// from `nvidia-smi --query-compute-apps`. UUID is the GPU UUID the
+// process is using; PID is the host PID.
+type MemFragProcessReading struct {
+	UUID      string
+	PID       uint32
+	UsedBytes int64
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

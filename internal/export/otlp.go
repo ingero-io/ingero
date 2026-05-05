@@ -403,6 +403,37 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	// NVML-poll memfrag heuristic (v0.14 item D, W1 baseline).
+	// Polling-based; not the IOCTL-level memfrag tracking that v0.15
+	// W1 brings. Four gauges per GPU labelled with gpu.uuid.
+	for _, r := range snap.MemFragReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt("gpu.memory.used", "GPU memory currently allocated (NVML poll)", "By",
+				nowNano, r.UsedBytes, attrs),
+			gaugeMetricInt("gpu.memory.free", "GPU memory free (NVML poll)", "By",
+				nowNano, r.FreeBytes, attrs),
+			gaugeMetricInt("gpu.memory.total", "Total GPU memory (NVML poll)", "By",
+				nowNano, r.TotalBytes, attrs),
+			gaugeMetric("gpu.memory.fragmentation_estimate",
+				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]; v0.15 will replace with IOCTL-level event-driven tracking",
+				"1", nowNano, r.FragmentationEstimate, attrs),
+		)
+	}
+	for _, p := range snap.MemFragProcessReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(p.UUID)},
+			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt("gpu.memory.process.allocated_bytes",
+				"Per-process GPU memory allocation (NVML compute-apps poll)", "By",
+				nowNano, p.UsedBytes, attrs),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than

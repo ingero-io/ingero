@@ -95,6 +95,11 @@ var (
 	// Default 10s; 0 disables. Scanner is independent of --nccl;
 	// useful by itself for "which nodes/processes have NCCL loaded".
 	traceLibNCCLDiscoveryInterval time.Duration
+
+	// v0.14 item D: NVML-poll memfrag heuristic interval. Default 10s;
+	// 0 disables. Polling-based; v0.15 W1 will replace with IOCTL-level
+	// tracing.
+	traceMemFragPollInterval time.Duration
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -173,6 +178,8 @@ func init() {
 		"interval between NVML clock-throttle reason polls (gpu.throttle.*_active metrics). 0 = disable. Floor: bursts shorter than this are missed by design.")
 	traceCmd.Flags().DurationVar(&traceLibNCCLDiscoveryInterval, "libnccl-discovery-interval", 10*time.Second,
 		"interval between libnccl process-discovery scans (gpu.nccl.process_loaded, gpu.nccl.processes_total metrics). 0 = disable. Independent of --nccl.")
+	traceCmd.Flags().DurationVar(&traceMemFragPollInterval, "memfrag-poll-interval", 10*time.Second,
+		"interval between NVML memory polls for the memfrag heuristic (gpu.memory.{used,free,total,fragmentation_estimate,process.allocated_bytes}). 0 = disable. Polling-based; v0.15 brings IOCTL-level tracking.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -1031,6 +1038,11 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default())
 	}
 
+	// Start NVML memfrag poller (v0.14 item D, W1 baseline).
+	if (otlpExporter != nil || promSrv != nil) && traceMemFragPollInterval > 0 {
+		startMemFragPoller(ctx, traceMemFragPollInterval, nvml.NewMemoryRunner(), nvml.NewComputeAppsRunner(), slog.Default())
+	}
+
 	// Snapshot callback for exporters (OTLP, Prometheus).
 	// Called every 1s from the table/JSON mode tickers.
 	// OTLP push is rate-limited: only every ExportInterval seconds (default 10s).
@@ -1078,6 +1090,8 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// semantics, last-batch-wins). Persists across snapshot
 			// ticks until the scanner pushes a new batch.
 			snap.NCCLProcessReadings = drainNCCLDiscoveryBuf()
+			// v0.14 item D: latest NVML memfrag poll snapshot.
+			snap.MemFragReadings, snap.MemFragProcessReadings = drainMemFragBuf()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}
