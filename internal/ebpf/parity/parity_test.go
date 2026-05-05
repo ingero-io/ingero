@@ -203,6 +203,33 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// TestCUDATracerMemcpyVariantsRequired locks in the v0.14 item C
+// contract: the cuda BPF object must export uprobe/uretprobe pairs
+// for cudaMemcpy2D, cudaMemcpy2DAsync, cudaMemcpyPeer, and
+// cudaMemcpyPeerAsync on BOTH archs. Without this, a build-config
+// drift could silently drop one of the new variants on one arch
+// only and the structural-parity test would still pass (since both
+// archs would be missing the same program), so we anchor the
+// minimum surface here.
+func TestCUDATracerMemcpyVariantsRequired(t *testing.T) {
+	required := []string{
+		"uprobe_cuda_memcpy_2d", "uretprobe_cuda_memcpy_2d",
+		"uprobe_cuda_memcpy_2d_async", "uretprobe_cuda_memcpy_2d_async",
+		"uprobe_cuda_memcpy_peer", "uretprobe_cuda_memcpy_peer",
+		"uprobe_cuda_memcpy_peer_async", "uretprobe_cuda_memcpy_peer_async",
+	}
+	for _, a := range archPair {
+		t.Run(a.arch, func(t *testing.T) {
+			spec := loadSpec(t, "cuda", "cudatrace", a.suffix)
+			for _, p := range required {
+				if _, ok := spec.Programs[p]; !ok {
+					t.Errorf("missing program %q on arch %s", p, a.arch)
+				}
+			}
+		})
+	}
+}
+
 // TestNCCLProbeRequiredPrograms asserts that the ncclprobe object
 // exports the v0.12.1 minimum probe set (8 collectives x 2 = 16
 // programs). v0.12.1 (QA audit ★2 #9): without this, a build-config
