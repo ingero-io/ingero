@@ -14,6 +14,24 @@ Skips v0.13.
 
 ### Added
 
+- **libnccl process discovery**: periodic `/proc/PID/maps` scanner
+  emits `gpu.nccl.process_loaded` (gauge=1 per discovered PID,
+  labelled with `pid`, `comm`, `libnccl_path`, `libnccl_version`)
+  and `gpu.nccl.processes_total`. New flag
+  `--libnccl-discovery-interval` (default 10s; 0 disables).
+- **Memcpy uprobes** for `cudaMemcpy2D`, `cudaMemcpy2DAsync`,
+  `cudaMemcpyPeer`, `cudaMemcpyPeerAsync`. Per-direction labels
+  (`h2h`, `h2d`, `d2h`, `d2d`, `default`, `unknown`). New gauges
+  `gpu.memcpy.bytes_total{direction}` (cumulative counter) and
+  `gpu.memcpy.duration_ms{direction}` (per-window average). 2D
+  variants encode `direction=unknown` because the kind argument
+  lives where libbpf's `PT_REGS_PARMn` macros cannot read it; the
+  1D variants remain the precise direction-and-bytes signal.
+- **W1 NVML-poll memfrag heuristic**: `gpu.memory.fragmentation_estimate`
+  (gauge 0..1, derived from nvidia-smi memory.{used,free,total}) and
+  per-PID `gpu.memory.process.allocated_bytes`. New flag
+  `--memfrag-poll-interval` (default 10s; 0 disables). Polling-based;
+  v0.15 will replace with an event-driven IOCTL kprobe variant.
 - Per-cgroup CUDA + CPU-stall metric variants alongside existing
   per-process series. New `internal/health/cgroup_cache.go` builds
   the cgroup-path-hash identity.
@@ -22,13 +40,18 @@ Skips v0.13.
 - `ingero rates update` CLI subcommand. Live update with embedded
   Markdown fallback.
 - `pagerduty_trigger` MCP tool. PagerDuty Events v2 trigger from
-  the agent's detection-event shape.
+  the agent's detection-event shape. Off by default; opt in via
+  `SetPagerDutyMCPEnabled(true)` after pairing the agent MCP with
+  bearer auth.
 - AWS validation harness: `scripts/aws/v0-13/{deploy,preflight,
   provision,teardown}.sh`.
 - YAML config loader (`internal/config/config.go`).
 - Trace-sampling policy (`internal/sampling/sampler.go`).
-- New attribute constants in `pkg/contract/contract.go`, including
-  `ingero.cgroup.path_hash`.
+- Six new metric-name constants in `pkg/contract/contract.go`
+  (`MetricGPUNCCLProcessLoaded`, `MetricGPUNCCLProcessesTotal`,
+  `MetricGPUMemoryFragmentation`, `MetricGPUMemoryProcessAllocated`,
+  `MetricGPUMemcpyBytesTotal`, `MetricGPUMemcpyDurationMS`); plus
+  `ingero.cgroup.path_hash` attribute constant.
 - `docs/troubleshooting.md`: patterns Ingero detects, operational
   cheat sheet, advanced configuration.
 
@@ -45,6 +68,17 @@ Skips v0.13.
   `docs/troubleshooting.md`.
 - `internal/store/store.go` schema extended with per-cgroup
   attribution columns (additive; older readers unaffected).
+- PagerDuty client response body bounded by `io.LimitReader(64KiB)`
+  before close.
+
+### Fixed
+
+- `cudaMemcpy2D` / `cudaMemcpy2DAsync` BPF probes encode
+  `direction=5` (`unknown`) instead of `direction=0` (`h2h`).
+  Earlier code relied on a userspace convention to interpret
+  direction=h2h on a 2D op as unknown; that convention was not in
+  the contract. The fix makes the metric label honest and prevents
+  silent mixing of true H2H copies with 2D-with-unknown-direction.
 
 ## [0.12.10] - 2026-05-04
 
