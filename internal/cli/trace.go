@@ -90,6 +90,11 @@ var (
 	tracePyWalker     string        // Python frame walker: auto, ebpf, userspace.
 	traceWorkloadType string        // Mirrors fleet.workload_type from configs/ingero.yaml; gates correlator window.
 	traceThrottlePoll time.Duration // NVML clock-throttle reason poll interval (default 5s; 0 = disabled).
+
+	// v0.14 item A: libnccl process-discovery scanner interval.
+	// Default 10s; 0 disables. Scanner is independent of --nccl;
+	// useful by itself for "which nodes/processes have NCCL loaded".
+	traceLibNCCLDiscoveryInterval time.Duration
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -166,6 +171,8 @@ func init() {
 		"Workload type from fleet.workload_type (training | inference | unknown). Selects correlator window: training/unknown=10s, inference=500ms.")
 	traceCmd.Flags().DurationVar(&traceThrottlePoll, "throttle-poll-interval", 5*time.Second,
 		"interval between NVML clock-throttle reason polls (gpu.throttle.*_active metrics). 0 = disable. Floor: bursts shorter than this are missed by design.")
+	traceCmd.Flags().DurationVar(&traceLibNCCLDiscoveryInterval, "libnccl-discovery-interval", 10*time.Second,
+		"interval between libnccl process-discovery scans (gpu.nccl.process_loaded, gpu.nccl.processes_total metrics). 0 = disable. Independent of --nccl.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -1018,6 +1025,12 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		startThrottlePoller(ctx, traceThrottlePoll, nvml.NewSubprocessRunner(), slog.Default())
 	}
 
+	// Start libnccl process-discovery scanner (v0.14 item A). Same gate
+	// as throttle: only useful when an exporter is wired up.
+	if (otlpExporter != nil || promSrv != nil) && traceLibNCCLDiscoveryInterval > 0 {
+		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default())
+	}
+
 	// Snapshot callback for exporters (OTLP, Prometheus).
 	// Called every 1s from the table/JSON mode tickers.
 	// OTLP push is rate-limited: only every ExportInterval seconds (default 10s).
@@ -1061,6 +1074,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// so the poller's per-UUID map flushes here. Nil when
 			// nvidia-smi is missing or the poller is disabled.
 			snap.ThrottleReadings = drainThrottleBuf()
+			// v0.14 item A: latest libnccl discovery batch (gauge
+			// semantics, last-batch-wins). Persists across snapshot
+			// ticks until the scanner pushes a new batch.
+			snap.NCCLProcessReadings = drainNCCLDiscoveryBuf()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}

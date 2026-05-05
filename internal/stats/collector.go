@@ -318,6 +318,15 @@ type Snapshot struct {
 	// four gauge data points (power/thermal/sw/hw active) labelled with
 	// gpu.uuid in the OTLP exporter.
 	ThrottleReadings []ThrottleReading
+
+	// NCCLProcessReadings carries the latest snapshot of NCCL-loaded
+	// processes from the libnccl discovery scanner (v0.14 item A).
+	// Each element becomes one gpu.nccl.process_loaded gauge=1 data
+	// point with pid/comm/libnccl_path/libnccl_version labels; the
+	// length of the slice becomes the gpu.nccl.processes_total gauge.
+	// Nil when --libnccl-discovery-interval is 0 or the scanner has
+	// not yet completed its first pass.
+	NCCLProcessReadings []NCCLProcessReading
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -367,6 +376,21 @@ type NCCLDataPoint struct {
 	// primitives (PARM4 of those calls). Zero for collectives. v0.12.2:
 	// enables topology-mapping for pipeline-parallel workloads.
 	PeerRank uint32
+}
+
+// NCCLProcessReading is one discovered NCCL-loaded process surfaced
+// by the libnccl discovery scanner (v0.14 item A). Plain fields so
+// the export package emits without importing ncclprobe (avoids an
+// import cycle).
+//
+// Each reading produces one gpu.nccl.process_loaded gauge=1 data
+// point with the four-label set (pid, comm, libnccl_path,
+// libnccl_version); the slice length feeds gpu.nccl.processes_total.
+type NCCLProcessReading struct {
+	PID        uint32
+	Comm       string
+	LibPath    string
+	LibVersion string
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store

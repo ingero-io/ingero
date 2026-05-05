@@ -376,6 +376,33 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		}
 	}
 
+	// libnccl process discovery (v0.14 item A). One gpu.nccl.process_loaded
+	// gauge=1 per discovered PID, plus gpu.nccl.processes_total per node.
+	// The scanner emits an empty slice (not nil) when it has run but
+	// found no NCCL processes; the per-node total still emits with
+	// value=0 in that case so dashboards can plot "this node has no
+	// NCCL workloads right now" alongside positive readings.
+	if snap.NCCLProcessReadings != nil {
+		for _, r := range snap.NCCLProcessReadings {
+			attrs := []otlpKeyValue{
+				{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
+				{Key: "comm", Value: stringVal(r.Comm)},
+				{Key: "libnccl_path", Value: stringVal(r.LibPath)},
+				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
+			}
+			metrics = append(metrics,
+				gaugeMetricInt("gpu.nccl.process_loaded",
+					"NCCL-loaded process discovered on this node (1=present)",
+					"1", nowNano, 1, attrs),
+			)
+		}
+		metrics = append(metrics,
+			gaugeMetricInt("gpu.nccl.processes_total",
+				"Count of NCCL-loaded processes on this node", "1",
+				nowNano, int64(len(snap.NCCLProcessReadings)), nil),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than
