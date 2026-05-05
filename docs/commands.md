@@ -62,6 +62,7 @@ sudo ingero trace --deadband 5              # suppress idle snapshots (5% thresh
 sudo ingero trace --deadband 5 --heartbeat 30s  # deadband + force report every 30s
 sudo ingero trace --prometheus :9090       # expose Prometheus /metrics endpoint
 sudo ingero trace --otlp localhost:4318    # push metrics via OTLP (see docs/otlp.md)
+sudo ingero trace --throttle-poll-interval 2s  # poll NVML clock-throttle reasons every 2s (default 5s; 0 disables)
 sudo ingero trace --node gpu-node-07      # tag events with node identity (for multi-node)
 sudo ingero trace --cuda-lib /opt/venv/lib/python3.11/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12
                                            # explicit libcudart path (skips auto-discovery)
@@ -88,6 +89,13 @@ sudo ingero trace --py-walker ebpf         # in-kernel CPython walker (works at 
   in-kernel CPython walker (supports 3.10, 3.11, 3.12: no
   `/proc/pid/mem` required, works at `ptrace_scope=3`). `userspace`
   forces the classic walker.
+- `--throttle-poll-interval DURATION`: NVML clock-throttle reason
+  poll interval. Default `5s`; `0` disables. Emits the four
+  `gpu.throttle.{power,thermal,sw,hw}_active` gauges per visible
+  GPU. The interval is the bursting floor: throttle events shorter
+  than the interval may be missed by design. See
+  [`docs/otlp.md`](otlp.md) for the bit-to-bucket mapping table and
+  metric semantics.
 
 `ingero check` reports the current `kernel.yama.ptrace_scope` value
 with actionable hints when it blocks Python source attribution.

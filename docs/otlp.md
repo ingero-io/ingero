@@ -42,6 +42,52 @@ Standard OTEL semantic conventions, per-operation, per-source granularity:
 | `system.cpu.utilization` | Gauge | Host CPU% from /proc |
 | `system.memory.utilization` | Gauge | Host mem% from /proc |
 | `ingero.anomaly.count` | Counter | Causal-chain anomalies detected |
+| `gpu.throttle.power_active` | Gauge | NVML throttle reason: power-cap active (1) or not (0); per `gpu.uuid` |
+| `gpu.throttle.thermal_active` | Gauge | NVML throttle reason: thermal active (1) or not (0); per `gpu.uuid` |
+| `gpu.throttle.sw_active` | Gauge | NVML throttle reason: software-side active (1) or not (0); per `gpu.uuid` |
+| `gpu.throttle.hw_active` | Gauge | NVML throttle reason: hardware umbrella (any HW reason); per `gpu.uuid` |
+| `nccl.collective.duration_ms` | Histogram | Per-collective op latency (`op_type`, `comm_id_hash`, `rank`, `nranks`, `datatype`, `reduce_op`, `nccl.peer_rank` for Send/Recv) |
+| `nccl.collective.barrier_wait_ms` | Histogram | Time between collective uretprobe and the matching `cudaStreamSynchronize` |
+
+## NVML throttle-reason metrics
+
+`gpu.throttle.{power,thermal,sw,hw}_active` come from
+`nvmlDeviceGetCurrentClocksThrottleReasons` polled at
+`--throttle-poll-interval` (default 5s, `0` disables). Each metric
+emits `1` when the bucket is active and `0` otherwise. Metric names
+are stable contract; dashboards may pin to them.
+
+`hw_active` is the umbrella for any hardware reason: future NVML
+bits not yet enumerated in the bucket table funnel here so dashboards
+do not silently lose visibility on a newer driver.
+
+Bit-to-bucket mapping (also documented in
+`internal/nvml/decoder.go`):
+
+| NVML bit | bucket(s) |
+|----------|-----------|
+| `nvmlClocksThrottleReasonGpuIdle` | (suppressed) |
+| `nvmlClocksThrottleReasonApplicationsClocksSetting` | sw |
+| `nvmlClocksThrottleReasonSwPowerCap` | power, sw |
+| `nvmlClocksThrottleReasonHwSlowdown` | hw |
+| `nvmlClocksThrottleReasonSyncBoost` | sw |
+| `nvmlClocksThrottleReasonSwThermalSlowdown` | thermal, sw |
+| `nvmlClocksThrottleReasonHwThermalSlowdown` | thermal, hw |
+| `nvmlClocksThrottleReasonHwPowerBrakeSlowdown` | power, hw |
+| `nvmlClocksThrottleReasonDisplayClockSetting` | sw |
+
+The poll interval is the bursting floor: a throttle event shorter
+than the interval may be missed by design. Choose the interval
+based on the workload (5s is a reasonable default for steady-state
+training; shorter intervals catch more bursty inference patterns
+at the cost of one extra `nvidia-smi` call per tick).
+
+Consumer GPUs that return `[Not Supported]` for the throttle field
+are skipped per device; the agent logs the skip once per GPU at
+info level instead of every tick.
+
+This is the polling-based variant of W2; an event-driven BPF
+version (issue #133) is on the roadmap for a future release.
 
 ## Implementation note
 
