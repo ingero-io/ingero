@@ -37,13 +37,16 @@ type Event struct {
 	TID         uint32
 	Source      uint8
 	Op          uint8
-	// _pad / _pad2 are intentional ABI padding to align CgroupID to
+	// Pad1 / Pad2 are intentional ABI padding to align CgroupID to
 	// 8 bytes, mirroring the C struct ingero_event_hdr in
 	// bpf/common.bpf.h. binary.Read consumes them; do not remove.
-	//lint:ignore U1000 ABI padding for C struct nccl_event hdr
-	_pad uint16
-	//lint:ignore U1000 ABI padding for C struct nccl_event hdr
-	_pad2    uint32
+	// v0.15 F1: must be exported so binary.Read's reflect path can
+	// write to them under Go 1.26's stricter unexported-field rules.
+	// (Pre-1.26 reflect tolerated SetUint on these via internal
+	// shortcuts; 1.26 panics. Field offsets and EventSize=104 stay
+	// identical.)
+	Pad1     uint16
+	Pad2     uint32
 	CgroupID uint64
 	Comm         [16]byte
 	DurationNs   uint64

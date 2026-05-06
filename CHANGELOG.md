@@ -21,7 +21,9 @@ Fleet-side changes (the OTel Collector distribution) live in the
   GPU VMs. Tracer API now exposes `Prepare()` + `AttachAt(libPath)`
   for the runtime-attach flow; `Attach(filterPIDs)` is a
   compatibility shim. New helper `Tracer.AttachedPaths()` for
-  observability.
+  observability. Validated end-to-end on Lambda A10 with PyTorch
+  2.4 + NCCL 2.20.5: 200 ncclAllReduce calls produced exactly
+  200 events in `gpu_nccl_collective_count`.
 - **Prometheus running counters for NCCL collectives.** Vanilla
   Prometheus scrapers can now see NCCL activity on the agent:
   `gpu_nccl_collective_count{op_type}`,
@@ -35,6 +37,14 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ### Fixed
 
+- **NCCL ringbuf decode panic under Go 1.26.** The Event struct
+  had unexported `_pad` / `_pad2` ABI padding fields that
+  `binary.Read` panicked on under Go 1.26's stricter
+  unexported-field reflect rules. Renamed to `Pad1` / `Pad2`;
+  EventSize=104 and field offsets stay identical. Latent bug
+  surfaced by the F1 work above (pre-F1 the agent rarely
+  received real NCCL events; F1 made PyTorch+NCCL events reach
+  the deserializer for the first time).
 - `tests/e2e/memcpy-2d-peer-multigpu.sh` and the new single-GPU
   diagnostic now compile the workload with `nvcc -cudart=shared`.
   Without this, nvcc statically links libcudart and the agent's
