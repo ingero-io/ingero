@@ -83,9 +83,15 @@ torch.cuda.set_device(rank % torch.cuda.device_count())
 dist.init_process_group(backend='nccl', rank=rank, world_size=world)
 print(f"rank={rank} nccl-version={torch.cuda.nccl.version()}", flush=True)
 t = torch.ones(1024 * 1024, device='cuda')
-for i in range(100):
-    dist.all_reduce(t)
-torch.cuda.synchronize()
+# 100 ops per cycle, sleep 0.1s between cycles so the workload runs
+# for at least 6-8 seconds. Gives the libnccl-discovery scanner
+# (interval 2s) at least 3 chances to observe the process holding
+# libnccl, which is what F1 needs to attach uprobes.
+for cycle in range(8):
+    for i in range(100):
+        dist.all_reduce(t)
+    torch.cuda.synchronize()
+    time.sleep(0.1)
 dist.destroy_process_group()
 print("done", flush=True)
 PY
@@ -107,13 +113,21 @@ run_for_version() {
   fi
 
   echo "==> [version $ver] boot agent with NCCL uprobes"
+  # --nccl is required to install the NCCL collective uprobes; without
+  # it setupNCCLTracer is never called and F1 (runtime libnccl uprobe
+  # attachment) has nothing to attach against. The libnccl-discovery
+  # scanner runs independently for the gauge metrics either way.
   sudo "$INGERO_BIN" trace --record --db "$WORK/trace-$ver.db" \
     --duration 90s \
-    --libnccl-discovery-interval 3s \
+    --nccl \
+    --libnccl-discovery-interval 2s \
     --prometheus :9090 \
     >"$WORK/agent-$ver.log" 2>&1 &
   AGENT_PID=$!
-  sleep 5
+  # Allow time for the agent to bind Prometheus AND for the discovery
+  # scanner to make at least one full pass before the workload starts.
+  wait_port_ready 127.0.0.1 9090 30 || { echo "FAIL: agent did not bind"; tail -20 "$WORK/agent-$ver.log"; deactivate; return 1; }
+  sleep 6
 
   echo "==> [version $ver] run 2-rank ncclAllReduce x 100"
   RANK=0 WORLD_SIZE=2 python "$WORK/allreduce.py" >"$WORK/r0-$ver.log" 2>&1 &

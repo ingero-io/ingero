@@ -97,6 +97,7 @@ func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log 
 			if nt == nil {
 				return
 			}
+			before := len(nt.AttachedPaths())
 			seen := map[string]bool{}
 			for _, p := range batch {
 				if p.LibPath == "" || seen[p.LibPath] {
@@ -107,6 +108,11 @@ func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log 
 					log.Debug("nccl-discovery: AttachAt failed",
 						"path", p.LibPath, "err", err)
 				}
+			}
+			after := len(nt.AttachedPaths())
+			if after > before {
+				log.Info("nccl-discovery: attached new libnccl path(s)",
+					"new_paths", after-before, "total_attached", after)
 			}
 		},
 		interval,
