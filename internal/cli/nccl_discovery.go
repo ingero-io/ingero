@@ -76,7 +76,13 @@ func resetNCCLDiscoveryState() {
 // enumerates /proc, looks up libnccl per PID, and forwards results
 // to the snapshot drain. interval <= 0 disables the feature; the
 // snapshot will see no NCCL discovery readings.
-func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log *slog.Logger) {
+//
+// v0.15 F1: when nt is non-nil, the sink also calls
+// nt.AttachAt(libPath) for each unique libnccl path the scanner
+// finds, so PyTorch+pip workloads (which ship libnccl in a venv that
+// startup-time eager attach can never see) get NCCL collective
+// uprobes attached as soon as the workload boots.
+func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log *slog.Logger, nt *ncclprobe.Tracer) {
 	if interval <= 0 {
 		return
 	}
@@ -88,6 +94,20 @@ func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log 
 		func(batch []ncclprobe.NCCLProcess) {
 			setNCCLDiscoveryBatch(batch)
 			log.Debug("nccl-discovery: scan complete", "n_processes", len(batch))
+			if nt == nil {
+				return
+			}
+			seen := map[string]bool{}
+			for _, p := range batch {
+				if p.LibPath == "" || seen[p.LibPath] {
+					continue
+				}
+				seen[p.LibPath] = true
+				if err := nt.AttachAt(p.LibPath); err != nil {
+					log.Debug("nccl-discovery: AttachAt failed",
+						"path", p.LibPath, "err", err)
+				}
+			}
 		},
 		interval,
 	)

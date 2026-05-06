@@ -285,9 +285,29 @@ func setupNCCLTracer(p ncclSetupParams) (*ncclprobe.Tracer, int) {
 		libPath = p.findLibSystemwide()
 	}
 	if libPath == "" {
-		fmt.Fprintln(p.stderr, "  Warning: --nccl set but no libnccl.so / libtorch_cuda.so found; NCCL tracing skipped")
-		p.debugf("nccl: no libnccl-bearing object found; skipping")
-		return nil, 0
+		// v0.15 F1: no eager libnccl found, but the discovery scanner
+		// may still find a venv-installed libnccl after the workload
+		// boots. Stand up a lazy tracer (BPF spec loaded, ringbuf
+		// reader open, no uprobes yet) so the scanner sink can call
+		// AttachAt later. Without --libnccl-discovery-interval set,
+		// this lazy tracer never gets used and is harmless.
+		fmt.Fprintln(p.stderr, "  No eager libnccl found; lazy-attach armed (uprobes wire up when discovery scanner finds a workload)")
+		p.debugf("nccl: lazy tracer; AttachAt will fire from the discovery scanner sink")
+		nt := ncclprobe.New("")
+		var filterPIDs []uint32
+		if p.explicitPIDs {
+			for _, pid := range p.targetPIDs {
+				if pid > 0 {
+					filterPIDs = append(filterPIDs, uint32(pid))
+				}
+			}
+		}
+		if err := nt.Prepare(filterPIDs); err != nil {
+			fmt.Fprintf(p.stderr, "  Warning: NCCL lazy-attach unavailable: %v\n", err)
+			p.debugf("nccl: lazy Prepare failed: %v", err)
+			return nil, 0
+		}
+		return nt, 0
 	}
 	// v0.12.2 (LHF #7 + Arch ★3 attach race): when --pid is set, scope
 	// the NCCL probe to just those PIDs. The filter is passed *into*
@@ -1035,7 +1055,10 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Start libnccl process-discovery scanner (v0.14 item A). Same gate
 	// as throttle: only useful when an exporter is wired up.
 	if (otlpExporter != nil || promSrv != nil) && traceLibNCCLDiscoveryInterval > 0 {
-		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default())
+		// v0.15 F1: pass ncclTracer so the scanner sink attaches
+		// uprobes against runtime-discovered libnccl paths
+		// (PyTorch+pip workloads that ship libnccl in a venv).
+		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default(), ncclTracer)
 	}
 
 	// Start NVML memfrag poller (v0.14 item D, W1 baseline).

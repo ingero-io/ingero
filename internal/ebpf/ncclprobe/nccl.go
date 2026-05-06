@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,7 +65,7 @@ const EventSize = 104
 // Tracer attaches uprobes/uretprobes to NCCL collective functions and
 // streams parsed Events on its output channel.
 type Tracer struct {
-	libPath      string
+	libPath      string // initial path passed to New; "" allowed (lazy-attach via AttachAt)
 	objs         ncclTraceObjects
 	links        []link.Link
 	reader       *ringbuf.Reader
@@ -72,7 +73,16 @@ type Tracer struct {
 	dropped      atomic.Uint64
 	parseErr     atomic.Uint64
 	closed       atomic.Bool
-	attachedSyms int // populated by Attach: count of NCCL symbols that resolved + attached
+	attachedSyms int // sum across all AttachAt calls
+
+	// v0.15 F1: support runtime attachment to libnccl paths discovered
+	// AFTER startup. Each call to AttachAt adds a set of uprobes
+	// against one ELF; mu protects links + attachedPaths + attachedSyms
+	// from concurrent calls (the discovery-scanner sink runs in its
+	// own goroutine).
+	mu            sync.Mutex
+	attachedPaths map[string]int // libPath -> sym count attached for that path
+	prepareDone   atomic.Bool
 }
 
 // New constructs a tracer for the given libnccl-bearing shared object.
@@ -114,6 +124,33 @@ func (t *Tracer) Dropped() uint64 { return t.dropped.Load() }
 // signature so callers can't accidentally Attach() with no args and get
 // system-wide tracing when they meant filtered.
 func (t *Tracer) Attach(targetPIDs []uint32) error {
+	if err := t.Prepare(targetPIDs); err != nil {
+		return err
+	}
+	if t.libPath == "" {
+		// v0.15 F1: zero-eager-libnccl is now allowed; AttachAt will
+		// add uprobes once the discovery scanner finds a workload.
+		return nil
+	}
+	return t.AttachAt(t.libPath)
+}
+
+// Prepare loads the eBPF spec, installs the PID filter (if any), and
+// opens the ringbuf reader. It does NOT attach uprobes; AttachAt does.
+// Splitting these out lets one Tracer serve multiple libnccl paths,
+// some of which may not exist yet at startup. Idempotent.
+//
+// v0.15 F1: when no libnccl is found at startup, the agent should still
+// stand up the BPF infrastructure so that AttachAt can wire uprobes
+// against newly-discovered ELFs at runtime (PyTorch+pip workloads ship
+// libnccl in their venv; the discovery scanner finds it after the
+// workload boots).
+func (t *Tracer) Prepare(targetPIDs []uint32) error {
+	if !t.prepareDone.CompareAndSwap(false, true) {
+		return nil
+	}
+	t.attachedPaths = map[string]int{}
+
 	spec, err := loadNcclTrace()
 	if err != nil {
 		return fmt.Errorf("loading eBPF spec: %w", err)
@@ -121,18 +158,47 @@ func (t *Tracer) Attach(targetPIDs []uint32) error {
 	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {
 		return fmt.Errorf("LoadAndAssign: %w", err)
 	}
-
 	if len(targetPIDs) > 0 {
 		if err := t.installPIDFilter(targetPIDs); err != nil {
 			t.objs.Close()
 			return fmt.Errorf("install PID filter: %w", err)
 		}
 	}
-
-	exec, err := link.OpenExecutable(t.libPath)
+	r, err := ringbuf.NewReader(t.objs.NcclEvents)
 	if err != nil {
 		t.objs.Close()
-		return fmt.Errorf("OpenExecutable %s: %w", t.libPath, err)
+		return fmt.Errorf("ringbuf reader: %w", err)
+	}
+	t.reader = r
+	return nil
+}
+
+// AttachAt opens the given libnccl-bearing ELF and wires uprobe +
+// uretprobe pairs onto each NCCL symbol it exports. Safe to call
+// repeatedly with different paths; idempotent per path. Returns nil
+// when the path was already attached. Thread-safe (the discovery
+// scanner sink runs in its own goroutine).
+//
+// v0.15 F1: this is the runtime-attach entry point used by the
+// libnccl discovery scanner. The same call also covers the eager
+// startup path (Tracer.Attach calls this with t.libPath when it is
+// non-empty).
+func (t *Tracer) AttachAt(libPath string) error {
+	if !t.prepareDone.Load() {
+		return fmt.Errorf("ncclprobe: AttachAt called before Prepare")
+	}
+	if libPath == "" {
+		return fmt.Errorf("ncclprobe: AttachAt requires a non-empty libPath")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, already := t.attachedPaths[libPath]; already {
+		return nil
+	}
+
+	exec, err := link.OpenExecutable(libPath)
+	if err != nil {
+		return fmt.Errorf("OpenExecutable %s: %w", libPath, err)
 	}
 
 	type probeDef struct {
@@ -142,23 +208,22 @@ func (t *Tracer) Attach(targetPIDs []uint32) error {
 	}
 	probes := []probeDef{
 		{"ncclCommInitRank", t.objs.UprobeNcclCommInitRank, t.objs.UretprobeNcclCommInitRank},
-		// v0.12.3 (deferred from v0.12.1): single-process multi-GPU init.
 		{"ncclCommInitAll", t.objs.UprobeNcclCommInitAll, t.objs.UretprobeNcclCommInitAll},
 		{"ncclCommDestroy", t.objs.UprobeNcclCommDestroy, t.objs.UretprobeNcclCommDestroy},
 		{"ncclAllReduce", t.objs.UprobeNcclAllReduce, t.objs.UretprobeNcclAllReduce},
 		{"ncclAllGather", t.objs.UprobeNcclAllGather, t.objs.UretprobeNcclAllGather},
 		{"ncclReduceScatter", t.objs.UprobeNcclReduceScatter, t.objs.UretprobeNcclReduceScatter},
 		{"ncclBcast", t.objs.UprobeNcclBcast, t.objs.UretprobeNcclBcast},
-		// v0.12.1 (LHF #17 long-tail): point-to-point primitives.
 		{"ncclSend", t.objs.UprobeNcclSend, t.objs.UretprobeNcclSend},
 		{"ncclRecv", t.objs.UprobeNcclRecv, t.objs.UretprobeNcclRecv},
 	}
 
 	attached := 0
+	added := []link.Link{}
 	for _, p := range probes {
-		sym, err := resolveSymbol(t.libPath, p.symbol)
+		sym, err := resolveSymbol(libPath, p.symbol)
 		if err != nil {
-			log.Printf("ncclprobe: %s not found in %s: %v (skipping; NCCL build may not export this collective)", p.symbol, t.libPath, err)
+			log.Printf("ncclprobe: %s not found in %s: %v (skipping; NCCL build may not export this collective)", p.symbol, libPath, err)
 			continue
 		}
 		l, err := exec.Uprobe(sym, p.entry, nil)
@@ -166,28 +231,39 @@ func (t *Tracer) Attach(targetPIDs []uint32) error {
 			log.Printf("ncclprobe: uprobe %s: %v", sym, err)
 			continue
 		}
-		t.links = append(t.links, l)
+		added = append(added, l)
 		lr, err := exec.Uretprobe(sym, p.retEntr, nil)
 		if err != nil {
 			log.Printf("ncclprobe: uretprobe %s: %v", sym, err)
 			continue
 		}
-		t.links = append(t.links, lr)
+		added = append(added, lr)
 		attached++
 	}
 	if attached == 0 {
-		t.detach()
-		return fmt.Errorf("no NCCL symbols resolved in %s", t.libPath)
+		// Roll back any half-attached links from this call.
+		for _, l := range added {
+			_ = l.Close()
+		}
+		return fmt.Errorf("no NCCL symbols resolved in %s", libPath)
 	}
-	t.attachedSyms = attached
-
-	r, err := ringbuf.NewReader(t.objs.NcclEvents)
-	if err != nil {
-		t.detach()
-		return fmt.Errorf("ringbuf reader: %w", err)
-	}
-	t.reader = r
+	t.links = append(t.links, added...)
+	t.attachedSyms += attached
+	t.attachedPaths[libPath] = attached
 	return nil
+}
+
+// AttachedPaths returns a copy of the libnccl paths currently
+// attached. Test + observability hook.
+func (t *Tracer) AttachedPaths() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, 0, len(t.attachedPaths))
+	for k := range t.attachedPaths {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Run reads events from the ringbuf until ctx is cancelled or the

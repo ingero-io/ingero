@@ -243,3 +243,35 @@ func TestFindLibNCCLSystemwide_Smoke(t *testing.T) {
 		t.Errorf("returned %q which doesn't look like libnccl.so", got)
 	}
 }
+
+// v0.15 F1: Tracer.AttachAt rejects empty path.
+func TestAttachAt_EmptyPath(t *testing.T) {
+	tr := New("")
+	// Don't actually call Prepare (would need BPF privileges); the
+	// empty-path check is the FIRST thing AttachAt does, so the
+	// before-Prepare error code path is what we test here.
+	if err := tr.AttachAt(""); err == nil {
+		t.Fatalf("AttachAt(\"\") should return error, got nil")
+	}
+}
+
+// v0.15 F1: AttachAt returns an explicit error when called before
+// Prepare. Without Prepare the BPF objects are not loaded, so any
+// link.OpenExecutable -> Uprobe call would fail confusingly deep in
+// libbpf; the explicit guard makes the failure mode obvious.
+func TestAttachAt_BeforePrepare(t *testing.T) {
+	tr := New("/dev/null")
+	if err := tr.AttachAt("/dev/null"); err == nil {
+		t.Fatalf("AttachAt before Prepare should return error, got nil")
+	}
+}
+
+// v0.15 F1: AttachedPaths returns an empty slice on a fresh Tracer
+// before any AttachAt call.
+func TestAttachedPaths_Empty(t *testing.T) {
+	tr := New("")
+	got := tr.AttachedPaths()
+	if len(got) != 0 {
+		t.Fatalf("AttachedPaths on fresh tracer = %v, want []", got)
+	}
+}

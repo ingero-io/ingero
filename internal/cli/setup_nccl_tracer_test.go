@@ -31,8 +31,15 @@ func TestSetupNCCLTracer_NoLibNCCL(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("probe count should be 0, got %d", count)
 	}
-	if !strings.Contains(buf.String(), "no libnccl.so") {
-		t.Fatalf("expected no-libnccl warning, got: %q", buf.String())
+	// v0.15 F1: the no-eager-libnccl path now arms a lazy tracer
+	// instead of returning a hard "no libnccl" error. On unprivileged
+	// runners that cannot load BPF the lazy Prepare itself fails, the
+	// function logs the failure and returns (nil, 0). Either of those
+	// markers in stderr proves the F1 path was entered correctly.
+	out := buf.String()
+	if !strings.Contains(out, "lazy-attach armed") &&
+		!strings.Contains(out, "NCCL lazy-attach unavailable") {
+		t.Fatalf("expected lazy-attach marker in stderr, got: %q", out)
 	}
 }
 
@@ -56,8 +63,9 @@ func TestSetupNCCLTracer_UnprivilegedNoLib(t *testing.T) {
 	if !strings.Contains(out, "CAP_BPF") {
 		t.Fatalf("expected CAP_BPF warning, got: %q", out)
 	}
-	if !strings.Contains(out, "no libnccl.so") {
-		t.Fatalf("expected no-libnccl warning, got: %q", out)
+	if !strings.Contains(out, "lazy-attach armed") &&
+		!strings.Contains(out, "NCCL lazy-attach unavailable") {
+		t.Fatalf("expected lazy-attach marker in stderr, got: %q", out)
 	}
 }
 
