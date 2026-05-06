@@ -8,6 +8,47 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-06
+
+### Added
+
+- **Runtime libnccl uprobe attachment.** The agent now attaches NCCL
+  collective uprobes against libnccl paths the libnccl-discovery
+  scanner finds at runtime, in addition to the systemwide
+  attachment that ran at startup. PyTorch + pip workloads ship
+  libnccl in a venv that startup-time attach could never see, so
+  the previous behavior captured zero NCCL events on bare cloud
+  GPU VMs. Tracer API now exposes `Prepare()` + `AttachAt(libPath)`
+  for the runtime-attach flow; `Attach(filterPIDs)` is a
+  compatibility shim. New helper `Tracer.AttachedPaths()` for
+  observability.
+- **Prometheus running counters for NCCL collectives.** Vanilla
+  Prometheus scrapers can now see NCCL activity on the agent:
+  `gpu_nccl_collective_count{op_type}`,
+  `gpu_nccl_collective_bytes_total{op_type}`,
+  `gpu_nccl_collective_barrier_events{op_type}`. OTLP keeps the
+  per-event gauge view as the canonical channel; the counters
+  here are the pull-friendly slice. Counters are monotonic across
+  the agent process lifetime.
+- `tests/e2e/memcpy-2d-single-gpu.sh`: small-footprint diagnostic
+  for the 2D memcpy BYTES counter on a single GPU.
+
+### Fixed
+
+- `tests/e2e/memcpy-2d-peer-multigpu.sh` and the new single-GPU
+  diagnostic now compile the workload with `nvcc -cudart=shared`.
+  Without this, nvcc statically links libcudart and the agent's
+  uprobes against `/usr/lib/.../libcudart.so` never see the
+  workload's calls. The "v0.14.1 H100 direction=unknown delta=0"
+  finding was a test-side static-link issue, not a product bug;
+  validated on Lambda A10 with the new diagnostic showing exactly
+  100 MiB delta from 100x cudaMemcpy2D(width=1 MiB) calls.
+- `tests/e2e/nccl-abi-matrix.sh`: passes `--nccl` (without it the
+  NCCL tracer is never set up); workload now runs an 8-cycle
+  allreduce loop with sleeps so the libnccl-discovery scanner has
+  multiple chances to see the process holding libnccl in
+  `/proc/PID/maps`.
+
 ## [0.14.2] - 2026-05-06
 
 ### Added
