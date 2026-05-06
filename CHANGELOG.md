@@ -8,6 +8,53 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-06
+
+### Fixed
+
+- Prometheus `/metrics` exporter now includes the v0.12.10 +
+  v0.14.0 metric set (`gpu_throttle_*`, `gpu_nccl_process_loaded`,
+  `gpu_nccl_processes_total`, `gpu_memory_{used,free,total}_bytes`,
+  `gpu_memory_fragmentation_estimate`,
+  `gpu_memory_process_allocated_bytes`,
+  `gpu_memcpy_bytes_total{direction}`,
+  `gpu_memcpy_duration_ms{direction}`). Same labels as the OTLP
+  emission. Operators scraping Prometheus directly previously saw
+  only the pre-v0.12.10 metric subset.
+
+### Added
+
+- Expanded end-to-end test harness under `tests/e2e/` covering ML
+  engineer workflows (install-from-release, trace flag matrix,
+  OTLP roundtrip, libnccl discovery assertions, memcpy/memfrag/
+  throttle behavior, NCCL ABI matrix, k3s migration, soak) and
+  data-plane completeness (event-coverage matrix, counter
+  reconciliation, drop counter, critical-event guarantee, external
+  OTel mirror, fan-in completeness, /investigate LLM behavior).
+  See `tests/e2e/README.md` for how to run.
+- Companion local-stack at `ingero-fleet/examples/local-stack/`
+  for GPU-less fan-in validation on WSL or CI runners.
+- `tests/e2e/quickstart-readme.sh`: regression test for the
+  README's "Try it in 60 seconds" path (`--help`, `version`,
+  `check`, `demo --no-gpu` for `incident`+`cold-start`,
+  `mcp --help` tool advertisement). Runs CPU-only and rootless
+  on every push via a new `README quickstart regression` step
+  in `.github/workflows/ci.yml`.
+- `tests/workloads/cuda_busy.cu`: small self-contained CUDA
+  stresser (compute-bound kernel, no external deps), used by
+  `throttle-induced.sh` as a PyTorch-free workload so the test
+  runs on bare GPU VMs without `pip install torch`. Helper
+  `_lib.sh::ensure_cuda_busy` builds it on demand and caches
+  the binary in `/tmp`.
+
+### Fixed (test harness)
+
+- e2e cleanup: replaced the brittle `sudo kill "$AGENT_PID"`
+  pattern (which captures the `sudo` PID, not the agent's, so
+  the actual `ingero trace` process leaks across sequential
+  test runs) with a `_lib.sh::kill_agent` helper that uses
+  `pkill -f`. Applied to every script that boots the agent.
+
 ## [0.14.0] - 2026-05-05
 
 Skips v0.13.
