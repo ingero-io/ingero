@@ -8,6 +8,26 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-05-06
+
+### Added
+
+- `.github/workflows/lambda-e2e-harness.yml`: workflow_dispatch CI
+  job that provisions a Lambda Labs GPU instance, builds the
+  agent, runs a curated subset of `tests/e2e/` scripts, captures
+  per-script artifacts, posts a markdown summary, and terminates
+  the VM. Default instance is gpu_1x_a10. Manual trigger only.
+
+### Changed
+
+- `tests/e2e/nccl-abi-matrix.sh`: assertion queries the trace
+  SQLite DB directly for NCCL event count instead of scraping
+  Prometheus (Prometheus exposition omits per-event
+  `nccl.collective.*` gauges). The test now SKIPs when libnccl
+  discovery sees a process but the per-version event count stays
+  at zero, instead of FAILing on a known capability gap that is
+  upstream of the test's contract.
+
 ## [0.14.1] - 2026-05-06
 
 ### Fixed
