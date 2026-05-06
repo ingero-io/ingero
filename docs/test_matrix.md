@@ -2,7 +2,7 @@
 
 > **Maintenance rule**: Update this file every time tests are added or removed.
 
-251 total tests.
+253 unit tests + the v0.14.1 e2e harness (see "End-to-end harness" section).
 
 ## Summary
 
@@ -311,6 +311,8 @@
 | 171 | TestOTLP_PushToServer | Pushes to test OTLP server | export_test.go |
 | 172 | TestOTLP_PushServerError | Handles server errors | export_test.go |
 | 173 | TestOTLP_PushConnectionRefused | Handles connection errors | export_test.go |
+| 173a | TestPrometheusMetrics_V014 | Prometheus exporter emits the v0.14 + v0.12.10 metric families (`gpu_throttle_*`, `gpu_nccl_process_loaded`, `gpu_memory_*`, `gpu_memcpy_*`) with correct labels (v0.14.1 parity fix). | export_test.go |
+| 173b | TestPrometheusMetrics_V014_EmptySnapshot | The v0.14 metric families stay silent on a nil/empty snapshot (no spurious zero rows when pollers are disabled). | export_test.go |
 
 ## Symbol Resolution (symtab/)
 
@@ -409,3 +411,58 @@
 | 238 | TestServer/client_reconnect | Server accepts new client after previous disconnects | server_test.go |
 | 239 | TestServer/json_field_names_match_schema | JSON keys exactly match cross-language MemoryState schema | server_test.go |
 | 240 | TestServer/close_removes_socket_file | Close deletes the UDS socket file from filesystem | server_test.go |
+
+## End-to-end harness (v0.14.1; tests/e2e/)
+
+End-to-end shell tests that exercise the agent binary, the
+release artifact contract, and the federated agent + fleet +
+echo data plane. These complement the unit suite above. Most
+require GPU + Linux kernel BPF and run on Lambda VMs via the
+manually-triggered `lambda-smoke.yml` workflow. The CPU-only
+ones run in CI on every push (`README quickstart regression`
+step in `.github/workflows/ci.yml`).
+
+### CPU-only (run on every CI push)
+
+| # | Script | Description | Notes |
+|---|---|---|---|
+| E1 | quickstart-readme.sh | Regression for the README's "Try it in 60 seconds" path: `--help` subcommand inventory, `version`, `check --debug`, `demo --no-gpu` (incident + cold-start), `mcp --help` tools/prompts. | HARD release-gate per tandem-release skill. ~15-30s. |
+
+### Local-stack (no GPU, requires docker)
+
+Substrate at `ingero-fleet/examples/local-stack/` (real fleet
++ real ingero-echo + 3 sim-agents).
+
+| # | Script | Description | Notes |
+|---|---|---|---|
+| 33 | data-plane/33-investigate-finds-everything.sh | Drives the federated `/investigate` prompt via the Anthropic Messages API + Echo's MCP tool-use. Asserts the LLM begins with `fleet.cluster.summary`, calls `find_stragglers` / `find_outlier_nodes`, and identifies the planted bad node. | Skips gracefully without `ANTHROPIC_API_KEY`. |
+| 34 | data-plane/34-fan-in-completeness.sh | Substrate validation: brings up local-stack, sim-agents emit, queries Echo's run_analysis MCP, asserts all 3 nodes landed in DuckDB and the planted straggler has the lowest min-score. | Closes the longstanding gap "no automated test of agent -> fleet -> echo -> DuckDB end-to-end". |
+
+### GPU-bound (Lambda smoke; tests/e2e/*.sh + data-plane/29-32, 35)
+
+ML-engineer workflow + data-plane completeness scripts. Run via
+`lambda-smoke.yml` (workflow_dispatch) on Lambda GH200 / H100.
+
+| # | Script | Description |
+|---|---|---|
+| 1 | install-from-release.sh | Curl-tarball install path advertised in the README. |
+| 2 | trace-v014-flags.sh | Every flag added/changed in v0.14: `--libnccl-discovery-interval`, `--memfrag-poll-interval`, `--throttle-poll-interval`. |
+| 5 | query-fanout.sh | Multi-host fan-out (deferred; needs 2+ VMs). |
+| 6 | migrate-upgrade.sh | `ingero migrate` on an existing pre-v0.14 SQLite DB. |
+| 8 | otlp-receiver-roundtrip.sh | Agent OTLP push -> external otelcol -> assert metric set + labels. |
+| 9 | (folded into 8) | Prometheus pull verification. |
+| 16 | nccl-discovery-asserts.sh | libnccl process discovery: PyTorch+NCCL workload, scrape Prometheus, assert `gpu_nccl_process_loaded` row carries pid/comm/libnccl_path/libnccl_version. |
+| 17 | memcpy-1d-direction-matrix.sh | Per-direction memcpy: 100x H2D + 100x D2H + 100x D2D + 100x default; assert per-direction byte totals within tolerance. |
+| 18 | memcpy-2d-peer-multigpu.sh | 2D + peer memcpy on a real multi-GPU host; assert `direction=unknown` rows produced. |
+| 19 | memfrag-emits-under-fragmentation.sh | NVML-poll fragmentation heuristic: planted allocator workload should drive the gauge above the idle baseline. |
+| 20 | throttle-induced.sh | Power-cap induce: agent should flip `gpu_throttle_power_active` to 1 then 0. |
+| 23 | pagerduty-trigger-gate.sh | PagerDuty MCP trigger gate: assert no fire without `--pd-key`. |
+| 25 | yaml-config-boot.sh | `--config configs/ingero.yaml` boot path. |
+| 26 | soak-test.sh | 1h soak: assert no ringbuf overflow, no FD leaks, DB size bounded. |
+| 27 | arm64-gpu-runtime.sh | arm64 (GH200) runtime: build + trace + parity. |
+| 28 | nccl-abi-matrix.sh | Sweep NCCL versions across PyPI ABI eras, assert collective uprobes fire under each. |
+| 29 | data-plane/29-event-coverage-matrix.sh | Every documented event source produces at least 1 event in a 60s window. |
+| 30 | data-plane/30-counter-reconcile.sh | Cumulative counter reconciliation: `gpu.memcpy.bytes_total` MAX-MIN per node sums to the real workload size. |
+| 31 | data-plane/31-drop-counter.sh | Forced ringbuf overflow: `ingero_ringbuf_overflows_total` advances. |
+| 32 | data-plane/32-critical-events-guaranteed.sh | OOM kill / pod_restart never dropped under load. |
+| 35 | data-plane/35-external-otel-mirror.sh | Agent's OTLP push to fleet matches Prometheus scrape on the same window. |
