@@ -53,6 +53,18 @@ jobs:
       - name: Staticcheck
         run: staticcheck ./...
 
+      # Regression gate for the README's "Try it in 60 seconds" path.
+      # Catches drift in `--help` subcommand listing, `version` output,
+      # `check` readiness surface, `demo --no-gpu` event production,
+      # and `mcp --help` tool/prompt advertisement. CPU-only and
+      # rootless so every matrix runner exercises it. See script
+      # header for the full per-step rationale.
+      - name: README quickstart regression
+        run: |
+          mkdir -p bin
+          go build -o bin/ingero ./cmd/ingero
+          INGERO_BIN="$PWD/bin/ingero" REPO_ROOT="$PWD" bash tests/e2e/quickstart-readme.sh
+
   lint:
     name: Lint
     runs-on: ubuntu-22.04
