@@ -141,6 +141,96 @@ func TestPrometheusMetrics_WithSnapshot(t *testing.T) {
 	}
 }
 
+// TestPrometheusMetrics_V014 covers the v0.14 + v0.12.10 metric families
+// added on v0.14.1: throttle, libnccl process discovery, NVML-poll memory
+// + fragmentation, and per-direction memcpy aggregates. Pre-fix the
+// Prometheus exporter only emitted system_*, gpu_cuda_operation_*, anomaly,
+// ringbuf, and trace_db_*; all v0.14-vintage metrics were OTLP-only.
+func TestPrometheusMetrics_V014(t *testing.T) {
+	p := NewPrometheus(":0")
+
+	snap := &stats.Snapshot{
+		ThrottleReadings: []stats.ThrottleReading{
+			{UUID: "GPU-AAAA", PowerActive: true, ThermalActive: false, SWActive: false, HWActive: true},
+			{UUID: "GPU-BBBB", PowerActive: false, ThermalActive: true, SWActive: false, HWActive: false},
+		},
+		NCCLProcessReadings: []stats.NCCLProcessReading{
+			{PID: 1234, Comm: "python3", LibPath: "/usr/lib/x86_64-linux-gnu/libnccl.so.2.26.2", LibVersion: "2.26.2"},
+		},
+		MemFragReadings: []stats.MemFragReading{
+			{UUID: "GPU-AAAA", UsedBytes: 8 << 30, FreeBytes: 16 << 30, TotalBytes: 24 << 30, FragmentationEstimate: 0.31},
+		},
+		MemFragProcessReadings: []stats.MemFragProcessReading{
+			{UUID: "GPU-AAAA", PID: 1234, UsedBytes: 4 << 30},
+		},
+		MemcpyDirReadings: []stats.MemcpyDirStats{
+			{Direction: "h2d", BytesTotal: 1 << 30, AverageDurationMs: 1.4, EventsInWindow: 10},
+			{Direction: "d2h", BytesTotal: 512 << 20, AverageDurationMs: 1.2, EventsInWindow: 8},
+		},
+	}
+	p.UpdateSnapshot(snap)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+
+	checks := []string{
+		// throttle (v0.12.10)
+		`gpu_throttle_power_active{gpu_uuid="GPU-AAAA"} 1`,
+		`gpu_throttle_thermal_active{gpu_uuid="GPU-AAAA"} 0`,
+		`gpu_throttle_hw_active{gpu_uuid="GPU-AAAA"} 1`,
+		`gpu_throttle_thermal_active{gpu_uuid="GPU-BBBB"} 1`,
+		// libnccl discovery (v0.14 item A)
+		`gpu_nccl_process_loaded{pid="1234",comm="python3"`,
+		`libnccl_version="2.26.2"`,
+		`gpu_nccl_processes_total 1`,
+		// memfrag (v0.14 item D)
+		`gpu_memory_used_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_free_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_total_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_fragmentation_estimate{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_process_allocated_bytes{gpu_uuid="GPU-AAAA",pid="1234"}`,
+		// memcpy (v0.14 item C)
+		`gpu_memcpy_bytes_total{direction="h2d"}`,
+		`gpu_memcpy_bytes_total{direction="d2h"}`,
+		`gpu_memcpy_duration_ms{direction="h2d"}`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(content, check) {
+			t.Errorf("metrics output missing %q\n--- body ---\n%s", check, content)
+		}
+	}
+}
+
+// TestPrometheusMetrics_V014_EmptySnapshot verifies the v0.14 sections
+// are silent when the relevant fields are nil/empty (no spurious zero
+// rows polluting scrapes when pollers are disabled).
+func TestPrometheusMetrics_V014_EmptySnapshot(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+
+	for _, name := range []string{
+		"gpu_throttle_power_active",
+		"gpu_nccl_process_loaded",
+		"gpu_memory_fragmentation_estimate",
+		"gpu_memcpy_bytes_total",
+	} {
+		if strings.Contains(content, name) {
+			t.Errorf("expected %q to be absent from empty-snapshot scrape, but it was emitted", name)
+		}
+	}
+}
+
 func TestPrometheusMetrics_HTTPHandler(t *testing.T) {
 	p := NewPrometheus(":0")
 	snap := &stats.Snapshot{TotalEvents: 42, AnomalyEvents: 1}

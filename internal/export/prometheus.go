@@ -150,5 +150,108 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		fmt.Fprintf(&b, "ingero_trace_db_pruned_rows_total %d\n", snap.TraceDB.PrunedRows)
 	}
 
+	// libnccl process discovery (v0.14 item A). Mirrors the OTLP emission
+	// in otlp.go: one gauge=1 row per discovered NCCL-loaded process, plus
+	// a per-node count. Empty slice (not nil) emits the total as 0 so
+	// dashboards can plot "no NCCL workloads on this node".
+	if snap.NCCLProcessReadings != nil {
+		b.WriteString("# HELP gpu_nccl_process_loaded NCCL-loaded process discovered on this node (1=present)\n")
+		b.WriteString("# TYPE gpu_nccl_process_loaded gauge\n")
+		for _, r := range snap.NCCLProcessReadings {
+			fmt.Fprintf(&b, "gpu_nccl_process_loaded{pid=\"%d\",comm=%q,libnccl_path=%q,libnccl_version=%q} 1\n",
+				r.PID, r.Comm, r.LibPath, r.LibVersion)
+		}
+		b.WriteString("# HELP gpu_nccl_processes_total Count of NCCL-loaded processes on this node\n")
+		b.WriteString("# TYPE gpu_nccl_processes_total gauge\n")
+		fmt.Fprintf(&b, "gpu_nccl_processes_total %d\n", len(snap.NCCLProcessReadings))
+	}
+
+	// NVML-poll memory snapshot. Polling-based; the fragmentation
+	// gauge is a coarse heuristic over (used, free, total).
+	if len(snap.MemFragReadings) > 0 {
+		b.WriteString("# HELP gpu_memory_used_bytes GPU memory currently allocated (NVML poll)\n")
+		b.WriteString("# TYPE gpu_memory_used_bytes gauge\n")
+		for _, r := range snap.MemFragReadings {
+			fmt.Fprintf(&b, "gpu_memory_used_bytes{gpu_uuid=%q} %d\n", r.UUID, r.UsedBytes)
+		}
+		b.WriteString("# HELP gpu_memory_free_bytes GPU memory free (NVML poll)\n")
+		b.WriteString("# TYPE gpu_memory_free_bytes gauge\n")
+		for _, r := range snap.MemFragReadings {
+			fmt.Fprintf(&b, "gpu_memory_free_bytes{gpu_uuid=%q} %d\n", r.UUID, r.FreeBytes)
+		}
+		b.WriteString("# HELP gpu_memory_total_bytes Total GPU memory (NVML poll)\n")
+		b.WriteString("# TYPE gpu_memory_total_bytes gauge\n")
+		for _, r := range snap.MemFragReadings {
+			fmt.Fprintf(&b, "gpu_memory_total_bytes{gpu_uuid=%q} %d\n", r.UUID, r.TotalBytes)
+		}
+		b.WriteString("# HELP gpu_memory_fragmentation_estimate Coarse GPU memory fragmentation heuristic from NVML poll [0,1]\n")
+		b.WriteString("# TYPE gpu_memory_fragmentation_estimate gauge\n")
+		for _, r := range snap.MemFragReadings {
+			fmt.Fprintf(&b, "gpu_memory_fragmentation_estimate{gpu_uuid=%q} %f\n", r.UUID, r.FragmentationEstimate)
+		}
+	}
+	if len(snap.MemFragProcessReadings) > 0 {
+		b.WriteString("# HELP gpu_memory_process_allocated_bytes Per-process GPU memory allocation (nvidia-smi compute-apps)\n")
+		b.WriteString("# TYPE gpu_memory_process_allocated_bytes gauge\n")
+		for _, p := range snap.MemFragProcessReadings {
+			fmt.Fprintf(&b, "gpu_memory_process_allocated_bytes{gpu_uuid=%q,pid=\"%d\"} %d\n",
+				p.UUID, p.PID, p.UsedBytes)
+		}
+	}
+
+	// Per-direction CUDA memcpy aggregates (v0.14 item C). bytes_total is
+	// cumulative; duration_ms is per-window average reset on each drain.
+	if len(snap.MemcpyDirReadings) > 0 {
+		b.WriteString("# HELP gpu_memcpy_bytes_total Cumulative CUDA memcpy bytes by direction\n")
+		b.WriteString("# TYPE gpu_memcpy_bytes_total counter\n")
+		for _, m := range snap.MemcpyDirReadings {
+			fmt.Fprintf(&b, "gpu_memcpy_bytes_total{direction=%q} %d\n", m.Direction, m.BytesTotal)
+		}
+		b.WriteString("# HELP gpu_memcpy_duration_ms Average per-event CUDA memcpy duration by direction over the last export window\n")
+		b.WriteString("# TYPE gpu_memcpy_duration_ms gauge\n")
+		for _, m := range snap.MemcpyDirReadings {
+			fmt.Fprintf(&b, "gpu_memcpy_duration_ms{direction=%q} %f\n", m.Direction, m.AverageDurationMs)
+		}
+	}
+
+	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
+	// GPU (1=active, 0=inactive). Polling-based; events shorter than the
+	// poll interval may be missed.
+	if len(snap.ThrottleReadings) > 0 {
+		for _, kind := range []struct {
+			name string
+			help string
+		}{
+			{"gpu_throttle_power_active", "GPU clock throttling for power reasons (1=active)"},
+			{"gpu_throttle_thermal_active", "GPU clock throttling for thermal reasons (1=active)"},
+			{"gpu_throttle_sw_active", "GPU clock throttling for software-imposed reasons (1=active)"},
+			{"gpu_throttle_hw_active", "GPU clock throttling for hardware reasons, umbrella (1=active)"},
+		} {
+			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n", kind.name, kind.help, kind.name)
+			for _, r := range snap.ThrottleReadings {
+				var v int
+				switch kind.name {
+				case "gpu_throttle_power_active":
+					if r.PowerActive {
+						v = 1
+					}
+				case "gpu_throttle_thermal_active":
+					if r.ThermalActive {
+						v = 1
+					}
+				case "gpu_throttle_sw_active":
+					if r.SWActive {
+						v = 1
+					}
+				case "gpu_throttle_hw_active":
+					if r.HWActive {
+						v = 1
+					}
+				}
+				fmt.Fprintf(&b, "%s{gpu_uuid=%q} %d\n", kind.name, r.UUID, v)
+			}
+		}
+	}
+
 	fmt.Fprint(w, b.String())
 }

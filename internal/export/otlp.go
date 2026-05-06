@@ -1,7 +1,7 @@
 // Package export provides OTEL-compatible metric and trace export.
 //
 // Architecture: parallel consumers of the Stats Engine snapshot.
-// OTLP and Prometheus are OPTIONAL — disabled by default, enabled via
+// OTLP and Prometheus are OPTIONAL - disabled by default, enabled via
 // --otlp <endpoint> or --prometheus <addr> flags.
 //
 // Call chain: watch.go calls export.OTLP.Push(snap) every ExportInterval →
@@ -9,11 +9,11 @@
 //   HTTP POST to <endpoint>/v1/metrics
 //
 // OTEL semantic conventions used:
-//   gpu.cuda.operation.duration  — per-op latency percentiles (microseconds)
-//   gpu.cuda.operation.count     — per-op event counts
-//   system.cpu.utilization       — system CPU ratio (0-1)
-//   system.memory.utilization    — system memory ratio (0-1)
-//   ingero.anomaly.count         — anomaly event count
+//   gpu.cuda.operation.duration  - per-op latency percentiles (microseconds)
+//   gpu.cuda.operation.count     - per-op event counts
+//   system.cpu.utilization       - system CPU ratio (0-1)
+//   system.memory.utilization    - system memory ratio (0-1)
+//   ingero.anomaly.count         - anomaly event count
 package export
 
 import (
@@ -50,7 +50,7 @@ type OTLPConfig struct {
 // Compatible with: OpenTelemetry Collector, Grafana Alloy, Grafana Cloud,
 // Datadog Agent, New Relic, any OTLP-compatible receiver.
 //
-// Zero external dependencies — uses only net/http and encoding/json.
+// Zero external dependencies - uses only net/http and encoding/json.
 type OTLPExporter struct {
 	config      OTLPConfig
 	client      *http.Client
@@ -404,9 +404,9 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
-	// NVML-poll memfrag heuristic (v0.14 item D, W1 baseline).
-	// Polling-based; not the IOCTL-level memfrag tracking that v0.15
-	// W1 brings. Four gauges per GPU labelled with gpu.uuid.
+	// NVML-poll memfrag heuristic. Polling-based; the gauge is a
+	// coarse heuristic over (used, free, total). Four gauges per
+	// GPU labelled with gpu.uuid.
 	for _, r := range snap.MemFragReadings {
 		attrs := []otlpKeyValue{
 			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
@@ -419,7 +419,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			gaugeMetricInt("gpu.memory.total", "Total GPU memory (NVML poll)", "By",
 				nowNano, r.TotalBytes, attrs),
 			gaugeMetric(contract.MetricGPUMemoryFragmentation,
-				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]; v0.15 will replace with IOCTL-level event-driven tracking",
+				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]",
 				"1", nowNano, r.FragmentationEstimate, attrs),
 		)
 	}
