@@ -1,0 +1,133 @@
+name: Lambda e2e harness
+
+# Provisions a Lambda Labs GPU instance, builds the agent, and runs
+# a curated subset of tests/e2e/ scripts against the live GPU.
+# Captures per-script logs as artifacts and posts a markdown summary.
+# Runs only on workflow_dispatch (no scheduled cadence; operators
+# trigger before non-trivial releases).
+#
+# Cost gate: the deploy script's LAUNCH_RETRY_MAX bounds capacity
+# polling. The destroy step in the post-job hook fires unconditionally
+# so a failed run does not leave a billing instance running. The
+# default subset finishes in well under one hour on A10.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: 'Lambda instance type (e.g. gpu_1x_a10, gpu_1x_gh200)'
+        required: false
+        default: 'gpu_1x_a10'
+      retry_max:
+        description: 'Max attempts to find capacity (each is 30s)'
+        required: false
+        default: '120'
+      scripts:
+        description: 'Space-separated subset of tests/e2e/ scripts to run'
+        required: false
+        default: 'quickstart-readme.sh trace-v014-flags.sh nccl-discovery-asserts.sh memcpy-1d-direction-matrix.sh throttle-induced.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lambda-e2e-harness
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    name: e2e on ${{ inputs.instance_type }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Provision VM
+        env:
+          LAMBDALABS_API_TOKEN: ${{ secrets.LAMBDALABS_API_TOKEN }}
+          LAMBDA_INSTANCE_TYPES: ${{ inputs.instance_type }}
+          LAUNCH_RETRY_MAX: ${{ inputs.retry_max }}
+          LAUNCH_RETRY_INTERVAL: '30'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          bash scripts/lambdalabs/vm.sh deploy --force
+
+      - name: Wait for cloud-init
+        run: bash scripts/lambdalabs/wait-cloud-init.sh
+
+      - name: Stage source + install Go + build agent
+        run: |
+          IP=$(jq -r .ip .lambdalabs-vm.json)
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@$IP \
+            "wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz -O /tmp/go.tgz \
+             && sudo tar -C /usr/local -xzf /tmp/go.tgz"
+          rsync -az --delete --exclude='.git' --exclude='/bin/' --exclude='/logs/' \
+            -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519" \
+            ./ ubuntu@$IP:~/workspace/ingero/
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@$IP \
+            'export PATH=/usr/local/go/bin:$PATH && cd ~/workspace/ingero && \
+             go build -o ~/ingero-bin ./cmd/ingero'
+
+      - name: Run e2e scripts
+        run: |
+          IP=$(jq -r .ip .lambdalabs-vm.json)
+          mkdir -p artifacts/logs
+          SCRIPTS="${{ inputs.scripts }}"
+          OVERALL=0
+          : > artifacts/SUMMARY.md
+          echo "# e2e harness results" >> artifacts/SUMMARY.md
+          echo "Instance type: \`${{ inputs.instance_type }}\`" >> artifacts/SUMMARY.md
+          echo "Run on $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> artifacts/SUMMARY.md
+          echo "" >> artifacts/SUMMARY.md
+          echo "| Script | Result |" >> artifacts/SUMMARY.md
+          echo "|---|---|" >> artifacts/SUMMARY.md
+          for s in $SCRIPTS; do
+            local_log="artifacts/logs/${s%.sh}.log"
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ubuntu@$IP \
+              "cd ~/workspace/ingero && \
+               INGERO_BIN=\$HOME/ingero-bin REPO_ROOT=\$HOME/workspace/ingero \
+               PATH=/usr/local/go/bin:/usr/local/cuda/bin:\$PATH \
+               timeout 600 bash tests/e2e/$s" \
+              > "$local_log" 2>&1 \
+              && echo "| \`$s\` | PASS |" >> artifacts/SUMMARY.md \
+              || { echo "| \`$s\` | FAIL |" >> artifacts/SUMMARY.md; OVERALL=1; }
+          done
+          cat artifacts/SUMMARY.md
+          test "$OVERALL" -eq 0
+
+      - name: Pull artifacts
+        if: always()
+        run: |
+          set -e
+          IP=$(jq -r .ip .lambdalabs-vm.json 2>/dev/null || echo "")
+          if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+            scp -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 -r \
+              ubuntu@$IP:~/workspace/ingero/logs/ artifacts/remote-logs/ 2>/dev/null || true
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-e2e-harness-${{ inputs.instance_type }}
+          path: artifacts/
+
+      - name: Post markdown summary
+        if: always()
+        run: |
+          if [ -f artifacts/SUMMARY.md ]; then
+            cat artifacts/SUMMARY.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Destroy VM (always, even on failure)
+        if: always()
+        env:
+          LAMBDALABS_API_TOKEN: ${{ secrets.LAMBDALABS_API_TOKEN }}
+        run: |
+          if [ -f .lambdalabs-vm.json ]; then
+            bash scripts/lambdalabs/vm.sh destroy --force || true
+          fi
