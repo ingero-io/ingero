@@ -105,7 +105,13 @@ var (
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
 // silently when the buffer is full (snapshot consumer is too slow OR
 // no exporter is configured to drain it).
+//
+// v0.15 F2: also tally the running counter so the Prometheus exporter
+// has something to emit. Buffer-full does NOT skip the counter
+// update; the counter survives back-pressure (we still want the
+// total to be honest even if per-event records get dropped).
 func ncclBufferAdd(p stats.NCCLDataPoint) {
+	recordNCCLCollective(p)
 	ncclBufMu.Lock()
 	defer ncclBufMu.Unlock()
 	if len(ncclBuf) >= ncclBufMax {
@@ -1117,6 +1123,9 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			snap.MemFragReadings, snap.MemFragProcessReadings = drainMemFragBuf()
 			// v0.14 item C: per-direction memcpy aggregates.
 			snap.MemcpyDirReadings = drainMemcpyStats()
+			// v0.15 F2: NCCL collective running counters (Prometheus
+			// pull-friendly view of nccl.collective.* events).
+			snap.NCCLCollectiveCounters = snapshotNCCLCollectiveCounters()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}

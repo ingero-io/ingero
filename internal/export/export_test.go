@@ -231,6 +231,50 @@ func TestPrometheusMetrics_V014_EmptySnapshot(t *testing.T) {
 	}
 }
 
+// v0.15 F2: NCCL collective running counters appear as
+// gpu_nccl_collective_count + gpu_nccl_collective_bytes_total +
+// gpu_nccl_collective_barrier_events on /metrics.
+func TestPrometheusMetrics_NCCLCollectiveCounters(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{
+		NCCLCollectiveCounters: []stats.NCCLCollectiveCounter{
+			{OpType: "ncclAllReduce", Count: 42, BytesTotal: 1234567},
+			{OpType: "ncclAllReduce", BarrierEvents: 7},
+			{OpType: "ncclBcast", Count: 3, BytesTotal: 100},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+	for _, want := range []string{
+		`gpu_nccl_collective_count{op_type="ncclAllReduce"} 42`,
+		`gpu_nccl_collective_bytes_total{op_type="ncclAllReduce"} 1234567`,
+		`gpu_nccl_collective_count{op_type="ncclBcast"} 3`,
+		`gpu_nccl_collective_barrier_events{op_type="ncclAllReduce"} 7`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing %q in /metrics output\n--- body ---\n%s", want, content)
+		}
+	}
+}
+
+// v0.15 F2: with no NCCL counter rows the section stays silent.
+func TestPrometheusMetrics_NCCLCollectiveCounters_EmptyStaysSilent(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	if strings.Contains(string(body), "gpu_nccl_collective_") {
+		t.Errorf("expected no nccl_collective_* lines on empty snapshot, got:\n%s", string(body))
+	}
+}
+
 func TestPrometheusMetrics_HTTPHandler(t *testing.T) {
 	p := NewPrometheus(":0")
 	snap := &stats.Snapshot{TotalEvents: 42, AnomalyEvents: 1}

@@ -348,6 +348,18 @@ type Snapshot struct {
 	// gpu.memcpy.duration_ms gauge labelled with `direction`.
 	// Empty when no memcpy events have been seen this run.
 	MemcpyDirReadings []MemcpyDirStats
+
+	// NCCLCollectiveCounters carries running counts of NCCL
+	// collective events grouped by op_type. Populated by
+	// snapshotNCCLCollectiveCounters in cli/nccl_counters.go and
+	// emitted by the Prometheus exporter as
+	// gpu_nccl_collective_count{op_type} +
+	// gpu_nccl_collective_bytes_total{op_type} +
+	// gpu_nccl_collective_barrier_events{op_type}. v0.15 F2:
+	// per-event NCCLDataPoints are OTLP-only because per-event
+	// gauges do not fit Prometheus pull; the running counters here
+	// are the pull-friendly equivalent.
+	NCCLCollectiveCounters []NCCLCollectiveCounter
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -591,4 +603,23 @@ func detectSpikePattern(positions []int64) string {
 	}
 
 	return ""
+}
+
+// NCCLCollectiveCounter is a running tally of one NCCL op type's
+// collective event count + bytes total since agent process start.
+// v0.15 F2 surface for the Prometheus pull exporter; OTLP keeps the
+// per-event gauge view via NCCLDataPoints.
+//
+// BarrierEvents is non-zero only on entries created from
+// IsBarrier=true data points; the standard collective entries leave
+// it at 0. A given OpType can appear in TWO entries when both
+// regular collectives and barrier-wait events have been seen for
+// it (regular collectives populate Count + BytesTotal, barriers
+// populate BarrierEvents). The Prometheus exporter sums or emits
+// independently as appropriate.
+type NCCLCollectiveCounter struct {
+	OpType        string
+	Count         int64 // collective events seen
+	BytesTotal    int64 // sum of CountBytes across collective events
+	BarrierEvents int64 // barrier-wait correlations
 }

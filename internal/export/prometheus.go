@@ -214,6 +214,58 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// NCCL collective running counters (v0.15 F2). The OTLP path
+	// emits one per-event gauge per collective; the running counters
+	// here are the pull-friendly view for vanilla Prometheus
+	// scrapers. count + bytes_total are monotonic across the agent
+	// process lifetime.
+	if len(snap.NCCLCollectiveCounters) > 0 {
+		// Emit count + bytes for non-barrier rows in a single pass per
+		// metric so the help/type lines stay grouped per Prometheus
+		// exposition convention.
+		hasCount := false
+		hasBytes := false
+		hasBarrier := false
+		for _, c := range snap.NCCLCollectiveCounters {
+			if c.Count > 0 {
+				hasCount = true
+			}
+			if c.BytesTotal > 0 {
+				hasBytes = true
+			}
+			if c.BarrierEvents > 0 {
+				hasBarrier = true
+			}
+		}
+		if hasCount {
+			b.WriteString("# HELP gpu_nccl_collective_count Total NCCL collective events captured per op_type\n")
+			b.WriteString("# TYPE gpu_nccl_collective_count counter\n")
+			for _, c := range snap.NCCLCollectiveCounters {
+				if c.Count > 0 {
+					fmt.Fprintf(&b, "gpu_nccl_collective_count{op_type=%q} %d\n", c.OpType, c.Count)
+				}
+			}
+		}
+		if hasBytes {
+			b.WriteString("# HELP gpu_nccl_collective_bytes_total Cumulative bytes transferred by NCCL collective per op_type\n")
+			b.WriteString("# TYPE gpu_nccl_collective_bytes_total counter\n")
+			for _, c := range snap.NCCLCollectiveCounters {
+				if c.BytesTotal > 0 {
+					fmt.Fprintf(&b, "gpu_nccl_collective_bytes_total{op_type=%q} %d\n", c.OpType, c.BytesTotal)
+				}
+			}
+		}
+		if hasBarrier {
+			b.WriteString("# HELP gpu_nccl_collective_barrier_events Total NCCL barrier-wait events captured per op_type\n")
+			b.WriteString("# TYPE gpu_nccl_collective_barrier_events counter\n")
+			for _, c := range snap.NCCLCollectiveCounters {
+				if c.BarrierEvents > 0 {
+					fmt.Fprintf(&b, "gpu_nccl_collective_barrier_events{op_type=%q} %d\n", c.OpType, c.BarrierEvents)
+				}
+			}
+		}
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU (1=active, 0=inactive). Polling-based; events shorter than the
 	// poll interval may be missed.
