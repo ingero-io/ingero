@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -226,11 +227,61 @@ type otlpScope struct {
 }
 
 type otlpMetric struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	Unit        string    `json:"unit,omitempty"`
-	Gauge       *otlpData `json:"gauge,omitempty"`
-	Sum         *otlpData `json:"sum,omitempty"`
+	Name                 string                       `json:"name"`
+	Description          string                       `json:"description,omitempty"`
+	Unit                 string                       `json:"unit,omitempty"`
+	Gauge                *otlpData                    `json:"gauge,omitempty"`
+	Sum                  *otlpData                    `json:"sum,omitempty"`
+	Histogram            *otlpHistogramData           `json:"histogram,omitempty"`
+	ExponentialHistogram *otlpExponentialHistogram    `json:"exponentialHistogram,omitempty"`
+}
+
+// v0.15 item B: OTLP/JSON histogram + exponential-histogram shapes.
+// References:
+//   https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
+//   https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto
+//
+// Counts are encoded as JSON strings per the OTLP/JSON convention
+// (uint64 fields cross the JS-safe-integer boundary).
+type otlpHistogramData struct {
+	DataPoints             []otlpHistogramPoint `json:"dataPoints"`
+	AggregationTemporality int                  `json:"aggregationTemporality,omitempty"`
+}
+
+type otlpHistogramPoint struct {
+	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
+	StartTimeUnixNano string         `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string         `json:"timeUnixNano"`
+	Count             string         `json:"count"`
+	Sum               *float64       `json:"sum,omitempty"`
+	BucketCounts      []string       `json:"bucketCounts,omitempty"`
+	ExplicitBounds    []float64      `json:"explicitBounds,omitempty"`
+	Min               *float64       `json:"min,omitempty"`
+	Max               *float64       `json:"max,omitempty"`
+}
+
+type otlpExponentialHistogram struct {
+	DataPoints             []otlpExponentialHistogramPoint `json:"dataPoints"`
+	AggregationTemporality int                             `json:"aggregationTemporality,omitempty"`
+}
+
+type otlpExponentialHistogramPoint struct {
+	Attributes        []otlpKeyValue              `json:"attributes,omitempty"`
+	StartTimeUnixNano string                      `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string                      `json:"timeUnixNano"`
+	Count             string                      `json:"count"`
+	Sum               *float64                    `json:"sum,omitempty"`
+	Scale             int32                       `json:"scale"`
+	ZeroCount         string                      `json:"zeroCount"`
+	Positive          *otlpExponentialHistoBuckets `json:"positive,omitempty"`
+	Negative          *otlpExponentialHistoBuckets `json:"negative,omitempty"`
+	Min               *float64                    `json:"min,omitempty"`
+	Max               *float64                    `json:"max,omitempty"`
+}
+
+type otlpExponentialHistoBuckets struct {
+	Offset       int32    `json:"offset"`
+	BucketCounts []string `json:"bucketCounts,omitempty"`
 }
 
 type otlpData struct {
@@ -447,9 +498,9 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			sumMetric(contract.MetricGPUMemcpyBytesTotal,
 				"Cumulative CUDA memcpy bytes by direction (v0.14 item C)",
 				"By", nowNano, m.BytesTotal, attrs),
-			gaugeMetric(contract.MetricGPUMemcpyDurationMS,
-				"Average per-event CUDA memcpy duration by direction over the last export window",
-				"ms", nowNano, m.AverageDurationMs, attrs),
+			histogramMetric(contract.MetricGPUMemcpyDurationMS,
+				"Per-event CUDA memcpy duration by direction (v0.15 item C; replaces v0.14 per-window-average gauge)",
+				"ms", nowNano, "", m.DurationHistogram, attrs),
 		)
 	}
 
@@ -531,6 +582,110 @@ func gaugeMetricInt(name, desc, unit, timeNano string, value int64, attrs []otlp
 			}},
 		},
 	}
+}
+
+// histogramMetric builds an OTLP Histogram metric from a frozen
+// stats.HistogramSnapshot. v0.15 item B. Cumulative temporality
+// (matches the Sum/Gauge convention elsewhere in this exporter).
+//
+// Empty snapshots (HasObservation=false) still emit a zero-count
+// data point so consumers see the metric is wired even before the
+// first observation.
+func histogramMetric(name, desc, unit, timeNano, startNano string, snap stats.HistogramSnapshot, attrs []otlpKeyValue) otlpMetric {
+	bounds := append([]float64(nil), snap.ExplicitBounds...)
+	bucketStrs := make([]string, len(snap.BucketCounts))
+	for i, c := range snap.BucketCounts {
+		bucketStrs[i] = uintToStr(c)
+	}
+	pt := otlpHistogramPoint{
+		Attributes:        attrs,
+		StartTimeUnixNano: startNano,
+		TimeUnixNano:      timeNano,
+		Count:             uintToStr(snap.Count),
+		BucketCounts:      bucketStrs,
+		ExplicitBounds:    bounds,
+	}
+	if snap.Count > 0 {
+		s := snap.Sum
+		pt.Sum = &s
+	}
+	if snap.HasObservation {
+		mn := snap.Min
+		mx := snap.Max
+		pt.Min = &mn
+		pt.Max = &mx
+	}
+	return otlpMetric{
+		Name:        name,
+		Description: desc,
+		Unit:        unit,
+		Histogram: &otlpHistogramData{
+			DataPoints:             []otlpHistogramPoint{pt},
+			AggregationTemporality: 2, // cumulative
+		},
+	}
+}
+
+// exponentialHistogramMetric emits an OTLP ExponentialHistogram.
+// v0.15 item B. Producer responsible for the scale + bucket layout;
+// this function is the wire-format encoder only.
+//
+// Reference: opentelemetry-proto metrics v1, message ExponentialHistogram.
+// Counts encoded as JSON strings per OTLP/JSON spec.
+func exponentialHistogramMetric(name, desc, unit, timeNano, startNano string,
+	count uint64, sum float64, scale int32, zeroCount uint64,
+	posOffset int32, posCounts []uint64,
+	negOffset int32, negCounts []uint64,
+	min, max float64, hasMinMax bool,
+	attrs []otlpKeyValue,
+) otlpMetric {
+	posBuckets := uintsToStrs(posCounts)
+	negBuckets := uintsToStrs(negCounts)
+	pt := otlpExponentialHistogramPoint{
+		Attributes:        attrs,
+		StartTimeUnixNano: startNano,
+		TimeUnixNano:      timeNano,
+		Count:             uintToStr(count),
+		Scale:             scale,
+		ZeroCount:         uintToStr(zeroCount),
+	}
+	if count > 0 {
+		s := sum
+		pt.Sum = &s
+	}
+	if len(posBuckets) > 0 {
+		pt.Positive = &otlpExponentialHistoBuckets{Offset: posOffset, BucketCounts: posBuckets}
+	}
+	if len(negBuckets) > 0 {
+		pt.Negative = &otlpExponentialHistoBuckets{Offset: negOffset, BucketCounts: negBuckets}
+	}
+	if hasMinMax {
+		mn := min
+		mx := max
+		pt.Min = &mn
+		pt.Max = &mx
+	}
+	return otlpMetric{
+		Name:        name,
+		Description: desc,
+		Unit:        unit,
+		ExponentialHistogram: &otlpExponentialHistogram{
+			DataPoints:             []otlpExponentialHistogramPoint{pt},
+			AggregationTemporality: 2, // cumulative
+		},
+	}
+}
+
+func uintToStr(u uint64) string {
+	return strconv.FormatUint(u, 10)
+}
+
+func uintsToStrs(xs []uint64) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = uintToStr(x)
+	}
+	return out
 }
 
 func sumMetric(name, desc, unit, timeNano string, value int64, attrs []otlpKeyValue) otlpMetric {

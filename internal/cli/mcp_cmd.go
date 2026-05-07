@@ -61,11 +61,12 @@ Examples:
 }
 
 var (
-	mcpDBPath   string
-	mcpHTTPAddr string
-	mcpTLSCert  string
-	mcpTLSKey   string
-	mcpLogPath  string
+	mcpDBPath      string
+	mcpHTTPAddr    string
+	mcpTLSCert     string
+	mcpTLSKey      string
+	mcpLogPath     string
+	mcpBearerToken string
 )
 
 func init() {
@@ -74,8 +75,25 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted with --http, a self-signed cert is generated")
 	mcpCmd.Flags().StringVar(&mcpTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
 	mcpCmd.Flags().StringVar(&mcpLogPath, "log", "", "write log output to file (append, no rotation)")
+	mcpCmd.Flags().StringVar(&mcpBearerToken, "mcp-bearer-token", "", "require Authorization: Bearer <token> for /mcp requests when set with --http. Constant-time compared. Empty disables auth (loopback-only deployments).")
 	mcpCmd.Flags().String("pagerduty-routing-key", "", "PagerDuty Events v2 routing key (enables pagerduty_trigger MCP tool). Overrides alerter.pagerduty.routing_key in --config when explicitly set.")
 	rootCmd.AddCommand(mcpCmd)
+}
+
+// pagerDutyMCPEnabled answers whether the pagerduty_trigger MCP tool
+// should be registered for this run. v0.15 item A replaces v0.14's
+// blanket default-off with an identity-based gate:
+//
+//   - stdio mode (httpAddr == ""): loopback by definition; enabled.
+//   - HTTP + bearer set: caller-identity enforced; enabled.
+//   - HTTP + bearer empty: unauthenticated listener; stays gated.
+//
+// Standalone for unit testability without an MCP server.
+func pagerDutyMCPEnabled(httpAddr, bearerToken string) bool {
+	if httpAddr == "" {
+		return true
+	}
+	return bearerToken != ""
 }
 
 // resolvePagerDutyRoutingKey composes the PagerDuty routing key from the
@@ -162,8 +180,13 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 		debugf("mcp: pagerduty backend configured")
 	}
 
+	pagerDutyEnabled := pagerDutyMCPEnabled(mcpHTTPAddr, mcpBearerToken)
+	srv.SetPagerDutyMCPEnabled(pagerDutyEnabled)
+	debugf("mcp: pagerduty_trigger enabled=%v (http=%q bearer_set=%v)",
+		pagerDutyEnabled, mcpHTTPAddr, mcpBearerToken != "")
+
 	if mcpHTTPAddr != "" {
-		return srv.RunHTTP(ctx, mcpHTTPAddr, mcpTLSCert, mcpTLSKey)
+		return srv.RunHTTP(ctx, mcpHTTPAddr, mcpTLSCert, mcpTLSKey, mcpBearerToken)
 	}
 	return srv.Run(ctx)
 }

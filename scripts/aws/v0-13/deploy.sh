@@ -81,6 +81,36 @@ PEER1_IP=$(get_ip peer1)
 PEER2_IP=$(get_ip peer2)
 FLEET_IP=$(get_ip fleet)
 
+# v0.15 item D (folds v0.14 R3 sec3): print a validation banner before
+# touching any node. Surfaces the exact SSH user, key file, and target
+# IPs the script is about to act on so an operator catches a stale or
+# wrong state file before rsync starts copying into the wrong host.
+###############################################################################
+# Validation banner
+###############################################################################
+cat 1>&2 <<EOF
+==============================================================================
+ingero v0.13 deploy: pre-flight validation
+  state file: $STATE_FILE
+  ssh user:   $SSH_USER
+  ssh key:    ${SSH_KEY_FILE:-<unset; ssh-agent / ~/.ssh defaults will be used>}
+  capture:    $CAPTURE_IP
+  peer1:      $PEER1_IP
+  peer2:      $PEER2_IP
+  fleet:      $FLEET_IP
+==============================================================================
+EOF
+for role_ip_pair in "capture:$CAPTURE_IP" "peer1:$PEER1_IP" "peer2:$PEER2_IP" "fleet:$FLEET_IP"; do
+    role="${role_ip_pair%%:*}"
+    ip="${role_ip_pair#*:}"
+    if [[ -z "$ip" || "$ip" == "null" || "$ip" == "None" ]]; then
+        abort "$role IP is empty/null in state file ($ip); refusing to deploy"
+    fi
+    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        abort "$role IP is not a valid IPv4 address: '$ip'"
+    fi
+done
+
 ###############################################################################
 # rsync the three repos to ~/repos/ on the target. We exclude .git/objects
 # and target build outputs to keep the transfer small; the remote build will

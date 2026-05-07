@@ -49,6 +49,7 @@ import (
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/ingero-io/ingero/internal/alerter"
+	"github.com/ingero-io/ingero/internal/auth"
 	"github.com/ingero-io/ingero/internal/fleet"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
@@ -152,7 +153,11 @@ func (s *Server) Run(ctx context.Context) error {
 // RunHTTP starts the MCP server as an HTTPS endpoint with TLS 1.3.
 // If certFile/keyFile are empty, an ephemeral self-signed certificate is
 // generated (ECDSA P-256, valid 24h, bound to localhost).
-func (s *Server) RunHTTP(ctx context.Context, addr, certFile, keyFile string) error {
+//
+// bearerToken, if non-empty, requires every request carry
+// `Authorization: Bearer <bearerToken>`. Empty bearerToken disables
+// the middleware (loopback-only deployments). v0.15 item A.
+func (s *Server) RunHTTP(ctx context.Context, addr, certFile, keyFile, bearerToken string) error {
 	handler := gomcp.NewStreamableHTTPHandler(func(r *http.Request) *gomcp.Server {
 		return s.mcpServer
 	}, &gomcp.StreamableHTTPOptions{
@@ -165,9 +170,9 @@ func (s *Server) RunHTTP(ctx context.Context, addr, certFile, keyFile string) er
 
 	// Wrap with Host header validation to prevent DNS rebinding attacks.
 	// The self-signed cert is bound to localhost/127.0.0.1/[::1], but an
-	// attacker's DNS could resolve to 127.0.0.1 — the Host header check
+	// attacker's DNS could resolve to 127.0.0.1; the Host header check
 	// rejects requests with unexpected Host values.
-	guardedMux := hostGuard(mux)
+	guardedMux := bearerAuth(hostGuard(mux), bearerToken)
 
 	// TLS 1.3 minimum — no legacy cipher suites, mandatory PFS.
 	tlsCfg := &tls.Config{
@@ -175,7 +180,7 @@ func (s *Server) RunHTTP(ctx context.Context, addr, certFile, keyFile string) er
 	}
 
 	if certFile != "" && keyFile != "" {
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		cert, err := auth.LoadTLSKeyPair(certFile, keyFile)
 		if err != nil {
 			return fmt.Errorf("loading TLS certificate: %w", err)
 		}
@@ -204,9 +209,17 @@ func (s *Server) RunHTTP(ctx context.Context, addr, certFile, keyFile string) er
 	}()
 
 	fmt.Fprintf(os.Stderr, "MCP HTTPS server listening on %s (TLS 1.3)\n", addr)
+	if bearerToken != "" {
+		fmt.Fprintf(os.Stderr, "  Bearer auth: required (Authorization: Bearer <token>)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "  Bearer auth: disabled (no --mcp-bearer-token; loopback-only deployments)\n")
+	}
 	fmt.Fprintf(os.Stderr, "  curl -sk https://localhost%s/mcp \\\n", addr)
 	fmt.Fprintf(os.Stderr, "    -H 'Content-Type: application/json' \\\n")
 	fmt.Fprintf(os.Stderr, "    -H 'Accept: application/json, text/event-stream' \\\n")
+	if bearerToken != "" {
+		fmt.Fprintf(os.Stderr, "    -H 'Authorization: Bearer <your-token>' \\\n")
+	}
 	fmt.Fprintf(os.Stderr, "    -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n")
 
 	// Use tls.Listen + Serve (not ListenAndServeTLS) because the certificate

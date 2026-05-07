@@ -85,9 +85,12 @@ const (
 	// Aggregators must compute MAX-MIN per (node, direction) over a
 	// window, NOT sum every observation.
 	MetricGPUMemcpyBytesTotal = "gpu.memcpy.bytes_total"
-	// MetricGPUMemcpyDurationMS is a per-window-AVERAGE gauge of
-	// cudaMemcpy* duration_ms per direction. v0.15 replaces with a
-	// per-event histogram once the OTLP histogram encoder lands.
+	// MetricGPUMemcpyDurationMS is a per-event histogram of
+	// cudaMemcpy* duration in milliseconds, labelled by direction.
+	// v0.15 item C: replaced the prior v0.14 per-window-average
+	// gauge with a real per-event histogram (OTLP Histogram type;
+	// Prometheus *_bucket / *_sum / *_count). Bucket layout:
+	// stats.DefaultMemcpyDurationBoundsMs.
 	MetricGPUMemcpyDurationMS = "gpu.memcpy.duration_ms"
 )
 

@@ -9,6 +9,16 @@
 //
 // Training and unknown modes bypass the sampler entirely (always emit) so
 // existing training-only deployments observe no behavior change.
+//
+// CRYPTO STATUS: math/rand/v2 is NOT cryptographically secure. The rate
+// gate decides admit/drop on every event; an adversary that observes
+// admit/drop sequences can predict future decisions and craft event
+// patterns that consistently win admission. This is acceptable here:
+// the sampler is a load-shedding device, not a security control. Do
+// NOT swap to crypto/rand: doing so would (1) break the deterministic-
+// seed test path that asserts admit-rate convergence under known
+// PRNG state, and (2) impose an unjustified per-event syscall cost.
+// v0.15 item D folds this clarification from v0.14 R3 ★3.
 package sampling
 
 import (

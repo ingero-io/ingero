@@ -132,8 +132,18 @@ func pollOnce(ctx context.Context, run nvml.Runner, log *slog.Logger) {
 			SWActive:       r.Buckets.SW,
 			HWActive:       r.Buckets.HW,
 		})
+		// v0.15 item L: feed the edge detector. Each rising edge per
+		// (uuid, bucket) is counted once into
+		// gpu.throttle.{power,thermal,sw,hw}.event_total. Sub-poll
+		// bursts are still missed by design (same floor as the gauge).
+		throttleEdgeDetector.Observe(r.UUID, r.Buckets)
 	}
 }
+
+// throttleEdgeDetector is the process-wide edge detector fed from
+// pollOnce. v0.15 item L. Snapshot()'d on each Prometheus / OTLP
+// push so consumers see cumulative event counters.
+var throttleEdgeDetector = nvml.NewThrottleEdgeDetector()
 
 func logThrottleNotSupportedOnce(uuid string, log *slog.Logger) {
 	throttleLogMu.Lock()

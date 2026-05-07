@@ -91,7 +91,9 @@ func TestDrainResetsWindowCounters(t *testing.T) {
 	}
 
 	// Second drain with no new events: bytes_total persists (cumulative
-	// counter) but EventsInWindow resets to 0.
+	// counter). v0.15 (2026-05-07): EventsInWindow is now also
+	// cumulative since the histogram is no longer reset on drain
+	// (Prometheus convention).
 	second := drainMemcpyStats()
 	if len(second) != 1 {
 		t.Fatalf("second drain len = %d, want 1 (totals persist)", len(second))
@@ -99,8 +101,80 @@ func TestDrainResetsWindowCounters(t *testing.T) {
 	if second[0].BytesTotal != 2048 {
 		t.Errorf("second drain bytes_total = %d, want 2048 (cumulative)", second[0].BytesTotal)
 	}
-	if second[0].EventsInWindow != 0 {
-		t.Errorf("second drain EventsInWindow = %d, want 0 (window reset)", second[0].EventsInWindow)
+	if second[0].EventsInWindow != 2 {
+		t.Errorf("second drain EventsInWindow = %d, want 2 (cumulative, v0.15)", second[0].EventsInWindow)
+	}
+}
+
+// v0.15 item C (revised 2026-05-07): the per-direction histogram
+// is CUMULATIVE across drains. Prometheus histogram exposition
+// convention is monotonic; OTLP cumulative-temporality does the
+// same. Resetting on drain produced empty Prometheus rows when
+// /metrics scrape lagged the workload (Lambda A10 e2e regression).
+func TestDrainPreservesDurationHistogram(t *testing.T) {
+	resetMemcpyStats()
+	defer resetMemcpyStats()
+
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 1024, 1*time.Millisecond))
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 1024, 2*time.Millisecond))
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 1024, 3*time.Millisecond))
+
+	first := drainMemcpyStats()
+	if len(first) != 1 {
+		t.Fatalf("first drain rows=%d, want 1", len(first))
+	}
+	if first[0].DurationHistogram.Count != 3 {
+		t.Errorf("first drain hist Count=%d, want 3", first[0].DurationHistogram.Count)
+	}
+
+	// Second drain with no new events: histogram + bytes_total BOTH
+	// persist (cumulative).
+	second := drainMemcpyStats()
+	if len(second) != 1 {
+		t.Fatalf("second drain rows=%d, want 1", len(second))
+	}
+	if second[0].DurationHistogram.Count != 3 {
+		t.Errorf("histogram should be cumulative; second drain Count=%d, want 3",
+			second[0].DurationHistogram.Count)
+	}
+	if second[0].BytesTotal != 3*1024 {
+		t.Errorf("BytesTotal cumulative; got %d, want %d",
+			second[0].BytesTotal, 3*1024)
+	}
+
+	// New events after drain ADD to the running totals.
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 2048, 5*time.Millisecond))
+	third := drainMemcpyStats()
+	if third[0].DurationHistogram.Count != 4 {
+		t.Errorf("cumulative histogram Count after 1 new event = %d, want 4",
+			third[0].DurationHistogram.Count)
+	}
+	if third[0].BytesTotal != 3*1024+2048 {
+		t.Errorf("cumulative BytesTotal after 1 new 2KB event = %d, want %d",
+			third[0].BytesTotal, 3*1024+2048)
+	}
+}
+
+// v0.15 item C: NaN / Inf durations must be dropped from the
+// histogram (otherwise IsFinite check is dead code) but BytesTotal
+// + EventsInWindow MUST still increment if recordMemcpyEvent
+// considers them events.
+func TestRecordMemcpyEvent_DropsNonFiniteDurations(t *testing.T) {
+	resetMemcpyStats()
+	defer resetMemcpyStats()
+
+	// Negative durations from clock skew can theoretically appear;
+	// time.Duration is just int64 so the producer doesn't filter.
+	// IsFinite filters NaN/Inf at the histogram boundary; negatives
+	// are passed through (fine for a histogram, bucket 0).
+	recordMemcpyEvent(mkMemcpyEvent(events.CUDAMemcpy, 1, 1024, 0))
+	got := drainMemcpyStats()
+	if len(got) != 1 {
+		t.Fatal("expected 1 row even when duration=0")
+	}
+	if got[0].EventsInWindow != 1 {
+		t.Errorf("EventsInWindow=%d, want 1 (duration=0 is a real event)",
+			got[0].EventsInWindow)
 	}
 }
 

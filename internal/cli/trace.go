@@ -24,6 +24,7 @@ import (
 	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/kprobe"
 	"github.com/ingero-io/ingero/internal/ebpf/blockio"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
 	"github.com/ingero-io/ingero/internal/ebpf/cudagraph"
@@ -73,6 +74,13 @@ var (
 	traceNCCL         bool          // Opt-in: attach NCCL collective uprobes (v0.12.0).
 	traceNCCLLib      string        // Explicit libnccl.so path (skip discovery).
 
+	// v0.15 Tier 2: experimental closed-driver kprobes (W1 memfrag,
+	// W2 throttle, kernel grid/block dims). Default off; when set,
+	// the agent additionally checks the running driver + kernel
+	// pair against an allowlist and only loads probes on tested
+	// configurations.
+	traceEnableExperimentalKprobes bool
+
 	// ncclBufMu guards ncclBuf, the per-snapshot drain buffer for NCCL
 	// data points. Producer: NCCL ringbuf goroutine. Consumer: onSnapshot
 	// callback. Capped at ncclBufMax to bound memory if the consumer
@@ -105,7 +113,13 @@ var (
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
 // silently when the buffer is full (snapshot consumer is too slow OR
 // no exporter is configured to drain it).
+//
+// v0.15 F2: also tally the running counter so the Prometheus exporter
+// has something to emit. Buffer-full does NOT skip the counter
+// update; the counter survives back-pressure (we still want the
+// total to be honest even if per-event records get dropped).
 func ncclBufferAdd(p stats.NCCLDataPoint) {
+	recordNCCLCollective(p)
 	ncclBufMu.Lock()
 	defer ncclBufMu.Unlock()
 	if len(ncclBuf) >= ncclBufMax {
@@ -179,7 +193,9 @@ func init() {
 	traceCmd.Flags().DurationVar(&traceLibNCCLDiscoveryInterval, "libnccl-discovery-interval", 10*time.Second,
 		"interval between libnccl process-discovery scans (gpu.nccl.process_loaded, gpu.nccl.processes_total metrics). 0 = disable. Independent of --nccl.")
 	traceCmd.Flags().DurationVar(&traceMemFragPollInterval, "memfrag-poll-interval", 10*time.Second,
-		"interval between NVML memory polls for the memfrag heuristic (gpu.memory.{used,free,total,fragmentation_estimate,process.allocated_bytes}). 0 = disable. Polling-based; v0.15 brings IOCTL-level tracking.")
+		"interval between NVML memory polls for the memfrag heuristic (gpu.memory.{used,free,total,fragmentation_estimate,process.allocated_bytes}). 0 = disable. Polling-based; v0.15 ships an event-driven IOCTL kprobe behind --enable-experimental-kprobes.")
+	traceCmd.Flags().BoolVar(&traceEnableExperimentalKprobes, "enable-experimental-kprobes", false,
+		"EXPERIMENTAL: load v0.15 closed-driver kprobes (memfrag IOCTL, throttle, kernel grid/block dims). Probes only attach when the running NVIDIA driver + Linux kernel pair is on a tested allowlist (DefaultAllowlist in internal/kprobe). Outside the allowlist: warning at startup, no probe load.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -285,9 +301,29 @@ func setupNCCLTracer(p ncclSetupParams) (*ncclprobe.Tracer, int) {
 		libPath = p.findLibSystemwide()
 	}
 	if libPath == "" {
-		fmt.Fprintln(p.stderr, "  Warning: --nccl set but no libnccl.so / libtorch_cuda.so found; NCCL tracing skipped")
-		p.debugf("nccl: no libnccl-bearing object found; skipping")
-		return nil, 0
+		// v0.15 F1: no eager libnccl found, but the discovery scanner
+		// may still find a venv-installed libnccl after the workload
+		// boots. Stand up a lazy tracer (BPF spec loaded, ringbuf
+		// reader open, no uprobes yet) so the scanner sink can call
+		// AttachAt later. Without --libnccl-discovery-interval set,
+		// this lazy tracer never gets used and is harmless.
+		fmt.Fprintln(p.stderr, "  No eager libnccl found; lazy-attach armed (uprobes wire up when discovery scanner finds a workload)")
+		p.debugf("nccl: lazy tracer; AttachAt will fire from the discovery scanner sink")
+		nt := ncclprobe.New("")
+		var filterPIDs []uint32
+		if p.explicitPIDs {
+			for _, pid := range p.targetPIDs {
+				if pid > 0 {
+					filterPIDs = append(filterPIDs, uint32(pid))
+				}
+			}
+		}
+		if err := nt.Prepare(filterPIDs); err != nil {
+			fmt.Fprintf(p.stderr, "  Warning: NCCL lazy-attach unavailable: %v\n", err)
+			p.debugf("nccl: lazy Prepare failed: %v", err)
+			return nil, 0
+		}
+		return nt, 0
 	}
 	// v0.12.2 (LHF #7 + Arch ★3 attach race): when --pid is set, scope
 	// the NCCL probe to just those PIDs. The filter is passed *into*
@@ -356,12 +392,24 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Resolve node identity early — fail fast if name contains colon.
+	// Resolve node identity early; fail fast if name contains colon.
 	nodeIdentity, err := ResolveNodeIdentity(traceNode)
 	if err != nil {
 		return err
 	}
 	debugf("node identity: %s", nodeIdentity)
+
+	// v0.15 Tier 2: experimental closed-driver kprobe gate. Detect
+	// the running NVIDIA driver + Linux kernel and check the
+	// allowlist. The result drives K/L/M probe-load decisions
+	// further down. Logged at startup so operators see the gate
+	// outcome.
+	expKprobesAllowed := false
+	if traceEnableExperimentalKprobes {
+		v := kprobe.DetectVersions()
+		expKprobesAllowed = kprobe.IsAllowed(v, kprobe.DefaultAllowlist)
+		slog.Info(kprobe.DescribeStatus(v, expKprobesAllowed, kprobe.DefaultAllowlist))
+	}
 
 	// Rank cache for distributed training rank detection (reads /proc/[pid]/environ).
 	rankCache := discover.NewRankCache()
@@ -1035,12 +1083,34 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Start libnccl process-discovery scanner (v0.14 item A). Same gate
 	// as throttle: only useful when an exporter is wired up.
 	if (otlpExporter != nil || promSrv != nil) && traceLibNCCLDiscoveryInterval > 0 {
-		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default())
+		// v0.15 F1: pass ncclTracer so the scanner sink attaches
+		// uprobes against runtime-discovered libnccl paths
+		// (PyTorch+pip workloads that ship libnccl in a venv).
+		startNCCLDiscoveryScanner(ctx, traceLibNCCLDiscoveryInterval, slog.Default(), ncclTracer)
 	}
 
 	// Start NVML memfrag poller (v0.14 item D, W1 baseline).
 	if (otlpExporter != nil || promSrv != nil) && traceMemFragPollInterval > 0 {
 		startMemFragPoller(ctx, traceMemFragPollInterval, nvml.NewMemoryRunner(), nvml.NewComputeAppsRunner(), slog.Default())
+	}
+
+	// v0.15 item K + M: experimental closed-driver kprobes /
+	// uprobes. Only attempted when (a) the operator passed
+	// --enable-experimental-kprobes AND (b) the driver/kernel pair
+	// is on internal/kprobe.DefaultAllowlist. Failure to attach
+	// (kprobe target absent, libcuda missing) is logged and the
+	// agent continues; the gauges/counters simply stay empty.
+	if expKprobesAllowed && (otlpExporter != nil || promSrv != nil) {
+		startMemfragTracer(ctx, slog.Default())
+		// kernel-launch uprobe needs the libcuda path. Reuse the
+		// driver tracer's discovery: if libcuda was found above,
+		// use the same path; otherwise skip the kernel-launch probe
+		// silently (the same behavior the driver tracer has).
+		if libcudaPath, err := discover.FindLibCUDA(); err == nil {
+			startKernelLaunchTracer(ctx, libcudaPath, slog.Default())
+		} else {
+			slog.Info("kernel-launch tracer: libcuda not found; skipping", "err", err)
+		}
 	}
 
 	// Snapshot callback for exporters (OTLP, Prometheus).
@@ -1094,6 +1164,21 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			snap.MemFragReadings, snap.MemFragProcessReadings = drainMemFragBuf()
 			// v0.14 item C: per-direction memcpy aggregates.
 			snap.MemcpyDirReadings = drainMemcpyStats()
+			// v0.15 F2: NCCL collective running counters (Prometheus
+			// pull-friendly view of nccl.collective.* events).
+			snap.NCCLCollectiveCounters = snapshotNCCLCollectiveCounters()
+			// v0.15 item K: per-cmd memfrag IOCTL counters.
+			snap.MemfragIOCTLCounters = snapshotMemfragCounters()
+			// v0.15 item L: throttle event-edge counters.
+			ec := throttleEdgeDetector.Snapshot()
+			snap.ThrottleEvents = stats.ThrottleEventCounters{
+				PowerEvents:   ec.PowerEvents,
+				ThermalEvents: ec.ThermalEvents,
+				SWEvents:      ec.SWEvents,
+				HWEvents:      ec.HWEvents,
+			}
+			// v0.15 item M: per-PID kernel-launch aggregates.
+			snap.KernelLaunches = snapshotKernelLaunchCounters()
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}
