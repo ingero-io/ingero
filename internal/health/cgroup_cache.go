@@ -21,6 +21,19 @@ const defaultCacheCapacity = 1024
 // contract.AttrCgroupPathHash so per-cgroup metrics emitted by the
 // per-cgroup collector and the legacy health_score data point share the
 // hash space.
+//
+// CONFIDENTIALITY STATUS (v0.15 item D, folds v0.14 R3 ★3):
+// This hash is a STABILITY tag for joining metric streams across the
+// per-cgroup collector and the health_score push, NOT a confidentiality
+// shield. SHA-256 of a known-shape input is reversible by an adversary
+// with the cgroup path catalog (e.g., container-name conventions on a
+// k8s node). If the cgroup path itself is sensitive in your deployment,
+// disable cgroup tagging at the collector OR pass a per-cluster salt
+// upstream of this function. We deliberately do NOT add a salt at this
+// layer because (1) operators relying on the hash for stability would
+// silently lose join keys across agent restarts unless the salt is
+// persisted, and (2) the threat model treats cgroup paths as
+// non-confidential by default.
 func hashCGroupPath(path string) string {
 	if path == "" {
 		return ""
