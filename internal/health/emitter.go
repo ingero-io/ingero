@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ingero-io/ingero/internal/auth"
 	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/pkg/contract"
 )
@@ -694,7 +695,7 @@ func LoadTLSConfig(t TLSConfig) (*tls.Config, error) {
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("ca_cert %q: no valid certificates", t.CACertPath)
 	}
-	cert, err := tls.LoadX509KeyPair(t.ClientCertPath, t.ClientKeyPath)
+	cert, err := auth.LoadTLSKeyPair(t.ClientCertPath, t.ClientKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("load client keypair: %w", err)
 	}
