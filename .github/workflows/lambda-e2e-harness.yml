@@ -10,12 +10,17 @@ name: Lambda e2e harness
 # polling. The destroy step in the post-job hook fires unconditionally
 # so a failed run does not leave a billing instance running. The
 # default subset finishes in well under one hour on A10.
+#
+# Cross-arch coverage: dispatch with `instance_type: gpu_1x_gh200`
+# (arm64 Grace+Hopper) to exercise the arm64 runtime path. The
+# default subset runs identically on amd64 + arm64 because all
+# scripts source-rsync from the runner.
 
 on:
   workflow_dispatch:
     inputs:
       instance_type:
-        description: 'Lambda instance type (e.g. gpu_1x_a10, gpu_1x_gh200)'
+        description: 'Lambda instance type. amd64: gpu_1x_a10, gpu_1x_a100, gpu_2x_h100_sxm5. arm64: gpu_1x_gh200.'
         required: false
         default: 'gpu_1x_a10'
       retry_max:
@@ -23,9 +28,9 @@ on:
         required: false
         default: '120'
       scripts:
-        description: 'Space-separated subset of tests/e2e/ scripts to run'
+        description: 'Space-separated subset of tests/e2e/ scripts to run. data-plane/ scripts use full path.'
         required: false
-        default: 'quickstart-readme.sh trace-v014-flags.sh nccl-discovery-asserts.sh memcpy-1d-direction-matrix.sh throttle-induced.sh'
+        default: 'quickstart-readme.sh trace-v014-flags.sh nccl-discovery-asserts.sh memcpy-1d-direction-matrix.sh throttle-induced.sh nccl-abi-matrix.sh data-plane/36-multi-libnccl-attach.sh data-plane/41-memfrag-kprobe.sh data-plane/42-throttle-event-edge.sh data-plane/43-kernel-launch-dims.sh'
 
 permissions:
   contents: read

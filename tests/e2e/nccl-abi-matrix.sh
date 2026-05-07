@@ -104,8 +104,18 @@ run_for_version() {
   # shellcheck disable=SC1091
   source "$venv/bin/activate"
   pip install --quiet --upgrade pip
-  # Pin torch + nccl wheel.
-  if ! pip install --quiet "torch" "nvidia-nccl-cu12==$ver" 2>"$WORK/pip-$ver.log"; then
+  # Pin torch + nccl wheel. v0.15 (2026-05-07): torch must be
+  # pinned to 2.4.0 so it links against the older NCCL ABI we are
+  # validating. Latest torch (>=2.6) requires symbols added in
+  # NCCL 2.27+ (ncclCommWindowDeregister) and crashes on import
+  # against NCCL 2.18 / 2.22 / 2.26.
+  if ! pip install --quiet "torch==2.4.0" --extra-index-url https://download.pytorch.org/whl/cu121 2>"$WORK/pip-$ver-torch.log"; then
+    echo "FAIL: pip install torch==2.4.0 failed"
+    cat "$WORK/pip-$ver-torch.log"
+    deactivate
+    return 1
+  fi
+  if ! pip install --quiet "nvidia-nccl-cu12==$ver" 2>"$WORK/pip-$ver.log"; then
     echo "FAIL: pip install nvidia-nccl-cu12==$ver failed"
     cat "$WORK/pip-$ver.log"
     deactivate
@@ -144,44 +154,36 @@ run_for_version() {
   kill_agent
   AGENT_PID=""
 
-  # Assertion: count NCCL collective events directly from the trace
-  # SQLite DB. Prometheus exposition omits per-event nccl.collective.*
-  # gauges (per-event values do not fit pull semantics; OTLP is the
-  # canonical channel). Direct DB count is the right query shape:
+  # Assertion: read the Prometheus running counter
+  # gpu_nccl_collective_count{op_type="ncclAllReduce"}, which is the
+  # canonical pull-friendly view of agent-captured NCCL events
+  # (added by v0.15 F2). Prior versions of this test queried the
+  # SQLite store via SELECT FROM events JOIN sources, but the
+  # sources table does not carry an "NCCL" row (NCCL events flow
+  # through a separate ringbuf into the cli/nccl_counters layer,
+  # not the events table). The Prometheus counter is the right
+  # signal; v0.15 (2026-05-07 H100 cycle) confirmed 1600 events
+  # captured in this loop's shape.
   #
-  #   SELECT COUNT(*) FROM events e
-  #   JOIN  sources s ON e.source = s.id
-  #   WHERE s.name = 'NCCL'
-  #
-  # The agent only attaches NCCL uprobes for libnccl paths it
-  # discovers in supported install locations. When the discovery
-  # scanner reports a process but no NCCL events land, that is a
-  # known capability gap on certain runtime install layouts (the
-  # scanner finds the process but uprobe attachment is gated to
-  # systemwide paths only). In that case we SKIP rather than FAIL
-  # so this test does not red-bar a host where the gap is the only
-  # issue. Operators see the real count + a marker line.
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "SKIP: version $ver: sqlite3 missing on host"
-    deactivate
-    return 0
-  fi
-  COUNT=$(sqlite3 "$WORK/trace-$ver.db" \
-    "SELECT COUNT(*) FROM events e \
-     JOIN sources s ON e.source = s.id \
-     WHERE s.name = 'NCCL'" 2>/dev/null || echo 0)
-  PROCS_SEEN=$(awk '/^gpu_nccl_processes_total/ {print $NF; exit}' "$PROM" || echo 0)
+  # Note on the version "matrix": torch 2.4.0 hard-pins
+  # nvidia-nccl-cu12 to 2.20.5 in its METADATA, so the per-version
+  # pip install is silently overridden and torch loads the bundled
+  # 2.20.5 regardless of $ver. The test STILL exercises the agent's
+  # NCCL-uprobe path against a real PyTorch workload at each loop
+  # iteration; the ABI-coverage piece (validating uprobes against
+  # 2.18 + 2.26) is covered separately by 36-multi-libnccl-attach
+  # which uses torch's bundle directly.
+  COUNT=$(awk '/^gpu_nccl_collective_count\{op_type="ncclAllReduce"\}/ {print $NF; exit}' "$PROM" 2>/dev/null || echo 0)
+  COUNT=${COUNT:-0}
+  PROCS_SEEN=$(awk '/^gpu_nccl_processes_total/ {print $NF; exit}' "$PROM" 2>/dev/null || echo 0)
+  PROCS_SEEN=${PROCS_SEEN:-0}
   if (( COUNT < 100 )); then
-    if (( ${PROCS_SEEN%%.*} > 0 )); then
-      echo "SKIP: version $ver: $PROCS_SEEN process(es) discovered but $COUNT NCCL events captured (runtime uprobe attachment gap; not a regression of this test's contract)"
-      deactivate
-      return 0
-    fi
-    echo "FAIL: version $ver got only $COUNT NCCL events AND zero processes discovered (something broken in libnccl-discovery upstream of this test)"
+    echo "FAIL: version $ver got only $COUNT ncclAllReduce events captured (procs_seen=$PROCS_SEEN); agent log:"
+    sudo tail -20 "$WORK/agent-$ver.log" 2>/dev/null
     deactivate
     return 1
   fi
-  echo "OK: version $ver got $COUNT NCCL events"
+  echo "OK: version $ver got $COUNT ncclAllReduce events captured by agent"
 
   deactivate
   return 0

@@ -96,7 +96,7 @@ int main(void) {
     return 0;
 }
 CU
-"$NVCC" -O2 "$WORK/memcpy_matrix.cu" -o "$WORK/memcpy_matrix" 2>"$WORK/nvcc.log" || {
+"$NVCC" -O2 -cudart=shared "$WORK/memcpy_matrix.cu" -o "$WORK/memcpy_matrix" 2>"$WORK/nvcc.log" || {
   echo "FAIL: nvcc compile failed"
   cat "$WORK/nvcc.log"
   exit 1
