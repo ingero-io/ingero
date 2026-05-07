@@ -3,7 +3,6 @@ package kernellaunch
 import (
 	"bytes"
 	"context"
-	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -186,23 +185,3 @@ func (t *Tracer) Close() error {
 	return nil
 }
 
-// resolveCuLaunchKernel verifies the symbol exists in libcuda
-// before attaching. Returns (sym, true) on success or ("", false)
-// when the symbol is missing.
-func resolveCuLaunchKernel(libcudaPath string) (string, bool) {
-	f, err := elf.Open(libcudaPath)
-	if err != nil {
-		return "", false
-	}
-	defer f.Close()
-	syms, err := f.DynamicSymbols()
-	if err != nil {
-		return "", false
-	}
-	for _, s := range syms {
-		if s.Name == "cuLaunchKernel" {
-			return s.Name, true
-		}
-	}
-	return "", false
-}

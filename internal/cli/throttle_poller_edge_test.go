@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/ingero-io/ingero/internal/nvml"
 )
@@ -98,5 +97,4 @@ func TestThrottleEdgeDetector_PristineAtTestBoundary(t *testing.T) {
 	if got != (nvml.ThrottleEventCounters{}) {
 		t.Errorf("detector state leaked between tests: %+v", got)
 	}
-	_ = time.Now() // kill unused-import noise from a future copy/paste
 }
