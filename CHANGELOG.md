@@ -8,7 +8,7 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
-## [0.15.0] - 2026-05-06
+## [0.15.0] - 2026-05-07
 
 ### Added
 
@@ -21,19 +21,105 @@ Fleet-side changes (the OTel Collector distribution) live in the
   GPU VMs. Tracer API now exposes `Prepare()` + `AttachAt(libPath)`
   for the runtime-attach flow; `Attach(filterPIDs)` is a
   compatibility shim. New helper `Tracer.AttachedPaths()` for
-  observability. Validated end-to-end on Lambda A10 with PyTorch
-  2.4 + NCCL 2.20.5: 200 ncclAllReduce calls produced exactly
-  200 events in `gpu_nccl_collective_count`.
+  observability.
 - **Prometheus running counters for NCCL collectives.** Vanilla
   Prometheus scrapers can now see NCCL activity on the agent:
   `gpu_nccl_collective_count{op_type}`,
   `gpu_nccl_collective_bytes_total{op_type}`,
   `gpu_nccl_collective_barrier_events{op_type}`. OTLP keeps the
   per-event gauge view as the canonical channel; the counters
-  here are the pull-friendly slice. Counters are monotonic across
-  the agent process lifetime.
-- `tests/e2e/memcpy-2d-single-gpu.sh`: small-footprint diagnostic
-  for the 2D memcpy BYTES counter on a single GPU.
+  here are the pull-friendly slice. Cumulative across the agent
+  process lifetime.
+- **`--mcp-bearer-token <token>` flag** on `ingero mcp`. Requires
+  `Authorization: Bearer <token>` for HTTPS MCP requests when set;
+  empty disables auth (loopback-only deployments). Constant-time
+  compare via SHA-256 padding so the wall-clock cost does not
+  depend on input length. The `pagerduty_trigger` MCP tool is now
+  registered automatically when (a) running on stdio (loopback by
+  definition), or (b) running on HTTP with `--mcp-bearer-token`
+  set; the v0.14 blanket default-off caveat is removed.
+- **OTLP `Histogram` and `ExponentialHistogram` encoders.** The
+  agent can now emit per-event distributions to OTLP receivers,
+  not just Gauge and Sum. Encoder is direct JSON, no OTel-SDK
+  dependency.
+- **`gpu.memcpy.duration_ms` is now a per-event histogram** instead
+  of the v0.14 per-window-average gauge. OTLP (`Histogram` data
+  point) and Prometheus (`*_bucket` / `*_sum` / `*_count`) both
+  updated. Bucket boundaries (ms): 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+  25, 50, 100, 250, 500, 1000. Histogram is cumulative (matches
+  Prometheus convention). Downstream queries reading the prior
+  gauge migrate to histogram queries OR use fleet's updated
+  `memcpy_bandwidth_summary` percentile output.
+
+### Changed
+
+- New `internal/auth` package: bearer parsing + constant-time
+  compare + hardened TLS keypair loader (`auth.LoadTLSKeyPair`).
+  Wires every TLS load site (MCP HTTPS, dashboard, fleet client,
+  healthee EE poller). Refuses world-readable keys
+  (`mode & 0o077 != 0`) unless `INGERO_TLS_ALLOW_LOOSE_KEY_PERMS=1`;
+  rejects directories.
+- `scripts/aws/v0-13/provision.sh`: validates operator public IP
+  is a real IPv4 address before passing it to AWS as a
+  SecurityGroup CidrIp; rejects HTML error bodies / captive-portal
+  redirects from `checkip.amazonaws.com`.
+- `scripts/aws/v0-13/deploy.sh`: pre-flight banner prints SSH user,
+  SSH key, and target IPs before the first rsync; refuses to
+  deploy on missing or non-IPv4 entries.
+- Sampler doc note in `internal/sampling`: intentionally not
+  cryptographically secure; this is a load-shedder, not a security
+  control.
+- `cgroup_path_hash` doc note in `internal/health/cgroup_cache.go`:
+  the SHA-256-truncated digest is a stability tag for joining
+  metric streams, not a confidentiality shield. Operators with
+  sensitive cgroup paths should disable cgroup tagging or pass a
+  per-cluster salt upstream.
+- `docs/otlp.md` adds a trust-model section: BPF-derived register
+  attributes (memcpy direction, NCCL op-type, IOCTL command numbers,
+  kernel grid/block dims) cannot be trusted as security signals on
+  multi-tenant hosts; cross-tenant correlation should rely on
+  cgroup attribution.
+
+### Added (experimental)
+
+- **`--enable-experimental-kprobes` flag** on `ingero trace`
+  (default off). When set, the agent reads
+  `/proc/driver/nvidia/version` + `uname -r` and only loads the
+  experimental probes if the pair is on the
+  `internal/kprobe.DefaultAllowlist`. Off-allowlist hosts get a
+  startup warning and the probes do NOT load. Allowlist seeded
+  with three pairs: `{driver: 535.*, kernel: 5.15.*}` (Lambda A10
+  prior baseline), `{driver: 535.*, kernel: 6.5.*}` (Lambda GH200
+  prior baseline), `{driver: 570.*, kernel: 6.8.*}` (Lambda current
+  Ubuntu 22.04 image, validated on A10 + 2x H100 amd64). New
+  pairs are added only after a real-hardware run confirms the
+  probes attach + fire correctly.
+- **Memfrag IOCTL kprobe.** Hooks `nvidia_unlocked_ioctl` on the
+  closed NVIDIA driver and emits per-cmd ringbuf events. v0.15
+  records the IOCTL `cmd` field; argument-buffer decode (alloc
+  size, virtual address) is a follow-up. Per-cmd counter
+  `gpu.memfrag.ioctl_event_total{cmd}` exposed via Prometheus +
+  OTLP. New `fleet.cluster.memfrag_hotspots` MCP tool reads it.
+  Only fires when the experimental-kprobes flag is on AND the
+  host is on the allowlist.
+- **Throttle event counters via edge detection.**
+  `gpu.throttle.{power,thermal,sw,hw}.event_total` counters
+  layered on the existing nvidia-smi throttle poller. Each rising
+  edge per (gpu_uuid, bucket) increments the counter once. The
+  underlying poll floor is unchanged; sub-poll bursts are still
+  missed by design (same caveat as the v0.12.10 W2 poller). Real
+  event-driven kernel-level throttle detection requires a kprobe
+  target NVIDIA does not publicly name or a libnvidia-ml.so cgo
+  binding; both are deferred.
+- **CUDA kernel launch dims uprobe.** Hooks `cuLaunchKernel` in
+  libcuda.so and captures grid (X, Y, Z) + block (X, Y)
+  dimensions per launch. Block Z requires PARM7 access (stack on
+  amd64, register on arm64) and is a follow-up. New metrics:
+  `gpu.kernel.launch.count`, `gpu.kernel.launch.threads_per_block`
+  (histogram), `gpu.kernel.launch.grid_blocks` (histogram). New
+  `fleet.cluster.kernel_launch_summary` MCP tool reads them. Only
+  fires when the experimental-kprobes flag is on AND the host is
+  on the allowlist.
 
 ### Fixed
 
@@ -41,23 +127,24 @@ Fleet-side changes (the OTel Collector distribution) live in the
   had unexported `_pad` / `_pad2` ABI padding fields that
   `binary.Read` panicked on under Go 1.26's stricter
   unexported-field reflect rules. Renamed to `Pad1` / `Pad2`;
-  EventSize=104 and field offsets stay identical. Latent bug
-  surfaced by the F1 work above (pre-F1 the agent rarely
-  received real NCCL events; F1 made PyTorch+NCCL events reach
-  the deserializer for the first time).
-- `tests/e2e/memcpy-2d-peer-multigpu.sh` and the new single-GPU
-  diagnostic now compile the workload with `nvcc -cudart=shared`.
-  Without this, nvcc statically links libcudart and the agent's
-  uprobes against `/usr/lib/.../libcudart.so` never see the
-  workload's calls. The "v0.14.1 H100 direction=unknown delta=0"
-  finding was a test-side static-link issue, not a product bug;
-  validated on Lambda A10 with the new diagnostic showing exactly
-  100 MiB delta from 100x cudaMemcpy2D(width=1 MiB) calls.
-- `tests/e2e/nccl-abi-matrix.sh`: passes `--nccl` (without it the
-  NCCL tracer is never set up); workload now runs an 8-cycle
-  allreduce loop with sleeps so the libnccl-discovery scanner has
-  multiple chances to see the process holding libnccl in
-  `/proc/PID/maps`.
+  EventSize=104 and field offsets stay identical.
+- **NCCL discovery dispatcher panic when running without `--nccl`.**
+  A typed-nil `*ncclprobe.Tracer` widened to a non-nil
+  `ncclAttacher` interface bypassed the naive `att == nil` check
+  and segfaulted on the next method call. Added an explicit
+  typed-nil guard in `dispatchNCCLAttach`. Triggered whenever the
+  agent ran with `--prometheus` but without `--nccl` (the typical
+  inference deployment shape).
+- `tests/e2e/memcpy-1d-direction-matrix.sh` and
+  `tests/e2e/memcpy-2d-peer-multigpu.sh` now compile the workload
+  with `nvcc -cudart=shared` so the agent's uprobes against
+  `/usr/lib/.../libcudart.so` see the workload's calls. Without
+  this, nvcc statically links libcudart.
+- `tests/e2e/nccl-abi-matrix.sh`: assertion now reads the
+  Prometheus running counter `gpu_nccl_collective_count{op_type}`
+  instead of the events-table SQL JOIN (the sources table has no
+  `NCCL` row; NCCL events flow through a separate aggregation
+  layer).
 
 ## [0.14.2] - 2026-05-06
 
