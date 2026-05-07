@@ -285,20 +285,31 @@ func (t *Tracer) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("ringbuf read: %w", err)
 		}
-		if len(rec.RawSample) < EventSize {
-			t.parseErr.Add(1)
-			continue
-		}
-		var e Event
-		if err := binary.Read(bytes.NewReader(rec.RawSample[:EventSize]), binary.LittleEndian, &e); err != nil {
-			t.parseErr.Add(1)
-			continue
-		}
-		select {
-		case t.eventCh <- e:
-		default:
-			t.dropped.Add(1)
-		}
+		t.handleRawSample(rec.RawSample)
+	}
+}
+
+// handleRawSample parses one ringbuf record and either forwards
+// the parsed Event to t.eventCh or increments parseErr / dropped
+// counters. Extracted from Run so unit tests can exercise the
+// deserialization path without standing up a real ringbuf reader.
+// v0.15 F1: this is the surface that panicked under Go 1.26 when
+// Event had unexported padding fields. A test that drives this
+// helper covers that regression class without BPF.
+func (t *Tracer) handleRawSample(raw []byte) {
+	if len(raw) < EventSize {
+		t.parseErr.Add(1)
+		return
+	}
+	var e Event
+	if err := binary.Read(bytes.NewReader(raw[:EventSize]), binary.LittleEndian, &e); err != nil {
+		t.parseErr.Add(1)
+		return
+	}
+	select {
+	case t.eventCh <- e:
+	default:
+		t.dropped.Add(1)
 	}
 }
 

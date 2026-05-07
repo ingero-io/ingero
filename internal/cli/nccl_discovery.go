@@ -94,28 +94,69 @@ func startNCCLDiscoveryScanner(ctx context.Context, interval time.Duration, log 
 		func(batch []ncclprobe.NCCLProcess) {
 			setNCCLDiscoveryBatch(batch)
 			log.Debug("nccl-discovery: scan complete", "n_processes", len(batch))
-			if nt == nil {
-				return
-			}
-			before := len(nt.AttachedPaths())
-			seen := map[string]bool{}
-			for _, p := range batch {
-				if p.LibPath == "" || seen[p.LibPath] {
-					continue
-				}
-				seen[p.LibPath] = true
-				if err := nt.AttachAt(p.LibPath); err != nil {
-					log.Debug("nccl-discovery: AttachAt failed",
-						"path", p.LibPath, "err", err)
-				}
-			}
-			after := len(nt.AttachedPaths())
-			if after > before {
-				log.Info("nccl-discovery: attached new libnccl path(s)",
-					"new_paths", after-before, "total_attached", after)
-			}
+			dispatchNCCLAttach(batch, nt, log)
 		},
 		interval,
 	)
 	go scanner.Run(ctx)
+}
+
+// nccLAttacher abstracts the slice of *ncclprobe.Tracer that
+// dispatchNCCLAttach uses. Lets unit tests mock the attach path
+// without standing up real BPF.
+type ncclAttacher interface {
+	AttachAt(libPath string) error
+	AttachedPaths() []string
+}
+
+// dispatchNCCLAttach calls AttachAt on the tracer for each unique
+// libnccl path in the batch. De-duplicates paths within a batch.
+// Logs growth at info level when total_attached increases.
+//
+// Returns the count of newly-attached paths (test hook). Returns 0
+// immediately when att is nil OR carries a typed-nil concrete
+// value (the no-NCCL-tracer case: setupNCCLTracer returns a
+// (*ncclprobe.Tracer)(nil) when --nccl is off, which Go widens to
+// a non-nil interface holding a nil pointer; a plain `att == nil`
+// check is FALSE in that case and the next AttachedPaths() call
+// panics).
+//
+// v0.15 real-HW finding (2026-05-07): the typed-nil case fires
+// whenever an agent runs with --prometheus or --otlp (which start
+// the discovery scanner) but without --nccl. Inference workloads
+// in production typically do not pass --nccl, so this manifested
+// as a startup crash on the first discovery cycle.
+func isNilNCCLAttacher(att ncclAttacher) bool {
+	// Specifically guard against a nil *ncclprobe.Tracer wrapped in
+	// the interface. Other concrete types passed by tests cannot be
+	// typed-nil because they're values, not pointers; the type
+	// switch keeps this guard from rejecting them spuriously.
+	if t, ok := att.(*ncclprobe.Tracer); ok && t == nil {
+		return true
+	}
+	return false
+}
+
+func dispatchNCCLAttach(batch []ncclprobe.NCCLProcess, att ncclAttacher, log *slog.Logger) int {
+	if att == nil || isNilNCCLAttacher(att) {
+		return 0
+	}
+	before := len(att.AttachedPaths())
+	seen := map[string]bool{}
+	for _, p := range batch {
+		if p.LibPath == "" || seen[p.LibPath] {
+			continue
+		}
+		seen[p.LibPath] = true
+		if err := att.AttachAt(p.LibPath); err != nil {
+			log.Debug("nccl-discovery: AttachAt failed",
+				"path", p.LibPath, "err", err)
+		}
+	}
+	after := len(att.AttachedPaths())
+	if after > before {
+		log.Info("nccl-discovery: attached new libnccl path(s)",
+			"new_paths", after-before, "total_attached", after)
+	}
+	return after - before
 }
