@@ -360,6 +360,12 @@ type Snapshot struct {
 	// gauges do not fit Prometheus pull; the running counters here
 	// are the pull-friendly equivalent.
 	NCCLCollectiveCounters []NCCLCollectiveCounter
+	// v0.15 item K: per-cmd memfrag IOCTL counters.
+	MemfragIOCTLCounters []MemfragIOCTLCounter
+	// v0.15 item L: throttle event-edge counters.
+	ThrottleEvents ThrottleEventCounters
+	// v0.15 item M: per-PID kernel-launch aggregates.
+	KernelLaunches []KernelLaunchSnapshot
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -440,16 +446,55 @@ type MemFragReading struct {
 }
 
 // MemcpyDirStats is one per-direction aggregate of CUDA memcpy
-// events (v0.14 item C). BytesTotal is monotonically growing
-// across the agent process lifetime so the OTLP exporter emits it
-// as a Sum (cumulative) metric. AverageDurationMs is per-window
-// (reset each drain) since cumulative percentiles need a real
-// histogram encoder, deferred to v0.15.
+// events (v0.14 item C, v0.15 item C).
+//
+// BytesTotal is monotonically growing across the agent process
+// lifetime; the OTLP exporter emits it as a cumulative Sum metric.
+//
+// DurationHistogram is the per-event histogram of memcpy duration in
+// milliseconds, reset each drain. Replaces the v0.14 per-window
+// AverageDurationMs gauge with a real per-event histogram (v0.15
+// item B + C). HasObservation=false on direction-with-only-Bytes
+// rows (rare; normally every direction has duration too).
+//
+// EventsInWindow mirrors DurationHistogram.Count and is preserved
+// for callers that want a count without inspecting the snapshot.
 type MemcpyDirStats struct {
-	Direction         string  // "h2h", "h2d", "d2h", "d2d", "default", "unknown"
+	Direction         string
 	BytesTotal        int64
-	AverageDurationMs float64
+	DurationHistogram HistogramSnapshot
 	EventsInWindow    int64
+}
+
+// MemfragIOCTLCounter is a per-IOCTL-cmd running tally fed by the
+// v0.15 W1 memfrag kprobe (internal/ebpf/memfrag). Cumulative
+// across the agent process lifetime; the OTLP exporter emits as a
+// Sum metric with cmd as a label.
+type MemfragIOCTLCounter struct {
+	Cmd   uint32
+	Count int64
+}
+
+// ThrottleEventCounters carries per-bucket cumulative event counts
+// from the v0.15 L edge detector. Mirrors
+// nvml.ThrottleEventCounters at the stats-shape layer so the
+// exporter doesn't need to import internal/nvml.
+type ThrottleEventCounters struct {
+	PowerEvents   int64
+	ThermalEvents int64
+	SWEvents      int64
+	HWEvents      int64
+}
+
+// KernelLaunchSnapshot is the per-PID aggregate from v0.15 M
+// (cuLaunchKernel uprobe). Count is cumulative; histograms are
+// per-window (reset each snapshot is the responsibility of the
+// caller, the same shape as MemcpyDirStats.DurationHistogram).
+type KernelLaunchSnapshot struct {
+	PID                 uint32
+	Count               int64
+	ThreadsPerBlockHist HistogramSnapshot
+	GridBlocksHist      HistogramSnapshot
 }
 
 // MemFragProcessReading is one per-process GPU-memory data point

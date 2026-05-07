@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -199,18 +200,33 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Per-direction CUDA memcpy aggregates (v0.14 item C). bytes_total is
-	// cumulative; duration_ms is per-window average reset on each drain.
+	// Per-direction CUDA memcpy aggregates (v0.14 item C, v0.15 item C).
+	// bytes_total: cumulative counter. duration_ms: per-event histogram
+	// (replaces v0.14 per-window-average gauge).
 	if len(snap.MemcpyDirReadings) > 0 {
+		// Sort by direction for deterministic exposition.
+		rows := make([]stats.MemcpyDirStats, len(snap.MemcpyDirReadings))
+		copy(rows, snap.MemcpyDirReadings)
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].Direction < rows[j].Direction })
+
 		b.WriteString("# HELP gpu_memcpy_bytes_total Cumulative CUDA memcpy bytes by direction\n")
 		b.WriteString("# TYPE gpu_memcpy_bytes_total counter\n")
-		for _, m := range snap.MemcpyDirReadings {
+		for _, m := range rows {
 			fmt.Fprintf(&b, "gpu_memcpy_bytes_total{direction=%q} %d\n", m.Direction, m.BytesTotal)
 		}
-		b.WriteString("# HELP gpu_memcpy_duration_ms Average per-event CUDA memcpy duration by direction over the last export window\n")
-		b.WriteString("# TYPE gpu_memcpy_duration_ms gauge\n")
-		for _, m := range snap.MemcpyDirReadings {
-			fmt.Fprintf(&b, "gpu_memcpy_duration_ms{direction=%q} %f\n", m.Direction, m.AverageDurationMs)
+		b.WriteString("# HELP gpu_memcpy_duration_ms Per-event CUDA memcpy duration by direction (histogram; replaces v0.14 gauge)\n")
+		b.WriteString("# TYPE gpu_memcpy_duration_ms histogram\n")
+		for _, m := range rows {
+			h := m.DurationHistogram
+			cum := uint64(0)
+			for i, b1 := range h.ExplicitBounds {
+				cum += h.BucketCounts[i]
+				fmt.Fprintf(&b, "gpu_memcpy_duration_ms_bucket{direction=%q,le=\"%g\"} %d\n", m.Direction, b1, cum)
+			}
+			cum += h.BucketCounts[len(h.BucketCounts)-1]
+			fmt.Fprintf(&b, "gpu_memcpy_duration_ms_bucket{direction=%q,le=\"+Inf\"} %d\n", m.Direction, cum)
+			fmt.Fprintf(&b, "gpu_memcpy_duration_ms_sum{direction=%q} %g\n", m.Direction, h.Sum)
+			fmt.Fprintf(&b, "gpu_memcpy_duration_ms_count{direction=%q} %d\n", m.Direction, h.Count)
 		}
 	}
 
@@ -220,13 +236,28 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	// scrapers. count + bytes_total are monotonic across the agent
 	// process lifetime.
 	if len(snap.NCCLCollectiveCounters) > 0 {
+		// Sort rows by (op_type, kind) for deterministic exposition.
+		// snapshotNCCLCollectiveCounters() returns rows in Go map
+		// iteration order, which differs across scrapes. Downstream
+		// tools that diff /metrics output need stable ordering.
+		// v0.15 F2: sort once at emission.
+		rows := make([]stats.NCCLCollectiveCounter, len(snap.NCCLCollectiveCounters))
+		copy(rows, snap.NCCLCollectiveCounters)
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].OpType != rows[j].OpType {
+				return rows[i].OpType < rows[j].OpType
+			}
+			// Within same op_type, collective row (BarrierEvents==0) before barrier row.
+			return rows[i].BarrierEvents < rows[j].BarrierEvents
+		})
+
 		// Emit count + bytes for non-barrier rows in a single pass per
 		// metric so the help/type lines stay grouped per Prometheus
 		// exposition convention.
 		hasCount := false
 		hasBytes := false
 		hasBarrier := false
-		for _, c := range snap.NCCLCollectiveCounters {
+		for _, c := range rows {
 			if c.Count > 0 {
 				hasCount = true
 			}
@@ -240,7 +271,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		if hasCount {
 			b.WriteString("# HELP gpu_nccl_collective_count Total NCCL collective events captured per op_type\n")
 			b.WriteString("# TYPE gpu_nccl_collective_count counter\n")
-			for _, c := range snap.NCCLCollectiveCounters {
+			for _, c := range rows {
 				if c.Count > 0 {
 					fmt.Fprintf(&b, "gpu_nccl_collective_count{op_type=%q} %d\n", c.OpType, c.Count)
 				}
@@ -249,7 +280,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		if hasBytes {
 			b.WriteString("# HELP gpu_nccl_collective_bytes_total Cumulative bytes transferred by NCCL collective per op_type\n")
 			b.WriteString("# TYPE gpu_nccl_collective_bytes_total counter\n")
-			for _, c := range snap.NCCLCollectiveCounters {
+			for _, c := range rows {
 				if c.BytesTotal > 0 {
 					fmt.Fprintf(&b, "gpu_nccl_collective_bytes_total{op_type=%q} %d\n", c.OpType, c.BytesTotal)
 				}
@@ -258,7 +289,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		if hasBarrier {
 			b.WriteString("# HELP gpu_nccl_collective_barrier_events Total NCCL barrier-wait events captured per op_type\n")
 			b.WriteString("# TYPE gpu_nccl_collective_barrier_events counter\n")
-			for _, c := range snap.NCCLCollectiveCounters {
+			for _, c := range rows {
 				if c.BarrierEvents > 0 {
 					fmt.Fprintf(&b, "gpu_nccl_collective_barrier_events{op_type=%q} %d\n", c.OpType, c.BarrierEvents)
 				}
@@ -302,6 +333,85 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 				}
 				fmt.Fprintf(&b, "%s{gpu_uuid=%q} %d\n", kind.name, r.UUID, v)
 			}
+		}
+	}
+
+	// v0.15 item L: throttle event-edge counters. Cumulative across
+	// process lifetime; one row per bucket. Always emitted (even
+	// when zero) so consumers can detect "agent saw zero throttle
+	// events" vs "agent isn't running this metric at all".
+	te := snap.ThrottleEvents
+	if te.PowerEvents != 0 || te.ThermalEvents != 0 || te.SWEvents != 0 || te.HWEvents != 0 {
+		b.WriteString("# HELP gpu_throttle_power_event_total Cumulative throttle rising-edge events for power reasons\n")
+		b.WriteString("# TYPE gpu_throttle_power_event_total counter\n")
+		fmt.Fprintf(&b, "gpu_throttle_power_event_total %d\n", te.PowerEvents)
+		b.WriteString("# HELP gpu_throttle_thermal_event_total Cumulative throttle rising-edge events for thermal reasons\n")
+		b.WriteString("# TYPE gpu_throttle_thermal_event_total counter\n")
+		fmt.Fprintf(&b, "gpu_throttle_thermal_event_total %d\n", te.ThermalEvents)
+		b.WriteString("# HELP gpu_throttle_sw_event_total Cumulative throttle rising-edge events for software-imposed reasons\n")
+		b.WriteString("# TYPE gpu_throttle_sw_event_total counter\n")
+		fmt.Fprintf(&b, "gpu_throttle_sw_event_total %d\n", te.SWEvents)
+		b.WriteString("# HELP gpu_throttle_hw_event_total Cumulative throttle rising-edge events for hardware reasons (umbrella)\n")
+		b.WriteString("# TYPE gpu_throttle_hw_event_total counter\n")
+		fmt.Fprintf(&b, "gpu_throttle_hw_event_total %d\n", te.HWEvents)
+	}
+
+	// v0.15 item K: per-cmd memfrag IOCTL event counters. cmd is
+	// the raw nvidia_unlocked_ioctl cmd field; operators decode
+	// against open-gpu-kernel-modules nv-ioctl-numbers.h /
+	// nvos.h. Only emitted when the agent ran with
+	// --enable-experimental-kprobes AND the host was on the
+	// allowlist AND the BPF program saw >= 1 ioctl.
+	if len(snap.MemfragIOCTLCounters) > 0 {
+		b.WriteString("# HELP gpu_memfrag_ioctl_event_total Cumulative nvidia_unlocked_ioctl invocations by cmd code\n")
+		b.WriteString("# TYPE gpu_memfrag_ioctl_event_total counter\n")
+		for _, c := range snap.MemfragIOCTLCounters {
+			fmt.Fprintf(&b, "gpu_memfrag_ioctl_event_total{cmd=\"0x%X\"} %d\n", c.Cmd, c.Count)
+		}
+	}
+
+	// v0.15 item M: per-PID kernel-launch aggregates. count is
+	// cumulative; threads_per_block / grid_blocks are histograms
+	// fed by the cuLaunchKernel uprobe. Only emitted when the
+	// agent ran with --enable-experimental-kprobes AND libcuda
+	// was discovered.
+	if len(snap.KernelLaunches) > 0 {
+		b.WriteString("# HELP gpu_kernel_launch_count Cumulative cuLaunchKernel invocations\n")
+		b.WriteString("# TYPE gpu_kernel_launch_count counter\n")
+		for _, k := range snap.KernelLaunches {
+			fmt.Fprintf(&b, "gpu_kernel_launch_count{pid=\"%d\"} %d\n", k.PID, k.Count)
+		}
+		b.WriteString("# HELP gpu_kernel_launch_threads_per_block Per-launch CUDA block thread count (BlockX*BlockY; BlockZ defaulted to 1)\n")
+		b.WriteString("# TYPE gpu_kernel_launch_threads_per_block histogram\n")
+		for _, k := range snap.KernelLaunches {
+			h := k.ThreadsPerBlockHist
+			cum := uint64(0)
+			for i, b1 := range h.ExplicitBounds {
+				cum += h.BucketCounts[i]
+				fmt.Fprintf(&b, "gpu_kernel_launch_threads_per_block_bucket{pid=\"%d\",le=\"%g\"} %d\n", k.PID, b1, cum)
+			}
+			if len(h.BucketCounts) > 0 {
+				cum += h.BucketCounts[len(h.BucketCounts)-1]
+			}
+			fmt.Fprintf(&b, "gpu_kernel_launch_threads_per_block_bucket{pid=\"%d\",le=\"+Inf\"} %d\n", k.PID, cum)
+			fmt.Fprintf(&b, "gpu_kernel_launch_threads_per_block_sum{pid=\"%d\"} %g\n", k.PID, h.Sum)
+			fmt.Fprintf(&b, "gpu_kernel_launch_threads_per_block_count{pid=\"%d\"} %d\n", k.PID, h.Count)
+		}
+		b.WriteString("# HELP gpu_kernel_launch_grid_blocks Per-launch grid block count (GridX*GridY*GridZ)\n")
+		b.WriteString("# TYPE gpu_kernel_launch_grid_blocks histogram\n")
+		for _, k := range snap.KernelLaunches {
+			h := k.GridBlocksHist
+			cum := uint64(0)
+			for i, b1 := range h.ExplicitBounds {
+				cum += h.BucketCounts[i]
+				fmt.Fprintf(&b, "gpu_kernel_launch_grid_blocks_bucket{pid=\"%d\",le=\"%g\"} %d\n", k.PID, b1, cum)
+			}
+			if len(h.BucketCounts) > 0 {
+				cum += h.BucketCounts[len(h.BucketCounts)-1]
+			}
+			fmt.Fprintf(&b, "gpu_kernel_launch_grid_blocks_bucket{pid=\"%d\",le=\"+Inf\"} %d\n", k.PID, cum)
+			fmt.Fprintf(&b, "gpu_kernel_launch_grid_blocks_sum{pid=\"%d\"} %g\n", k.PID, h.Sum)
+			fmt.Fprintf(&b, "gpu_kernel_launch_grid_blocks_count{pid=\"%d\"} %d\n", k.PID, h.Count)
 		}
 	}
 
