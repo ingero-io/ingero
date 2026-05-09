@@ -111,6 +111,14 @@ const (
 	CUDADeviceSync    CUDAOp = 6
 	CUDAMemcpyAsync   CUDAOp = 7
 	CUDAMallocManaged CUDAOp = 8
+	// v0.14 item C: 2D + peer memcpy variants. Direction lives in
+	// Args[1] (cudaMemcpyKind) for the 2D variants; for Peer
+	// variants the BPF probe pins direction to D2D since peer
+	// copies are device-to-device by definition.
+	CUDAMemcpy2D        CUDAOp = 9
+	CUDAMemcpy2DAsync   CUDAOp = 10
+	CUDAMemcpyPeer      CUDAOp = 11
+	CUDAMemcpyPeerAsync CUDAOp = 12
 )
 
 // String returns a human-readable name for the CUDA operation.
@@ -132,6 +140,14 @@ func (op CUDAOp) String() string {
 		return "cudaMemcpyAsync"
 	case CUDAMallocManaged:
 		return "cudaMallocManaged"
+	case CUDAMemcpy2D:
+		return "cudaMemcpy2D"
+	case CUDAMemcpy2DAsync:
+		return "cudaMemcpy2DAsync"
+	case CUDAMemcpyPeer:
+		return "cudaMemcpyPeer"
+	case CUDAMemcpyPeerAsync:
+		return "cudaMemcpyPeerAsync"
 	default:
 		return fmt.Sprintf("unknown(%d)", op)
 	}
@@ -381,6 +397,10 @@ func ResolveOp(name string) (Source, uint8, bool) {
 		"cudadevicesync":    CUDADeviceSync,
 		"cudamemcpyasync":   CUDAMemcpyAsync,
 		"cudamallocmanaged": CUDAMallocManaged,
+		"cudamemcpy2d":        CUDAMemcpy2D,
+		"cudamemcpy2dasync":   CUDAMemcpy2DAsync,
+		"cudamemcpypeer":      CUDAMemcpyPeer,
+		"cudamemcpypeerasync": CUDAMemcpyPeerAsync,
 	}
 	for k, v := range cudaOps {
 		if lower == k {

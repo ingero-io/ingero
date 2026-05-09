@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+
+	"github.com/ingero-io/ingero/internal/auth"
 	"strings"
 	"time"
 
@@ -154,7 +156,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if s.certFile != "" && s.keyFile != "" {
-		cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+		cert, err := auth.LoadTLSKeyPair(s.certFile, s.keyFile)
 		if err != nil {
 			return fmt.Errorf("loading TLS certificate: %w", err)
 		}

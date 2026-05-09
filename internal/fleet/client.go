@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ingero-io/ingero/internal/auth"
 )
 
 // DefaultTimeout is the per-node HTTP request timeout.
@@ -80,7 +82,7 @@ func New(cfg Config) (*Client, error) {
 		}
 
 		if cfg.ClientCert != "" && cfg.ClientKey != "" {
-			cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
+			cert, err := auth.LoadTLSKeyPair(cfg.ClientCert, cfg.ClientKey)
 			if err != nil {
 				return nil, fmt.Errorf("fleet: loading client cert: %w", err)
 			}

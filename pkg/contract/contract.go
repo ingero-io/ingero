@@ -58,6 +58,40 @@ const (
 	// correlate against MetricCUDAKernelLaunchTotal to see "high CPU
 	// stall + flat kernel launches = blocked".
 	MetricCPUStallNanosTotal = "ingero.node.cpu_stall_nanos_total"
+
+	// v0.14 sensor-surface metrics. Single source of truth so agent and
+	// fleet (Echo MCP read-paths) reference the same string. Centralized
+	// after a v0.14 R2 ★4 finding flagged the same hardcode-in-two-places
+	// pattern that v0.12.9 had to fix retrospectively.
+
+	// MetricGPUNCCLProcessLoaded is a gauge=1 per process discovered with
+	// libnccl loaded, labelled with pid, comm, libnccl_path,
+	// libnccl_version. The agent's libnccl-discovery scanner emits one
+	// per scan tick.
+	MetricGPUNCCLProcessLoaded = "gpu.nccl.process_loaded"
+	// MetricGPUNCCLProcessesTotal is the count of libnccl-loaded
+	// processes per node.
+	MetricGPUNCCLProcessesTotal = "gpu.nccl.processes_total"
+	// MetricGPUMemoryFragmentation is a polling-based heuristic of GPU
+	// memory fragmentation derived from nvidia-smi memory.{used,free,
+	// total}. Range 0..1. Replaced at v0.15 by the IOCTL-level event-
+	// driven W1 memfrag tracer.
+	MetricGPUMemoryFragmentation = "gpu.memory.fragmentation_estimate"
+	// MetricGPUMemoryProcessAllocated is per-PID allocated GPU memory
+	// in bytes, sourced from `nvidia-smi --query-compute-apps`.
+	MetricGPUMemoryProcessAllocated = "gpu.memory.process.allocated_bytes"
+	// MetricGPUMemcpyBytesTotal is a cumulative counter (OTel
+	// temporality=cumulative) of cudaMemcpy* bytes per direction.
+	// Aggregators must compute MAX-MIN per (node, direction) over a
+	// window, NOT sum every observation.
+	MetricGPUMemcpyBytesTotal = "gpu.memcpy.bytes_total"
+	// MetricGPUMemcpyDurationMS is a per-event histogram of
+	// cudaMemcpy* duration in milliseconds, labelled by direction.
+	// v0.15 item C: replaced the prior v0.14 per-window-average
+	// gauge with a real per-event histogram (OTLP Histogram type;
+	// Prometheus *_bucket / *_sum / *_count). Bucket layout:
+	// stats.DefaultMemcpyDurationBoundsMs.
+	MetricGPUMemcpyDurationMS = "gpu.memcpy.duration_ms"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).

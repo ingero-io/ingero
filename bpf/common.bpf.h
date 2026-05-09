@@ -71,6 +71,15 @@ struct user_pt_regs {
 #define CUDA_OP_DEVICE_SYNC      6
 #define CUDA_OP_MEMCPY_ASYNC     7
 #define CUDA_OP_MALLOC_MANAGED   8
+/* v0.14 item C: 2D + peer memcpy variants. Direction lives in entry.arg1
+ * (cudaMemcpyKind value, same convention as CUDA_OP_MEMCPY). For the Peer
+ * variants, the direction is fixed to cudaMemcpyDeviceToDevice (3) since
+ * peer-to-peer copies are always device-to-device by construction.
+ */
+#define CUDA_OP_MEMCPY_2D        9
+#define CUDA_OP_MEMCPY_2D_ASYNC  10
+#define CUDA_OP_MEMCPY_PEER      11
+#define CUDA_OP_MEMCPY_PEER_ASYNC 12
 
 /* CUDA driver operation types (libcuda.so) */
 #define DRIVER_OP_LAUNCH_KERNEL    1

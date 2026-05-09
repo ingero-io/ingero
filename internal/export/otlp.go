@@ -1,7 +1,7 @@
 // Package export provides OTEL-compatible metric and trace export.
 //
 // Architecture: parallel consumers of the Stats Engine snapshot.
-// OTLP and Prometheus are OPTIONAL — disabled by default, enabled via
+// OTLP and Prometheus are OPTIONAL - disabled by default, enabled via
 // --otlp <endpoint> or --prometheus <addr> flags.
 //
 // Call chain: watch.go calls export.OTLP.Push(snap) every ExportInterval →
@@ -9,11 +9,11 @@
 //   HTTP POST to <endpoint>/v1/metrics
 //
 // OTEL semantic conventions used:
-//   gpu.cuda.operation.duration  — per-op latency percentiles (microseconds)
-//   gpu.cuda.operation.count     — per-op event counts
-//   system.cpu.utilization       — system CPU ratio (0-1)
-//   system.memory.utilization    — system memory ratio (0-1)
-//   ingero.anomaly.count         — anomaly event count
+//   gpu.cuda.operation.duration  - per-op latency percentiles (microseconds)
+//   gpu.cuda.operation.count     - per-op event counts
+//   system.cpu.utilization       - system CPU ratio (0-1)
+//   system.memory.utilization    - system memory ratio (0-1)
+//   ingero.anomaly.count         - anomaly event count
 package export
 
 import (
@@ -24,11 +24,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/pkg/contract"
 )
 
 // OTLPConfig configures the OTLP exporter.
@@ -49,7 +51,7 @@ type OTLPConfig struct {
 // Compatible with: OpenTelemetry Collector, Grafana Alloy, Grafana Cloud,
 // Datadog Agent, New Relic, any OTLP-compatible receiver.
 //
-// Zero external dependencies — uses only net/http and encoding/json.
+// Zero external dependencies - uses only net/http and encoding/json.
 type OTLPExporter struct {
 	config      OTLPConfig
 	client      *http.Client
@@ -225,11 +227,61 @@ type otlpScope struct {
 }
 
 type otlpMetric struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	Unit        string    `json:"unit,omitempty"`
-	Gauge       *otlpData `json:"gauge,omitempty"`
-	Sum         *otlpData `json:"sum,omitempty"`
+	Name                 string                       `json:"name"`
+	Description          string                       `json:"description,omitempty"`
+	Unit                 string                       `json:"unit,omitempty"`
+	Gauge                *otlpData                    `json:"gauge,omitempty"`
+	Sum                  *otlpData                    `json:"sum,omitempty"`
+	Histogram            *otlpHistogramData           `json:"histogram,omitempty"`
+	ExponentialHistogram *otlpExponentialHistogram    `json:"exponentialHistogram,omitempty"`
+}
+
+// v0.15 item B: OTLP/JSON histogram + exponential-histogram shapes.
+// References:
+//   https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
+//   https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto
+//
+// Counts are encoded as JSON strings per the OTLP/JSON convention
+// (uint64 fields cross the JS-safe-integer boundary).
+type otlpHistogramData struct {
+	DataPoints             []otlpHistogramPoint `json:"dataPoints"`
+	AggregationTemporality int                  `json:"aggregationTemporality,omitempty"`
+}
+
+type otlpHistogramPoint struct {
+	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
+	StartTimeUnixNano string         `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string         `json:"timeUnixNano"`
+	Count             string         `json:"count"`
+	Sum               *float64       `json:"sum,omitempty"`
+	BucketCounts      []string       `json:"bucketCounts,omitempty"`
+	ExplicitBounds    []float64      `json:"explicitBounds,omitempty"`
+	Min               *float64       `json:"min,omitempty"`
+	Max               *float64       `json:"max,omitempty"`
+}
+
+type otlpExponentialHistogram struct {
+	DataPoints             []otlpExponentialHistogramPoint `json:"dataPoints"`
+	AggregationTemporality int                             `json:"aggregationTemporality,omitempty"`
+}
+
+type otlpExponentialHistogramPoint struct {
+	Attributes        []otlpKeyValue              `json:"attributes,omitempty"`
+	StartTimeUnixNano string                      `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string                      `json:"timeUnixNano"`
+	Count             string                      `json:"count"`
+	Sum               *float64                    `json:"sum,omitempty"`
+	Scale             int32                       `json:"scale"`
+	ZeroCount         string                      `json:"zeroCount"`
+	Positive          *otlpExponentialHistoBuckets `json:"positive,omitempty"`
+	Negative          *otlpExponentialHistoBuckets `json:"negative,omitempty"`
+	Min               *float64                    `json:"min,omitempty"`
+	Max               *float64                    `json:"max,omitempty"`
+}
+
+type otlpExponentialHistoBuckets struct {
+	Offset       int32    `json:"offset"`
+	BucketCounts []string `json:"bucketCounts,omitempty"`
 }
 
 type otlpData struct {
@@ -376,6 +428,82 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		}
 	}
 
+	// libnccl process discovery (v0.14 item A). One gpu.nccl.process_loaded
+	// gauge=1 per discovered PID, plus gpu.nccl.processes_total per node.
+	// The scanner emits an empty slice (not nil) when it has run but
+	// found no NCCL processes; the per-node total still emits with
+	// value=0 in that case so dashboards can plot "this node has no
+	// NCCL workloads right now" alongside positive readings.
+	if snap.NCCLProcessReadings != nil {
+		for _, r := range snap.NCCLProcessReadings {
+			attrs := []otlpKeyValue{
+				{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
+				{Key: "comm", Value: stringVal(r.Comm)},
+				{Key: "libnccl_path", Value: stringVal(r.LibPath)},
+				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
+			}
+			metrics = append(metrics,
+				gaugeMetricInt(contract.MetricGPUNCCLProcessLoaded,
+					"NCCL-loaded process discovered on this node (1=present)",
+					"1", nowNano, 1, attrs),
+			)
+		}
+		metrics = append(metrics,
+			gaugeMetricInt(contract.MetricGPUNCCLProcessesTotal,
+				"Count of NCCL-loaded processes on this node", "1",
+				nowNano, int64(len(snap.NCCLProcessReadings)), nil),
+		)
+	}
+
+	// NVML-poll memfrag heuristic. Polling-based; the gauge is a
+	// coarse heuristic over (used, free, total). Four gauges per
+	// GPU labelled with gpu.uuid.
+	for _, r := range snap.MemFragReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt("gpu.memory.used", "GPU memory currently allocated (NVML poll)", "By",
+				nowNano, r.UsedBytes, attrs),
+			gaugeMetricInt("gpu.memory.free", "GPU memory free (NVML poll)", "By",
+				nowNano, r.FreeBytes, attrs),
+			gaugeMetricInt("gpu.memory.total", "Total GPU memory (NVML poll)", "By",
+				nowNano, r.TotalBytes, attrs),
+			gaugeMetric(contract.MetricGPUMemoryFragmentation,
+				"Coarse GPU memory fragmentation heuristic from NVML poll [0,1]",
+				"1", nowNano, r.FragmentationEstimate, attrs),
+		)
+	}
+	for _, p := range snap.MemFragProcessReadings {
+		attrs := []otlpKeyValue{
+			{Key: "gpu.uuid", Value: stringVal(p.UUID)},
+			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
+		}
+		metrics = append(metrics,
+			gaugeMetricInt(contract.MetricGPUMemoryProcessAllocated,
+				"Per-process GPU memory allocation (NVML compute-apps poll)", "By",
+				nowNano, p.UsedBytes, attrs),
+		)
+	}
+
+	// Per-direction CUDA memcpy aggregates (v0.14 item C). Two
+	// metrics per direction: a cumulative counter for byte totals
+	// and a per-window gauge for average duration. Direction labels
+	// are h2h / h2d / d2h / d2d / default / unknown.
+	for _, m := range snap.MemcpyDirReadings {
+		attrs := []otlpKeyValue{
+			{Key: "direction", Value: stringVal(m.Direction)},
+		}
+		metrics = append(metrics,
+			sumMetric(contract.MetricGPUMemcpyBytesTotal,
+				"Cumulative CUDA memcpy bytes by direction (v0.14 item C)",
+				"By", nowNano, m.BytesTotal, attrs),
+			histogramMetric(contract.MetricGPUMemcpyDurationMS,
+				"Per-event CUDA memcpy duration by direction (v0.15 item C; replaces v0.14 per-window-average gauge)",
+				"ms", nowNano, "", m.DurationHistogram, attrs),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than
@@ -454,6 +582,110 @@ func gaugeMetricInt(name, desc, unit, timeNano string, value int64, attrs []otlp
 			}},
 		},
 	}
+}
+
+// histogramMetric builds an OTLP Histogram metric from a frozen
+// stats.HistogramSnapshot. v0.15 item B. Cumulative temporality
+// (matches the Sum/Gauge convention elsewhere in this exporter).
+//
+// Empty snapshots (HasObservation=false) still emit a zero-count
+// data point so consumers see the metric is wired even before the
+// first observation.
+func histogramMetric(name, desc, unit, timeNano, startNano string, snap stats.HistogramSnapshot, attrs []otlpKeyValue) otlpMetric {
+	bounds := append([]float64(nil), snap.ExplicitBounds...)
+	bucketStrs := make([]string, len(snap.BucketCounts))
+	for i, c := range snap.BucketCounts {
+		bucketStrs[i] = uintToStr(c)
+	}
+	pt := otlpHistogramPoint{
+		Attributes:        attrs,
+		StartTimeUnixNano: startNano,
+		TimeUnixNano:      timeNano,
+		Count:             uintToStr(snap.Count),
+		BucketCounts:      bucketStrs,
+		ExplicitBounds:    bounds,
+	}
+	if snap.Count > 0 {
+		s := snap.Sum
+		pt.Sum = &s
+	}
+	if snap.HasObservation {
+		mn := snap.Min
+		mx := snap.Max
+		pt.Min = &mn
+		pt.Max = &mx
+	}
+	return otlpMetric{
+		Name:        name,
+		Description: desc,
+		Unit:        unit,
+		Histogram: &otlpHistogramData{
+			DataPoints:             []otlpHistogramPoint{pt},
+			AggregationTemporality: 2, // cumulative
+		},
+	}
+}
+
+// exponentialHistogramMetric emits an OTLP ExponentialHistogram.
+// v0.15 item B. Producer responsible for the scale + bucket layout;
+// this function is the wire-format encoder only.
+//
+// Reference: opentelemetry-proto metrics v1, message ExponentialHistogram.
+// Counts encoded as JSON strings per OTLP/JSON spec.
+func exponentialHistogramMetric(name, desc, unit, timeNano, startNano string,
+	count uint64, sum float64, scale int32, zeroCount uint64,
+	posOffset int32, posCounts []uint64,
+	negOffset int32, negCounts []uint64,
+	min, max float64, hasMinMax bool,
+	attrs []otlpKeyValue,
+) otlpMetric {
+	posBuckets := uintsToStrs(posCounts)
+	negBuckets := uintsToStrs(negCounts)
+	pt := otlpExponentialHistogramPoint{
+		Attributes:        attrs,
+		StartTimeUnixNano: startNano,
+		TimeUnixNano:      timeNano,
+		Count:             uintToStr(count),
+		Scale:             scale,
+		ZeroCount:         uintToStr(zeroCount),
+	}
+	if count > 0 {
+		s := sum
+		pt.Sum = &s
+	}
+	if len(posBuckets) > 0 {
+		pt.Positive = &otlpExponentialHistoBuckets{Offset: posOffset, BucketCounts: posBuckets}
+	}
+	if len(negBuckets) > 0 {
+		pt.Negative = &otlpExponentialHistoBuckets{Offset: negOffset, BucketCounts: negBuckets}
+	}
+	if hasMinMax {
+		mn := min
+		mx := max
+		pt.Min = &mn
+		pt.Max = &mx
+	}
+	return otlpMetric{
+		Name:        name,
+		Description: desc,
+		Unit:        unit,
+		ExponentialHistogram: &otlpExponentialHistogram{
+			DataPoints:             []otlpExponentialHistogramPoint{pt},
+			AggregationTemporality: 2, // cumulative
+		},
+	}
+}
+
+func uintToStr(u uint64) string {
+	return strconv.FormatUint(u, 10)
+}
+
+func uintsToStrs(xs []uint64) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = uintToStr(x)
+	}
+	return out
 }
 
 func sumMetric(name, desc, unit, timeNano string, value int64, attrs []otlpKeyValue) otlpMetric {

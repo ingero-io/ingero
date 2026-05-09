@@ -196,9 +196,17 @@ func (t *Tracer) Attach() error {
 		t.links = append(t.links, uret)
 	}
 
-	// Optional probes — non-fatal if symbol not found.
+	// Optional probes - non-fatal if symbol not found.
+	// v0.14 item C adds the 2D + Peer memcpy variants. Older CUDA
+	// runtimes might not export every symbol; treating them as
+	// optional means the tracer still attaches the rest of the set
+	// when one symbol is missing.
 	optionalSpecs := []probeSpec{
 		{"cudaMallocManaged", t.objs.UprobeCudaMallocManaged, t.objs.UretprobeCudaMallocManaged},
+		{"cudaMemcpy2D", t.objs.UprobeCudaMemcpy2d, t.objs.UretprobeCudaMemcpy2d},
+		{"cudaMemcpy2DAsync", t.objs.UprobeCudaMemcpy2dAsync, t.objs.UretprobeCudaMemcpy2dAsync},
+		{"cudaMemcpyPeer", t.objs.UprobeCudaMemcpyPeer, t.objs.UretprobeCudaMemcpyPeer},
+		{"cudaMemcpyPeerAsync", t.objs.UprobeCudaMemcpyPeerAsync, t.objs.UretprobeCudaMemcpyPeerAsync},
 	}
 	for _, spec := range optionalSpecs {
 		up, err := exe.Uprobe(spec.symbol, spec.uprobe, uprobeOpts)

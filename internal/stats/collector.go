@@ -318,6 +318,54 @@ type Snapshot struct {
 	// four gauge data points (power/thermal/sw/hw active) labelled with
 	// gpu.uuid in the OTLP exporter.
 	ThrottleReadings []ThrottleReading
+
+	// NCCLProcessReadings carries the latest snapshot of NCCL-loaded
+	// processes from the libnccl discovery scanner (v0.14 item A).
+	// Each element becomes one gpu.nccl.process_loaded gauge=1 data
+	// point with pid/comm/libnccl_path/libnccl_version labels; the
+	// length of the slice becomes the gpu.nccl.processes_total gauge.
+	// Nil when --libnccl-discovery-interval is 0 or the scanner has
+	// not yet completed its first pass.
+	NCCLProcessReadings []NCCLProcessReading
+
+	// MemFragReadings carries the latest NVML-poll memory-usage
+	// snapshot per GPU (v0.14 item D, W1 baseline). Each element
+	// becomes four gauges (used/free/total/fragmentation_estimate)
+	// labelled with gpu.uuid. Nil when --memfrag-poll-interval is 0
+	// or the poller has not yet completed its first read.
+	MemFragReadings []MemFragReading
+
+	// MemFragProcessReadings carries per-process GPU memory usage
+	// from `nvidia-smi --query-compute-apps`. Each element becomes
+	// one gpu.memory.process.allocated_bytes gauge labelled with
+	// gpu.uuid + pid. Nil under the same conditions as
+	// MemFragReadings.
+	MemFragProcessReadings []MemFragProcessReading
+
+	// MemcpyDirReadings carries per-direction memcpy aggregates
+	// (v0.14 item C). Each element becomes one
+	// gpu.memcpy.bytes_total counter and one
+	// gpu.memcpy.duration_ms gauge labelled with `direction`.
+	// Empty when no memcpy events have been seen this run.
+	MemcpyDirReadings []MemcpyDirStats
+
+	// NCCLCollectiveCounters carries running counts of NCCL
+	// collective events grouped by op_type. Populated by
+	// snapshotNCCLCollectiveCounters in cli/nccl_counters.go and
+	// emitted by the Prometheus exporter as
+	// gpu_nccl_collective_count{op_type} +
+	// gpu_nccl_collective_bytes_total{op_type} +
+	// gpu_nccl_collective_barrier_events{op_type}. v0.15 F2:
+	// per-event NCCLDataPoints are OTLP-only because per-event
+	// gauges do not fit Prometheus pull; the running counters here
+	// are the pull-friendly equivalent.
+	NCCLCollectiveCounters []NCCLCollectiveCounter
+	// v0.15 item K: per-cmd memfrag IOCTL counters.
+	MemfragIOCTLCounters []MemfragIOCTLCounter
+	// v0.15 item L: throttle event-edge counters.
+	ThrottleEvents ThrottleEventCounters
+	// v0.15 item M: per-PID kernel-launch aggregates.
+	KernelLaunches []KernelLaunchSnapshot
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,
@@ -367,6 +415,95 @@ type NCCLDataPoint struct {
 	// primitives (PARM4 of those calls). Zero for collectives. v0.12.2:
 	// enables topology-mapping for pipeline-parallel workloads.
 	PeerRank uint32
+}
+
+// NCCLProcessReading is one discovered NCCL-loaded process surfaced
+// by the libnccl discovery scanner (v0.14 item A). Plain fields so
+// the export package emits without importing ncclprobe (avoids an
+// import cycle).
+//
+// Each reading produces one gpu.nccl.process_loaded gauge=1 data
+// point with the four-label set (pid, comm, libnccl_path,
+// libnccl_version); the slice length feeds gpu.nccl.processes_total.
+type NCCLProcessReading struct {
+	PID        uint32
+	Comm       string
+	LibPath    string
+	LibVersion string
+}
+
+// MemFragReading is one polled NVML memory snapshot per GPU
+// (v0.14 item D). The fragmentation estimate is a coarse heuristic
+// computed from used/free/total: it is NOT the IOCTL-level memfrag
+// tracking that v0.15 W1 ships; the comment in the OTLP encoder
+// surfaces this caveat in the metric description.
+type MemFragReading struct {
+	UUID                  string
+	UsedBytes             int64
+	FreeBytes             int64
+	TotalBytes            int64
+	FragmentationEstimate float64 // [0,1]: 0 = unfragmented, 1 = fully fragmented
+}
+
+// MemcpyDirStats is one per-direction aggregate of CUDA memcpy
+// events (v0.14 item C, v0.15 item C).
+//
+// BytesTotal is monotonically growing across the agent process
+// lifetime; the OTLP exporter emits it as a cumulative Sum metric.
+//
+// DurationHistogram is the per-event histogram of memcpy duration in
+// milliseconds, reset each drain. Replaces the v0.14 per-window
+// AverageDurationMs gauge with a real per-event histogram (v0.15
+// item B + C). HasObservation=false on direction-with-only-Bytes
+// rows (rare; normally every direction has duration too).
+//
+// EventsInWindow mirrors DurationHistogram.Count and is preserved
+// for callers that want a count without inspecting the snapshot.
+type MemcpyDirStats struct {
+	Direction         string
+	BytesTotal        int64
+	DurationHistogram HistogramSnapshot
+	EventsInWindow    int64
+}
+
+// MemfragIOCTLCounter is a per-IOCTL-cmd running tally fed by the
+// v0.15 W1 memfrag kprobe (internal/ebpf/memfrag). Cumulative
+// across the agent process lifetime; the OTLP exporter emits as a
+// Sum metric with cmd as a label.
+type MemfragIOCTLCounter struct {
+	Cmd   uint32
+	Count int64
+}
+
+// ThrottleEventCounters carries per-bucket cumulative event counts
+// from the v0.15 L edge detector. Mirrors
+// nvml.ThrottleEventCounters at the stats-shape layer so the
+// exporter doesn't need to import internal/nvml.
+type ThrottleEventCounters struct {
+	PowerEvents   int64
+	ThermalEvents int64
+	SWEvents      int64
+	HWEvents      int64
+}
+
+// KernelLaunchSnapshot is the per-PID aggregate from v0.15 M
+// (cuLaunchKernel uprobe). Count is cumulative; histograms are
+// per-window (reset each snapshot is the responsibility of the
+// caller, the same shape as MemcpyDirStats.DurationHistogram).
+type KernelLaunchSnapshot struct {
+	PID                 uint32
+	Count               int64
+	ThreadsPerBlockHist HistogramSnapshot
+	GridBlocksHist      HistogramSnapshot
+}
+
+// MemFragProcessReading is one per-process GPU-memory data point
+// from `nvidia-smi --query-compute-apps`. UUID is the GPU UUID the
+// process is using; PID is the host PID.
+type MemFragProcessReading struct {
+	UUID      string
+	PID       uint32
+	UsedBytes int64
 }
 
 // TraceDBSnapshot mirrors store.Stats without importing the store
@@ -511,4 +648,23 @@ func detectSpikePattern(positions []int64) string {
 	}
 
 	return ""
+}
+
+// NCCLCollectiveCounter is a running tally of one NCCL op type's
+// collective event count + bytes total since agent process start.
+// v0.15 F2 surface for the Prometheus pull exporter; OTLP keeps the
+// per-event gauge view via NCCLDataPoints.
+//
+// BarrierEvents is non-zero only on entries created from
+// IsBarrier=true data points; the standard collective entries leave
+// it at 0. A given OpType can appear in TWO entries when both
+// regular collectives and barrier-wait events have been seen for
+// it (regular collectives populate Count + BytesTotal, barriers
+// populate BarrierEvents). The Prometheus exporter sums or emits
+// independently as appropriate.
+type NCCLCollectiveCounter struct {
+	OpType        string
+	Count         int64 // collective events seen
+	BytesTotal    int64 // sum of CountBytes across collective events
+	BarrierEvents int64 // barrier-wait correlations
 }

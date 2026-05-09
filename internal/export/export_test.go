@@ -141,6 +141,238 @@ func TestPrometheusMetrics_WithSnapshot(t *testing.T) {
 	}
 }
 
+// TestPrometheusMetrics_V014 covers the v0.14 + v0.12.10 metric families
+// added on v0.14.1: throttle, libnccl process discovery, NVML-poll memory
+// + fragmentation, and per-direction memcpy aggregates. Pre-fix the
+// Prometheus exporter only emitted system_*, gpu_cuda_operation_*, anomaly,
+// ringbuf, and trace_db_*; all v0.14-vintage metrics were OTLP-only.
+func TestPrometheusMetrics_V014(t *testing.T) {
+	p := NewPrometheus(":0")
+
+	snap := &stats.Snapshot{
+		ThrottleReadings: []stats.ThrottleReading{
+			{UUID: "GPU-AAAA", PowerActive: true, ThermalActive: false, SWActive: false, HWActive: true},
+			{UUID: "GPU-BBBB", PowerActive: false, ThermalActive: true, SWActive: false, HWActive: false},
+		},
+		NCCLProcessReadings: []stats.NCCLProcessReading{
+			{PID: 1234, Comm: "python3", LibPath: "/usr/lib/x86_64-linux-gnu/libnccl.so.2.26.2", LibVersion: "2.26.2"},
+		},
+		MemFragReadings: []stats.MemFragReading{
+			{UUID: "GPU-AAAA", UsedBytes: 8 << 30, FreeBytes: 16 << 30, TotalBytes: 24 << 30, FragmentationEstimate: 0.31},
+		},
+		MemFragProcessReadings: []stats.MemFragProcessReading{
+			{UUID: "GPU-AAAA", PID: 1234, UsedBytes: 4 << 30},
+		},
+		MemcpyDirReadings: []stats.MemcpyDirStats{
+			{
+				Direction:  "h2d",
+				BytesTotal: 1 << 30,
+				DurationHistogram: stats.HistogramSnapshot{
+					Count: 10, Sum: 14.0, Min: 0.5, Max: 5.0, HasObservation: true,
+					BucketCounts:   []uint64{0, 0, 5, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+					ExplicitBounds: stats.DefaultMemcpyDurationBoundsMs,
+				},
+				EventsInWindow: 10,
+			},
+			{
+				Direction:  "d2h",
+				BytesTotal: 512 << 20,
+				DurationHistogram: stats.HistogramSnapshot{
+					Count: 8, Sum: 9.6, Min: 0.4, Max: 3.0, HasObservation: true,
+					BucketCounts:   []uint64{0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+					ExplicitBounds: stats.DefaultMemcpyDurationBoundsMs,
+				},
+				EventsInWindow: 8,
+			},
+		},
+	}
+	p.UpdateSnapshot(snap)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+
+	checks := []string{
+		// throttle (v0.12.10)
+		`gpu_throttle_power_active{gpu_uuid="GPU-AAAA"} 1`,
+		`gpu_throttle_thermal_active{gpu_uuid="GPU-AAAA"} 0`,
+		`gpu_throttle_hw_active{gpu_uuid="GPU-AAAA"} 1`,
+		`gpu_throttle_thermal_active{gpu_uuid="GPU-BBBB"} 1`,
+		// libnccl discovery (v0.14 item A)
+		`gpu_nccl_process_loaded{pid="1234",comm="python3"`,
+		`libnccl_version="2.26.2"`,
+		`gpu_nccl_processes_total 1`,
+		// memfrag (v0.14 item D)
+		`gpu_memory_used_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_free_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_total_bytes{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_fragmentation_estimate{gpu_uuid="GPU-AAAA"}`,
+		`gpu_memory_process_allocated_bytes{gpu_uuid="GPU-AAAA",pid="1234"}`,
+		// memcpy (v0.14 item C, v0.15 item C: histogram replaces gauge)
+		`gpu_memcpy_bytes_total{direction="h2d"}`,
+		`gpu_memcpy_bytes_total{direction="d2h"}`,
+		`# TYPE gpu_memcpy_duration_ms histogram`,
+		`gpu_memcpy_duration_ms_bucket{direction="h2d",le="+Inf"} 10`,
+		`gpu_memcpy_duration_ms_count{direction="h2d"} 10`,
+		`gpu_memcpy_duration_ms_count{direction="d2h"} 8`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(content, check) {
+			t.Errorf("metrics output missing %q\n--- body ---\n%s", check, content)
+		}
+	}
+}
+
+// TestPrometheusMetrics_V014_EmptySnapshot verifies the v0.14 sections
+// are silent when the relevant fields are nil/empty (no spurious zero
+// rows polluting scrapes when pollers are disabled).
+func TestPrometheusMetrics_V014_EmptySnapshot(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+
+	for _, name := range []string{
+		"gpu_throttle_power_active",
+		"gpu_nccl_process_loaded",
+		"gpu_memory_fragmentation_estimate",
+		"gpu_memcpy_bytes_total",
+	} {
+		if strings.Contains(content, name) {
+			t.Errorf("expected %q to be absent from empty-snapshot scrape, but it was emitted", name)
+		}
+	}
+}
+
+// v0.15 F2: NCCL collective running counters appear as
+// gpu_nccl_collective_count + gpu_nccl_collective_bytes_total +
+// gpu_nccl_collective_barrier_events on /metrics.
+func TestPrometheusMetrics_NCCLCollectiveCounters(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{
+		NCCLCollectiveCounters: []stats.NCCLCollectiveCounter{
+			{OpType: "ncclAllReduce", Count: 42, BytesTotal: 1234567},
+			{OpType: "ncclAllReduce", BarrierEvents: 7},
+			{OpType: "ncclBcast", Count: 3, BytesTotal: 100},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+	for _, want := range []string{
+		`gpu_nccl_collective_count{op_type="ncclAllReduce"} 42`,
+		`gpu_nccl_collective_bytes_total{op_type="ncclAllReduce"} 1234567`,
+		`gpu_nccl_collective_count{op_type="ncclBcast"} 3`,
+		`gpu_nccl_collective_barrier_events{op_type="ncclAllReduce"} 7`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing %q in /metrics output\n--- body ---\n%s", want, content)
+		}
+	}
+}
+
+// v0.15 F2: with no NCCL counter rows the section stays silent.
+func TestPrometheusMetrics_NCCLCollectiveCounters_EmptyStaysSilent(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{})
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	if strings.Contains(string(body), "gpu_nccl_collective_") {
+		t.Errorf("expected no nccl_collective_* lines on empty snapshot, got:\n%s", string(body))
+	}
+}
+
+// v0.15 F2 (LOW): row ordering across scrapes is deterministic.
+// snapshotNCCLCollectiveCounters returns rows in Go map iteration
+// order; the exporter sorts by (op_type, kind) for stable output
+// so downstream tools that diff /metrics get reproducible results.
+func TestPrometheusMetrics_NCCLCollectiveCounters_DeterministicOrdering(t *testing.T) {
+	p := NewPrometheus(":0")
+	// Ten unsorted op_types; same Snapshot should produce identical
+	// output across multiple scrapes regardless of input order.
+	counters := []stats.NCCLCollectiveCounter{
+		{OpType: "ncclSend", Count: 1},
+		{OpType: "ncclAllReduce", Count: 100, BytesTotal: 1000},
+		{OpType: "ncclAllGather", Count: 50},
+		{OpType: "ncclBcast", Count: 25},
+		{OpType: "ncclReduceScatter", Count: 10},
+		{OpType: "ncclRecv", Count: 1},
+		{OpType: "ncclAllReduce", BarrierEvents: 5},
+	}
+	p.UpdateSnapshot(&stats.Snapshot{NCCLCollectiveCounters: counters})
+
+	doScrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics", nil)
+		w := httptest.NewRecorder()
+		p.handleMetrics(w, req)
+		body, _ := io.ReadAll(w.Result().Body)
+		return string(body)
+	}
+	first := doScrape()
+	for i := 0; i < 5; i++ {
+		if got := doScrape(); got != first {
+			t.Fatalf("scrape %d differs from scrape 0\n--- scrape 0 ---\n%s\n--- scrape %d ---\n%s",
+				i+1, first, i+1, got)
+		}
+	}
+
+	// Also assert the count rows are alphabetically sorted by op_type.
+	// Easier check: ncclAllGather appears before ncclAllReduce, both
+	// before ncclBcast, etc.
+	idx := func(s string) int { return strings.Index(first, s) }
+	for _, pair := range [][2]string{
+		{`gpu_nccl_collective_count{op_type="ncclAllGather"}`, `gpu_nccl_collective_count{op_type="ncclAllReduce"}`},
+		{`gpu_nccl_collective_count{op_type="ncclAllReduce"}`, `gpu_nccl_collective_count{op_type="ncclBcast"}`},
+		{`gpu_nccl_collective_count{op_type="ncclBcast"}`, `gpu_nccl_collective_count{op_type="ncclReduceScatter"}`},
+	} {
+		i, j := idx(pair[0]), idx(pair[1])
+		if i < 0 || j < 0 {
+			t.Errorf("missing row pair %q before %q in:\n%s", pair[0], pair[1], first)
+			continue
+		}
+		if i >= j {
+			t.Errorf("ordering wrong: %q at %d not before %q at %d", pair[0], i, pair[1], j)
+		}
+	}
+}
+
+// v0.15 F2 (LOW): op_type label values containing characters that
+// would otherwise need Prometheus escaping are emitted via %q so
+// they pass through correctly. Defensive coverage for the case where
+// an upstream feed delivers an unexpected op_type string.
+func TestPrometheusMetrics_NCCLCollectiveCounters_EscapesLabelValues(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{
+		NCCLCollectiveCounters: []stats.NCCLCollectiveCounter{
+			{OpType: `weird"op\name`, Count: 1},
+		},
+	})
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	content := string(body)
+	// %q escapes both " and \ ; verify the emitted line is parseable.
+	want := `gpu_nccl_collective_count{op_type="weird\"op\\name"} 1`
+	if !strings.Contains(content, want) {
+		t.Errorf("expected %q in output, got:\n%s", want, content)
+	}
+}
+
 func TestPrometheusMetrics_HTTPHandler(t *testing.T) {
 	p := NewPrometheus(":0")
 	snap := &stats.Snapshot{TotalEvents: 42, AnomalyEvents: 1}
@@ -714,3 +946,316 @@ func TestOTLP_ThrottleReadings_BucketValuesAreOneOrZero(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v0.15 item B: OTLP Histogram + ExponentialHistogram encoder tests
+// ---------------------------------------------------------------------------
+
+func TestHistogramMetric_RoundTripsJSON(t *testing.T) {
+	h := stats.NewHistogram([]float64{1, 10, 100})
+	for _, v := range []float64{0.5, 5, 50, 500} {
+		h.Observe(v)
+	}
+	snap := h.Snapshot()
+	m := histogramMetric("gpu.memcpy.duration_ms", "memcpy duration", "ms", "1700000000000000000", "1690000000000000000", snap, nil)
+
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"histogram"`) {
+		t.Errorf("payload missing histogram key: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"count":"4"`) {
+		t.Errorf("payload missing count=4 (string-encoded): %s", raw)
+	}
+	if !strings.Contains(string(raw), `"bucketCounts":["1","1","1","1"]`) {
+		t.Errorf("payload missing per-bucket counts: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"explicitBounds":[1,10,100]`) {
+		t.Errorf("payload missing explicit bounds: %s", raw)
+	}
+	// Round-trip back to confirm shape parses.
+	var decoded otlpMetric
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Histogram == nil || len(decoded.Histogram.DataPoints) != 1 {
+		t.Errorf("decoded shape lost: %+v", decoded)
+	}
+	dp := decoded.Histogram.DataPoints[0]
+	if dp.Count != "4" {
+		t.Errorf("decoded count=%q want 4", dp.Count)
+	}
+	if dp.Sum == nil || *dp.Sum != 0.5+5+50+500 {
+		t.Errorf("decoded sum=%v want 555.5", dp.Sum)
+	}
+	if dp.Min == nil || *dp.Min != 0.5 {
+		t.Errorf("decoded min=%v want 0.5", dp.Min)
+	}
+	if dp.Max == nil || *dp.Max != 500 {
+		t.Errorf("decoded max=%v want 500", dp.Max)
+	}
+	if decoded.Histogram.AggregationTemporality != 2 {
+		t.Errorf("aggregationTemporality=%d want 2 (cumulative)", decoded.Histogram.AggregationTemporality)
+	}
+}
+
+func TestHistogramMetric_EmptySnapshotEmitsZero(t *testing.T) {
+	h := stats.NewHistogram([]float64{1, 10})
+	snap := h.Snapshot()
+	m := histogramMetric("gpu.memcpy.duration_ms", "", "ms", "1700000000000000000", "", snap, nil)
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// count=0, no sum, no min, no max
+	if !strings.Contains(string(raw), `"count":"0"`) {
+		t.Errorf("empty: payload missing count=0: %s", raw)
+	}
+	if strings.Contains(string(raw), `"min"`) || strings.Contains(string(raw), `"max"`) {
+		t.Errorf("empty: should not emit min/max: %s", raw)
+	}
+	if strings.Contains(string(raw), `"sum"`) {
+		t.Errorf("empty: should not emit sum: %s", raw)
+	}
+}
+
+func TestExponentialHistogramMetric_RoundTripsJSON(t *testing.T) {
+	m := exponentialHistogramMetric(
+		"gpu.memcpy.duration_ms",
+		"memcpy duration",
+		"ms",
+		"1700000000000000000",
+		"1690000000000000000",
+		100,            // count
+		1234.5,         // sum
+		4,              // scale
+		0,              // zero count
+		0,              // pos offset
+		[]uint64{10, 20, 30, 40}, // pos buckets
+		0, nil,         // no negative
+		0.5, 200.0, true, // min/max
+		nil,            // no attrs
+	)
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"exponentialHistogram"`) {
+		t.Errorf("payload missing exponentialHistogram key: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"scale":4`) {
+		t.Errorf("payload missing scale=4: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"zeroCount":"0"`) {
+		t.Errorf("payload missing zeroCount: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"bucketCounts":["10","20","30","40"]`) {
+		t.Errorf("payload missing pos bucketCounts: %s", raw)
+	}
+	if strings.Contains(string(raw), `"negative"`) {
+		t.Errorf("payload should NOT include negative buckets when none provided: %s", raw)
+	}
+	var decoded otlpMetric
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.ExponentialHistogram == nil {
+		t.Fatalf("decoded ExponentialHistogram nil")
+	}
+	dp := decoded.ExponentialHistogram.DataPoints[0]
+	if dp.Count != "100" || dp.Scale != 4 {
+		t.Errorf("decoded count=%q scale=%d want 100/4", dp.Count, dp.Scale)
+	}
+	if dp.Positive == nil || len(dp.Positive.BucketCounts) != 4 {
+		t.Errorf("decoded positive missing or wrong shape")
+	}
+}
+
+// v0.15 item B: ExponentialHistogram with both positive AND
+// negative buckets. Real-world data with both signs (e.g., a
+// signed delta metric) needs the negative branch on the wire.
+func TestExponentialHistogramMetric_WithNegativeBuckets(t *testing.T) {
+	m := exponentialHistogramMetric(
+		"signed.delta", "", "", "1700000000000000000", "",
+		200,    // count
+		-50.0,  // sum (negative)
+		2,      // scale
+		5,      // zero count
+		0, []uint64{30, 40},  // pos buckets
+		1, []uint64{60, 65},  // neg buckets
+		-100, 100, true,      // min/max
+		nil,
+	)
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"negative"`) {
+		t.Errorf("payload should include negative bucket section: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"positive"`) {
+		t.Errorf("payload should include positive bucket section: %s", raw)
+	}
+	var decoded otlpMetric
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dp := decoded.ExponentialHistogram.DataPoints[0]
+	if dp.Negative == nil || len(dp.Negative.BucketCounts) != 2 {
+		t.Errorf("decoded negative shape lost: %+v", dp.Negative)
+	}
+	if dp.Negative.Offset != 1 {
+		t.Errorf("decoded negative offset = %d, want 1", dp.Negative.Offset)
+	}
+	if dp.Sum == nil || *dp.Sum != -50.0 {
+		t.Errorf("decoded sum = %v, want -50.0", dp.Sum)
+	}
+}
+
+// v0.15 item B: zeroCount > 0 with no observations elsewhere is a
+// valid OTLP shape (a histogram of values that all rounded to zero).
+func TestExponentialHistogramMetric_ZeroCountOnly(t *testing.T) {
+	m := exponentialHistogramMetric(
+		"only.zero", "", "", "1700000000000000000", "",
+		7,      // count
+		0,      // sum
+		2,      // scale
+		7,      // zero count = full count
+		0, nil, // no positive
+		0, nil, // no negative
+		0, 0, false,
+		nil,
+	)
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"zeroCount":"7"`) {
+		t.Errorf("payload should carry zeroCount=7: %s", raw)
+	}
+	if strings.Contains(string(raw), `"positive"`) || strings.Contains(string(raw), `"negative"`) {
+		t.Errorf("payload should NOT include positive/negative sections when both empty: %s", raw)
+	}
+}
+
+func TestUintToStr(t *testing.T) {
+	if got := uintToStr(0); got != "0" {
+		t.Errorf("uintToStr(0)=%q want 0", got)
+	}
+	if got := uintToStr(18446744073709551615); got != "18446744073709551615" {
+		t.Errorf("uintToStr(uint64-max)=%q (no precision loss)", got)
+	}
+}
+
+// v0.15 item L: throttle event-edge counters render in /metrics.
+func TestPrometheus_ThrottleEventCounters(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{
+		ThrottleEvents: stats.ThrottleEventCounters{
+			PowerEvents:   3,
+			ThermalEvents: 1,
+			SWEvents:      0,
+			HWEvents:      2,
+		},
+	})
+	body := scrapeMetrics(t, p)
+	for _, want := range []string{
+		"# TYPE gpu_throttle_power_event_total counter",
+		"gpu_throttle_power_event_total 3",
+		"gpu_throttle_thermal_event_total 1",
+		"gpu_throttle_sw_event_total 0",
+		"gpu_throttle_hw_event_total 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in scrape body", want)
+		}
+	}
+}
+
+// All-zero counters must NOT emit (silence is the signal that the
+// agent isn't running with the experimental flag, vs zero events).
+func TestPrometheus_ThrottleEventCounters_SilentWhenAllZero(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{ThrottleEvents: stats.ThrottleEventCounters{}})
+	body := scrapeMetrics(t, p)
+	if strings.Contains(body, "gpu_throttle_power_event_total") {
+		t.Errorf("zero counters should stay silent; body included the metric")
+	}
+}
+
+// v0.15 item K: per-cmd memfrag IOCTL counters render with hex cmd.
+func TestPrometheus_MemfragIOCTLCounters(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{
+		MemfragIOCTLCounters: []stats.MemfragIOCTLCounter{
+			{Cmd: 0xC0184601, Count: 100},
+			{Cmd: 0xC0184602, Count: 50},
+		},
+	})
+	body := scrapeMetrics(t, p)
+	for _, want := range []string{
+		"# TYPE gpu_memfrag_ioctl_event_total counter",
+		`gpu_memfrag_ioctl_event_total{cmd="0xC0184601"} 100`,
+		`gpu_memfrag_ioctl_event_total{cmd="0xC0184602"} 50`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in scrape body\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+// v0.15 item M: per-PID kernel-launch count + histograms render.
+func TestPrometheus_KernelLaunch(t *testing.T) {
+	p := NewPrometheus(":0")
+	tpb := stats.NewHistogram([]float64{32, 64, 128, 256, 512, 1024})
+	tpb.Observe(256)
+	tpb.Observe(512)
+	gb := stats.NewHistogram([]float64{1, 4, 16, 64, 256, 1024})
+	gb.Observe(64)
+	gb.Observe(128)
+	p.UpdateSnapshot(&stats.Snapshot{
+		KernelLaunches: []stats.KernelLaunchSnapshot{
+			{
+				PID:                 100,
+				Count:               2,
+				ThreadsPerBlockHist: tpb.Snapshot(),
+				GridBlocksHist:      gb.Snapshot(),
+			},
+		},
+	})
+	body := scrapeMetrics(t, p)
+	for _, want := range []string{
+		"# TYPE gpu_kernel_launch_count counter",
+		`gpu_kernel_launch_count{pid="100"} 2`,
+		"# TYPE gpu_kernel_launch_threads_per_block histogram",
+		`gpu_kernel_launch_threads_per_block_count{pid="100"} 2`,
+		`gpu_kernel_launch_threads_per_block_sum{pid="100"} 768`,
+		"# TYPE gpu_kernel_launch_grid_blocks histogram",
+		`gpu_kernel_launch_grid_blocks_count{pid="100"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in scrape body\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestPrometheus_KernelLaunch_SilentWhenEmpty(t *testing.T) {
+	p := NewPrometheus(":0")
+	p.UpdateSnapshot(&stats.Snapshot{})
+	body := scrapeMetrics(t, p)
+	if strings.Contains(body, "gpu_kernel_launch_") {
+		t.Errorf("empty snapshot should not emit kernel_launch metrics: %s", body)
+	}
+}
+
+func scrapeMetrics(t *testing.T, p *PrometheusServer) string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	p.handleMetrics(w, req)
+	body, _ := io.ReadAll(w.Result().Body)
+	return string(body)
+}
+

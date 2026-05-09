@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -122,7 +123,14 @@ func (p *PagerDuty) post(ctx context.Context, payload map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("pagerduty POST: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// v0.14 R3 ★4: bound response body read so a hostile or
+		// misconfigured upstream cannot return a multi-GB chunked
+		// body that the runtime would buffer before close. 64 KiB is
+		// far above any legitimate Events API response.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("pagerduty POST: status %d", resp.StatusCode)
 	}

@@ -116,3 +116,31 @@ func TestResolvePagerDutyRoutingKey_FlagEmptyExplicit(t *testing.T) {
 		t.Errorf("got %q; want '' (explicit empty flag must override YAML)", got)
 	}
 }
+
+// v0.15 item A: pagerduty_trigger gates on listener identity.
+func TestPagerDutyMCPEnabled_StdioModeAlways(t *testing.T) {
+	if !pagerDutyMCPEnabled("", "") {
+		t.Errorf("stdio mode (no http) should enable pagerduty_trigger by default; loopback by definition")
+	}
+	if !pagerDutyMCPEnabled("", "any-token") {
+		t.Errorf("stdio mode with bearer should also enable")
+	}
+}
+
+func TestPagerDutyMCPEnabled_HTTPRequiresBearer(t *testing.T) {
+	if pagerDutyMCPEnabled(":8080", "") {
+		t.Errorf("HTTP without bearer must NOT enable pagerduty_trigger (v0.14 R3 ★4 caveat)")
+	}
+	if pagerDutyMCPEnabled("0.0.0.0:8080", "") {
+		t.Errorf("HTTP on all-interfaces without bearer must stay gated")
+	}
+}
+
+func TestPagerDutyMCPEnabled_HTTPWithBearerEnables(t *testing.T) {
+	if !pagerDutyMCPEnabled(":8080", "secret-token") {
+		t.Errorf("HTTP + bearer should enable pagerduty_trigger; identity-bearing listener")
+	}
+	if !pagerDutyMCPEnabled("127.0.0.1:8080", "tok") {
+		t.Errorf("HTTP loopback + bearer should enable")
+	}
+}

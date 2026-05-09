@@ -1,4 +1,4 @@
-# Ingero OSS DaemonSet — runs one observability pod per GPU node.
+# Ingero OSS DaemonSet - runs one observability pod per GPU node.
 #
 # Prerequisites:
 #   - NVIDIA GPU Operator installed (provides nvidia.com/gpu.present label)
@@ -24,10 +24,10 @@ metadata:
     app.kubernetes.io/name: ingero
     app.kubernetes.io/component: observability
     # ingero-version:daemonset-image product=ingero channel=stable
-    app.kubernetes.io/version: "0.12.10"
+    app.kubernetes.io/version: "0.15.0"
 spec:
   # OnDelete: prevents eBPF event loss during rolling updates. Probes detach
-  # when the old pod dies — OnDelete lets the operator control upgrade pace.
+  # when the old pod dies - OnDelete lets the operator control upgrade pace.
   updateStrategy:
     type: OnDelete
   selector:
@@ -39,7 +39,7 @@ spec:
         app.kubernetes.io/name: ingero
         app.kubernetes.io/component: observability
         # ingero-version:daemonset-template-version product=ingero channel=stable
-        app.kubernetes.io/version: "0.12.10"
+        app.kubernetes.io/version: "0.15.0"
     spec:
       hostPID: true
       terminationGracePeriodSeconds: 30

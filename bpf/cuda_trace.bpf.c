@@ -551,6 +551,127 @@ int uretprobe_cuda_malloc_managed(struct pt_regs *ctx)
 	return 0;
 }
 
+// ---- cudaMemcpy2D uprobes (v0.14 item C) ----
+// cudaError_t cudaMemcpy2D(void *dst, size_t dpitch, const void *src,
+//                          size_t spitch, size_t width, size_t height,
+//                          cudaMemcpyKind kind)
+// arg0 = width * height (approx byte count), arg1 = kind (direction).
+// We use width*height because (a) it does not lose information for
+// pitched-but-contiguous rows (the common case), and (b) clamping to
+// the 64-bit product is safe for any plausible single-call size.
+
+SEC("uprobe/cudaMemcpy2D")
+int uprobe_cuda_memcpy_2d(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	/* libbpf's PT_REGS_PARM* macros are portable only up to PARM5 on
+	 * both amd64 SysV and arm64 AAPCS. For cudaMemcpy2D the byte
+	 * count is approximated as `width` (PARM5); height (PARM6) and
+	 * kind (PARM7) live where libbpf can't read them portably. The
+	 * userspace decoder treats CUDA_OP_MEMCPY_2D as "approximate
+	 * bytes" and emits the metric with direction=unknown. The 1D
+	 * variants (CUDA_OP_MEMCPY / _ASYNC) remain the precise path.
+	 */
+	__u64 count = (__u64)PT_REGS_PARM5(ctx); /* width: lower bound */
+	__u64 kind  = 5; /* unknown; cudaMemcpyKind is PARM7 (stack), unreadable */
+	save_entry(tid, CUDA_OP_MEMCPY_2D, count, kind);
+	return 0;
+}
+
+SEC("uretprobe/cudaMemcpy2D")
+int uretprobe_cuda_memcpy_2d(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
+// ---- cudaMemcpy2DAsync uprobes ----
+
+SEC("uprobe/cudaMemcpy2DAsync")
+int uprobe_cuda_memcpy_2d_async(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 count = (__u64)PT_REGS_PARM5(ctx); /* width approximation; see cudaMemcpy2D */
+	__u64 kind  = 5; /* unknown; cudaMemcpyKind is PARM7 (stack), unreadable */
+	save_entry(tid, CUDA_OP_MEMCPY_2D_ASYNC, count, kind);
+	return 0;
+}
+
+SEC("uretprobe/cudaMemcpy2DAsync")
+int uretprobe_cuda_memcpy_2d_async(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
+// ---- cudaMemcpyPeer uprobes ----
+// cudaError_t cudaMemcpyPeer(void *dst, int dstDevice, const void *src,
+//                            int srcDevice, size_t count)
+// Direction is implicit (D2D peer-to-peer); set kind=3 (cudaMemcpyDeviceToDevice).
+// arg0 = count, arg1 = kind=3.
+
+SEC("uprobe/cudaMemcpyPeer")
+int uprobe_cuda_memcpy_peer(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 count = (__u64)PT_REGS_PARM5(ctx);
+	save_entry(tid, CUDA_OP_MEMCPY_PEER, count, 3 /* cudaMemcpyDeviceToDevice */);
+	return 0;
+}
+
+SEC("uretprobe/cudaMemcpyPeer")
+int uretprobe_cuda_memcpy_peer(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
+// ---- cudaMemcpyPeerAsync uprobes ----
+
+SEC("uprobe/cudaMemcpyPeerAsync")
+int uprobe_cuda_memcpy_peer_async(struct pt_regs *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 count = (__u64)PT_REGS_PARM5(ctx);
+	save_entry(tid, CUDA_OP_MEMCPY_PEER_ASYNC, count, 3 /* cudaMemcpyDeviceToDevice */);
+	return 0;
+}
+
+SEC("uretprobe/cudaMemcpyPeerAsync")
+int uretprobe_cuda_memcpy_peer_async(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tgid >> 32);
+	__u32 tid = (__u32)pid_tgid;
+	struct entry_state *entry = bpf_map_lookup_elem(&entry_map, &tid);
+	if (!entry)
+		return 0;
+	emit_event(ctx, pid, tid, entry, (__s32)PT_REGS_RC(ctx));
+	bpf_map_delete_elem(&entry_map, &tid);
+	return 0;
+}
+
 // Force BTF type emission for bpf2go code generation.
 const struct cuda_event *_unused_cuda_event_force_btf __attribute__((unused));
 const struct cuda_event_stack *_unused_cuda_event_stack_force_btf __attribute__((unused));

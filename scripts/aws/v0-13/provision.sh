@@ -90,6 +90,21 @@ ensure_security_group() {
     if [[ -z "$op_ip" ]]; then
         abort "operator public IP came back empty"
     fi
+    # v0.15 item D (folds v0.14 R3 sec3): the value goes straight into
+    # an AWS SecurityGroup CidrIp; an HTML error body or captive-portal
+    # redirect from checkip.amazonaws.com would otherwise be passed as
+    # garbage to AWS, producing an opaque API error or, worse, an
+    # over-permissive SG rule. Reject any non-IPv4 string up front.
+    if ! [[ "$op_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        abort "operator public IP is not a valid IPv4 address: '$op_ip'"
+    fi
+    local o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$op_ip"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        if (( octet > 255 )); then
+            abort "operator public IP has octet > 255: '$op_ip'"
+        fi
+    done
     local sg_id
     sg_id=$(aws_cli ec2 create-security-group \
         --group-name "ingero-v0-13-$TAG_RUN_ID" \
