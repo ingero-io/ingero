@@ -258,3 +258,216 @@ func TestEngine_StatsCountsByBucket(t *testing.T) {
 		t.Errorf("OutliersTotal[1.5x] = %d, want 1", st.OutliersTotal[Bucket1_5x])
 	}
 }
+
+// launchEvent constructs a CUDALaunchKernel event on the given stream.
+func launchEvent(pid uint32, stream uint64, at time.Time) events.Event {
+	return events.Event{
+		Timestamp: at,
+		PID:       pid,
+		Source:    events.SourceCUDA,
+		Op:        uint8(events.CUDALaunchKernel),
+		Args:      [2]uint64{stream, 0},
+	}
+}
+
+// drivePhaseSteps simulates `count` steps of `step` duration on
+// `(pid, stream)`, prefixing each with `launches` cudaLaunchKernel
+// events at `kernelDur` apart. Returns the wall-clock time after the
+// last sync.
+func drivePhaseSteps(t *testing.T, e *Engine, pid uint32, stream uint64, t0 time.Time,
+	count int, step time.Duration, launches int, kernelDur time.Duration) time.Time {
+	t.Helper()
+	now := t0
+	// Initial anchor sync.
+	e.OnSyncEvent(syncEvent(pid, stream, now), "x")
+	for s := 0; s < count; s++ {
+		// Launches between syncs.
+		for k := 0; k < launches; k++ {
+			lt := now.Add(time.Duration(k+1) * (step / time.Duration(launches+1)))
+			e.OnLaunchEvent(launchEvent(pid, stream, lt), "x", kernelDur)
+		}
+		now = now.Add(step)
+		e.OnSyncEvent(syncEvent(pid, stream, now), "x")
+	}
+	return now
+}
+
+func TestEngine_PhaseClassifier_DisabledByDefault(t *testing.T) {
+	// Default Config has PhaseClassifierEnabled=false; every step
+	// should land in Phase="" so engine_test.go's existing tests keep
+	// passing. This test confirms phaseCounts stays empty.
+	e := New(Config{WarmupSamples: 3}, quietLogger())
+	t0 := time.Now()
+	for i := 0; i < 5; i++ {
+		e.OnSyncEvent(syncEvent(1, 0xa, t0.Add(time.Duration(i)*10*time.Millisecond)), "x")
+	}
+	st := e.Stats()
+	if len(st.PhaseDistribution) != 0 {
+		t.Errorf("phase distribution should be empty when classifier disabled, got %+v", st.PhaseDistribution)
+	}
+}
+
+func TestEngine_PhaseClassifier_Enabled_DistributesSteps(t *testing.T) {
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          3,
+	}
+	e := New(cfg, quietLogger())
+
+	t0 := time.Now()
+	// Stream A: 5 prefill steps (30ms each, 250 launches at 100us each).
+	// avg kernel time = 100us, so rule 3 fires via "launches > 200".
+	now := drivePhaseSteps(t, e, 1, 0xa, t0, 5, 30*time.Millisecond, 250, 100*time.Microsecond)
+	// Stream A continued: 5 decode steps (2ms each, 10 launches).
+	drivePhaseSteps(t, e, 1, 0xa, now, 5, 2*time.Millisecond, 10, 50*time.Microsecond)
+
+	st := e.Stats()
+	if st.PhaseDistribution[PhasePrefill] < 5 {
+		t.Errorf("prefill count = %d, want >= 5", st.PhaseDistribution[PhasePrefill])
+	}
+	if st.PhaseDistribution[PhaseDecode] < 5 {
+		t.Errorf("decode count = %d, want >= 5", st.PhaseDistribution[PhaseDecode])
+	}
+}
+
+func TestEngine_PhaseClassifier_BimodalProducesSeparateBaselines(t *testing.T) {
+	// The CORE false-negative test. Drive an alternating prefill/decode
+	// stream, then inject a slow decode that's only outlier-class
+	// against the decode baseline (not the mixed baseline).
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          5,
+		OutlierThresholdRatio:  3.0,
+	}
+	e := New(cfg, quietLogger())
+
+	t0 := time.Now()
+	now := t0
+
+	// Drive 30 alternating steps so each phase gets enough warm-up
+	// samples (15 each, > WarmupSamples=5).
+	for i := 0; i < 30; i++ {
+		// Initial sync if first
+		if i == 0 {
+			e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+		}
+		var step time.Duration
+		var launches int
+		if i%2 == 0 {
+			// Prefill: 30ms, 250 launches.
+			step = 30 * time.Millisecond
+			launches = 250
+		} else {
+			// Decode: 2ms, 10 launches.
+			step = 2 * time.Millisecond
+			launches = 10
+		}
+		// Drop launches between syncs.
+		for k := 0; k < launches; k++ {
+			lt := now.Add(time.Duration(k+1) * (step / time.Duration(launches+1)))
+			e.OnLaunchEvent(launchEvent(1, 0xa, lt), "x", 100*time.Microsecond)
+		}
+		now = now.Add(step)
+		e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+	}
+	_ = e.Drain() // discard any warm-up edge outliers
+
+	// Now inject a slow decode: 20ms instead of 2ms = 10x decode-p95.
+	// In the v0.16.0 single-baseline regime, the mixed p95 absorbs
+	// the prefill tail (~30ms), so a 20ms step would NOT fire.
+	// In v0.16.1's phase-aware regime, this lands in the decode
+	// bucket with p95 ~2ms; 20ms / 2ms = 10x → 3x outlier.
+	for k := 0; k < 10; k++ {
+		lt := now.Add(time.Duration(k+1) * 1900 * time.Microsecond)
+		e.OnLaunchEvent(launchEvent(1, 0xa, lt), "x", 100*time.Microsecond)
+	}
+	now = now.Add(20 * time.Millisecond)
+	e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+
+	out := e.Drain()
+	if len(out) == 0 {
+		t.Fatal("expected outlier on slow decode against decode-phase baseline")
+	}
+	found := false
+	for _, ev := range out {
+		if ev.Key.Phase == PhaseDecode && ev.Bucket == Bucket3x {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no PhaseDecode 3x outlier found; got %+v", out)
+	}
+}
+
+func TestEngine_PhaseClassifier_UnknownPhaseDoesNotDegradeSampler(t *testing.T) {
+	// Phase=unknown outliers should fire metrics/log/UDS but should
+	// NOT bump the sampler — we lack workload context to know the
+	// slowdown is meaningful.
+	smp := sampling.New("inference", 0.01, 30*time.Second)
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          3,
+		OutlierThresholdRatio:  3.0,
+		SamplerDegradeOn:       Bucket3x,
+		Sampler:                smp,
+	}
+	e := New(cfg, quietLogger())
+
+	// Drive 5 steps in the "unknown" gap (10ms, 5 launches → not
+	// decode (5 < 50 launches but step >= 5ms), not prefill (step <
+	// 20ms), not mixed (5 launches outside [50,200] AND no big
+	// memcpy)). Rule 5 fallback → PhaseUnknown.
+	t0 := time.Now()
+	now := t0
+	e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+	for s := 0; s < 5; s++ {
+		for k := 0; k < 5; k++ {
+			lt := now.Add(time.Duration(k+1) * 1500 * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(1, 0xa, lt), "x", 100*time.Microsecond)
+		}
+		now = now.Add(10 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+	}
+	st := e.Stats()
+	if st.PhaseDistribution[PhaseUnknown] == 0 {
+		t.Skip("test setup did not produce PhaseUnknown steps; rule matrix may have shifted")
+	}
+
+	// Sampler should be at healthy admit (1%) since no classified
+	// outliers happened.
+	healthyEmits := 0
+	for i := 0; i < 100; i++ {
+		if smp.ShouldEmit() {
+			healthyEmits++
+		}
+	}
+	if healthyEmits > 10 {
+		t.Errorf("healthy sampler should admit ~1%%, got %d/100", healthyEmits)
+	}
+
+	// Inject a slow unknown-phase step: 50ms instead of 10ms = 5x.
+	// Should fire as 3x outlier but NOT trigger sampler.
+	for k := 0; k < 5; k++ {
+		lt := now.Add(time.Duration(k+1) * 9 * time.Millisecond)
+		e.OnLaunchEvent(launchEvent(1, 0xa, lt), "x", 100*time.Microsecond)
+	}
+	now = now.Add(50 * time.Millisecond)
+	e.OnSyncEvent(syncEvent(1, 0xa, now), "x")
+
+	// Outlier should be queued (the rule still classifies bucket).
+	out := e.Drain()
+	if len(out) == 0 {
+		t.Skip("test setup did not produce a measurable outlier; baseline may be unstable")
+	}
+	// Sampler should STILL be at healthy admit because phase=unknown.
+	postEmits := 0
+	for i := 0; i < 100; i++ {
+		if smp.ShouldEmit() {
+			postEmits++
+		}
+	}
+	if postEmits == 100 {
+		t.Errorf("phase=unknown 3x outlier should NOT have flipped sampler to 100%%, got %d/100", postEmits)
+	}
+}

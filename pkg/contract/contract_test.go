@@ -136,3 +136,45 @@ func TestAPIPath_StartsWithSlash(t *testing.T) {
 		t.Errorf("ThresholdAPIPath = %q: must start with /", ThresholdAPIPath)
 	}
 }
+
+// TestOTelGenAISemconv_PinnedToV137 guards against silent drift if
+// the OTel GenAI semantic conventions change name on us. v0.16.2
+// pins to v1.37 (May 2026 experimental). When OTel GA lands, audit
+// each name against
+// https://opentelemetry.io/docs/specs/semconv/gen-ai/ and update
+// both this test AND the constants together — the test is a
+// build-time alarm, not a one-way ratchet.
+func TestOTelGenAISemconv_PinnedToV137(t *testing.T) {
+	want := map[string]string{
+		"MetricGenAITTFT":            "gen_ai.client.operation.time_to_first_token",
+		"MetricGenAITPOT":            "gen_ai.server.time_per_output_token",
+		"MetricGenAIRequestDuration": "gen_ai.client.operation.duration",
+		"MetricGenAIPrefillDuration": "gen_ai.server.request.duration.prefill",
+		"MetricGenAIDecodeDuration":  "gen_ai.server.request.duration.decode",
+		"MetricGenAITokenUsage":      "gen_ai.client.token.usage",
+		"AttrGenAISystem":            "gen_ai.system",
+		"AttrGenAIRequestModel":      "gen_ai.request.model",
+		"AttrGenAIResponseModel":     "gen_ai.response.model",
+		"AttrGenAIOperationName":     "gen_ai.operation.name",
+	}
+	got := map[string]string{
+		"MetricGenAITTFT":            MetricGenAITTFT,
+		"MetricGenAITPOT":            MetricGenAITPOT,
+		"MetricGenAIRequestDuration": MetricGenAIRequestDuration,
+		"MetricGenAIPrefillDuration": MetricGenAIPrefillDuration,
+		"MetricGenAIDecodeDuration":  MetricGenAIDecodeDuration,
+		"MetricGenAITokenUsage":      MetricGenAITokenUsage,
+		"AttrGenAISystem":            AttrGenAISystem,
+		"AttrGenAIRequestModel":      AttrGenAIRequestModel,
+		"AttrGenAIResponseModel":     AttrGenAIResponseModel,
+		"AttrGenAIOperationName":     AttrGenAIOperationName,
+	}
+	for name, expect := range want {
+		if got[name] != expect {
+			t.Errorf("OTel GenAI semconv drift: %s = %q, pinned %q; "+
+				"audit https://opentelemetry.io/docs/specs/semconv/gen-ai/ "+
+				"and update both contract.go and this test together",
+				name, got[name], expect)
+		}
+	}
+}

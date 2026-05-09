@@ -6,22 +6,32 @@ import (
 	"time"
 )
 
-// WorkloadKey identifies one inference workload bucket. v0.16 keys on
-// the cgroup path hash + the OS PID + the CUDA stream handle. Stream
-// handle is the BPF event Args[0] for sync events; in real serving
-// frameworks (PyTorch, vLLM, TGI, SGLang) distinct streams typically
-// correspond to distinct logical work paths (prefill / decode / copy)
-// and therefore have distinct healthy step distributions.
+// WorkloadKey identifies one inference workload bucket. v0.16.0 keyed
+// on (cgroup_path_hash, pid, stream_handle); v0.16.1 added the Phase
+// dimension so each (cgroup, pid, stream) workload has up to four
+// independent baselines (one per phase classification).
+//
+// Why phase is part of the key (not a label): a single P² baseline
+// that absorbs both prefill (~200ms) and decode (~5ms) steps from a
+// vLLM continuous-batching stream produces false negatives — a slow
+// decode under the prefill tail goes undetected. Splitting baselines
+// by phase makes each baseline unimodal and enables apples-to-apples
+// outlier comparison.
+//
+// Stream handle is the BPF event Args[0] for sync events; in real
+// serving frameworks (PyTorch, vLLM, TGI, SGLang) distinct streams
+// typically correspond to distinct logical work paths.
 //
 // Future revisions may add a kernel-fingerprint dimension (rolling
 // hash of kernel-name set per step) to cover the "two models in one
-// process on one stream" case; deferred from v0.16 because it adds
-// memory overhead and a noisy second baseline before AWS validation
-// shows the simpler key produces unstable buckets.
+// process on one stream on one phase" case; deferred from v0.16
+// because phase-awareness already eliminates the dominant
+// false-negative class.
 type WorkloadKey struct {
 	CGroupHash   string
 	PID          uint32
 	StreamHandle uint64
+	Phase        Phase
 }
 
 // workloadEntry is the LRU map's value cell. The list element pointer

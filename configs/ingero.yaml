@@ -153,6 +153,22 @@ inference:
     # Pause baseline updates while a causal chain at this severity or
     # higher is active for the PID. Set "" to disable.
     pause_on_severity: HIGH
+  # v0.16.1: phase-aware baselines split per-(cgroup,pid,stream)
+  # baselines into per-phase sub-baselines (prefill / decode / mixed
+  # / unknown). Eliminates false negatives on heterogeneous-task
+  # streams (vLLM continuous batching, single-stream PyTorch with
+  # mixed prompt sizes) by classifying each step from observable
+  # signals (kernel launches, NCCL participation, avg kernel
+  # duration) — duration-INVARIANT so a slow decode is still decode.
+  phase:
+    classifier: rule          # rule (default) | off
+    decode_max_launches: 50
+    decode_max_memcpy: 1m
+    prefill_min_launches: 200
+    prefill_min_avg_kernel: 500us
+    mixed_memcpy: 10m
+    mixed_launch_low: 50
+    mixed_launch_high: 200
   outlier:
     # Multiplier on baseline p95 for the LARGEST outlier bucket.
     # Smaller buckets fire at fixed 1.5x and 2x.
@@ -173,6 +189,20 @@ inference:
     # umbrella picks /tmp/ingero-trace-<pid>.log so stderr stays clean
     # for systemd / k8s log collectors.
     log_path: ""
+  # v0.16.2: engine /metrics scrape. Auto-detect vLLM/TGI/SGLang/
+  # Triton from the target PIDs' cmdlines and periodically pull
+  # /metrics. Maps engine-specific Prometheus names to OTel GenAI
+  # semantic conventions (gen_ai.client.operation.time_to_first_token,
+  # gen_ai.server.time_per_output_token, etc.) so any downstream
+  # consumer (Datadog, Grafana, Honeycomb, Arize) sees TTFT/TPOT
+  # without any Ingero-specific dashboard work.
+  scrape:
+    enabled: auto      # auto (default; auto-detect from cmdline) | off
+    interval: 10s
+    # Engine /metrics host. 127.0.0.1 covers same-pod deployments
+    # (the typical case). Override only for sidecar-on-different-host
+    # topologies.
+    host: "127.0.0.1"
 
 # Prometheus /metrics endpoint (optional, disabled by default)
 prometheus:

@@ -27,6 +27,8 @@ import (
 	"github.com/ingero-io/ingero/internal/discover"
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/infer"
+	"github.com/ingero-io/ingero/internal/infer/enginedetect"
+	"github.com/ingero-io/ingero/internal/infer/scrape"
 	"github.com/ingero-io/ingero/internal/kprobe"
 	"github.com/ingero-io/ingero/internal/sampling"
 	"github.com/ingero-io/ingero/internal/ebpf/blockio"
@@ -125,6 +127,20 @@ var (
 	traceInferenceOutlierRatio      float64
 	traceInferencePauseSeverity     string
 	traceInferenceSamplerDegradeOn  string
+
+	// v0.16.1 phase-classifier flags. Phase-aware baselines
+	// eliminate false negatives on heterogeneous-task streams
+	// (vLLM continuous batching, single-stream PyTorch with mixed
+	// prompt sizes). Default-on when --inference is engaged.
+	traceInferencePhaseClassifier      string // "rule" | "off"
+	traceInferencePhaseDecodeMaxLaunch int
+	traceInferencePhaseDecodeMaxMemcpy string // human size
+	traceInferencePhasePrefillMinLaunch int
+	traceInferencePhasePrefillMinAvgKern time.Duration
+	traceInferencePhaseMixedMemcpy       string // human size
+	traceInferencePhaseMixedLaunchLow    int
+	traceInferencePhaseMixedLaunchHigh   int
+
 	// inferEngine is the per-workload step-duration baseline +
 	// classifier. Constructed only when --inference is set.
 	inferEngine *infer.Engine
@@ -135,6 +151,16 @@ var (
 	// per-workload key on the infer engine matches the emitter's
 	// emission attribute. Constructed only when --inference is set.
 	inferCgroupCache *health.PIDCGroupHashCache
+
+	// v0.16.2 engine /metrics scrape flags.
+	traceInferenceScrape         string // auto | off
+	traceInferenceScrapeInterval time.Duration
+	traceInferenceScrapeHost     string // override of localhost for non-typical pod topologies
+
+	// inferScraper is the periodic engine /metrics scraper. Active
+	// only when --inference is set AND scrape mode is "auto" AND
+	// at least one engine PID is detected on the host.
+	inferScraper *scrape.Scraper
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -245,6 +271,40 @@ func init() {
 		"pause baseline updates while a causal chain at this severity or higher is active for the PID (HIGH | MEDIUM | LOW | empty to disable).")
 	traceCmd.Flags().StringVar(&traceInferenceSamplerDegradeOn, "inference-sampler-degrade-on", "3x",
 		"smallest outlier bucket that bumps the store sampler to admit 100%% of events (1.5x | 2x | 3x | off).")
+
+	// v0.16.1 phase classifier flags. Phase-aware baselines split the
+	// per-(cgroup, pid, stream) baseline by phase (prefill / decode /
+	// mixed / unknown), so a 10x slow decode is compared against the
+	// decode baseline (not the mixed-bucket p95 absorbed by prefill).
+	traceCmd.Flags().StringVar(&traceInferencePhaseClassifier, "inference-phase-classifier", "rule",
+		"per-step phase classifier mode: rule (default) | off. When off, all steps land in a single per-(cgroup,pid,stream) baseline, restoring v0.16.0 behavior.")
+	traceCmd.Flags().IntVar(&traceInferencePhaseDecodeMaxLaunch, "inference-phase-decode-max-launches", 50,
+		"a step is decode if launches < this AND memcpy < threshold AND no NCCL. Tighten for embedding/vision workloads.")
+	traceCmd.Flags().StringVar(&traceInferencePhaseDecodeMaxMemcpy, "inference-phase-decode-max-memcpy", "1m",
+		"max memcpy bytes for a decode step (e.g., 1m, 512k). Above this, the step lands in mixed.")
+	traceCmd.Flags().IntVar(&traceInferencePhasePrefillMinLaunch, "inference-phase-prefill-min-launches", 200,
+		"a step is prefill if launches > this OR avg-kernel > prefill-min-avg-kernel.")
+	traceCmd.Flags().DurationVar(&traceInferencePhasePrefillMinAvgKern, "inference-phase-prefill-min-avg-kernel", 500*time.Microsecond,
+		"a step is prefill if launches > prefill-min-launches OR avg kernel duration > this.")
+	traceCmd.Flags().StringVar(&traceInferencePhaseMixedMemcpy, "inference-phase-mixed-memcpy", "10m",
+		"a step is mixed if memcpy >= this (e.g., 10m, 50m).")
+	traceCmd.Flags().IntVar(&traceInferencePhaseMixedLaunchLow, "inference-phase-mixed-launch-low", 50,
+		"low end of the mixed-phase launch range (inclusive).")
+	traceCmd.Flags().IntVar(&traceInferencePhaseMixedLaunchHigh, "inference-phase-mixed-launch-high", 200,
+		"high end of the mixed-phase launch range (inclusive).")
+
+	// v0.16.2 engine /metrics scrape flags. When --inference is set
+	// and an engine (vLLM/TGI/SGLang/Triton) is detected on the host,
+	// the agent periodically pulls /metrics and translates engine-
+	// specific names to OTel GenAI semantic conventions
+	// (gen_ai.client.operation.time_to_first_token, etc). Downstream
+	// dashboards that already speak OTel GenAI light up automatically.
+	traceCmd.Flags().StringVar(&traceInferenceScrape, "inference-scrape", "auto",
+		"engine /metrics scraping: auto (default; auto-detect vLLM/TGI/SGLang/Triton from cmdline) | off.")
+	traceCmd.Flags().DurationVar(&traceInferenceScrapeInterval, "inference-scrape-interval", 10*time.Second,
+		"how often to scrape an engine's /metrics endpoint.")
+	traceCmd.Flags().StringVar(&traceInferenceScrapeHost, "inference-scrape-host", "127.0.0.1",
+		"host to scrape engine /metrics from. Defaults to 127.0.0.1 (engine in same pod). Set to a remote host only for sidecar-on-different-host topologies.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -910,6 +970,22 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		inferEngine, inferSampler = configureInferenceEngine(eventStore)
 		_ = inferSampler // captured via Engine config; reference here keeps compiler happy when the symbol is otherwise unused
 
+		// v0.16.2: engine /metrics scraper. Auto-detects vLLM/TGI/
+		// SGLang/Triton from the target PIDs' cmdlines and pulls
+		// /metrics every --inference-scrape-interval. Maps
+		// engine-specific Prometheus names to OTel GenAI semantic
+		// conventions (TTFT, TPOT, prefill/decode, token usage).
+		// No-op when --inference is off or --inference-scrape=off.
+		inferScraper = configureInferenceScraper(targetPIDs)
+		if inferScraper != nil {
+			go func() {
+				if err := inferScraper.Run(ctx); err != nil &&
+					err != context.Canceled {
+					debugf("infer scrape Run: %v", err)
+				}
+			}()
+		}
+
 		// Record session metadata (GPU model, driver, CPU, OS, etc.).
 		// These are ~1ms reads at startup — no overhead concern.
 		kernelVer, _ := discover.KernelVersion()
@@ -1083,6 +1159,20 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				// barrier-wait correlation against the next
 				// cudaStreamSynchronize on the same (pid, stream).
 				recordNCCLForBarrier(ev)
+
+				// v0.16.1: feed NCCL participation into the infer
+				// engine's phase classifier. NCCL on a stream is
+				// the strongest signal for prefill (tensor-parallel
+				// allreduce); the classifier fires rule 1 on any
+				// non-zero NCCL count. Engine method is no-op when
+				// the phase classifier is disabled.
+				if inferEngine != nil {
+					cgroupHash := ""
+					if inferCgroupCache != nil {
+						cgroupHash = inferCgroupCache.Resolve(ev.PID)
+					}
+					inferEngine.OnNCCLEvent(ev.PID, cgroupHash, ev.StreamHandle, time.Unix(0, int64(ev.TimestampNs)))
+				}
 			}
 			fmt.Fprintf(os.Stderr, "  NCCL tracing: %d events captured (%d dropped)\n", n, ncclTracer.Dropped())
 		}()
@@ -2879,17 +2969,37 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			// codes exercises the work path.
 			recordMemcpyEvent(evt)
 
-			// v0.16 inference baseliner. Engine.OnSyncEvent
-			// internally short-circuits on non-sync events, so the
-			// hot-path cost when a non-sync event arrives is one
-			// type-switch + one mutex Lock+Unlock. Active only when
-			// --inference is engaged (inferEngine is nil otherwise).
+			// v0.16 inference baseliner. Sync events drive the per-
+			// workload baseliner; v0.16.1 also feeds kernel-launch /
+			// memcpy / NCCL events into the phase classifier so the
+			// baseline split works (apples-to-apples comparison
+			// against the appropriate phase bucket). All hot-path
+			// methods short-circuit on non-relevant events.
 			if inferEngine != nil {
 				cgroupHash := ""
 				if inferCgroupCache != nil {
 					cgroupHash = inferCgroupCache.Resolve(evt.PID)
 				}
-				inferEngine.OnSyncEvent(evt, cgroupHash)
+				if evt.Source == events.SourceCUDA {
+					switch events.CUDAOp(evt.Op) {
+					case events.CUDAStreamSync, events.CUDADeviceSync:
+						inferEngine.OnSyncEvent(evt, cgroupHash)
+					case events.CUDALaunchKernel:
+						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
+					}
+					// NOTE on memcpy: events.CUDAMemcpy / CUDAMemcpyAsync
+					// carry byte count in Args[0], NOT stream handle, per
+					// pkg/events/types.go:550. The infer engine's per-
+					// stream observable keying needs the stream handle,
+					// which the BPF probe does not yet emit for memcpy.
+					// Until the probe gains that field (v0.16.x followup),
+					// the classifier runs without memcpy_bytes input —
+					// launches + NCCL + avg-kernel are sufficient to
+					// distinguish prefill / decode in practice.
+				} else if evt.Source == events.SourceDriver &&
+					events.DriverOp(evt.Op) == events.DriverCtxSync {
+					inferEngine.OnSyncEvent(evt, cgroupHash)
+				}
 			}
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
@@ -4069,6 +4179,11 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 		PauseOnSeverity:       traceInferencePauseSeverity,
 		SamplerDegradeOn:      infer.OutlierBucket(strings.ToLower(strings.TrimSpace(traceInferenceSamplerDegradeOn))),
 		Sampler:               smp,
+		// v0.16.1: phase-aware baseline split. Default-on (rule
+		// classifier) so the umbrella ships robust against
+		// heterogeneous-task streams without operator action.
+		PhaseClassifierEnabled: strings.ToLower(strings.TrimSpace(traceInferencePhaseClassifier)) != "off",
+		PhaseConfig:            buildPhaseConfig(),
 	}
 	if cfg.SamplerDegradeOn == "off" {
 		cfg.SamplerDegradeOn = infer.BucketNone
@@ -4079,6 +4194,93 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 	// (1024) matches the existing per-cgroup metrics LRU.
 	inferCgroupCache = health.NewPIDCGroupHashCache(0)
 	return eng, smp
+}
+
+// configureInferenceScraper constructs the periodic engine /metrics
+// scraper when --inference is set AND --inference-scrape is "auto".
+// The scraper auto-detects vLLM/TGI/SGLang/Triton against the
+// agent's target PID set; engines that aren't running yet at agent
+// startup are picked up on the next periodic re-scan (handled
+// elsewhere in this file).
+//
+// Returns nil + nil when scraping is disabled. Caller is responsible
+// for invoking Run() on a goroutine.
+func configureInferenceScraper(targetPIDs []int) *scrape.Scraper {
+	if !traceInference {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(traceInferenceScrape), "off") {
+		return nil
+	}
+
+	host := traceInferenceScrapeHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	sink := func(target scrape.Target, samples []scrape.ScrapedSample) {
+		// v0.16.2 ships the scrape primitives + sample channel; the
+		// OTLP exporter integration that emits these as OTel GenAI
+		// metric points is a separate v0.16.x story (the existing
+		// internal/export/otlp.go is the natural home but its
+		// extension is non-trivial). For now the sink logs at
+		// Debug-level so operators with --debug see the canonical
+		// names flowing — confirms the scraper is alive. Production
+		// emission lands in v0.16.3.
+		debugf("infer scrape: %s %d samples (PID %d, engine %s)",
+			target.URL(), len(samples), target.PID, target.Engine)
+	}
+
+	cfg := scrape.Config{
+		Interval: traceInferenceScrapeInterval,
+		// Timeout = min(interval/2, 5s) so the scraper never blocks
+		// past half its own interval.
+		Timeout: capDuration(traceInferenceScrapeInterval/2, 5*time.Second),
+	}
+	s := scrape.NewScraper(cfg, sink, slog.Default())
+
+	// Detect engines on the configured target PIDs. When --pid is
+	// not set, targetPIDs is empty and no scraping happens; the
+	// scraper still runs (idle) so dynamic re-detection in a
+	// follow-up commit doesn't need to construct it on the fly.
+	for _, pid := range targetPIDs {
+		if pid <= 0 {
+			continue
+		}
+		det, ok := enginedetect.Detect(uint32(pid))
+		if !ok {
+			continue
+		}
+		s.AddTarget(scrape.Target{
+			Engine: det.Engine,
+			Host:   host,
+			Port:   det.Port,
+			Path:   det.Engine.MetricsPath(),
+			PID:    uint32(pid),
+		})
+		fmt.Fprintf(os.Stderr, "  Inference: detected %s (PID %d, scraping http://%s:%d/metrics)\n",
+			det.Engine, pid, host, det.Port)
+	}
+	return s
+}
+
+// capDuration returns the smaller of a and b; a fallback of 1ms is
+// used when both are <= 0 to avoid degenerate zero-timeout HTTP
+// clients.
+func capDuration(a, b time.Duration) time.Duration {
+	if a <= 0 && b <= 0 {
+		return time.Millisecond
+	}
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // configureRollover wires the resolved rollover policy into the
@@ -4124,10 +4326,45 @@ func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev 
 			ev.BaselineP95Ns,
 			ev.BaselineMeanNs,
 			string(ev.Bucket),
+			string(ev.Key.Phase),
 		)
 	}
 	// OTLP histogram + counter emission goes through the existing
 	// stats / export pipelines on the next snapshot tick. The infer
 	// engine's Snapshot() and Stats() are read by the snapshot
 	// builder below; no per-outlier OTLP push is needed here.
+}
+
+// buildPhaseConfig assembles the infer.PhaseConfig from the v0.16.1
+// flag values. Human-friendly size strings (1m, 10m) are parsed via
+// the existing store.ParseSize helper so the syntax matches --max-db
+// and --db-rollover-size. Parse failures fall through to the
+// PhaseConfig.Resolved defaults — operator typos do not crash the
+// agent's startup, the phase classifier just runs with safer
+// thresholds and an INFO log alerts the operator.
+func buildPhaseConfig() infer.PhaseConfig {
+	cfg := infer.PhaseConfig{
+		DecodeMaxLaunches:    traceInferencePhaseDecodeMaxLaunch,
+		PrefillMinLaunches:   traceInferencePhasePrefillMinLaunch,
+		PrefillMinAvgKernel:  traceInferencePhasePrefillMinAvgKern,
+		MixedLaunchLow:       traceInferencePhaseMixedLaunchLow,
+		MixedLaunchHigh:      traceInferencePhaseMixedLaunchHigh,
+	}
+	if traceInferencePhaseDecodeMaxMemcpy != "" {
+		if n, err := store.ParseSize(traceInferencePhaseDecodeMaxMemcpy); err == nil {
+			cfg.DecodeMaxMemcpy = n
+		} else {
+			slog.Default().Warn("infer: --inference-phase-decode-max-memcpy parse failed, using default",
+				"value", traceInferencePhaseDecodeMaxMemcpy, "err", err.Error())
+		}
+	}
+	if traceInferencePhaseMixedMemcpy != "" {
+		if n, err := store.ParseSize(traceInferencePhaseMixedMemcpy); err == nil {
+			cfg.MixedMemcpyThreshold = n
+		} else {
+			slog.Default().Warn("infer: --inference-phase-mixed-memcpy parse failed, using default",
+				"value", traceInferencePhaseMixedMemcpy, "err", err.Error())
+		}
+	}
+	return cfg
 }

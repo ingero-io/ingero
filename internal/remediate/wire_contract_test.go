@@ -106,7 +106,7 @@ var Contract = []TypeContract{
 		},
 		Optional: []string{
 			"event_id", "cgroup_path_hash", "stream_handle",
-			"baseline_mean_ns", "rank", "world_size",
+			"baseline_mean_ns", "rank", "world_size", "phase",
 		},
 		goType: reflect.TypeOf(inferenceOutlierMessage{}),
 	},

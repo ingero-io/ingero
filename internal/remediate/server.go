@@ -347,6 +347,10 @@ type inferenceOutlierMessage struct {
 	CGroupPathHash string    `json:"cgroup_path_hash,omitempty"`
 	PID            uint32    `json:"pid"`
 	StreamHandle   uint64    `json:"stream_handle,omitempty"`
+	// Phase is the v0.16.1 phase classification: "prefill" |
+	// "decode" | "mixed" | "unknown" | "" (classifier disabled).
+	// Backward compatible — pre-v0.16.1 consumers ignore it.
+	Phase          string    `json:"phase,omitempty"`
 	StepDurationNs int64     `json:"step_duration_ns"`
 	BaselineP95Ns  int64     `json:"baseline_p95_ns"`
 	BaselineMeanNs int64     `json:"baseline_mean_ns,omitempty"`
@@ -407,6 +411,7 @@ func (s *Server) SendInferenceOutlier(
 	cgroupPathHash string, pid uint32, streamHandle uint64,
 	stepDurationNs, baselineP95Ns, baselineMeanNs int64,
 	bucket string,
+	phase string,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -425,6 +430,7 @@ func (s *Server) SendInferenceOutlier(
 		CGroupPathHash: cgroupPathHash,
 		PID:            pid,
 		StreamHandle:   streamHandle,
+		Phase:          phase,
 		StepDurationNs: stepDurationNs,
 		BaselineP95Ns:  baselineP95Ns,
 		BaselineMeanNs: baselineMeanNs,

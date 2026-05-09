@@ -317,6 +317,84 @@ The FOSS agent only publishes; consumers (the [ingero-ee orchestrator](https://g
 | `--db-rollover-size` / `inference.db_rollover.size` | `1g` | Trace DB file rollover threshold |
 | `--db-rollover-keep` / `inference.db_rollover.keep` | `6` | Rolled-over files retained on disk |
 
+### Phase-aware baselines (v0.16.1)
+
+A naive single-baseline-per-stream design produces **false negatives** on heterogeneous-task streams. A vLLM continuous-batching server interleaves prefill (~200ms, kernel-heavy) and decode (~5ms, sparse-launch) on one hot-path stream. The mixed-bucket p95 lands near the prefill tail (~180ms), so a 10× slow decode (50ms vs 5ms baseline) gets absorbed and never fires.
+
+v0.16.1 splits the per-`(cgroup, pid, stream)` baseline by **phase**, classifying each step from observable signals **before** the duration is compared to the baseline. The classifier is **duration-invariant**: a slow decode is still a decode (few launches, no memcpy, no NCCL), so it lands in the decode bucket and gets compared against the decode-phase p95.
+
+Phase set: `prefill` / `decode` / `mixed` / `unknown`.
+
+Rule order (first match wins; defaults LLM-tuned for 7B-70B serving):
+
+1. **NCCL > 0** → `prefill` (distributed tensor-parallel allreduce)
+2. **launches == 0 AND memcpy == 0** → `unknown` (idle-poll, not a real step)
+3. **avg_kernel > 500us** → `prefill` (compute-heavy GEMM-style)
+4. **launches > 200** → `prefill` (typical LLM attention/MLP layer count)
+5. **launches < 50 AND memcpy < 1 MiB** → `decode`
+6. **launches in [50, 200] OR memcpy >= 10 MiB** → `mixed`
+7. (anything else) → `unknown`
+
+`unknown`-classified steps participate in their own bucket but **do not** trigger sampler degradation — we lack workload context to know whether the slowdown is meaningful, so flipping to 100% admit on novel patterns would just burn storage.
+
+### Tuning the phase classifier
+
+| Flag / YAML key | Default | What it controls |
+|---|---|---|
+| `--inference-phase-classifier` / `inference.phase.classifier` | `rule` | `rule` (on) or `off` (revert to v0.16.0 single-baseline) |
+| `--inference-phase-decode-max-launches` / `inference.phase.decode_max_launches` | 50 | Decode if launches < this (and memcpy small, no NCCL) |
+| `--inference-phase-decode-max-memcpy` / `inference.phase.decode_max_memcpy` | `1m` | Above this, the step exits the decode bucket |
+| `--inference-phase-prefill-min-launches` / `inference.phase.prefill_min_launches` | 200 | Prefill if launches > this OR avg-kernel > threshold |
+| `--inference-phase-prefill-min-avg-kernel` / `inference.phase.prefill_min_avg_kernel` | `500us` | Prefill via fat-kernel branch |
+| `--inference-phase-mixed-memcpy` / `inference.phase.mixed_memcpy` | `10m` | Bulk memcpy threshold for mixed |
+| `--inference-phase-mixed-launch-low` / `inference.phase.mixed_launch_low` | 50 | Lower end of the mixed launch range (inclusive) |
+| `--inference-phase-mixed-launch-high` / `inference.phase.mixed_launch_high` | 200 | Upper end of the mixed launch range (inclusive) |
+
+Embedding, vision, and MoE workloads should tune individual thresholds — defaults are LLM-tuned and may misclassify other workloads (which fall to `unknown`, harmlessly).
+
+### Engine /metrics scrape + OTel GenAI (v0.16.2)
+
+The eBPF baseline answers "is this engine running about as fast as it usually does?" v0.16.2 layers on the engine's own canonical SLO metrics — TTFT (Time-To-First-Token), TPOT (Time-Per-Output-Token), prefill/decode latencies, token counts — by pulling the engine's `/metrics` endpoint and translating engine-specific Prometheus names to OTel GenAI semantic conventions.
+
+**Auto-detection**: at startup, the agent reads `/proc/<pid>/cmdline` for each `--pid` target and matches:
+
+| cmdline pattern | Engine | Default port |
+|---|---|---|
+| `vllm.entrypoints.openai.api_server` or `vllm serve` | vLLM | 8000 |
+| `text-generation-launcher` | TGI | 8080 |
+| `sglang.launch_server` | SGLang | 30000 |
+| `tritonserver` | Triton | 8002 |
+
+`--port`/`--http-port` flags on the cmdline override the default. NIM passes through vLLM's metric format unchanged, so it's covered by the vLLM detector.
+
+**Output**: scraped metrics emit on the same OTLP endpoint as the eBPF metrics, using OTel GenAI semconv (v1.37):
+
+| Engine name (vLLM example) | OTel GenAI canonical |
+|---|---|
+| `vllm:time_to_first_token_seconds` | `gen_ai.client.operation.time_to_first_token` |
+| `vllm:inter_token_latency_seconds` | `gen_ai.server.time_per_output_token` |
+| `vllm:e2e_request_latency_seconds` | `gen_ai.client.operation.duration` |
+| `vllm:request_prefill_time_seconds` | `gen_ai.server.request.duration.prefill` |
+| `vllm:request_decode_time_seconds` | `gen_ai.server.request.duration.decode` |
+| `vllm:prompt_tokens_total` | `gen_ai.client.token.usage.input` |
+| `vllm:generation_tokens_total` | `gen_ai.client.token.usage.output` |
+
+**Engine-down behavior**: if the engine isn't responding (cold start, restart, network blip), the scraper logs at Debug, increments `MetricInferScrapeFailures`, and keeps ticking. Layer 1 (eBPF) continues uninterrupted — the agent stays useful regardless of engine health.
+
+**One-line invocation** (vLLM example):
+
+```bash
+sudo ingero trace --inference --pid $(pgrep -f vllm.entrypoints) --otlp localhost:4318
+```
+
+Datadog Agent or OTel Collector receiving the OTLP exporter output sees both `ingero.infer.*` (eBPF baseline) and `gen_ai.*` (engine canonical SLO) metrics in the same ingestion. Existing Datadog LLM Observability dashboards (which speak OTel GenAI as of v1.37+) light up automatically with no Ingero-specific configuration.
+
+**What v0.16.2 does NOT include**:
+- TensorRT-LLM (no Prometheus endpoint; profiler-only)
+- Ray Serve (no canonical /metrics format)
+- Bespoke PyTorch endpoints (operator-defined; configure manually as a Prometheus scrape target)
+- Dynamic engine re-discovery during a long trace run (engines detected at startup; restart trace if you start a new engine mid-run)
+
 ### What's NOT in the v0.16 umbrella
 
 These are intentionally separate stories on the v0.16.x roadmap:

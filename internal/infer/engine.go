@@ -87,6 +87,23 @@ type Config struct {
 	// On overflow, oldest is dropped — same shape as the NCCL drain
 	// buffer in internal/cli/trace.go. Default 4096.
 	OutlierQueueCap int
+
+	// PhaseClassifierEnabled toggles phase-aware baselines. When
+	// true (default), each step's observable signals are read at
+	// sync-event time and ClassifyPhase decides which sub-baseline
+	// (per (cgroup, pid, stream, phase)) to update. When false,
+	// every step uses Phase="" and the engine reverts to v0.16.0
+	// single-baseline-per-stream behavior.
+	PhaseClassifierEnabled bool
+
+	// PhaseConfig holds the classifier thresholds. Empty fields
+	// resolve to LLM-tuned defaults via PhaseConfig.Resolved.
+	PhaseConfig PhaseConfig
+
+	// ObservableTTL bounds memory growth in the observable counter
+	// store. Entries idle longer than this duration are pruned on
+	// each Engine.Stats() call. Default 5 minutes.
+	ObservableTTL time.Duration
 }
 
 // resolved fills in defaults; called once at New.
@@ -115,6 +132,10 @@ func (c Config) resolved() Config {
 	if c.SamplerDegradeOn == BucketNone {
 		c.SamplerDegradeOn = Bucket3x
 	}
+	if c.ObservableTTL <= 0 {
+		c.ObservableTTL = 5 * time.Minute
+	}
+	c.PhaseConfig = c.PhaseConfig.Resolved()
 	return c
 }
 
@@ -138,6 +159,12 @@ type EngineStats struct {
 	Evictions        uint64
 	OutliersTotal    map[OutlierBucket]uint64
 	QueueDropped     uint64
+	// PhaseDistribution counts how many steps have been classified
+	// into each phase. Cumulative across the engine's lifetime.
+	// Useful for verifying the phase classifier is producing a
+	// reasonable distribution (e.g. for vLLM serving, expect
+	// roughly 1 prefill per N decodes).
+	PhaseDistribution map[Phase]uint64
 }
 
 // Engine is the per-workload step-duration baseline + outlier
@@ -155,16 +182,35 @@ type Engine struct {
 	mu       sync.Mutex
 	wmap     *workloadMap
 	severity *severityGate
-	lastSync map[WorkloadKey]time.Time
-	queue    []OutlierEvent
+
+	// lastSync is keyed by the observable tuple (cgroup, pid,
+	// stream) WITHOUT phase — we need the step duration before we
+	// can classify phase, so we look up lastSync by the un-phased
+	// key, compute step, then build the full WorkloadKey for the
+	// baseliner lookup.
+	lastSync map[observableKey]time.Time
+
+	// observables holds the kernel-launch / memcpy / NCCL counters
+	// per (cgroup, pid, stream), accumulated between consecutive
+	// syncs and read+reset at each sync. Phase classifier feeds on
+	// the snapshot returned by ResetAndRead.
+	observables *stepObservables
+
+	queue []OutlierEvent
 
 	// per-workload INFO log rate-limit. Mirrors the maybeLogAnomaly
-	// pattern in internal/health/loop.go:506-521.
+	// pattern in internal/health/loop.go:506-521. Keyed by the
+	// post-classification WorkloadKey so rate-limiting is per-phase.
 	lastLogAt map[WorkloadKey]time.Time
 
 	// Cumulative outlier counters per bucket. Engine-owned; emitter
 	// reads via Stats() and projects onto the OTLP cumulative counter.
 	outliers map[OutlierBucket]uint64
+
+	// phaseCounts tracks the cumulative classification distribution
+	// for telemetry. Lock-protected by mu (updated on the sync
+	// hot path).
+	phaseCounts map[Phase]uint64
 
 	// Cumulative count of events dropped because the queue was full
 	// when the producer tried to append. Surfaced via Stats().
@@ -193,15 +239,83 @@ func New(cfg Config, log *slog.Logger) *Engine {
 		cfg.SamplerDegradeOn = Bucket3x
 	}
 	return &Engine{
-		cfg:       cfg,
-		log:       log,
-		wmap:      newWorkloadMap(cfg.MaxWorkloads),
-		severity:  newSeverityGate(cfg.SeverityTTL),
-		lastSync:  make(map[WorkloadKey]time.Time, cfg.MaxWorkloads),
-		lastLogAt: make(map[WorkloadKey]time.Time),
-		outliers:  make(map[OutlierBucket]uint64, 3),
-		pauseRank: parseSeverity(cfg.PauseOnSeverity),
+		cfg:         cfg,
+		log:         log,
+		wmap:        newWorkloadMap(cfg.MaxWorkloads),
+		severity:    newSeverityGate(cfg.SeverityTTL),
+		lastSync:    make(map[observableKey]time.Time, cfg.MaxWorkloads),
+		observables: newStepObservables(),
+		lastLogAt:   make(map[WorkloadKey]time.Time),
+		outliers:    make(map[OutlierBucket]uint64, 4),
+		phaseCounts: make(map[Phase]uint64, 4),
+		pauseRank:   parseSeverity(cfg.PauseOnSeverity),
 	}
+}
+
+// OnLaunchEvent records a cudaLaunchKernel event between syncs. The
+// (cgroup, pid, stream) observable counters accumulate; the phase
+// classifier reads them at step-boundary (next sync). cgroupHash is
+// the resolved cgroup_path_hash for the event's PID. kernelDuration
+// is the per-event duration that the BPF probe measured.
+//
+// Hot path; no allocations beyond map insert on first event for a
+// new key. No-op when the engine's phase classifier is disabled.
+func (e *Engine) OnLaunchEvent(evt events.Event, cgroupHash string, kernelDuration time.Duration) {
+	if !e.cfg.PhaseClassifierEnabled {
+		return
+	}
+	if evt.Source != events.SourceCUDA {
+		return
+	}
+	switch events.CUDAOp(evt.Op) {
+	case events.CUDALaunchKernel:
+		// allowed
+	default:
+		return
+	}
+	e.observables.AddLaunch(observableKey{
+		CGroupHash:   cgroupHash,
+		PID:          evt.PID,
+		StreamHandle: evt.Args[0],
+	}, kernelDuration, evt.Timestamp)
+}
+
+// OnMemcpyEvent records a cudaMemcpy / cudaMemcpyAsync event. bytes
+// is taken from the BPF event's Args[0] (per cuda_trace.bpf.c). No
+// direction differentiation — the phase classifier only checks
+// total bytes moved per step.
+func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64) {
+	if !e.cfg.PhaseClassifierEnabled {
+		return
+	}
+	if evt.Source != events.SourceCUDA {
+		return
+	}
+	switch events.CUDAOp(evt.Op) {
+	case events.CUDAMemcpy, events.CUDAMemcpyAsync:
+		// allowed
+	default:
+		return
+	}
+	e.observables.AddMemcpy(observableKey{
+		CGroupHash:   cgroupHash,
+		PID:          evt.PID,
+		StreamHandle: evt.Args[0],
+	}, bytes, evt.Timestamp)
+}
+
+// OnNCCLEvent records participation in an NCCL collective during
+// a step. The classifier treats any non-zero NCCL count as a strong
+// prefill signal (rule 1).
+func (e *Engine) OnNCCLEvent(pid uint32, cgroupHash string, streamHandle uint64, at time.Time) {
+	if !e.cfg.PhaseClassifierEnabled {
+		return
+	}
+	e.observables.AddNCCL(observableKey{
+		CGroupHash:   cgroupHash,
+		PID:          pid,
+		StreamHandle: streamHandle,
+	}, at)
 }
 
 // OnSyncEvent processes one cudaStreamSynchronize / cudaDeviceSync /
@@ -210,13 +324,20 @@ func New(cfg Config, log *slog.Logger) *Engine {
 // or cgroup cache). Empty cgroupHash is allowed; it produces a
 // "unattributable" workload bucket but the baseline still tracks.
 //
-// The hot path: lookup last sync for this key; compute delta; gate
-// on severity; classify or warmup-update; enqueue outlier if any.
+// The hot path:
+//  1. Lookup last sync for the (cgroup, pid, stream) observable
+//     tuple; compute step duration.
+//  2. ResetAndRead the observable counters accumulated since the
+//     prior sync.
+//  3. ClassifyPhase from the observables (when enabled). Build the
+//     full WorkloadKey including phase.
+//  4. Gate on severity. Look up the per-(workload, phase) baseliner.
+//  5. Update baseline, or classify outlier, or both.
 func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	if !isSyncEvent(evt) {
 		return
 	}
-	key := WorkloadKey{
+	obsKey := observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
 		StreamHandle: evt.Args[0],
@@ -224,9 +345,15 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	now := evt.Timestamp
 
 	e.mu.Lock()
-	prev, hadPrev := e.lastSync[key]
-	e.lastSync[key] = now
+	prev, hadPrev := e.lastSync[obsKey]
+	e.lastSync[obsKey] = now
 	e.mu.Unlock()
+
+	// Always reset observables on a sync, even on the first sync —
+	// otherwise launch/memcpy/NCCL events that arrived before the
+	// first sync would leak into the second step's classification.
+	obs := e.observables.ResetAndRead(obsKey, now)
+
 	if !hadPrev {
 		return
 	}
@@ -247,6 +374,34 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	if e.severity.IsAtLeast(evt.PID, e.pauseRank, now) {
 		return
 	}
+
+	// Classify the step into a phase. When the classifier is
+	// disabled, every step lands in the empty-string phase bucket
+	// (preserving v0.16.0 single-baseline-per-stream behavior).
+	phase := Phase("")
+	if e.cfg.PhaseClassifierEnabled {
+		phase = ClassifyPhase(
+			step,
+			obs.LaunchCount,
+			obs.TotalKernelNs,
+			obs.MemcpyBytes,
+			obs.NCCLCount,
+			e.cfg.PhaseConfig,
+		)
+	}
+
+	key := WorkloadKey{
+		CGroupHash:   obsKey.CGroupHash,
+		PID:          obsKey.PID,
+		StreamHandle: obsKey.StreamHandle,
+		Phase:        phase,
+	}
+
+	e.mu.Lock()
+	if e.cfg.PhaseClassifierEnabled {
+		e.phaseCounts[phase]++
+	}
+	e.mu.Unlock()
 
 	bl := e.wmap.GetOrCreate(key, now)
 
@@ -274,6 +429,12 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	// Outlier: do NOT fold (preserves baseline cleanliness during
 	// extended anomaly windows). Enqueue, count, log (rate-limited),
 	// optionally degrade the sampler.
+	//
+	// Phase=unknown steps fire outliers normally (so operators see
+	// the anomaly) but DO NOT trigger sampler degradation: we lack
+	// the workload context to know whether a slowdown is meaningful,
+	// so flipping the sampler to 100% would cause unnecessary
+	// storage pressure on novel patterns.
 	ev := OutlierEvent{
 		Key:            key,
 		StepDurationNs: step.Nanoseconds(),
@@ -285,7 +446,9 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	}
 	e.enqueueOutlier(ev)
 	e.maybeLogOutlier(ev)
-	e.maybeDegradeSampler(bucket)
+	if !e.cfg.PhaseClassifierEnabled || phase.IsClassified() {
+		e.maybeDegradeSampler(bucket)
+	}
 }
 
 // OnChainSnapshot updates the per-PID severity gate from the latest
@@ -329,17 +492,25 @@ func (e *Engine) Snapshot() []workloadSnapshot {
 }
 
 // Stats returns cumulative engine telemetry. Engine clears nothing
-// — values are monotonic. The returned map is a copy; the caller may
-// mutate it freely.
+// — values are monotonic. The returned maps are copies; the caller
+// may mutate them freely.
+//
+// Side effect: prunes stale observable counters (entries idle longer
+// than cfg.ObservableTTL). The snapshot loop is the natural cadence
+// for this — once per snapshot tick is plenty.
 func (e *Engine) Stats() EngineStats {
 	e.mu.Lock()
 	out := EngineStats{
-		WorkloadsTracked: e.wmap.Len(),
-		QueueDropped:     e.queueDropped,
-		OutliersTotal:    make(map[OutlierBucket]uint64, len(e.outliers)),
+		WorkloadsTracked:  e.wmap.Len(),
+		QueueDropped:      e.queueDropped,
+		OutliersTotal:     make(map[OutlierBucket]uint64, len(e.outliers)),
+		PhaseDistribution: make(map[Phase]uint64, len(e.phaseCounts)),
 	}
 	for k, v := range e.outliers {
 		out.OutliersTotal[k] = v
+	}
+	for k, v := range e.phaseCounts {
+		out.PhaseDistribution[k] = v
 	}
 	e.mu.Unlock()
 
@@ -350,6 +521,15 @@ func (e *Engine) Stats() EngineStats {
 		e.log.Warn("infer: workload LRU evicting; consider increasing capacity",
 			"capacity", e.cfg.MaxWorkloads)
 		e.wmap.ClearEvictionFlag()
+	}
+
+	// Prune observable counters that have not seen activity within
+	// the TTL. Bounds memory in the face of LRU evictions on the
+	// workload map. observables.PruneStale takes its own lock; do
+	// not hold e.mu during this call to avoid contention with the
+	// hot path.
+	if e.observables != nil {
+		e.observables.PruneStale(time.Now(), e.cfg.ObservableTTL)
 	}
 	return out
 }

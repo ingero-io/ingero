@@ -130,6 +130,71 @@ const (
 	// (cgroup_path_hash, pid, stream_handle) workloads currently held
 	// in the agent's bounded LRU. Gauge, no per-workload attributes.
 	MetricInferWorkloadsTracked = "ingero.infer.workloads_tracked"
+
+	// v0.16.2 OTel GenAI semantic-convention metric names. The
+	// agent's engine /metrics scraper (internal/infer/scrape) maps
+	// engine-specific Prometheus names (vllm:time_to_first_token_seconds,
+	// tgi_request_duration, sglang_request_latency, etc.) into these
+	// canonical names so any downstream consumer (Datadog, Grafana,
+	// Honeycomb, Arize) sees a unified TTFT/TPOT surface regardless
+	// of which engine is running locally.
+	//
+	// Pinned to OTel semconv v1.37 (2026-05). A CI test in
+	// pkg/contract/contract_test.go flags drift if the upstream spec
+	// renames any of these. When OTel GA lands, retest and bump.
+	// Source: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+
+	// MetricGenAITTFT is the histogram of Time-To-First-Token in
+	// seconds. The user-perceived prefill SLO for chat completions.
+	MetricGenAITTFT = "gen_ai.client.operation.time_to_first_token"
+
+	// MetricGenAITPOT is the histogram of Time-Per-Output-Token in
+	// seconds. The user-perceived decode SLO; memory-bandwidth-bound.
+	MetricGenAITPOT = "gen_ai.server.time_per_output_token"
+
+	// MetricGenAIRequestDuration is the histogram of end-to-end
+	// request latency in seconds. From request arrival to final
+	// token delivered.
+	MetricGenAIRequestDuration = "gen_ai.client.operation.duration"
+
+	// MetricGenAIPrefillDuration is the histogram of prefill-phase
+	// latency in seconds. Operator-diagnostic per-phase split.
+	MetricGenAIPrefillDuration = "gen_ai.server.request.duration.prefill"
+
+	// MetricGenAIDecodeDuration is the histogram of decode-phase
+	// latency in seconds. Operator-diagnostic per-phase split.
+	MetricGenAIDecodeDuration = "gen_ai.server.request.duration.decode"
+
+	// MetricGenAITokenUsage is the histogram of input + output token
+	// counts per request. v0.16.2 maps engine-specific counters
+	// (vllm:prompt_tokens_total, vllm:generation_tokens_total) to
+	// the corresponding .input / .output sub-metric.
+	MetricGenAITokenUsage = "gen_ai.client.token.usage"
+)
+
+// OTel GenAI semantic-convention attribute keys. Pinned to v1.37.
+const (
+	// AttrGenAISystem identifies the inference engine ("vllm" |
+	// "tgi" | "sglang" | "triton") on every gen_ai.* sample.
+	AttrGenAISystem = "gen_ai.system"
+
+	// AttrGenAIRequestModel and AttrGenAIResponseModel carry the
+	// model identifier the engine reports. Often the same value;
+	// some engines (NIM, Triton) distinguish requested vs served
+	// model.
+	AttrGenAIRequestModel  = "gen_ai.request.model"
+	AttrGenAIResponseModel = "gen_ai.response.model"
+
+	// AttrGenAIOperationName labels the operation kind ("chat",
+	// "completion", "embedding"). Mostly informational at the
+	// scraper layer; engines don't always emit it.
+	AttrGenAIOperationName = "gen_ai.operation.name"
+
+	// AttrIngeroEnginePID is the agent-emitted attribute that ties
+	// scraped gen_ai.* samples back to the eBPF-side workload key
+	// (the (cgroup, pid, stream) tuple the infer engine baselines).
+	// Custom (ingero-prefixed) — not a semconv attribute.
+	AttrIngeroEnginePID = "ingero.engine.pid"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -191,6 +256,16 @@ const (
 	// exclusive at emission; SLO-style "exceeded 1.5x or higher" math
 	// happens at PromQL/Grafana time over the cumulative counter sums.
 	AttrInferOutlierBucket = "ingero.infer.outlier_bucket"
+
+	// AttrInferPhase labels MetricInfer* data points with the
+	// observed phase of the step. Allowed values: "prefill" |
+	// "decode" | "mixed" | "unknown". v0.16.1: per-phase baselines
+	// split the per-(cgroup, pid, stream) baseline so a slow decode
+	// is compared against the decode-phase p95 (not a mixed-bucket
+	// p95 absorbed by prefill steps). When the phase classifier is
+	// disabled (operator passes --inference-phase-classifier=off),
+	// the attribute is the empty string.
+	AttrInferPhase = "ingero.infer.phase"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:
