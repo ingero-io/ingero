@@ -252,11 +252,17 @@ func New(cfg Config, log *slog.Logger) *Engine {
 	}
 }
 
-// OnLaunchEvent records a cudaLaunchKernel event between syncs. The
-// (cgroup, pid, stream) observable counters accumulate; the phase
-// classifier reads them at step-boundary (next sync). cgroupHash is
-// the resolved cgroup_path_hash for the event's PID. kernelDuration
-// is the per-event duration that the BPF probe measured.
+// OnLaunchEvent records a cudaLaunchKernel event between syncs.
+// Observable counters accumulate at the (cgroup, pid) level —
+// stream=0 sentinel — because today's BPF probe puts the kernel
+// function pointer in Args[0], NOT the stream handle (per
+// bpf/cuda_trace.bpf.c:368). cudaMemcpy similarly carries byte
+// count (Args[0]) and direction (Args[1]) but no stream. Until a
+// BPF extension threads the stream through these events, phase
+// classification is per-PID rather than per-stream — a documented
+// v0.16.x limitation that's acceptable for the common case
+// (single inference engine per pod) and degraded but functional
+// for multi-stream serving.
 //
 // Hot path; no allocations beyond map insert on first event for a
 // new key. No-op when the engine's phase classifier is disabled.
@@ -276,14 +282,15 @@ func (e *Engine) OnLaunchEvent(evt events.Event, cgroupHash string, kernelDurati
 	e.observables.AddLaunch(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
-		StreamHandle: evt.Args[0],
+		StreamHandle: 0, // PID-level aggregation; see func comment
 	}, kernelDuration, evt.Timestamp)
 }
 
 // OnMemcpyEvent records a cudaMemcpy / cudaMemcpyAsync event. bytes
 // is taken from the BPF event's Args[0] (per cuda_trace.bpf.c). No
 // direction differentiation — the phase classifier only checks
-// total bytes moved per step.
+// total bytes moved per step. Aggregates at PID level for the same
+// reason as OnLaunchEvent (no stream in the BPF event today).
 func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64) {
 	if !e.cfg.PhaseClassifierEnabled {
 		return
@@ -300,21 +307,27 @@ func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64)
 	e.observables.AddMemcpy(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
-		StreamHandle: evt.Args[0],
+		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
 	}, bytes, evt.Timestamp)
 }
 
 // OnNCCLEvent records participation in an NCCL collective during
 // a step. The classifier treats any non-zero NCCL count as a strong
 // prefill signal (rule 1).
+//
+// streamHandle parameter is accepted but currently dropped — see
+// OnLaunchEvent comment for the rationale (PID-level observable
+// aggregation in v0.16.x). When the BPF probe extension lands, this
+// reverts to per-stream attribution.
 func (e *Engine) OnNCCLEvent(pid uint32, cgroupHash string, streamHandle uint64, at time.Time) {
+	_ = streamHandle
 	if !e.cfg.PhaseClassifierEnabled {
 		return
 	}
 	e.observables.AddNCCL(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          pid,
-		StreamHandle: streamHandle,
+		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
 	}, at)
 }
 
@@ -337,22 +350,37 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	if !isSyncEvent(evt) {
 		return
 	}
-	obsKey := observableKey{
+	// streamKey carries the actual sync stream pointer for the per-
+	// (cgroup, pid, stream) lastSync map and the eventual WorkloadKey.
+	// Keeps separate baselines for separate streams (vLLM/TGI prefill
+	// vs decode streams stay distinct).
+	streamKey := observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
 		StreamHandle: evt.Args[0],
 	}
+	// pidKey is the PID-level observable bucket — that's where
+	// OnLaunchEvent / OnMemcpyEvent / OnNCCLEvent accumulate today,
+	// since the BPF probes for those events don't carry the stream.
+	// When the BPF probe is extended (v0.16.x followup), this folds
+	// back into streamKey.
+	pidKey := observableKey{
+		CGroupHash:   cgroupHash,
+		PID:          evt.PID,
+		StreamHandle: 0,
+	}
 	now := evt.Timestamp
 
 	e.mu.Lock()
-	prev, hadPrev := e.lastSync[obsKey]
-	e.lastSync[obsKey] = now
+	prev, hadPrev := e.lastSync[streamKey]
+	e.lastSync[streamKey] = now
 	e.mu.Unlock()
 
 	// Always reset observables on a sync, even on the first sync —
 	// otherwise launch/memcpy/NCCL events that arrived before the
 	// first sync would leak into the second step's classification.
-	obs := e.observables.ResetAndRead(obsKey, now)
+	// Read from the PID-level bucket where launches accumulated.
+	obs := e.observables.ResetAndRead(pidKey, now)
 
 	if !hadPrev {
 		return
@@ -391,9 +419,9 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	}
 
 	key := WorkloadKey{
-		CGroupHash:   obsKey.CGroupHash,
-		PID:          obsKey.PID,
-		StreamHandle: obsKey.StreamHandle,
+		CGroupHash:   streamKey.CGroupHash,
+		PID:          streamKey.PID,
+		StreamHandle: streamKey.StreamHandle,
 		Phase:        phase,
 	}
 
@@ -586,6 +614,7 @@ func (e *Engine) maybeLogOutlier(ev OutlierEvent) {
 		"cgroup", ev.Key.CGroupHash,
 		"pid", ev.Key.PID,
 		"stream", ev.Key.StreamHandle,
+		"phase", string(ev.Key.Phase),
 		"bucket", string(ev.Bucket),
 		"step_ns", ev.StepDurationNs,
 		"baseline_p95_ns", ev.BaselineP95Ns,

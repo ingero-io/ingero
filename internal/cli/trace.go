@@ -3638,6 +3638,32 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 			// v0.14 item C: per-direction memcpy aggregator.
 			recordMemcpyEvent(evt)
 
+			// v0.16 inference baseliner. Mirror of the hook in the
+			// other event loop above (~line 2978). Both loops feed
+			// the same engine because the agent runs ONE loop per
+			// invocation (chosen at startup based on stack-tracing
+			// configuration); without this duplication the engine
+			// silently sees zero sync events on the --json / no-
+			// stack-trace path. Surfaced during AWS validation
+			// 2026-05-09.
+			if inferEngine != nil {
+				cgroupHash := ""
+				if inferCgroupCache != nil {
+					cgroupHash = inferCgroupCache.Resolve(evt.PID)
+				}
+				if evt.Source == events.SourceCUDA {
+					switch events.CUDAOp(evt.Op) {
+					case events.CUDAStreamSync, events.CUDADeviceSync:
+						inferEngine.OnSyncEvent(evt, cgroupHash)
+					case events.CUDALaunchKernel:
+						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
+					}
+				} else if evt.Source == events.SourceDriver &&
+					events.DriverOp(evt.Op) == events.DriverCtxSync {
+					inferEngine.OnSyncEvent(evt, cgroupHash)
+				}
+			}
+
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
 				memTracker.ProcessEvent(evt)
