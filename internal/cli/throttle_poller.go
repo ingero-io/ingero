@@ -115,6 +115,7 @@ func pollOnce(ctx context.Context, run nvml.Runner, log *slog.Logger) {
 		log.Debug("throttle poller: query failed", "err", err)
 		return
 	}
+	var orFolded uint64
 	for _, r := range readings {
 		if r.Err != nil {
 			if errors.Is(r.Err, nvml.ErrNotSupported) {
@@ -137,7 +138,14 @@ func pollOnce(ctx context.Context, run nvml.Runner, log *slog.Logger) {
 		// gpu.throttle.{power,thermal,sw,hw}.event_total. Sub-poll
 		// bursts are still missed by design (same floor as the gauge).
 		throttleEdgeDetector.Observe(r.UUID, r.Buckets)
+		orFolded |= r.Bitmask
 	}
+	// v0.16.3: publish the OR-fold so the inference engine's
+	// throttleReader can read the latest bitmap when an outlier
+	// fires. Always store, even when zero - that's how we transition
+	// the inference outlier context from "throttle was active" to
+	// "throttle has cleared" without the engine needing TTL logic.
+	updateCurrentThrottleReasons(orFolded)
 }
 
 // throttleEdgeDetector is the process-wide edge detector fed from

@@ -3,12 +3,14 @@ package infer
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/sampling"
+	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/pkg/events"
 )
 
@@ -142,6 +144,14 @@ func (c Config) resolved() Config {
 // OutlierEvent is one classified step that exceeded its baseline.
 // Drained from Engine on each snapshot tick and emitted to OTLP +
 // Prometheus + (when --remediate is on) the UDS socket.
+//
+// MemfragEvents and ThrottleReasons are v0.16.3 contextual fields:
+// MemfragEvents is the count of NVIDIA memfrag IOCTL events observed
+// during the step (KV cache pressure indicator); ThrottleReasons is
+// the OR-fold of NVML clock-throttle bitmaps observed during the step
+// (non-zero means a thermal/power slowdown coincided with the step).
+// MinSMClockMHz is reserved for a future v0.16.x extension that pulls
+// SM clock from the existing throttle poller; populated as 0 today.
 type OutlierEvent struct {
 	Key            WorkloadKey
 	StepDurationNs int64
@@ -150,6 +160,25 @@ type OutlierEvent struct {
 	Bucket         OutlierBucket
 	At             time.Time
 	EventID        string // UUIDv4-shaped, opaque, for cross-channel correlation
+
+	MemfragEvents    uint32
+	ThrottleReasons  uint64
+	MinSMClockMHz    uint32
+}
+
+// SamplerDegradedEvent fires when the engine flips the store sampler
+// from healthy to degraded (admit 100%) on a fresh outlier. v0.16.3
+// adds this as a sibling to OutlierEvent so operators see the cause
+// + cooldown end on the UDS socket and as OTLP metrics, instead of
+// only learning "the sampler degraded again" by inspecting per-event
+// JSON. CooldownEnd is when the sampler will return to healthy
+// admission absent another trigger.
+type SamplerDegradedEvent struct {
+	Key         WorkloadKey
+	Bucket      OutlierBucket
+	At          time.Time
+	CooldownEnd time.Time
+	Cause       string // human-friendly summary, also used as AttrInferSamplerCause
 }
 
 // EngineStats is a snapshot of cumulative engine telemetry. Returned
@@ -165,6 +194,27 @@ type EngineStats struct {
 	// reasonable distribution (e.g. for vLLM serving, expect
 	// roughly 1 prefill per N decodes).
 	PhaseDistribution map[Phase]uint64
+
+	// v0.16.3: sampler-degradation state surface.
+	// SamplerDegraded is true while the store sampler is in degraded
+	// (100% admit) state; the field flips back to false once the
+	// configured cooldown elapses. SamplerDegradationsTotal counts
+	// every flip-to-degraded transition since engine start (lossless
+	// edge counter so back-to-back degrades are visible). LastCause
+	// is a human-friendly summary of the most recent flip
+	// ("3x:cgroup=<hash>,pid=<n>,phase=<p>"). SamplerDegradedUntil is
+	// the wall-clock time the cooldown ends; zero when no degradation
+	// has fired yet.
+	SamplerDegraded         bool
+	SamplerDegradationsTotal uint64
+	LastDegradationCause    string
+	SamplerDegradedUntil    time.Time
+
+	// v0.16.3: ThrottleAtOutlier is the cumulative count of outliers
+	// whose ThrottleReasons was non-zero, broken down by bucket. Lets
+	// dashboards distinguish "outliers caused by thermal slowdown"
+	// from background outliers without joining gauge time series.
+	ThrottleAtOutlier map[OutlierBucket]uint64
 }
 
 // Engine is the per-workload step-duration baseline + outlier
@@ -219,7 +269,40 @@ type Engine struct {
 	// pauseRank is the cached rank threshold parsed once from cfg so
 	// the hot path doesn't re-parse a string per sync event.
 	pauseRank severityRank
+
+	// v0.16.3 sampler-degradation observability state. Mirrors the
+	// fields documented on EngineStats; lock-protected by mu.
+	samplerDegradedUntil    time.Time
+	samplerDegradationsCnt  uint64
+	samplerLastCause        string
+	throttleAtOutlier       map[OutlierBucket]uint64
+
+	// v0.16.3 sampler-degraded event queue. Drained by Engine.DrainSampler
+	// at the same cadence as DrainOutliers. Bounded by samplerQueueCap
+	// so a flapping degrade loop does not grow unbounded.
+	samplerQueue []SamplerDegradedEvent
+
+	// v0.16.3 throttle reader hook. Set by the agent (cli/trace.go)
+	// after Engine.New so OnSyncEvent can read the latest aggregated
+	// throttle bitmap when an outlier fires. Nil-safe: when unset
+	// (tests, or operators without the throttle poller running) the
+	// engine falls back to the per-step OR-fold from observables.
+	throttleReader func() uint64
 }
+
+// samplerCooldownDuration is the duration the sampler stays in
+// "degraded" state after a triggering outlier. Mirrors
+// sampling.DefaultCooldownDuration so an operator who never tunes the
+// sampler config sees the same value here as on the sampler itself.
+// Used only by the observability fields (samplerDegradedUntil); the
+// underlying sampling.Sampler owns its own decay clock.
+const samplerCooldownDuration = 30 * time.Second
+
+// samplerQueueCap bounds the in-engine queue of SamplerDegradedEvent
+// drained on each snapshot tick. Mirrors OutlierQueueCap but smaller
+// because sampler flips are rare events (one per cooldown window in
+// the worst case).
+const samplerQueueCap = 256
 
 // New constructs an Engine with cfg's defaults filled in. Returns
 // nil if cfg.SamplerDegradeOn is set to a value that's not one of
@@ -239,17 +322,32 @@ func New(cfg Config, log *slog.Logger) *Engine {
 		cfg.SamplerDegradeOn = Bucket3x
 	}
 	return &Engine{
-		cfg:         cfg,
-		log:         log,
-		wmap:        newWorkloadMap(cfg.MaxWorkloads),
-		severity:    newSeverityGate(cfg.SeverityTTL),
-		lastSync:    make(map[observableKey]time.Time, cfg.MaxWorkloads),
-		observables: newStepObservables(),
-		lastLogAt:   make(map[WorkloadKey]time.Time),
-		outliers:    make(map[OutlierBucket]uint64, 4),
-		phaseCounts: make(map[Phase]uint64, 4),
-		pauseRank:   parseSeverity(cfg.PauseOnSeverity),
+		cfg:               cfg,
+		log:               log,
+		wmap:              newWorkloadMap(cfg.MaxWorkloads),
+		severity:          newSeverityGate(cfg.SeverityTTL),
+		lastSync:          make(map[observableKey]time.Time, cfg.MaxWorkloads),
+		observables:       newStepObservables(),
+		lastLogAt:         make(map[WorkloadKey]time.Time),
+		outliers:          make(map[OutlierBucket]uint64, 4),
+		phaseCounts:       make(map[Phase]uint64, 4),
+		throttleAtOutlier: make(map[OutlierBucket]uint64, 4),
+		pauseRank:         parseSeverity(cfg.PauseOnSeverity),
 	}
+}
+
+// SetThrottleReader installs a callback the engine consults when an
+// outlier fires, to pull the latest aggregated NVML throttle-reasons
+// bitmap. The agent (cli/trace.go) sets this after constructing the
+// engine; nil-safe both before and after - when unset, OutlierEvent
+// falls back to the per-step OR-fold accumulated via RecordThrottle
+// (which today is empty because the agent doesn't yet thread per-PID
+// throttle into observables).
+//
+// Concurrency: callers must call this once at startup before the
+// event hot path goes live. The function is not lock-protected.
+func (e *Engine) SetThrottleReader(fn func() uint64) {
+	e.throttleReader = fn
 }
 
 // OnLaunchEvent records a cudaLaunchKernel event between syncs.
@@ -325,6 +423,27 @@ func (e *Engine) OnNCCLEvent(pid uint32, cgroupHash string, streamHandle uint64,
 		return
 	}
 	e.observables.AddNCCL(observableKey{
+		CGroupHash:   cgroupHash,
+		PID:          pid,
+		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
+	}, at)
+}
+
+// OnMemfragEvent records one NVIDIA closed-driver IOCTL event for
+// the given PID (typically a KV-cache eviction or fragmenting
+// allocation under VRAM pressure). Bumping the per-step memfrag
+// count feeds the v0.16.3 phase rule that classifies memfrag-pressure
+// steps with low launch density as decode (KV-cache pressure is
+// decode-shape).
+//
+// Wired from cli/trace.go's memfrag tracer ringbuf consumer when
+// --inference is engaged AND the experimental memfrag kprobe is
+// loaded. No-op when the phase classifier is disabled.
+func (e *Engine) OnMemfragEvent(pid uint32, cgroupHash string, at time.Time) {
+	if !e.cfg.PhaseClassifierEnabled {
+		return
+	}
+	e.observables.AddMemfrag(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          pid,
 		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
@@ -414,6 +533,7 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 			obs.TotalKernelNs,
 			obs.MemcpyBytes,
 			obs.NCCLCount,
+			int(obs.MemfragCount),
 			e.cfg.PhaseConfig,
 		)
 	}
@@ -463,19 +583,37 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	// the workload context to know whether a slowdown is meaningful,
 	// so flipping the sampler to 100% would cause unnecessary
 	// storage pressure on novel patterns.
+	//
+	// v0.16.3: attach memfrag + throttle context. Throttle reasons
+	// come from either (a) the explicit reader hook installed by the
+	// agent (current state of the NVML poller, aggregated across
+	// GPUs) or (b) the per-step OR-fold accumulated via
+	// RecordThrottle. (a) is preferred because it covers the
+	// whole-step interval even when no per-PID throttle plumbing is
+	// wired; (b) is the eventual per-step path once the closed-driver
+	// throttle kprobe lands.
+	throttleReasons := obs.MaxThrottleReasons
+	if e.throttleReader != nil {
+		if r := e.throttleReader(); r != 0 {
+			throttleReasons |= r
+		}
+	}
 	ev := OutlierEvent{
-		Key:            key,
-		StepDurationNs: step.Nanoseconds(),
-		BaselineP95Ns:  int64(p95),
-		BaselineMeanNs: int64(bl.Mean()),
-		Bucket:         bucket,
-		At:             now,
-		EventID:        newEventID(),
+		Key:             key,
+		StepDurationNs:  step.Nanoseconds(),
+		BaselineP95Ns:   int64(p95),
+		BaselineMeanNs:  int64(bl.Mean()),
+		Bucket:          bucket,
+		At:              now,
+		EventID:         newEventID(),
+		MemfragEvents:   obs.MemfragCount,
+		ThrottleReasons: throttleReasons,
+		MinSMClockMHz:   0, // reserved; SM clock plumbing deferred (see Batch 1 commit)
 	}
 	e.enqueueOutlier(ev)
 	e.maybeLogOutlier(ev)
 	if !e.cfg.PhaseClassifierEnabled || phase.IsClassified() {
-		e.maybeDegradeSampler(bucket)
+		e.maybeDegradeSampler(bucket, key, now)
 	}
 }
 
@@ -512,11 +650,70 @@ func (e *Engine) Drain() []OutlierEvent {
 	return out
 }
 
+// DrainSampler returns and clears the queued sampler-degraded events.
+// v0.16.3: parallel to Drain, called from the same onSnapshot callback
+// so the agent can emit one UDS message per flip-to-degraded transition.
+func (e *Engine) DrainSampler() []SamplerDegradedEvent {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.samplerQueue) == 0 {
+		return nil
+	}
+	out := e.samplerQueue
+	e.samplerQueue = nil
+	return out
+}
+
 // Snapshot returns the current baseline state for every tracked
 // workload. Called once per snapshot tick to emit baseline mean +
 // p95 gauges. Holds the workload map mutex internally.
 func (e *Engine) Snapshot() []workloadSnapshot {
 	return e.wmap.Snapshot(e.cfg.WarmupSamples)
+}
+
+// SnapshotForExport assembles the v0.16.3 exporter view of every
+// tracked workload plus the engine-level aggregates. Returns:
+//
+//   - per-workload stats (mean, p95, sample count, full histogram
+//     snapshot, plus the workload-key fields used as data point
+//     attributes by the OTLP/Prometheus exporters);
+//   - engine-level aggregates (workloads tracked, cumulative outlier
+//     counts per bucket, throttle-at-outlier counts per bucket);
+//   - sampler state (degraded flag, cumulative degradation count, the
+//     human-friendly cause of the most recent flip).
+//
+// Plain stats types (no internal/infer types in the return) so the
+// export package can encode without an import cycle.
+func (e *Engine) SnapshotForExport() ([]stats.InferWorkloadStats, stats.InferEngineStats, stats.InferSamplerState) {
+	rows := e.wmap.SnapshotForExport(e.cfg.WarmupSamples)
+
+	e.mu.Lock()
+	es := stats.InferEngineStats{
+		WorkloadsTracked:  e.wmap.Len(),
+		OutliersTotal:     make(map[string]uint64, len(e.outliers)),
+		ThrottleAtOutlier: make(map[string]uint64, len(e.throttleAtOutlier)),
+	}
+	for k, v := range e.outliers {
+		if k == BucketNone {
+			continue
+		}
+		es.OutliersTotal[string(k)] = v
+	}
+	for k, v := range e.throttleAtOutlier {
+		if k == BucketNone {
+			continue
+		}
+		es.ThrottleAtOutlier[string(k)] = v
+	}
+	now := time.Now()
+	ss := stats.InferSamplerState{
+		Degraded:          !e.samplerDegradedUntil.IsZero() && now.Before(e.samplerDegradedUntil),
+		DegradationsTotal: e.samplerDegradationsCnt,
+		LastCause:         e.samplerLastCause,
+	}
+	e.mu.Unlock()
+
+	return rows, es, ss
 }
 
 // Stats returns cumulative engine telemetry. Engine clears nothing
@@ -528,17 +725,26 @@ func (e *Engine) Snapshot() []workloadSnapshot {
 // for this — once per snapshot tick is plenty.
 func (e *Engine) Stats() EngineStats {
 	e.mu.Lock()
+	now := time.Now()
 	out := EngineStats{
-		WorkloadsTracked:  e.wmap.Len(),
-		QueueDropped:      e.queueDropped,
-		OutliersTotal:     make(map[OutlierBucket]uint64, len(e.outliers)),
-		PhaseDistribution: make(map[Phase]uint64, len(e.phaseCounts)),
+		WorkloadsTracked:         e.wmap.Len(),
+		QueueDropped:             e.queueDropped,
+		OutliersTotal:            make(map[OutlierBucket]uint64, len(e.outliers)),
+		PhaseDistribution:        make(map[Phase]uint64, len(e.phaseCounts)),
+		SamplerDegraded:          !e.samplerDegradedUntil.IsZero() && now.Before(e.samplerDegradedUntil),
+		SamplerDegradationsTotal: e.samplerDegradationsCnt,
+		LastDegradationCause:     e.samplerLastCause,
+		SamplerDegradedUntil:     e.samplerDegradedUntil,
+		ThrottleAtOutlier:        make(map[OutlierBucket]uint64, len(e.throttleAtOutlier)),
 	}
 	for k, v := range e.outliers {
 		out.OutliersTotal[k] = v
 	}
 	for k, v := range e.phaseCounts {
 		out.PhaseDistribution[k] = v
+	}
+	for k, v := range e.throttleAtOutlier {
+		out.ThrottleAtOutlier[k] = v
 	}
 	e.mu.Unlock()
 
@@ -585,6 +791,9 @@ func (e *Engine) enqueueOutlier(ev OutlierEvent) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.outliers[ev.Bucket]++
+	if ev.ThrottleReasons != 0 {
+		e.throttleAtOutlier[ev.Bucket]++
+	}
 	if len(e.queue) >= e.cfg.OutlierQueueCap {
 		// Drop oldest (front-of-slice) so the most recent outlier is
 		// always retained — those are the ones an operator most wants
@@ -626,15 +835,52 @@ func (e *Engine) maybeLogOutlier(ev OutlierEvent) {
 // when the bucket meets the configured threshold. The sampler's own
 // 30s cooldown handles decay back to the healthy admit rate; we never
 // need to call SetDegraded(false).
-func (e *Engine) maybeDegradeSampler(bucket OutlierBucket) {
+//
+// v0.16.3: also surfaces a SamplerDegradedEvent on the engine's
+// dedicated queue (drained by DrainSampler at snapshot tick) and
+// updates the observability counters consumed by Stats(). Cause is a
+// human-friendly summary that becomes the AttrInferSamplerCause data
+// point attribute on ingero.infer.sampler.* metrics. The function
+// short-circuits when the bucket is below the configured threshold,
+// preserving the previous behavior for unrelated buckets.
+func (e *Engine) maybeDegradeSampler(bucket OutlierBucket, key WorkloadKey, now time.Time) {
 	if e.cfg.Sampler == nil || e.cfg.SamplerDegradeOn == BucketNone {
 		return
 	}
 	// Bucket order: 1.5x < 2x < 3x. Trigger when the observed bucket
 	// is at-or-above the configured threshold.
-	if bucketRank(bucket) >= bucketRank(e.cfg.SamplerDegradeOn) {
-		e.cfg.Sampler.SetDegraded(true)
+	if bucketRank(bucket) < bucketRank(e.cfg.SamplerDegradeOn) {
+		return
 	}
+	e.cfg.Sampler.SetDegraded(true)
+
+	cooldownEnd := now.Add(samplerCooldownDuration)
+	cause := fmt.Sprintf("%s:cgroup=%s,pid=%d,phase=%s",
+		string(bucket), key.CGroupHash, key.PID, string(key.Phase))
+
+	e.mu.Lock()
+	e.samplerDegradationsCnt++
+	e.samplerDegradedUntil = cooldownEnd
+	e.samplerLastCause = cause
+	if len(e.samplerQueue) < samplerQueueCap {
+		e.samplerQueue = append(e.samplerQueue, SamplerDegradedEvent{
+			Key:         key,
+			Bucket:      bucket,
+			At:          now,
+			CooldownEnd: cooldownEnd,
+			Cause:       cause,
+		})
+	}
+	// Always log: sampler flips are infrequent enough not to need
+	// rate-limiting, and operators want to see every flip for incident
+	// timelines. Pattern parallels stragglerDetector logging in
+	// internal/cli/trace.go.
+	e.mu.Unlock()
+	e.log.Info("infer: sampler degraded",
+		"cause", cause,
+		"bucket", string(bucket),
+		"cooldown_end", cooldownEnd.Format(time.RFC3339Nano),
+	)
 }
 
 // bucketRank totals a bucket so we can compare with >= without

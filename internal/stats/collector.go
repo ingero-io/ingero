@@ -366,6 +366,58 @@ type Snapshot struct {
 	ThrottleEvents ThrottleEventCounters
 	// v0.15 item M: per-PID kernel-launch aggregates.
 	KernelLaunches []KernelLaunchSnapshot
+
+	// v0.16.3 inference exporter surface. Populated by the
+	// cli/trace.go onSnapshot callback from infer.Engine when the
+	// --inference umbrella is engaged; nil/empty otherwise. The OTLP
+	// + Prometheus exporters fan these out as ingero.infer.* metrics
+	// so operators get the same workload-key view they already get on
+	// the UDS socket.
+	InferWorkloads []InferWorkloadStats
+	InferStats     InferEngineStats
+	InferSampler   InferSamplerState
+}
+
+// InferWorkloadStats is the per-workload exporter view of one entry
+// in the infer.Engine LRU. v0.16.3 surface for ingero.infer.* metric
+// emission. Plain types (no time.Duration / no internal/infer types)
+// so the export package can read this without an import cycle.
+//
+// Phase is the v0.16.1 classifier verdict ("prefill" | "decode" |
+// "mixed" | "unknown" | "" when classifier disabled); used as a data
+// point attribute. Histogram is a frozen view of the per-workload
+// step-duration histogram (the same Histogram type as memcpy /
+// kernel-launch elsewhere in this package).
+type InferWorkloadStats struct {
+	CGroupHash   string
+	PID          uint32
+	StreamHandle uint64
+	Phase        string
+	MeanNs       float64
+	P95Ns        float64
+	Samples      int
+	Histogram    HistogramSnapshot
+}
+
+// InferEngineStats is the engine-level exporter view (v0.16.3).
+// WorkloadsTracked feeds ingero.infer.workloads_tracked; OutliersTotal
+// feeds ingero.infer.outlier_total per bucket; ThrottleAtOutlier feeds
+// ingero.infer.throttle_active_total per bucket.
+type InferEngineStats struct {
+	WorkloadsTracked   int
+	OutliersTotal      map[string]uint64 // bucket ("1.5x"|"2x"|"3x") -> cumulative
+	ThrottleAtOutlier  map[string]uint64 // bucket -> cumulative outliers seen with non-zero throttle
+}
+
+// InferSamplerState is the engine's sampler-degradation state for
+// ingero.infer.sampler.* metric emission (v0.16.3). Cause is a single
+// human-friendly string ("3x:cgroup=<hash>,pid=<n>,phase=<p>") that
+// becomes the AttrInferSamplerCause attribute on the gauge. Empty
+// when no degradation has fired yet.
+type InferSamplerState struct {
+	Degraded          bool
+	DegradationsTotal uint64
+	LastCause         string
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,

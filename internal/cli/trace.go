@@ -36,6 +36,7 @@ import (
 	"github.com/ingero-io/ingero/internal/ebpf/cudagraph"
 	"github.com/ingero-io/ingero/internal/ebpf/driver"
 	"github.com/ingero-io/ingero/internal/ebpf/host"
+	"github.com/ingero-io/ingero/internal/ebpf/memfrag"
 	"github.com/ingero-io/ingero/internal/ebpf/ncclprobe"
 	nettracer "github.com/ingero-io/ingero/internal/ebpf/net"
 	"github.com/ingero-io/ingero/internal/ebpf/pytrace"
@@ -140,6 +141,7 @@ var (
 	traceInferencePhaseMixedMemcpy       string // human size
 	traceInferencePhaseMixedLaunchLow    int
 	traceInferencePhaseMixedLaunchHigh   int
+	traceInferencePhaseMemfragDecodeMin  int
 
 	// inferEngine is the per-workload step-duration baseline +
 	// classifier. Constructed only when --inference is set.
@@ -292,6 +294,8 @@ func init() {
 		"low end of the mixed-phase launch range (inclusive).")
 	traceCmd.Flags().IntVar(&traceInferencePhaseMixedLaunchHigh, "inference-phase-mixed-launch-high", 200,
 		"high end of the mixed-phase launch range (inclusive).")
+	traceCmd.Flags().IntVar(&traceInferencePhaseMemfragDecodeMin, "inference-phase-memfrag-decode-min", 1,
+		"minimum NVIDIA memfrag IOCTL events between syncs to classify a low-launch step as decode (KV-cache pressure rule). Set to a large value to effectively disable.")
 
 	// v0.16.2 engine /metrics scrape flags. When --inference is set
 	// and an engine (vLLM/TGI/SGLang/Triton) is detected on the host,
@@ -1359,14 +1363,21 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// publish each outlier on the FOSS UDS socket (when
 			// --remediate is enabled). The slog INFO line in
 			// internal/infer/engine.go's maybeLogOutlier handles the
-			// rate-limited operator log. OTLP histogram + counter
-			// emission of MetricInferStepDurationNs and friends is a
-			// follow-up v0.16.x story; for v0.16.0 the on-wire surface
-			// is UDS + structured logs.
+			// rate-limited operator log.
+			//
+			// v0.16.3 expands the on-wire surface: OTLP histogram +
+			// per-bucket counter + sampler-degraded gauge + thermal
+			// context. The per-workload + engine-stats + sampler-state
+			// triple is captured here so the OTLP/Prometheus exporters
+			// see a fresh view on every push.
 			if inferEngine != nil {
 				for _, oe := range inferEngine.Drain() {
 					emitInferOutlier(remediateSrv, traceNode, "", oe)
 				}
+				for _, sd := range inferEngine.DrainSampler() {
+					emitInferSamplerDegraded(remediateSrv, traceNode, "", sd)
+				}
+				snap.InferWorkloads, snap.InferStats, snap.InferSampler = inferEngine.SnapshotForExport()
 			}
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
@@ -4219,6 +4230,27 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 	// hot-path doesn't need to re-construct it. Default capacity
 	// (1024) matches the existing per-cgroup metrics LRU.
 	inferCgroupCache = health.NewPIDCGroupHashCache(0)
+
+	// v0.16.3 wiring: throttle reasons. The NVML throttle poller
+	// (already running when --otlp / --prometheus is on) writes the
+	// OR-folded bitmap into a process-level atomic; the engine reads
+	// it on each sync to attach thermal context to outlier events.
+	eng.SetThrottleReader(readCurrentThrottleReasons)
+
+	// v0.16.3 wiring: memfrag IOCTL events. The closed-driver kprobe
+	// (gated on --enable-experimental-kprobes + the driver/kernel
+	// allowlist) calls recordMemfragEvent per event; we install a
+	// hook so the same events also feed the inference engine's
+	// per-PID observable bucket. The hook is nil-safe and inert when
+	// the kprobe didn't load.
+	setMemfragInferenceHook(func(ev memfrag.Event) {
+		cgroupHash := ""
+		if inferCgroupCache != nil {
+			cgroupHash = inferCgroupCache.Resolve(ev.PID)
+		}
+		eng.OnMemfragEvent(ev.PID, cgroupHash, time.Unix(0, int64(ev.TimestampNs)))
+	})
+
 	return eng, smp
 }
 
@@ -4342,23 +4374,50 @@ func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev 
 	// orchestrator, react however they choose). When the socket is
 	// not enabled, udsServer is nil and we skip.
 	if udsServer != nil {
-		_ = udsServer.SendInferenceOutlier(
-			ev.At,
-			nodeID, clusterID, ev.EventID,
-			ev.Key.CGroupHash,
-			ev.Key.PID,
-			ev.Key.StreamHandle,
-			ev.StepDurationNs,
-			ev.BaselineP95Ns,
-			ev.BaselineMeanNs,
-			string(ev.Bucket),
-			string(ev.Key.Phase),
-		)
+		_ = udsServer.SendInferenceOutlier(remediate.InferenceOutlier{
+			Timestamp:           ev.At,
+			NodeID:              nodeID,
+			ClusterID:           clusterID,
+			EventID:             ev.EventID,
+			CGroupPathHash:      ev.Key.CGroupHash,
+			PID:                 ev.Key.PID,
+			StreamHandle:        ev.Key.StreamHandle,
+			Phase:               string(ev.Key.Phase),
+			StepDurationNs:      ev.StepDurationNs,
+			BaselineP95Ns:       ev.BaselineP95Ns,
+			BaselineMeanNs:      ev.BaselineMeanNs,
+			Bucket:              string(ev.Bucket),
+			MemfragEventsInStep: ev.MemfragEvents,
+			ThrottleReasons:     ev.ThrottleReasons,
+			MinSMClockMHz:       ev.MinSMClockMHz,
+		})
 	}
 	// OTLP histogram + counter emission goes through the existing
 	// stats / export pipelines on the next snapshot tick. The infer
-	// engine's Snapshot() and Stats() are read by the snapshot
-	// builder below; no per-outlier OTLP push is needed here.
+	// engine's SnapshotForExport is read by the snapshot builder
+	// below; no per-outlier OTLP push is needed here.
+}
+
+// emitInferSamplerDegraded publishes one sampler-degraded edge event
+// to the UDS socket. v0.16.3 sibling of emitInferOutlier; OTLP /
+// Prometheus emission goes through the snapshot path via
+// InferSamplerState gauges + Sum.
+func emitInferSamplerDegraded(udsServer *remediate.Server, nodeID, clusterID string, ev infer.SamplerDegradedEvent) {
+	if udsServer == nil {
+		return
+	}
+	_ = udsServer.SendInferenceSamplerDegraded(remediate.InferenceSamplerDegraded{
+		Timestamp:      ev.At,
+		NodeID:         nodeID,
+		ClusterID:      clusterID,
+		CGroupPathHash: ev.Key.CGroupHash,
+		PID:            ev.Key.PID,
+		StreamHandle:   ev.Key.StreamHandle,
+		Phase:          string(ev.Key.Phase),
+		Bucket:         string(ev.Bucket),
+		Cause:          ev.Cause,
+		CooldownEnd:    ev.CooldownEnd,
+	})
 }
 
 // buildPhaseConfig assembles the infer.PhaseConfig from the v0.16.1
@@ -4375,6 +4434,7 @@ func buildPhaseConfig() infer.PhaseConfig {
 		PrefillMinAvgKernel:  traceInferencePhasePrefillMinAvgKern,
 		MixedLaunchLow:       traceInferencePhaseMixedLaunchLow,
 		MixedLaunchHigh:      traceInferencePhaseMixedLaunchHigh,
+		MemfragDecodeMin:     traceInferencePhaseMemfragDecodeMin,
 	}
 	if traceInferencePhaseDecodeMaxMemcpy != "" {
 		if n, err := store.ParseSize(traceInferencePhaseDecodeMaxMemcpy); err == nil {

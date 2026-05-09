@@ -100,6 +100,30 @@ func TestWorkloadBaseliner_WarmedGate(t *testing.T) {
 	}
 }
 
+func TestWorkloadBaseliner_HistogramTracksSamples(t *testing.T) {
+	// v0.16.3: the per-workload histogram is fed alongside the EMA / P²
+	// for OTLP exposition. Confirm the cumulative count matches Samples()
+	// and the bucket counts sum to the same.
+	b := NewWorkloadBaseliner()
+	for i := 0; i < 50; i++ {
+		b.Update(5_000_000)
+	}
+	snap := b.HistogramSnapshot()
+	if !snap.HasObservation {
+		t.Fatal("histogram snapshot should have HasObservation=true after Updates")
+	}
+	if int(snap.Count) != b.Samples() {
+		t.Errorf("histogram count %d != Samples() %d", snap.Count, b.Samples())
+	}
+	var bucketSum uint64
+	for _, c := range snap.BucketCounts {
+		bucketSum += c
+	}
+	if bucketSum != snap.Count {
+		t.Errorf("bucket sum %d != Count %d", bucketSum, snap.Count)
+	}
+}
+
 func TestWorkloadBaseliner_OutlierDoesNotPoisonBaselineWhenSkipped(t *testing.T) {
 	// This test confirms the *math* of "outliers don't fold into the
 	// baseline" by simulating it: the engine skips Update when an

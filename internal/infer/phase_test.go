@@ -10,7 +10,7 @@ func TestDefaultPhaseConfig_NonZero(t *testing.T) {
 	if d.DecodeMaxLaunches <= 0 || d.DecodeMaxMemcpy <= 0 ||
 		d.PrefillMinLaunches <= 0 || d.PrefillMinAvgKernel <= 0 ||
 		d.MixedMemcpyThreshold <= 0 || d.MixedLaunchLow <= 0 ||
-		d.MixedLaunchHigh <= 0 {
+		d.MixedLaunchHigh <= 0 || d.MemfragDecodeMin <= 0 {
 		t.Fatalf("DefaultPhaseConfig has zero/negative fields: %+v", d)
 	}
 }
@@ -42,9 +42,11 @@ func TestPhaseConfig_Resolved_PreservesNonZero(t *testing.T) {
 
 // classify is a small wrapper so the tests don't repeat the cfg
 // argument or the "stepDuration is reserved" detail. Defaults to
-// 1ms step which the rules ignore.
+// 1ms step which the rules ignore. memfragCount stays 0 so the
+// memfrag-decode rule (v0.16.3) doesn't fire unless a test names it
+// explicitly.
 func classifyTC(launches int, totalKernelNs time.Duration, memcpyBytes int64, ncclCount int) Phase {
-	return ClassifyPhase(1*time.Millisecond, launches, totalKernelNs, memcpyBytes, ncclCount, PhaseConfig{})
+	return ClassifyPhase(1*time.Millisecond, launches, totalKernelNs, memcpyBytes, ncclCount, 0, PhaseConfig{})
 }
 
 func TestClassifyPhase_NCCLAlwaysPrefill(t *testing.T) {
@@ -87,7 +89,7 @@ func TestClassifyPhase_DecodeIsDurationInvariant(t *testing.T) {
 		100 * time.Millisecond,
 		1 * time.Second,
 	} {
-		if got := ClassifyPhase(dur, 10, 100*time.Microsecond, 0, 0, cfg); got != PhaseDecode {
+		if got := ClassifyPhase(dur, 10, 100*time.Microsecond, 0, 0, 0, cfg); got != PhaseDecode {
 			t.Errorf("dur=%v should still be decode, got %v", dur, got)
 		}
 	}
@@ -124,7 +126,7 @@ func TestClassifyPhase_PrefillIsDurationInvariant(t *testing.T) {
 		200 * time.Millisecond,
 		2 * time.Second,
 	} {
-		if got := ClassifyPhase(dur, 500, 50*time.Millisecond, 0, 0, cfg); got != PhasePrefill {
+		if got := ClassifyPhase(dur, 500, 50*time.Millisecond, 0, 0, 0, cfg); got != PhasePrefill {
 			t.Errorf("dur=%v should still be prefill, got %v", dur, got)
 		}
 	}
@@ -186,8 +188,38 @@ func TestClassifyPhase_CustomConfigOverridesDefaults(t *testing.T) {
 	cfg := PhaseConfig{
 		DecodeMaxLaunches: 10,
 	}
-	if got := ClassifyPhase(1*time.Millisecond, 30, 100*time.Microsecond, 0, 0, cfg); got == PhaseDecode {
+	if got := ClassifyPhase(1*time.Millisecond, 30, 100*time.Microsecond, 0, 0, 0, cfg); got == PhaseDecode {
 		t.Error("custom DecodeMaxLaunches=10 should reject 30 launches as decode")
+	}
+}
+
+func TestClassifyPhase_MemfragDecodeRule(t *testing.T) {
+	// v0.16.3: memfrag-pressure with low launch count classifies as
+	// decode. Higher priority than NCCL so a memfrag-storm step folds
+	// into the decode baseline (where it fires as a decode-bucket
+	// outlier) rather than getting absorbed into prefill.
+	cfg := PhaseConfig{}
+	// Few launches + memfrag: decode.
+	if got := ClassifyPhase(1*time.Millisecond, 10, 100*time.Microsecond, 0, 0, 5, cfg); got != PhaseDecode {
+		t.Errorf("memfrag=5 + launches=10 should be decode, got %v", got)
+	}
+	// Few launches + memfrag + NCCL: decode (rule 0 wins over rule 1).
+	if got := ClassifyPhase(1*time.Millisecond, 10, 100*time.Microsecond, 0, 1, 5, cfg); got != PhaseDecode {
+		t.Errorf("memfrag overrides NCCL when launches low, got %v", got)
+	}
+	// MANY launches + memfrag: rule 0 doesn't fire (launch_count gate);
+	// falls through to NCCL/prefill.
+	if got := ClassifyPhase(1*time.Millisecond, 500, 50*time.Millisecond, 0, 0, 5, cfg); got != PhasePrefill {
+		t.Errorf("memfrag with many launches falls through to prefill, got %v", got)
+	}
+	// Threshold gates: memfrag below MemfragDecodeMin doesn't fire.
+	highThresh := PhaseConfig{MemfragDecodeMin: 10}
+	if got := ClassifyPhase(1*time.Millisecond, 10, 100*time.Microsecond, 0, 0, 5, highThresh); got != PhaseDecode {
+		// Note: at memfrag=5 < threshold=10, rule 0 doesn't fire, but
+		// the step still meets rule 5 (decode by shape). Confirms the
+		// rule is purely additive — disabling it never reclassifies a
+		// natural decode away.
+		t.Errorf("rule-disabled but natural decode shape: got %v", got)
 	}
 }
 

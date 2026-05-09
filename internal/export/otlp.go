@@ -504,6 +504,81 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	// v0.16.3 inference exporter surface. Three groups of metrics:
+	//
+	//   1. Per-workload baseline shape: histogram, mean, p95.
+	//      Attributes: cgroup_path_hash, pid, stream_handle, phase.
+	//   2. Engine-level cumulative counters: outlier total per bucket,
+	//      throttle-at-outlier per bucket, workloads tracked.
+	//   3. Sampler observability: degraded gauge, degradations total,
+	//      cause label.
+	//
+	// All emit only when the snapshot carries non-empty inference data
+	// (i.e. --inference is engaged AND the engine has at least one
+	// warmed workload). Pre-v0.16.3 collectors that don't recognize
+	// these names ignore them; consumers that do receive a complete
+	// view of the agent's inference baseline state.
+	for _, w := range snap.InferWorkloads {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrCgroupPathHash, Value: stringVal(w.CGroupHash)},
+			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(w.PID))}},
+			{Key: contract.AttrInferStreamHandle, Value: stringVal(strconv.FormatUint(w.StreamHandle, 10))},
+			{Key: contract.AttrInferPhase, Value: stringVal(w.Phase)},
+		}
+		metrics = append(metrics,
+			histogramMetric(contract.MetricInferStepDurationNs,
+				"Per-workload inference step duration distribution (cumulative)",
+				"ns", nowNano, "", w.Histogram, attrs),
+			gaugeMetric(contract.MetricInferBaselineMeanNs,
+				"Per-workload inference step EMA mean", "ns",
+				nowNano, w.MeanNs, attrs),
+			gaugeMetric(contract.MetricInferBaselineP95Ns,
+				"Per-workload inference step P² p95 estimate", "ns",
+				nowNano, w.P95Ns, attrs),
+		)
+	}
+	if len(snap.InferWorkloads) > 0 || snap.InferStats.WorkloadsTracked > 0 ||
+		len(snap.InferStats.OutliersTotal) > 0 || snap.InferSampler.DegradationsTotal > 0 {
+		metrics = append(metrics, gaugeMetricInt(
+			contract.MetricInferWorkloadsTracked,
+			"Distinct (cgroup,pid,stream,phase) workloads currently tracked by the infer engine",
+			"1", nowNano, int64(snap.InferStats.WorkloadsTracked), nil))
+	}
+	for bucket, count := range snap.InferStats.OutliersTotal {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrInferOutlierBucket, Value: stringVal(bucket)},
+		}
+		metrics = append(metrics, sumMetric(
+			contract.MetricInferOutlierTotal,
+			"Cumulative inference step-duration outliers per bucket",
+			"1", nowNano, int64(count), attrs))
+	}
+	for bucket, count := range snap.InferStats.ThrottleAtOutlier {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrInferOutlierBucket, Value: stringVal(bucket)},
+		}
+		metrics = append(metrics, sumMetric(
+			contract.MetricInferThrottleActiveTotal,
+			"Cumulative inference outliers observed while NVML throttle reasons were active",
+			"1", nowNano, int64(count), attrs))
+	}
+	if snap.InferSampler.DegradationsTotal > 0 || snap.InferSampler.Degraded {
+		samplerAttrs := []otlpKeyValue{}
+		if snap.InferSampler.LastCause != "" {
+			samplerAttrs = append(samplerAttrs, otlpKeyValue{
+				Key: contract.AttrInferSamplerCause, Value: stringVal(snap.InferSampler.LastCause),
+			})
+		}
+		metrics = append(metrics,
+			gaugeMetric(contract.MetricInferSamplerDegraded,
+				"Inference sampler degraded state (1=admitting 100% of events)", "1",
+				nowNano, boolToFloat(snap.InferSampler.Degraded), samplerAttrs),
+			sumMetric(contract.MetricInferSamplerDegradationsTotal,
+				"Cumulative inference sampler flip-to-degraded transitions", "1",
+				nowNano, int64(snap.InferSampler.DegradationsTotal), samplerAttrs),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than

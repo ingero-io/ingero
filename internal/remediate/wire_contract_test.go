@@ -107,8 +107,24 @@ var Contract = []TypeContract{
 		Optional: []string{
 			"event_id", "cgroup_path_hash", "stream_handle",
 			"baseline_mean_ns", "rank", "world_size", "phase",
+			// v0.16.3 contextual fields. Backward-compatible: pre-v0.16.3
+			// consumers ignore unknown fields, so adding these does not
+			// constitute a contract break.
+			"memfrag_events_in_step", "throttle_reasons", "min_sm_clock_mhz",
 		},
 		goType: reflect.TypeOf(inferenceOutlierMessage{}),
+	},
+	{
+		Name:      "inference_sampler_degraded",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "bucket", "cause", "cooldown_end",
+		},
+		Optional: []string{
+			"cgroup_path_hash", "stream_handle", "phase", "rank", "world_size",
+		},
+		goType: reflect.TypeOf(inferenceSamplerDegradedMessage{}),
 	},
 }
 

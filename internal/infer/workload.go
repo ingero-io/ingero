@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"sync"
 	"time"
+
+	"github.com/ingero-io/ingero/internal/stats"
 )
 
 // WorkloadKey identifies one inference workload bucket. v0.16.0 keyed
@@ -145,6 +147,37 @@ func (m *workloadMap) Snapshot(warmupSamples int) []workloadSnapshot {
 			P95:     e.bl.P95(),
 			Samples: e.bl.Samples(),
 			Warmed:  e.bl.Warmed(warmupSamples),
+		})
+	}
+	return out
+}
+
+// SnapshotForExport returns the v0.16.3 exporter-shape view: each
+// tracked workload's mean / p95 / sample count plus the histogram
+// snapshot. Plain stats types so the export package can read this
+// without an internal/infer import (which would cycle through
+// internal/cli on the way back).
+//
+// Skips not-yet-warmed workloads to avoid emitting noisy data points
+// for entries with too-few samples; warmed-only matches the gauge
+// emission path's existing convention. Caller owns the returned slice.
+func (m *workloadMap) SnapshotForExport(warmupSamples int) []stats.InferWorkloadStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]stats.InferWorkloadStats, 0, len(m.entries))
+	for k, e := range m.entries {
+		if !e.bl.Warmed(warmupSamples) {
+			continue
+		}
+		out = append(out, stats.InferWorkloadStats{
+			CGroupHash:   k.CGroupHash,
+			PID:          k.PID,
+			StreamHandle: k.StreamHandle,
+			Phase:        string(k.Phase),
+			MeanNs:       e.bl.Mean(),
+			P95Ns:        e.bl.P95(),
+			Samples:      e.bl.Samples(),
+			Histogram:    e.bl.HistogramSnapshot(),
 		})
 	}
 	return out

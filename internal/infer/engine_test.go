@@ -400,6 +400,111 @@ func TestEngine_PhaseClassifier_BimodalProducesSeparateBaselines(t *testing.T) {
 	}
 }
 
+func TestEngine_SamplerDegradedSurfacesObservability(t *testing.T) {
+	// v0.16.3: a 3x outlier should populate the sampler-degraded queue,
+	// bump the cumulative degradations counter, and stamp a non-empty
+	// cause string. Mirrors the AWS-validation expectation.
+	smp := sampling.New("inference", 0.01, 30*time.Second)
+	cfg := Config{
+		WarmupSamples:    5,
+		SamplerDegradeOn: Bucket3x,
+		Sampler:          smp,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	for i := 0; i < 7; i++ {
+		e.OnSyncEvent(syncEvent(7, 0xc, t0.Add(time.Duration(i)*10*time.Millisecond)), "wl-x")
+	}
+	_ = e.Drain()
+	// 3x outlier (50ms vs 10ms baseline = 5x ratio).
+	e.OnSyncEvent(syncEvent(7, 0xc, t0.Add(70*time.Millisecond+50*time.Millisecond)), "wl-x")
+	if got := e.Drain(); len(got) == 0 {
+		t.Fatal("expected outlier event")
+	}
+	sd := e.DrainSampler()
+	if len(sd) != 1 {
+		t.Fatalf("expected 1 sampler-degraded event, got %d", len(sd))
+	}
+	if sd[0].Cause == "" {
+		t.Error("sampler-degraded cause should not be empty")
+	}
+	if sd[0].Bucket != Bucket3x {
+		t.Errorf("sampler-degraded bucket = %v, want 3x", sd[0].Bucket)
+	}
+	if sd[0].CooldownEnd.Before(sd[0].At) {
+		t.Errorf("CooldownEnd should be after At")
+	}
+	st := e.Stats()
+	if st.SamplerDegradationsTotal != 1 {
+		t.Errorf("DegradationsTotal = %d, want 1", st.SamplerDegradationsTotal)
+	}
+	if !st.SamplerDegraded {
+		t.Error("SamplerDegraded should be true within cooldown window")
+	}
+	if st.LastDegradationCause != sd[0].Cause {
+		t.Errorf("LastDegradationCause %q != event Cause %q",
+			st.LastDegradationCause, sd[0].Cause)
+	}
+}
+
+func TestEngine_SnapshotForExport_ReturnsWarmedWorkloads(t *testing.T) {
+	// v0.16.3 exporter contract: SnapshotForExport returns one entry per
+	// warmed workload with a populated histogram, plus engine-level
+	// outlier counts.
+	cfg := Config{WarmupSamples: 5}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	for i := 0; i < 7; i++ {
+		e.OnSyncEvent(syncEvent(11, 0xa, t0.Add(time.Duration(i)*10*time.Millisecond)), "wl-y")
+	}
+	rows, es, ss := e.SnapshotForExport()
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 warmed workload, got %d", len(rows))
+	}
+	if rows[0].PID != 11 {
+		t.Errorf("workload PID = %d, want 11", rows[0].PID)
+	}
+	if !rows[0].Histogram.HasObservation {
+		t.Error("histogram should have observations after warmup")
+	}
+	if es.WorkloadsTracked != 1 {
+		t.Errorf("WorkloadsTracked = %d, want 1", es.WorkloadsTracked)
+	}
+	if ss.Degraded {
+		t.Error("sampler should NOT be degraded with no outliers")
+	}
+}
+
+func TestEngine_OnMemfragEventClassifiesDecode(t *testing.T) {
+	// v0.16.3 memfrag rule: a memfrag burst with low launch count
+	// classifies as decode. The test exercises the full path:
+	// OnMemfragEvent -> observables -> ClassifyPhase -> phase counter.
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          1,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	now := t0
+	// First sync to anchor.
+	e.OnSyncEvent(syncEvent(42, 0xa, now), "wl-z")
+	// Inject 3 memfrag events between syncs.
+	for k := 0; k < 3; k++ {
+		e.OnMemfragEvent(42, "wl-z", now.Add(time.Duration(k+1)*time.Millisecond))
+	}
+	// A few launches (< DecodeMaxLaunches=50).
+	for k := 0; k < 5; k++ {
+		e.OnLaunchEvent(launchEvent(42, 0xa, now.Add(time.Duration(k+1)*time.Millisecond)),
+			"wl-z", 100*time.Microsecond)
+	}
+	now = now.Add(10 * time.Millisecond)
+	e.OnSyncEvent(syncEvent(42, 0xa, now), "wl-z")
+	st := e.Stats()
+	if st.PhaseDistribution[PhaseDecode] != 1 {
+		t.Errorf("expected 1 PhaseDecode step from memfrag rule, got distribution %+v", st.PhaseDistribution)
+	}
+}
+
 func TestEngine_PhaseClassifier_UnknownPhaseDoesNotDegradeSampler(t *testing.T) {
 	// Phase=unknown outliers should fire metrics/log/UDS but should
 	// NOT bump the sampler — we lack workload context to know the

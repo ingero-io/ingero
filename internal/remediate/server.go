@@ -357,6 +357,58 @@ type inferenceOutlierMessage struct {
 	Bucket         string    `json:"bucket"` // "1.5x" | "2x" | "3x"
 	Rank           int       `json:"rank,omitempty"`
 	WorldSize      int       `json:"world_size,omitempty"`
+
+	// v0.16.3 contextual fields. All optional and backward-compatible:
+	// pre-v0.16.3 consumers ignore unknown JSON fields.
+	//
+	// MemfragEventsInStep is the count of NVIDIA closed-driver IOCTL
+	// events (KV-cache eviction or fragmenting allocation) observed
+	// between the previous and current syncs. A non-zero value on a
+	// decode-shape outlier flags VRAM pressure as the proximate cause.
+	//
+	// ThrottleReasons is the OR-fold of NVML clock-throttle bitmaps
+	// observed during the step. Bit semantics follow NVML
+	// nvmlClocksThrottleReasons (see open-gpu-kernel-modules headers).
+	// A non-zero value means a thermal/power slowdown coincided with
+	// the slow step; combined with the agent's existing
+	// gpu.throttle.{power,thermal,sw,hw}.event_total counters,
+	// operators can tell apart "outlier caused by throttle" from
+	// "throttle elsewhere".
+	//
+	// MinSMClockMHz is reserved for a future v0.16.x extension that
+	// pulls SM clock from the existing throttle poller; populated as 0
+	// today.
+	MemfragEventsInStep uint32 `json:"memfrag_events_in_step,omitempty"`
+	ThrottleReasons     uint64 `json:"throttle_reasons,omitempty"`
+	MinSMClockMHz       uint32 `json:"min_sm_clock_mhz,omitempty"`
+}
+
+// inferenceSamplerDegradedMessage is the UDS envelope for the engine's
+// flip-to-degraded edge. v0.16.3 sibling to inferenceOutlierMessage.
+// Fired once per cooldown window so a back-to-back trigger after
+// cooldown produces a second message; consumers can de-dup by
+// (cgroup_path_hash, pid, cooldown_end) if needed.
+//
+// Cause is the human-friendly summary
+// ("3x:cgroup=<hash>,pid=<n>,phase=<p>") that also lands as the
+// AttrInferSamplerCause attribute on the gauge / counter side. Bucket
+// is the bucket the OUTLIER WAS IN (not the configured threshold);
+// CooldownEnd is when the sampler will return to healthy admission
+// absent another trigger.
+type inferenceSamplerDegradedMessage struct {
+	Type           string    `json:"type"`
+	NodeID         string    `json:"node_id"`
+	ClusterID      string    `json:"cluster_id"`
+	Timestamp      time.Time `json:"timestamp"`
+	CGroupPathHash string    `json:"cgroup_path_hash,omitempty"`
+	PID            uint32    `json:"pid"`
+	StreamHandle   uint64    `json:"stream_handle,omitempty"`
+	Phase          string    `json:"phase,omitempty"`
+	Bucket         string    `json:"bucket"`
+	Cause          string    `json:"cause"`
+	CooldownEnd    time.Time `json:"cooldown_end"`
+	Rank           int       `json:"rank,omitempty"`
+	WorldSize      int       `json:"world_size,omitempty"`
 }
 
 // SendFleetStragglerState writes a peer-relative straggler notification
@@ -393,6 +445,32 @@ func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detect
 	return s.writeLocked(msg)
 }
 
+// InferenceOutlier captures one classified step-duration outlier for
+// publication on the UDS socket. Struct-shaped so v0.16.3 can add
+// contextual fields (memfrag, throttle, SM clock) without growing a
+// positional argument list. Bucket is one of "1.5x" | "2x" | "3x" -
+// the largest baseline-p95 multiplier the step crossed. EventID is the
+// UUID that appears on the matching OTLP histogram data-point so
+// consumers can correlate channels.
+type InferenceOutlier struct {
+	Timestamp      time.Time
+	NodeID         string
+	ClusterID      string
+	EventID        string
+	CGroupPathHash string
+	PID            uint32
+	StreamHandle   uint64
+	Phase          string
+	StepDurationNs int64
+	BaselineP95Ns  int64
+	BaselineMeanNs int64
+	Bucket         string
+
+	MemfragEventsInStep uint32
+	ThrottleReasons     uint64
+	MinSMClockMHz       uint32
+}
+
 // SendInferenceOutlier writes a per-workload step-duration outlier
 // notification to the UDS consumer. Non-blocking; same drop semantics
 // as SendFleetStragglerState.
@@ -400,19 +478,7 @@ func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detect
 // Wire-protocol-only. The FOSS agent classifies and publishes; any
 // follow-up action lives in the consumer (notably the ingero-ee
 // orchestrator, but the protocol is open).
-//
-// bucket is one of "1.5x" | "2x" | "3x" — the largest baseline-p95
-// multiplier the step crossed. eventID is the same UUID that appears
-// on the matching OTLP histogram data-point so consumers can correlate
-// channels.
-func (s *Server) SendInferenceOutlier(
-	ts time.Time,
-	nodeID, clusterID, eventID string,
-	cgroupPathHash string, pid uint32, streamHandle uint64,
-	stepDurationNs, baselineP95Ns, baselineMeanNs int64,
-	bucket string,
-	phase string,
-) error {
+func (s *Server) SendInferenceOutlier(o InferenceOutlier) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -422,19 +488,69 @@ func (s *Server) SendInferenceOutlier(
 	}
 
 	msg := inferenceOutlierMessage{
-		Type:           "inference_outlier",
-		NodeID:         nodeID,
-		ClusterID:      clusterID,
-		Timestamp:      ts,
-		EventID:        eventID,
-		CGroupPathHash: cgroupPathHash,
-		PID:            pid,
-		StreamHandle:   streamHandle,
-		Phase:          phase,
-		StepDurationNs: stepDurationNs,
-		BaselineP95Ns:  baselineP95Ns,
-		BaselineMeanNs: baselineMeanNs,
-		Bucket:         bucket,
+		Type:                "inference_outlier",
+		NodeID:              o.NodeID,
+		ClusterID:           o.ClusterID,
+		Timestamp:           o.Timestamp,
+		EventID:             o.EventID,
+		CGroupPathHash:      o.CGroupPathHash,
+		PID:                 o.PID,
+		StreamHandle:        o.StreamHandle,
+		Phase:               o.Phase,
+		StepDurationNs:      o.StepDurationNs,
+		BaselineP95Ns:       o.BaselineP95Ns,
+		BaselineMeanNs:      o.BaselineMeanNs,
+		Bucket:              o.Bucket,
+		MemfragEventsInStep: o.MemfragEventsInStep,
+		ThrottleReasons:     o.ThrottleReasons,
+		MinSMClockMHz:       o.MinSMClockMHz,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
+// InferenceSamplerDegraded captures one flip-to-degraded edge from
+// the engine's sampler observability path. v0.16.3 sibling to
+// InferenceOutlier; same wire-protocol-only contract.
+type InferenceSamplerDegraded struct {
+	Timestamp      time.Time
+	NodeID         string
+	ClusterID      string
+	CGroupPathHash string
+	PID            uint32
+	StreamHandle   uint64
+	Phase          string
+	Bucket         string
+	Cause          string
+	CooldownEnd    time.Time
+}
+
+// SendInferenceSamplerDegraded writes a sampler-degraded edge
+// notification. Non-blocking; same drop semantics as SendInferenceOutlier.
+func (s *Server) SendInferenceSamplerDegraded(d InferenceSamplerDegraded) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	msg := inferenceSamplerDegradedMessage{
+		Type:           "inference_sampler_degraded",
+		NodeID:         d.NodeID,
+		ClusterID:      d.ClusterID,
+		Timestamp:      d.Timestamp,
+		CGroupPathHash: d.CGroupPathHash,
+		PID:            d.PID,
+		StreamHandle:   d.StreamHandle,
+		Phase:          d.Phase,
+		Bucket:         d.Bucket,
+		Cause:          d.Cause,
+		CooldownEnd:    d.CooldownEnd,
 	}
 	if s.worldSize > 0 {
 		msg.Rank = s.rank

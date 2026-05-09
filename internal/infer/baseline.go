@@ -14,6 +14,7 @@ package infer
 
 import (
 	"github.com/ingero-io/ingero/internal/health"
+	"github.com/ingero-io/ingero/internal/stats"
 )
 
 // emaAlphaMean is the smoothing factor for the per-workload mean. We
@@ -51,12 +52,22 @@ type WorkloadBaseliner struct {
 	dn    [5]float64 // desired-position increment per new sample
 	init0 [5]float64 // first 5 raw samples, sorted at fill-complete
 	filled int       // count of init samples observed (caps at 5)
+
+	// hist is the cumulative step-duration distribution. v0.16.3
+	// surface for OTLP/Prometheus emission so operators see the same
+	// shape the EMA + P² baseliner does, without having to back-compute
+	// it from the per-event JSON stream. Cumulative across the
+	// baseliner's lifetime; never reset (matches the OTel cumulative
+	// temporality used by every other histogram in this codebase).
+	hist *stats.Histogram
 }
 
 // NewWorkloadBaseliner constructs an empty baseliner. Heights are
 // initialized lazily on the first 5 samples.
 func NewWorkloadBaseliner() *WorkloadBaseliner {
-	b := &WorkloadBaseliner{}
+	b := &WorkloadBaseliner{
+		hist: stats.NewHistogram(stats.DefaultInferStepDurationBoundsNs),
+	}
 	// Desired-position formula for an arbitrary quantile p:
 	//   ns[0] = 1
 	//   ns[1] = 1 + 2p
@@ -84,6 +95,16 @@ func (b *WorkloadBaseliner) Update(stepNs float64) {
 	// EMA mean. CleanFinite already coerced any pathological value to
 	// 0 and we filtered <=0 above, so the EMA stays well-formed.
 	b.mean = health.EMAUpdate(b.mean, stepNs, emaAlphaMean)
+
+	// Fold the step into the cumulative histogram. The Engine only
+	// calls Update for healthy + warmup steps (post-warmup outliers
+	// skip Update to keep the EMA/P² baseline clean), so the
+	// histogram represents the workload's healthy distribution.
+	// Outlier counts are visible separately via the per-bucket
+	// counter (MetricInferOutlierTotal).
+	if b.hist != nil {
+		b.hist.Observe(stepNs)
+	}
 
 	// P² fill phase: collect the first 5 samples raw.
 	if b.filled < 5 {
@@ -215,4 +236,16 @@ func (b *WorkloadBaseliner) Samples() int { return b.samples }
 // meaningful.
 func (b *WorkloadBaseliner) Warmed(warmupSamples int) bool {
 	return b.samples >= warmupSamples && b.filled == 5
+}
+
+// HistogramSnapshot returns a frozen copy of the cumulative
+// step-duration histogram. Returns the zero value when the baseliner
+// was constructed before histogram support landed (test-only legacy
+// path); callers that emit OTLP can detect this via
+// HasObservation==false.
+func (b *WorkloadBaseliner) HistogramSnapshot() stats.HistogramSnapshot {
+	if b.hist == nil {
+		return stats.HistogramSnapshot{}
+	}
+	return b.hist.Snapshot()
 }

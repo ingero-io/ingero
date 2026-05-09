@@ -39,12 +39,25 @@ type stepObservables struct {
 
 // observableCounters holds the running per-step totals plus a
 // last-update timestamp for stale eviction.
+//
+// MemfragCount is the count of NVIDIA closed-driver IOCTL events
+// observed via the v0.15 W1 memfrag kprobe between consecutive syncs.
+// Non-zero values are a strong "decode-pressure" signal (KV cache
+// eviction storm under VRAM pressure) and feed the v0.16.3 phase rule.
+//
+// MaxThrottleReasons is the OR-fold of NVML clock-throttle bitmaps
+// observed during the step; non-zero means at least one throttle
+// reason fired. v0.16.3 surface for thermal-context-on-outlier so a
+// step slowdown caused by HW_SLOWDOWN is visibly thermal in the JSON
+// envelope.
 type observableCounters struct {
-	LaunchCount   int
-	TotalKernelNs time.Duration
-	MemcpyBytes   int64
-	NCCLCount     int
-	LastUpdate    time.Time
+	LaunchCount        int
+	TotalKernelNs      time.Duration
+	MemcpyBytes        int64
+	NCCLCount          int
+	MemfragCount       uint32
+	MaxThrottleReasons uint64
+	LastUpdate         time.Time
 }
 
 // newStepObservables constructs an empty store. The Engine owns one
@@ -92,6 +105,43 @@ func (s *stepObservables) AddNCCL(key observableKey, now time.Time) {
 	c.LastUpdate = now
 }
 
+// AddMemfrag increments the memfrag IOCTL event count for the
+// workload key. v0.16.3 wiring of the v0.15 W1 memfrag kprobe into
+// the inference path; the phase classifier reads memfragCount to
+// distinguish KV-cache-pressure decode steps (memfrag>0 + few
+// launches) from compute-bound work.
+func (s *stepObservables) AddMemfrag(key observableKey, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.getOrCreateLocked(key)
+	if c.MemfragCount < ^uint32(0) {
+		c.MemfragCount++
+	}
+	c.LastUpdate = now
+}
+
+// RecordThrottle OR-folds an NVML throttle-reasons bitmap into the
+// per-step max. v0.16.3 thermal-context surface; the engine writes
+// here on each NVML poll tick (latest-wins per step) and reads back
+// at sync-event time to attach the bitmap to outlier events.
+//
+// The OR-fold preserves any reason that fired anywhere in the step,
+// which is what an operator wants when asking "did this slow step
+// coincide with a throttle?" — not "what was the last throttle
+// reading." A zero reasons value is a no-op so the throttle path can
+// call this on every poll tick without churn when no throttle is
+// active.
+func (s *stepObservables) RecordThrottle(key observableKey, reasons uint64, now time.Time) {
+	if reasons == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.getOrCreateLocked(key)
+	c.MaxThrottleReasons |= reasons
+	c.LastUpdate = now
+}
+
 // ResetAndRead atomically returns the current counters for the
 // workload key and zeroes them in place. Called from the Engine's
 // OnSyncEvent after computing step duration — the returned snapshot
@@ -118,6 +168,8 @@ func (s *stepObservables) ResetAndRead(key observableKey, now time.Time) observa
 	c.TotalKernelNs = 0
 	c.MemcpyBytes = 0
 	c.NCCLCount = 0
+	c.MemfragCount = 0
+	c.MaxThrottleReasons = 0
 	c.LastUpdate = now
 	return out
 }

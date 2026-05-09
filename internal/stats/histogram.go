@@ -134,3 +134,23 @@ var DefaultMemcpyDurationBoundsMs = []float64{
 func IsFinite(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
+
+// DefaultInferStepDurationBoundsNs is the bucket layout for
+// ingero.infer.step_duration_ns. Geometric progression covering
+// inference engine iterations from sub-millisecond decodes to
+// multi-second stalls. Calibrated against the v0.16.1 phase classifier
+// regimes (vLLM/TGI/SGLang serving): decode p50 ~5 ms, prefill p95
+// ~500 ms on 70B serving, and a long tail to 10 s for stuck steps.
+//
+// Why nanoseconds, not milliseconds: the metric name and the OTel
+// histogram both carry the "ns" unit, so consumers don't need a
+// conversion step. Bucket widths span 100us (sub-decode) to 10s
+// (deep stall) so a single histogram covers every realistic regime.
+var DefaultInferStepDurationBoundsNs = []float64{
+	100_000, 250_000, 500_000,
+	1_000_000, 2_500_000, 5_000_000,
+	10_000_000, 25_000_000, 50_000_000,
+	100_000_000, 250_000_000, 500_000_000,
+	1_000_000_000, 2_500_000_000, 5_000_000_000,
+	10_000_000_000,
+}

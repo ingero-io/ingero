@@ -61,6 +61,14 @@ type PhaseConfig struct {
 	MixedMemcpyThreshold int64
 	MixedLaunchLow       int
 	MixedLaunchHigh      int
+
+	// MemfragDecodeMin is the minimum memfrag IOCTL event count that
+	// triggers the high-priority "memfrag pressure -> decode" rule.
+	// v0.16.3: KV-cache eviction storms are decode-shape failures and
+	// should be classified into the decode bucket so the slow step
+	// fires against the decode baseline (not unknown / mixed). Zero
+	// disables the rule. Default 1 (any memfrag activity counts).
+	MemfragDecodeMin int
 }
 
 // DefaultPhaseConfig returns LLM-tuned thresholds derived from the
@@ -75,6 +83,7 @@ func DefaultPhaseConfig() PhaseConfig {
 		MixedMemcpyThreshold: 10 * 1024 * 1024, // 10 MiB
 		MixedLaunchLow:       50,
 		MixedLaunchHigh:      200,
+		MemfragDecodeMin:     1,
 	}
 }
 
@@ -104,6 +113,9 @@ func (c PhaseConfig) Resolved() PhaseConfig {
 	if c.MixedLaunchHigh <= 0 {
 		c.MixedLaunchHigh = d.MixedLaunchHigh
 	}
+	if c.MemfragDecodeMin <= 0 {
+		c.MemfragDecodeMin = d.MemfragDecodeMin
+	}
 	return c
 }
 
@@ -120,6 +132,9 @@ func (c PhaseConfig) Resolved() PhaseConfig {
 //   - totalKernelNs: sum of kernel durations
 //   - memcpyBytes:  total memcpy bytes (any direction)
 //   - ncclCount:    NCCL collective events
+//   - memfragCount: NVIDIA closed-driver IOCTL events (v0.15 W1
+//     memfrag kprobe). Non-zero is a strong "decode-pressure" signal
+//     (KV-cache eviction storm under VRAM pressure). v0.16.3.
 //
 // Rule order matters; first match wins. The bias is toward
 // PhaseUnknown on ambiguous input — better a step bucket of its
@@ -130,10 +145,27 @@ func ClassifyPhase(
 	totalKernelNs time.Duration,
 	memcpyBytes int64,
 	ncclCount int,
+	memfragCount int,
 	cfg PhaseConfig,
 ) Phase {
 	_ = stepDuration // reserved; see doc comment above
 	cfg = cfg.Resolved()
+
+	// Rule 0: memfrag IOCTL pressure with low launch density is a
+	// KV-cache eviction storm — decode-shape failure under VRAM
+	// pressure. Higher priority than NCCL because operators want a
+	// memfrag-storm step folded into the decode baseline (so the
+	// slow decode fires as a decode-bucket outlier), not absorbed
+	// into prefill where it gets dwarfed. The launch_count gate
+	// keeps the rule from firing on prefill-shape steps that happen
+	// to coincide with a memfrag event (memfrag during a 200-launch
+	// prefill is a different scenario - probably allocation, not
+	// eviction). Disabled when MemfragDecodeMin <= 0.
+	if cfg.MemfragDecodeMin > 0 &&
+		memfragCount >= cfg.MemfragDecodeMin &&
+		launchCount < cfg.DecodeMaxLaunches {
+		return PhaseDecode
+	}
 
 	// Rule 1: NCCL participation -> distributed prefill (allreduce,
 	// allgather, etc.). In inference servers NCCL is overwhelmingly

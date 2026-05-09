@@ -20,13 +20,20 @@ var (
 
 func recordMemfragEvent(ev memfrag.Event) {
 	memfragCounterMu.Lock()
-	defer memfragCounterMu.Unlock()
 	c, ok := memfragCounter[ev.Cmd]
 	if !ok {
 		c = &stats.MemfragIOCTLCounter{Cmd: ev.Cmd}
 		memfragCounter[ev.Cmd] = c
 	}
 	c.Count++
+	memfragCounterMu.Unlock()
+	// v0.16.3: also fan the event into the inference engine's
+	// per-PID observable bucket (when --inference is engaged) so the
+	// phase classifier can fire its decode-pressure rule on
+	// KV-cache eviction storms. The hook is nil-safe and held
+	// outside memfragCounterMu so the existing counter path stays
+	// short.
+	callMemfragInferenceHook(ev)
 }
 
 // snapshotMemfragCounters returns a sorted-by-cmd copy of the

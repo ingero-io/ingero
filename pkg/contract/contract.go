@@ -131,6 +131,29 @@ const (
 	// in the agent's bounded LRU. Gauge, no per-workload attributes.
 	MetricInferWorkloadsTracked = "ingero.infer.workloads_tracked"
 
+	// MetricInferSamplerDegraded is a 0/1 gauge that tracks the
+	// store-sampler degraded state. The infer engine flips the
+	// sampler to admit 100% of events when an outlier crosses the
+	// configured bucket threshold (default 3x); without observability
+	// operators cannot tell which workload triggered the storage
+	// pressure. Value 1 while degraded; 0 once the cooldown elapses.
+	MetricInferSamplerDegraded = "ingero.infer.sampler.degraded"
+
+	// MetricInferSamplerDegradationsTotal is the cumulative count of
+	// times the sampler entered degraded state since agent start. OTel
+	// Sum (monotonic, cumulative). Gauge edge-counts are lossy because
+	// a back-to-back degrade re-arms the cooldown without a 0
+	// transition; this counter is the lossless edge count.
+	MetricInferSamplerDegradationsTotal = "ingero.infer.sampler.degradations_total"
+
+	// MetricInferThrottleActiveTotal is the cumulative count of
+	// inference-step outliers observed while at least one NVML clock
+	// throttle reason was active. OTel Sum (monotonic, cumulative)
+	// labeled by ingero.infer.outlier_bucket. Pairs with
+	// gpu.throttle.{power,thermal,sw,hw}.event_total to tell apart
+	// "outlier coincided with a throttle" from "throttle elsewhere".
+	MetricInferThrottleActiveTotal = "ingero.infer.throttle_active_total"
+
 	// v0.16.2 OTel GenAI semantic-convention metric names. The
 	// agent's engine /metrics scraper (internal/infer/scrape) maps
 	// engine-specific Prometheus names (vllm:time_to_first_token_seconds,
@@ -266,6 +289,13 @@ const (
 	// disabled (operator passes --inference-phase-classifier=off),
 	// the attribute is the empty string.
 	AttrInferPhase = "ingero.infer.phase"
+
+	// AttrInferSamplerCause labels MetricInferSamplerDegraded* data
+	// points with the workload identity that triggered the most
+	// recent flip. Format is "<bucket>:cgroup=<hash>,pid=<n>,phase=<p>"
+	// so a single attribute string is enough for an operator to find
+	// the offending workload without scanning per-workload metrics.
+	AttrInferSamplerCause = "ingero.infer.sampler.cause"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:
