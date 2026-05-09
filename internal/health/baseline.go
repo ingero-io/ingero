@@ -328,26 +328,21 @@ func emaStep(prev Baselines, obs RawObservation, alpha float64) Baselines {
 }
 
 func emaUpdate(prev, x, alpha float64) float64 {
-	return alpha*x + (1-alpha)*prev
+	return EMAUpdate(prev, x, alpha)
 }
 
-// biasCorrect applies s_hat_t = s_t / (1 - (1-alpha)^t) so that samples
-// near t=0 aren't pulled toward zero. Returns zero baselines when
-// sampleCount is zero (nothing observed yet).
+// biasCorrect applies s_hat_t = s_t / (1 - (1-alpha)^t) component-wise
+// across a Baselines tuple, delegating the per-signal math to
+// BiasCorrectScalar. Returns the zero Baselines when t <= 0.
 func biasCorrect(raw Baselines, alpha float64, t int) Baselines {
 	if t <= 0 {
 		return Baselines{}
 	}
-	correction := 1 - math.Pow(1-alpha, float64(t))
-	if correction <= 0 {
-		return Baselines{}
-	}
-	inv := 1 / correction
 	return Baselines{
-		Throughput: raw.Throughput * inv,
-		Compute:    raw.Compute * inv,
-		Memory:     raw.Memory * inv,
-		CPU:        raw.CPU * inv,
+		Throughput: BiasCorrectScalar(raw.Throughput, alpha, t),
+		Compute:    BiasCorrectScalar(raw.Compute, alpha, t),
+		Memory:     BiasCorrectScalar(raw.Memory, alpha, t),
+		CPU:        BiasCorrectScalar(raw.CPU, alpha, t),
 	}
 }
 
@@ -361,10 +356,7 @@ func ratioBelowWarm(fast, floor, warmthMin, warn float64) bool {
 }
 
 func cleanFinite(x float64) float64 {
-	if math.IsNaN(x) || math.IsInf(x, 0) {
-		return 0
-	}
-	return x
+	return CleanFinite(x)
 }
 
 func baselinesFinite(b Baselines) bool {

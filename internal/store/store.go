@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -499,6 +500,16 @@ type Store struct {
 	// ReadStats() once a metric is wired in a later slice.
 	droppedBySampler atomic.Uint64
 
+	// Rollover state — installed via SetRolloverConfig and consumed by
+	// MaybeRollover/RolloverNow (defined in rollover.go). When
+	// rolloverCfg.Load() returns nil, all rollover paths are no-ops
+	// and pre-rollover behavior is preserved.
+	rolloverCfg      atomic.Pointer[RolloverConfig]
+	rolloverMu       sync.RWMutex
+	rolloverInFlight atomic.Bool
+	rolloverCount    atomic.Uint64
+	rolloverFailures atomic.Uint64
+
 	mu      sync.Mutex
 	closed  bool
 }
@@ -726,185 +737,12 @@ func New(dbPath string) (*Store, error) {
 			dbPath, onDiskVersion, CurrentUserVersion)
 	}
 
-	// Create schema.
-	if _, err := db.Exec(schema); err != nil {
+	// Create schema and run all idempotent migrations. Extracted into
+	// applyAgentSchema so the rollover path (rollover.go) re-applies
+	// the exact same sequence on the freshly-opened DB without drift.
+	if err := applyAgentSchema(db, onDiskVersion); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("creating schema: %w", err)
-	}
-
-	// Schema migrations for backward compatibility with older databases.
-	// Both ALTER TABLEs are idempotent — they fail silently if the column
-	// already exists. New databases get stack_hash from the schema and
-	// stack_ips from this migration (unused but harmless — 0 bytes overhead).
-	db.Exec(migrateAddStackHash)
-	db.Exec(migrateAddStackIPs)
-
-	// Create stack_traces table (deduplicated stack interning).
-	if _, err := db.Exec(stackTracesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating stack_traces table: %w", err)
-	}
-
-	// Add resolved frames column. Idempotent — no-op if column exists.
-	db.Exec(migrateAddFramesColumn)
-
-	// Migrate: if there are events with inline stack_ips, intern them into
-	// the stack_traces table. No-op for new databases.
-	migrateInlineStacks(db)
-
-	// Create causal_chains table.
-	if _, err := db.Exec(chainsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating causal_chains table: %w", err)
-	}
-
-	// Create and populate static lookup tables (sources, ops, schema_info).
-	if _, err := db.Exec(lookupSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating lookup tables: %w", err)
-	}
-	populateLookupTables(db)
-
-	// Ensure schema_info reflects the running binary, even for databases
-	// created by an older version (populateLookupTables skips inserts when
-	// tables are already populated).
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
-
-	// v0.8 migration: add new sources and ops for existing databases.
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (5, 'IO', 'Block I/O events')")
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (6, 'TCP', 'TCP events')")
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (7, 'NET', 'Network socket events')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (1, 8, 'cudaMallocManaged', 'Unified Memory allocation')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (4, 6, 'cuMemAllocManaged', 'Unified Memory allocation via driver API')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 1, 'block_read', 'Block device read request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 2, 'block_write', 'Block device write request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 3, 'block_discard', 'Block device discard/trim request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (6, 1, 'tcp_retransmit', 'TCP segment retransmission')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 1, 'net_send', 'Socket send/sendto syscall')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 2, 'net_recv', 'Socket recv/recvfrom syscall')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 10, 'pod_restart', 'K8s pod container restart detected')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 11, 'pod_eviction', 'K8s pod eviction detected')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 12, 'pod_oom_kill', 'K8s pod OOM kill detected')")
-	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
-	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates. sum_arg0 tracks mm_page_alloc total bytes (chain engine threshold: >1GB). count-stored = discarded count.')")
-	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
-	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols. Use get_stacks MCP tool for call stack analysis.')")
-
-	// Composite index for get_stacks MCP tool (GROUP BY source,op,stack_hash).
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_source_op_stack ON events(source, op, stack_hash)")
-
-	// Drop redundant idx_events_source_op — the composite idx_events_source_op_stack
-	// covers all (source, op) queries via SQLite leftmost-prefix matching.
-	// Old DBs created before this optimization carry the redundant index (~10MB/1M events).
-	db.Exec("DROP INDEX IF EXISTS idx_events_source_op")
-
-	// Create system_snapshots table (metrics sampled every 1s during recording).
-	if _, err := db.Exec(snapshotsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating system_snapshots table: %w", err)
-	}
-	// Migrate pre-dedup databases: add unique index, drop redundant non-unique index.
-	db.Exec(snapshotsMigration)
-
-	// Create sessions table (one row per 'ingero trace' invocation).
-	if _, err := db.Exec(sessionsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating sessions table: %w", err)
-	}
-
-	// Create process_names table (PID→name mapping for query enrichment).
-	if _, err := db.Exec(processNamesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating process_names table: %w", err)
-	}
-
-	// Create event_aggregates table (selective storage minute-buckets).
-	if _, err := db.Exec(aggregatesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating event_aggregates table: %w", err)
-	}
-
-	// Create event_aggregates_5s table (sub-minute health signal buckets).
-	if _, err := db.Exec(aggregates5sSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating event_aggregates_5s table: %w", err)
-	}
-
-	// Add sum_arg0 column for mm_page_alloc total bytes. Idempotent.
-	db.Exec(migrateAddSumArg0)
-
-	// v0.7: Add cgroup_id column to events table. Idempotent.
-	db.Exec(migrateAddCGroupID)
-
-	// Partial index on cgroup_id — only indexes non-zero values (container events).
-	// Sparse: bare-metal events (cgroup_id=0) don't bloat the index.
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_cgroup ON events(cgroup_id) WHERE cgroup_id != 0")
-
-	// v0.7: Create cgroup_metadata table (cgroup_id → container_id + pod metadata).
-	if _, err := db.Exec(cgroupMetadataSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating cgroup_metadata table: %w", err)
-	}
-
-	// v0.7: Add pod_name/namespace columns to cgroup_metadata. Idempotent —
-	// no-op for new DBs (schema already has them), adds columns for old DBs.
-	db.Exec(migrateAddPodName)
-	db.Exec(migrateAddNamespace)
-
-	// v0.8: Create cgroup_schedstat table for noisy neighbor detection.
-	if _, err := db.Exec(cgroupSchedstatSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating cgroup_schedstat table: %w", err)
-	}
-
-	// Update schema version to 0.8.
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id → container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
-
-	// v0.9: Add node identity and rank columns. Idempotent — no-op for new DBs.
-	db.Exec(migrateAddEventsNode)
-	db.Exec(migrateAddEventsRank)
-	db.Exec(migrateAddEventsLocalRank)
-	db.Exec(migrateAddEventsWorldSize)
-	db.Exec(migrateAddSessionsNode)
-	db.Exec(migrateAddSessionsRank)
-	db.Exec(migrateAddSessionsLocalRank)
-	db.Exec(migrateAddSessionsWorldSize)
-	db.Exec(migrateAddChainsNode)
-
-	// Update schema version to 0.9.
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.9')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('node_note', 'Node identity for multi-node correlation. events.id format: {node}:{seq}. causal_chains.id format: {node}:{descriptor}.')")
-
-	// v0.10: Add comm column to events table (PID hardening).
-	// Captured kernel-side via bpf_get_current_comm() at event emission time —
-	// immune to PID reuse and process exit, unlike the lazy /proc-based
-	// process_names table (which is preserved as a read-side fallback).
-	// Idempotent — no-op for new DBs that already have it from schema.
-	//
-	// Migration error gating: ALTER TABLE may silently fail on read-only DBs,
-	// disk full, or other I/O errors. We bump schema_info to 0.10 ONLY after
-	// confirming via PRAGMA that the column actually exists — protects against
-	// inconsistent state where the version says 0.10 but the column is missing.
-	db.Exec(migrateAddComm)
-
-	if hasEventsCommColumn(db) {
-		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.10')")
-		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('comm_note', 'events.comm captured kernel-side at event time. Empty for pre-v0.10 rows (fall back to process_names LEFT JOIN for legacy display).')")
-	}
-	// On read-only DBs the version stays at 0.9 — read paths must use
-	// hasColumn() guards if they want to be tolerant of either schema.
-
-	// Ratchet PRAGMA user_version forward to the current binary's level.
-	// Only advances; pragma syntax does not accept parameters so the int
-	// value is formatted in. Runs only when the on-disk value is behind
-	// us so a concurrent downgrade-and-upgrade cycle on the same file
-	// doesn't flap the marker. If the DB is read-only this silently
-	// fails, matching how the schema_info writes above behave.
-	if onDiskVersion < CurrentUserVersion {
-		db.Exec(fmt.Sprintf("PRAGMA user_version = %d", CurrentUserVersion))
+		return nil, err
 	}
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -1043,6 +881,9 @@ func (s *Store) Run(ctx context.Context) {
 			if len(batch) >= DefaultBatchSize {
 				s.flushBatch(batch)
 				batch = batch[:0]
+				if err := s.MaybeRollover(); err != nil {
+					slog.Default().Warn("store: rollover after batch flush failed", "err", err.Error())
+				}
 			}
 
 		case snap := <-s.snapshotCh:
@@ -1052,10 +893,19 @@ func (s *Store) Run(ctx context.Context) {
 			if len(batch) > 0 {
 				s.flushBatch(batch)
 				batch = batch[:0]
+				if err := s.MaybeRollover(); err != nil {
+					slog.Default().Warn("store: rollover after timed flush failed", "err", err.Error())
+				}
 			}
 
 		case <-pruneTicker.C:
 			s.prune()
+			// Tick-driven rollover so a low-write daemon still rotates
+			// when the file size has slowly crept past MaxSize via
+			// background activity (e.g. snapshot writes).
+			if err := s.MaybeRollover(); err != nil {
+				slog.Default().Warn("store: rollover on prune tick failed", "err", err.Error())
+			}
 
 		case <-ctx.Done():
 			// Final flush.

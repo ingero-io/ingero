@@ -242,6 +242,93 @@ CLI flags always override file values. The full schema lives in
 
 ---
 
+## Inference daemon mode (v0.16)
+
+`ingero trace --inference` is the production daemon shape for inference workloads. It bundles five behaviors that are individually opt-in but most useful together:
+
+1. **Sub-second causal window** (`--fleet-workload-type=inference`, 500ms instead of the 10s training default).
+2. **Event sampler** attached to the SQLite store: 1% admission in healthy state, 100% under degradation, 30s cooldown back to healthy. Caps storage on inference workloads that emit kernel events at production QPS.
+3. **JSON output** by default (no TUI), suitable for systemd / k8s log collectors.
+4. **DB rollover** instead of in-place pruning: rotates `ingero.db` to `ingero.<UTC-timestamp>.db` when the file crosses the threshold (default 1g), keeps the last 6.
+5. **Per-workload step-duration baseline + outlier detection.** Tracks the running mean (EMA) and 95th-percentile (P²) of step durations for each `(cgroup_path_hash, pid, stream_handle)` workload. Classifies each step against the workload's own p95 once warmed (default 30 healthy steps); emits `inference_outlier` events on the FOSS UDS socket and as rate-limited INFO logs.
+
+### One-line invocation
+
+```bash
+sudo ingero trace --inference
+```
+
+Equivalent expanded form (every flag the umbrella sets, written explicitly):
+
+```bash
+sudo ingero trace \
+  --fleet-workload-type=inference \
+  --duration=0 \
+  --json \
+  --heartbeat=30s \
+  --remediate \
+  --max-db=0 \
+  --db-rollover-size=1g \
+  --db-rollover-keep=6
+```
+
+Any individually set flag wins over the umbrella default. For example `ingero trace --inference --json=false` keeps everything else and re-enables the TUI.
+
+### Step-duration baseline
+
+A "step" is the wall-clock interval between consecutive `cudaStreamSynchronize` (also `cudaDeviceSynchronize`, driver `ctxSynchronize`) events on the same `(pid, stream_handle)`. For continuous-batching servers like vLLM, SGLang, and TGI, **each step is one engine iteration, not one user-facing HTTP request** — every request typically produces multiple syncs. The metric name `ingero.infer.step_duration_ns` reflects this honestly.
+
+Baseline updates pause while any HIGH-severity causal chain is active for the PID — see `--inference-pause-on-severity` to widen the gate (e.g. to `MEDIUM`). Outliers do not fold into the baseline, preserving cleanliness during sustained anomaly windows.
+
+### Outlier buckets
+
+Buckets are mutually exclusive at emission. A step that exceeds 3× of baseline-p95 increments the `3x` bucket only, not also `1.5x` and `2x`. SLO-style "exceeded 1.5x or higher" math happens at PromQL/Grafana time over the cumulative counter sums.
+
+| Bucket | Trigger | Default action |
+|---|---|---|
+| `1.5x` | step >= 1.5 × baseline-p95 | log + UDS publish |
+| `2x` | step >= 2.0 × baseline-p95 | log + UDS publish |
+| `3x` | step >= 3.0 × baseline-p95 (configurable via `--inference-outlier-ratio`) | log + UDS publish + sampler bumped to 100% admission for the cooldown window |
+
+The `3x` bucket also flips the sampler to admit 100% of events for the next 30s, so when the outlier resolves you have full-fidelity event history surrounding the spike. Configure with `--inference-sampler-degrade-on={1.5x,2x,3x,off}`.
+
+### UDS protocol extension
+
+When `--remediate` is on (default under `--inference`), each outlier emits a typed NDJSON message on `/tmp/ingero-remediate.sock`:
+
+```json
+{"type":"inference_outlier","node_id":"…","cluster_id":"…",
+ "timestamp":"2026-05-09T14:30:55Z","event_id":"…",
+ "cgroup_path_hash":"…","pid":12345,"stream_handle":18446744073709551615,
+ "step_duration_ns":50000000,"baseline_p95_ns":12000000,
+ "baseline_mean_ns":10500000,"bucket":"3x"}
+```
+
+The FOSS agent only publishes; consumers (the [ingero-ee orchestrator](https://github.com/ingero-io/ingero-ee), custom operator scripts) subscribe and react however they choose. Backward-compatible: existing consumers that decode by `type` ignore unknown variants.
+
+### Tuning
+
+| Flag / YAML key | Default | What it controls |
+|---|---|---|
+| `--inference-warmup` / `inference.baseline.warmup_samples` | 30 | Healthy steps before classification activates per workload |
+| `--inference-outlier-ratio` / `inference.outlier.threshold_ratio` | 3.0 | Multiplier on baseline-p95 for the largest bucket |
+| `--inference-pause-on-severity` / `inference.baseline.pause_on_severity` | `HIGH` | Lowest causal-chain severity that pauses baseline updates |
+| `--inference-sampler-degrade-on` / `inference.outlier.sampler_degrade_on` | `3x` | Smallest bucket that bumps the sampler to 100% |
+| `--db-rollover-size` / `inference.db_rollover.size` | `1g` | Trace DB file rollover threshold |
+| `--db-rollover-keep` / `inference.db_rollover.keep` | `6` | Rolled-over files retained on disk |
+
+### What's NOT in the v0.16 umbrella
+
+These are intentionally separate stories on the v0.16.x roadmap:
+- **KV-cache block-level lineage** (vLLM PagedAttention scrape) — engine `/metrics` HTTP scrape primitive
+- **Speculative-decoding accept-ratio** — engine `/metrics` extension
+- **Quantization health basics** (FP8 staleness, NaN/Inf detection)
+- **Memory-fragmentation precursors** (`mm_page_alloc_extfrag`, compaction tracepoints) — `internal/ebpf/memfrag` already shipped in v0.14; wiring into the trace path is a follow-up
+- **Power/thermal probes** (NVML power-state polling)
+- **OTLP histogram + counter emission** of `ingero.infer.*` — uses the v0.15 histogram encoder; follow-up
+
+---
+
 ## Related
 
 - [Multi-node Fleet quickstart](quickstart_fleet.md) (K8s, bare-metal, Docker)

@@ -97,6 +97,19 @@ var Contract = []TypeContract{
 		Required: []string{"type", "node_id", "cluster_id", "timestamp"},
 		goType:   reflect.TypeOf(fleetStragglerResolvedMessage{}),
 	},
+	{
+		Name:      "inference_outlier",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "step_duration_ns", "baseline_p95_ns", "bucket",
+		},
+		Optional: []string{
+			"event_id", "cgroup_path_hash", "stream_handle",
+			"baseline_mean_ns", "rank", "world_size",
+		},
+		goType: reflect.TypeOf(inferenceOutlierMessage{}),
+	},
 }
 
 // TestWireContract_FieldsDeclared fails the build if any type's struct

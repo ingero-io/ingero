@@ -131,6 +131,49 @@ alerter:
   pagerduty:
     routing_key: ""
 
+# Inference daemon-mode umbrella (v0.16+). Wired into `ingero trace`
+# since v0.16: setting inference.enabled (or passing --inference on
+# the CLI) flips a coordinated set of defaults appropriate for a 24/7
+# inference daemon. CLI flags override individual fields when
+# explicitly set; leaving both this block and --inference unset
+# preserves the prior trace behavior for one-shot debugging runs.
+#
+# Per-workload step-duration outliers are emitted on the FOSS UDS
+# socket (when `--remediate` is on) as `inference_outlier` typed
+# messages. Consumers (the EE orchestrator, custom operator scripts)
+# subscribe and react however they choose — the FOSS agent's only
+# job is publication.
+inference:
+  enabled: false
+  baseline:
+    # Healthy steps required before per-workload outlier classification
+    # activates. Lower = faster detection but more false positives
+    # during initial calibration.
+    warmup_samples: 30
+    # Pause baseline updates while a causal chain at this severity or
+    # higher is active for the PID. Set "" to disable.
+    pause_on_severity: HIGH
+  outlier:
+    # Multiplier on baseline p95 for the LARGEST outlier bucket.
+    # Smaller buckets fire at fixed 1.5x and 2x.
+    threshold_ratio: 3.0
+    # Smallest outlier bucket that bumps the store sampler to admit
+    # 100% of events for the cooldown window. 1.5x | 2x | 3x | off.
+    sampler_degrade_on: 3x
+  db_rollover:
+    # Rotate the SQLite trace DB when its size crosses this value.
+    # Empty disables rollover; mutually exclusive with --max-db.
+    size: 1g
+    # Number of rolled-over files retained on disk (oldest deleted).
+    keep: 6
+  daemon:
+    # Trace duration. 0 = run until ctx cancellation (the daemon shape).
+    duration: 0s
+    # Operator-supplied log path. When empty AND --log is not set, the
+    # umbrella picks /tmp/ingero-trace-<pid>.log so stderr stays clean
+    # for systemd / k8s log collectors.
+    log_path: ""
+
 # Prometheus /metrics endpoint (optional, disabled by default)
 prometheus:
   enabled: false

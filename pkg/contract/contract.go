@@ -92,6 +92,44 @@ const (
 	// Prometheus *_bucket / *_sum / *_count). Bucket layout:
 	// stats.DefaultMemcpyDurationBoundsMs.
 	MetricGPUMemcpyDurationMS = "gpu.memcpy.duration_ms"
+
+	// v0.16 inference-umbrella metrics. Active only when
+	// `ingero trace --inference` is set. The agent's per-workload
+	// step-duration baseliner (internal/infer) populates these.
+
+	// MetricInferStepDurationNs is the per-workload distribution of
+	// inference step durations in nanoseconds. OTel Histogram with
+	// attributes ingero.cgroup_path_hash, pid,
+	// ingero.infer.stream_handle. A "step" is the wall-clock interval
+	// between consecutive cudaStreamSynchronize / cudaDeviceSync /
+	// driver ctxSync events on the same (pid, stream); for
+	// continuous-batching servers (vLLM, SGLang, TGI) each step is one
+	// engine iteration, NOT one user-facing HTTP request.
+	MetricInferStepDurationNs = "ingero.infer.step_duration_ns"
+
+	// MetricInferOutlierTotal is the cumulative count of step durations
+	// classified as outliers (>=1.5x of the workload's running p95).
+	// OTel Sum (monotonic, cumulative) with the same workload-key
+	// attributes as MetricInferStepDurationNs plus
+	// ingero.infer.outlier_bucket ("1.5x" | "2x" | "3x"). Buckets are
+	// mutually exclusive — a step that crosses 3x increments the "3x"
+	// bucket only.
+	MetricInferOutlierTotal = "ingero.infer.outlier_total"
+
+	// MetricInferBaselineMeanNs is the current EMA mean of step
+	// durations for one workload, in nanoseconds. Gauge.
+	MetricInferBaselineMeanNs = "ingero.infer.baseline_mean_ns"
+
+	// MetricInferBaselineP95Ns is the current p95 estimate (P²
+	// algorithm) of step durations for one workload, in nanoseconds.
+	// The classifier compares each step against this value to decide
+	// outlier bucket membership. Gauge.
+	MetricInferBaselineP95Ns = "ingero.infer.baseline_p95_ns"
+
+	// MetricInferWorkloadsTracked is the count of distinct
+	// (cgroup_path_hash, pid, stream_handle) workloads currently held
+	// in the agent's bounded LRU. Gauge, no per-workload attributes.
+	MetricInferWorkloadsTracked = "ingero.infer.workloads_tracked"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -140,6 +178,19 @@ const (
 	// MemcpyDirection* constants below. Namespaced to align with the
 	// other Attr* constants in this package.
 	AttrMemcpyDirection = "ingero.memcpy.direction"
+
+	// AttrInferStreamHandle labels MetricInfer* data points with the
+	// CUDA stream handle the workload's syncs were observed on. Stored
+	// as a string-encoded uint64 so the wire format matches other
+	// pointer-shaped attributes in this package.
+	AttrInferStreamHandle = "ingero.infer.stream_handle"
+
+	// AttrInferOutlierBucket labels MetricInferOutlierTotal data points
+	// with the largest baseline-p95 multiplier the step crossed.
+	// Allowed values: "1.5x" | "2x" | "3x". Buckets are mutually
+	// exclusive at emission; SLO-style "exceeded 1.5x or higher" math
+	// happens at PromQL/Grafana time over the cumulative counter sums.
+	AttrInferOutlierBucket = "ingero.infer.outlier_bucket"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:

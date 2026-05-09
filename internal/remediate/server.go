@@ -326,6 +326,35 @@ type fleetStragglerResolvedMessage struct {
 	WorldSize int    `json:"world_size,omitempty"`
 }
 
+// inferenceOutlierMessage is the UDS envelope for per-workload
+// step-duration outliers detected by internal/infer's classifier.
+// Emitted only when `ingero trace --inference` is set. Consumers
+// (the EE orchestrator, custom operator scripts) decode by the
+// `type` field and react however they choose; the FOSS agent's
+// only job is publication.
+//
+// The shape mirrors fleetStragglerStateMessage where it makes sense
+// (timestamp, node/cluster ids, event_id for cross-channel
+// correlation) and adds workload-key fields (cgroup_path_hash, pid,
+// stream_handle) plus the classification verdict (step_duration_ns,
+// baseline_p95_ns, bucket).
+type inferenceOutlierMessage struct {
+	Type           string    `json:"type"`
+	NodeID         string    `json:"node_id"`
+	ClusterID      string    `json:"cluster_id"`
+	Timestamp      time.Time `json:"timestamp"`
+	EventID        string    `json:"event_id,omitempty"`
+	CGroupPathHash string    `json:"cgroup_path_hash,omitempty"`
+	PID            uint32    `json:"pid"`
+	StreamHandle   uint64    `json:"stream_handle,omitempty"`
+	StepDurationNs int64     `json:"step_duration_ns"`
+	BaselineP95Ns  int64     `json:"baseline_p95_ns"`
+	BaselineMeanNs int64     `json:"baseline_mean_ns,omitempty"`
+	Bucket         string    `json:"bucket"` // "1.5x" | "2x" | "3x"
+	Rank           int       `json:"rank,omitempty"`
+	WorldSize      int       `json:"world_size,omitempty"`
+}
+
 // SendFleetStragglerState writes a peer-relative straggler notification
 // to the UDS consumer. Non-blocking: drops silently if no consumer is
 // connected or the write exceeds 50ms. Wire format follows the existing
@@ -352,6 +381,54 @@ func (s *Server) SendFleetStragglerState(ts time.Time, nodeID, clusterID, detect
 		DominantSignal: dominantSignal,
 		Timestamp:      ts,
 		EventID:        eventID,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
+// SendInferenceOutlier writes a per-workload step-duration outlier
+// notification to the UDS consumer. Non-blocking; same drop semantics
+// as SendFleetStragglerState.
+//
+// Wire-protocol-only. The FOSS agent classifies and publishes; any
+// follow-up action lives in the consumer (notably the ingero-ee
+// orchestrator, but the protocol is open).
+//
+// bucket is one of "1.5x" | "2x" | "3x" — the largest baseline-p95
+// multiplier the step crossed. eventID is the same UUID that appears
+// on the matching OTLP histogram data-point so consumers can correlate
+// channels.
+func (s *Server) SendInferenceOutlier(
+	ts time.Time,
+	nodeID, clusterID, eventID string,
+	cgroupPathHash string, pid uint32, streamHandle uint64,
+	stepDurationNs, baselineP95Ns, baselineMeanNs int64,
+	bucket string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	msg := inferenceOutlierMessage{
+		Type:           "inference_outlier",
+		NodeID:         nodeID,
+		ClusterID:      clusterID,
+		Timestamp:      ts,
+		EventID:        eventID,
+		CGroupPathHash: cgroupPathHash,
+		PID:            pid,
+		StreamHandle:   streamHandle,
+		StepDurationNs: stepDurationNs,
+		BaselineP95Ns:  baselineP95Ns,
+		BaselineMeanNs: baselineMeanNs,
+		Bucket:         bucket,
 	}
 	if s.worldSize > 0 {
 		msg.Rank = s.rank

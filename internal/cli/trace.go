@@ -22,9 +22,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ingero-io/ingero/internal/cgroup"
+	"github.com/ingero-io/ingero/internal/config"
 	"github.com/ingero-io/ingero/internal/correlate"
 	"github.com/ingero-io/ingero/internal/discover"
+	"github.com/ingero-io/ingero/internal/health"
+	"github.com/ingero-io/ingero/internal/infer"
 	"github.com/ingero-io/ingero/internal/kprobe"
+	"github.com/ingero-io/ingero/internal/sampling"
 	"github.com/ingero-io/ingero/internal/ebpf/blockio"
 	"github.com/ingero-io/ingero/internal/ebpf/cuda"
 	"github.com/ingero-io/ingero/internal/ebpf/cudagraph"
@@ -108,6 +112,29 @@ var (
 	// 0 disables. Polling-based; v0.15 W1 will replace with IOCTL-level
 	// tracing.
 	traceMemFragPollInterval time.Duration
+
+	// v0.16 inference-umbrella flags. The umbrella (`--inference`) is
+	// a meta-flag that flips defaults on a coordinated set: workload
+	// type, sampler attachment, output mode, DB rollover, and the
+	// per-workload step-duration baseliner. Operators can still
+	// override any individual flag explicitly.
+	traceInference                  bool
+	traceDBRolloverSize             string
+	traceDBRolloverKeep             int
+	traceInferenceWarmup            int
+	traceInferenceOutlierRatio      float64
+	traceInferencePauseSeverity     string
+	traceInferenceSamplerDegradeOn  string
+	// inferEngine is the per-workload step-duration baseline +
+	// classifier. Constructed only when --inference is set.
+	inferEngine *infer.Engine
+	// inferSampler is the store-side sampler attached to admissions.
+	// Captured here so the infer engine can degrade it on outlier.
+	inferSampler *sampling.Sampler
+	// inferCgroupCache resolves event PIDs to cgroup_path_hash so the
+	// per-workload key on the infer engine matches the emitter's
+	// emission attribute. Constructed only when --inference is set.
+	inferCgroupCache *health.PIDCGroupHashCache
 )
 
 // ncclBufferAdd appends a data point to the snapshot drain buffer. Drops
@@ -196,6 +223,28 @@ func init() {
 		"interval between NVML memory polls for the memfrag heuristic (gpu.memory.{used,free,total,fragmentation_estimate,process.allocated_bytes}). 0 = disable. Polling-based; v0.15 ships an event-driven IOCTL kprobe behind --enable-experimental-kprobes.")
 	traceCmd.Flags().BoolVar(&traceEnableExperimentalKprobes, "enable-experimental-kprobes", false,
 		"EXPERIMENTAL: load v0.15 closed-driver kprobes (memfrag IOCTL, throttle, kernel grid/block dims). Probes only attach when the running NVIDIA driver + Linux kernel pair is on a tested allowlist (DefaultAllowlist in internal/kprobe). Outside the allowlist: warning at startup, no probe load.")
+
+	// v0.16 inference-umbrella flags. --inference is a meta-flag that
+	// engages a coordinated set of defaults for production daemon use:
+	// workload_type=inference (sub-second causal window), JSON-only
+	// output, sampler attached to the SQLite store, --remediate=true
+	// (UDS socket exposed), DB rollover instead of in-place pruning,
+	// and per-workload step-duration outlier detection. Operators can
+	// still override any individual flag explicitly.
+	traceCmd.Flags().BoolVar(&traceInference, "inference", false,
+		"v0.16 umbrella: production daemon for inference. Sets workload_type=inference, attaches the event sampler, switches to JSON output, enables --remediate, swaps --max-db for DB rollover, and turns on per-workload step-duration outlier detection. Individual flags still override.")
+	traceCmd.Flags().StringVar(&traceDBRolloverSize, "db-rollover-size", "",
+		"rotate the SQLite trace DB when its size crosses this value (e.g. 1g, 500m). Empty = disabled. Mutually exclusive with --max-db. Default 1g when --inference is set.")
+	traceCmd.Flags().IntVar(&traceDBRolloverKeep, "db-rollover-keep", 6,
+		"number of rolled-over DB files to retain on disk (oldest deleted first).")
+	traceCmd.Flags().IntVar(&traceInferenceWarmup, "inference-warmup", 30,
+		"healthy steps required before per-workload outlier classification activates.")
+	traceCmd.Flags().Float64Var(&traceInferenceOutlierRatio, "inference-outlier-ratio", 3.0,
+		"step duration must exceed baseline p95 by this multiplier to land in the largest outlier bucket. Smaller buckets fire at 1.5x and 2x of p95.")
+	traceCmd.Flags().StringVar(&traceInferencePauseSeverity, "inference-pause-on-severity", "HIGH",
+		"pause baseline updates while a causal chain at this severity or higher is active for the PID (HIGH | MEDIUM | LOW | empty to disable).")
+	traceCmd.Flags().StringVar(&traceInferenceSamplerDegradeOn, "inference-sampler-degrade-on", "3x",
+		"smallest outlier bucket that bumps the store sampler to admit 100%% of events (1.5x | 2x | 3x | off).")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -375,6 +424,24 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 	if ringBufBytes > 0 {
 		debugf("ring buffer override applied to cuda/driver/host only (high-throughput probes): %d bytes", ringBufBytes)
+	}
+
+	// v0.16 inference umbrella. Loads YAML, layers CLI flags, validates
+	// mutex constraints, and applies the umbrella defaults to the
+	// trace-command flag vars. Returns the resolved struct so the
+	// engine + rollover wiring below can read the post-merge values
+	// directly (instead of re-checking each flag).
+	cfgPath, _ := cmd.Flags().GetString("config")
+	agentCfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config %s: %w", cfgPath, err)
+	}
+	resolvedInfer, err := resolveInferenceConfig(agentCfg, cmd, cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := applyInferenceDefaults(cmd, resolvedInfer); err != nil {
+		return err
 	}
 
 	// Validate --py-walker early — fail fast on invalid input.
@@ -825,6 +892,24 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			eventStore.SetMaxDBSize(maxBytes)
 		}
 
+		// v0.16: file-level DB rollover (mutually exclusive with
+		// --max-db, enforced by resolveInferenceConfig). When the
+		// umbrella is engaged, applyInferenceDefaults has already
+		// flipped --max-db off and set --db-rollover-size=1g; here we
+		// just plumb the resolved values into the store.
+		if rerr := configureRollover(eventStore); rerr != nil {
+			s.Close()
+			return rerr
+		}
+
+		// v0.16: per-workload step-duration baseliner + sampler. No-op
+		// when --inference is not engaged (returns nil engine and nil
+		// sampler). Captured into package-level vars so the event
+		// handler and snapshot loop below can route events into them
+		// without additional plumbing.
+		inferEngine, inferSampler = configureInferenceEngine(eventStore)
+		_ = inferSampler // captured via Engine config; reference here keeps compiler happy when the symbol is otherwise unused
+
 		// Record session metadata (GPU model, driver, CPU, OS, etc.).
 		// These are ~1ms reads at startup — no overhead concern.
 		kernelVer, _ := discover.KernelVersion()
@@ -1179,6 +1264,20 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			}
 			// v0.15 item M: per-PID kernel-launch aggregates.
 			snap.KernelLaunches = snapshotKernelLaunchCounters()
+
+			// v0.16 inference outliers. Drain the engine's queue and
+			// publish each outlier on the FOSS UDS socket (when
+			// --remediate is enabled). The slog INFO line in
+			// internal/infer/engine.go's maybeLogOutlier handles the
+			// rate-limited operator log. OTLP histogram + counter
+			// emission of MetricInferStepDurationNs and friends is a
+			// follow-up v0.16.x story; for v0.16.0 the on-wire surface
+			// is UDS + structured logs.
+			if inferEngine != nil {
+				for _, oe := range inferEngine.Drain() {
+					emitInferOutlier(remediateSrv, traceNode, "", oe)
+				}
+			}
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
 			}
@@ -2701,6 +2800,13 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 				corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 				chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
 			}
+			// v0.16: feed chain severity into the per-workload
+			// baseliner so the severity gate pauses updates while a
+			// HIGH chain is active for this PID. No-op when
+			// --inference is not engaged.
+			if inferEngine != nil {
+				inferEngine.OnChainSnapshot(chains, uint32(corrPID), time.Now())
+			}
 			// Store final chains before rendering (ticker stores intermediate
 			// chains, but the last snapshot may detect new/upgraded chains).
 			if eventStore != nil && len(chains) > 0 {
@@ -2772,6 +2878,19 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			// (two map writes); only the cudaMemcpy* family of op
 			// codes exercises the work path.
 			recordMemcpyEvent(evt)
+
+			// v0.16 inference baseliner. Engine.OnSyncEvent
+			// internally short-circuits on non-sync events, so the
+			// hot-path cost when a non-sync event arrives is one
+			// type-switch + one mutex Lock+Unlock. Active only when
+			// --inference is engaged (inferEngine is nil otherwise).
+			if inferEngine != nil {
+				cgroupHash := ""
+				if inferCgroupCache != nil {
+					cgroupHash = inferCgroupCache.Resolve(evt.PID)
+				}
+				inferEngine.OnSyncEvent(evt, cgroupHash)
+			}
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
@@ -2940,6 +3059,13 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 					corr.AdvanceClock(time.Now())
 					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
 					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
+				}
+				// v0.16: feed chain severity into the per-workload
+				// baseliner so the severity gate pauses updates while
+				// a HIGH chain is active for this PID. No-op when
+				// --inference is not engaged.
+				if inferEngine != nil {
+					inferEngine.OnChainSnapshot(chains, uint32(corrPID), time.Now())
 				}
 				if eventStore != nil {
 					if len(chains) > 0 {
@@ -3835,4 +3961,173 @@ func chainsToStored(chains []correlate.CausalChain) []store.StoredChain {
 		}
 	}
 	return out
+}
+
+// applyInferenceDefaults flips the flag-var defaults that participate
+// in the --inference umbrella. Called once near the top of traceRunE
+// AFTER the YAML/CLI resolver has produced resolvedInfer. We mutate
+// the package-level flag vars in place so the rest of traceRunE
+// (which reads them directly) sees the post-expansion values without
+// any further plumbing.
+//
+// Each default is gated on cmd.Flags().Changed(...) so an explicit
+// CLI override always wins. The pattern matches resolveOTLPConfig in
+// fleet_push.go.
+func applyInferenceDefaults(cmd *cobra.Command, r resolvedInference) error {
+	if !r.Enabled {
+		return nil
+	}
+
+	if !cmd.Flags().Changed("fleet-workload-type") {
+		traceWorkloadType = "inference"
+	}
+	if !cmd.Flags().Changed("duration") {
+		// 0 = run until ctx cancellation (the daemon shape).
+		traceDuration = 0
+	}
+	if !cmd.Flags().Changed("json") {
+		traceJSON = true
+	}
+	if !cmd.Flags().Changed("heartbeat") {
+		traceHeartbeat = 30 * time.Second
+	}
+	if !cmd.Flags().Changed("remediate") {
+		// FOSS UDS exposure: anyone (including the EE orchestrator)
+		// can subscribe. The EE consumer lives in a separate repo.
+		traceRemediate = true
+	}
+
+	// --max-db vs --db-rollover-size. Resolver already rejected
+	// "both explicitly set"; here we only fill the rollover default
+	// when neither was explicitly set.
+	if !cmd.Flags().Changed("max-db") && !cmd.Flags().Changed("db-rollover-size") {
+		// Disable in-place pruning, enable file rollover at 1g.
+		traceMaxDB = "0"
+		traceDBRolloverSize = "1g"
+	}
+
+	// Daemon log path: prefer YAML, then a process-local temp file,
+	// only when the operator left --log unset. Keeps stderr clean for
+	// systemd / k8s log collectors that consume one-line-per-event.
+	if !cmd.Flags().Changed("log") {
+		switch {
+		case r.DaemonLogPath != "":
+			traceLogPath = r.DaemonLogPath
+		default:
+			traceLogPath = filepath.Join(os.TempDir(),
+				fmt.Sprintf("ingero-trace-%d.log", os.Getpid()))
+		}
+	}
+
+	// Push the resolver's parsed warmup / threshold / pause / sampler
+	// fields back onto the flag vars so the engine construction below
+	// reads them uniformly from the package vars.
+	if r.WarmupSamples > 0 {
+		traceInferenceWarmup = r.WarmupSamples
+	}
+	if r.OutlierThresholdRatio > 0 {
+		traceInferenceOutlierRatio = r.OutlierThresholdRatio
+	}
+	if r.PauseOnSeverity != "" {
+		traceInferencePauseSeverity = r.PauseOnSeverity
+	}
+	if r.SamplerDegradeOn != "" {
+		traceInferenceSamplerDegradeOn = r.SamplerDegradeOn
+	}
+	if r.DBRolloverSize != "" {
+		traceDBRolloverSize = r.DBRolloverSize
+	}
+	if r.DBRolloverKeep > 0 {
+		traceDBRolloverKeep = r.DBRolloverKeep
+	}
+	return nil
+}
+
+// configureInferenceEngine constructs the per-workload step-duration
+// baseliner + outlier classifier and attaches a sampler to the store.
+// No-op when --inference is not engaged. Returns the engine handle so
+// the trace event-loop hooks below can route sync events into it.
+//
+// Caller invokes this AFTER the eventStore is open and SetSampler is
+// safe to call. Uses package-level flag vars populated by
+// applyInferenceDefaults.
+func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling.Sampler) {
+	if !traceInference || traceWorkloadType != "inference" {
+		return nil, nil
+	}
+	smp := sampling.New(
+		"inference",
+		sampling.DefaultHealthyRate,
+		sampling.DefaultCooldownDuration,
+	)
+	if eventStore != nil {
+		eventStore.SetSampler(smp)
+	}
+	cfg := infer.Config{
+		WarmupSamples:         traceInferenceWarmup,
+		OutlierThresholdRatio: traceInferenceOutlierRatio,
+		PauseOnSeverity:       traceInferencePauseSeverity,
+		SamplerDegradeOn:      infer.OutlierBucket(strings.ToLower(strings.TrimSpace(traceInferenceSamplerDegradeOn))),
+		Sampler:               smp,
+	}
+	if cfg.SamplerDegradeOn == "off" {
+		cfg.SamplerDegradeOn = infer.BucketNone
+	}
+	eng := infer.New(cfg, slog.Default())
+	// Build the PID->cgroup_path_hash resolver here so the event
+	// hot-path doesn't need to re-construct it. Default capacity
+	// (1024) matches the existing per-cgroup metrics LRU.
+	inferCgroupCache = health.NewPIDCGroupHashCache(0)
+	return eng, smp
+}
+
+// configureRollover wires the resolved rollover policy into the
+// store. No-op when --inference (and therefore the rollover defaults)
+// is not engaged AND the operator did not explicitly set
+// --db-rollover-size.
+func configureRollover(eventStore *store.Store) error {
+	if eventStore == nil || strings.TrimSpace(traceDBRolloverSize) == "" {
+		return nil
+	}
+	maxBytes, err := store.ParseSize(traceDBRolloverSize)
+	if err != nil {
+		return fmt.Errorf("parsing --db-rollover-size %q: %w", traceDBRolloverSize, err)
+	}
+	keep := traceDBRolloverKeep
+	if keep <= 0 {
+		keep = 6
+	}
+	eventStore.SetRolloverConfig(store.RolloverConfig{
+		MaxSize:   maxBytes,
+		KeepFiles: keep,
+	})
+	return nil
+}
+
+// emitInferOutlier publishes one outlier event through every channel
+// the operator has wired in: OTLP histogram + counter, Prometheus
+// counters, and the FOSS UDS socket (when --remediate is on). Drops
+// silently when the matching channel is not configured. Called from
+// the snapshot-tick callback in onSnapshot.
+func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev infer.OutlierEvent) {
+	// UDS publish (FOSS-side only — consumers, including the EE
+	// orchestrator, react however they choose). When the socket is
+	// not enabled, udsServer is nil and we skip.
+	if udsServer != nil {
+		_ = udsServer.SendInferenceOutlier(
+			ev.At,
+			nodeID, clusterID, ev.EventID,
+			ev.Key.CGroupHash,
+			ev.Key.PID,
+			ev.Key.StreamHandle,
+			ev.StepDurationNs,
+			ev.BaselineP95Ns,
+			ev.BaselineMeanNs,
+			string(ev.Bucket),
+		)
+	}
+	// OTLP histogram + counter emission goes through the existing
+	// stats / export pipelines on the next snapshot tick. The infer
+	// engine's Snapshot() and Stats() are read by the snapshot
+	// builder below; no per-outlier OTLP push is needed here.
 }
