@@ -570,6 +570,14 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			"Cumulative inference outliers observed while NVML throttle reasons were active",
 			"1", nowNano, int64(count), attrs))
 	}
+	// KV-cache alloc-age histogram. Engine-wide cumulative;
+	// per-decode-outlier per-PID attribution lives on the UDS path.
+	if snap.InferStats.KVCacheAllocAgeHist.HasObservation {
+		metrics = append(metrics, histogramMetric(
+			contract.MetricInferKVCacheAllocAgeMs,
+			"Live cudaMalloc allocation ages sampled at decode-phase outliers",
+			"ms", nowNano, "", snap.InferStats.KVCacheAllocAgeHist, nil))
+	}
 	if snap.InferSampler.DegradationsTotal > 0 || snap.InferSampler.Degraded {
 		samplerAttrs := []otlpKeyValue{}
 		if snap.InferSampler.LastCause != "" {

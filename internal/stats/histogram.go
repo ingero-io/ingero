@@ -154,3 +154,20 @@ var DefaultInferStepDurationBoundsNs = []float64{
 	1_000_000_000, 2_500_000_000, 5_000_000_000,
 	10_000_000_000,
 }
+
+// DefaultInferKVCacheAllocAgeBoundsMs is the bucket layout for
+// ingero.infer.kvcache.alloc_age_ms. Geometric progression spanning
+// "fresh allocation" (< 10 ms) to "decade-old straggler" (> 10
+// minutes). The interesting band for KV-cache stalls is 100 ms - 60
+// s: a stale block that's lived through hundreds of decode steps
+// without eviction. Anything older than 10 minutes is almost
+// certainly a model-weight tensor that was never meant to age out;
+// keeping the bucket in the layout (vs clipping) preserves the
+// signal "yes there ARE old allocs, here's how old".
+var DefaultInferKVCacheAllocAgeBoundsMs = []float64{
+	10, 25, 50,
+	100, 250, 500,
+	1_000, 2_500, 5_000,
+	10_000, 30_000, 60_000,
+	120_000, 300_000, 600_000,
+}

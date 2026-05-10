@@ -453,6 +453,23 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 			fmt.Fprintf(&b, "ingero_infer_throttle_active_total{bucket=%q} %d\n", bk, snap.InferStats.ThrottleAtOutlier[bk])
 		}
 	}
+	// KV-cache alloc-age histogram. Engine-wide cumulative.
+	if snap.InferStats.KVCacheAllocAgeHist.HasObservation {
+		h := snap.InferStats.KVCacheAllocAgeHist
+		b.WriteString("# HELP ingero_infer_kvcache_alloc_age_ms Live cudaMalloc allocation ages sampled at decode-phase outliers\n")
+		b.WriteString("# TYPE ingero_infer_kvcache_alloc_age_ms histogram\n")
+		cum := uint64(0)
+		for i, bound := range h.ExplicitBounds {
+			cum += h.BucketCounts[i]
+			fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_bucket{le=\"%g\"} %d\n", bound, cum)
+		}
+		if len(h.BucketCounts) > 0 {
+			cum += h.BucketCounts[len(h.BucketCounts)-1]
+		}
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_bucket{le=\"+Inf\"} %d\n", cum)
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_sum %g\n", h.Sum)
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_count %d\n", h.Count)
+	}
 	if snap.InferSampler.DegradationsTotal > 0 || snap.InferSampler.Degraded {
 		causeLabel := ""
 		if snap.InferSampler.LastCause != "" {

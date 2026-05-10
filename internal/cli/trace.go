@@ -28,6 +28,7 @@ import (
 	"github.com/ingero-io/ingero/internal/health"
 	"github.com/ingero-io/ingero/internal/infer"
 	"github.com/ingero-io/ingero/internal/infer/enginedetect"
+	"github.com/ingero-io/ingero/internal/infer/kvcache"
 	"github.com/ingero-io/ingero/internal/infer/scrape"
 	"github.com/ingero-io/ingero/internal/kprobe"
 	"github.com/ingero-io/ingero/internal/sampling"
@@ -145,6 +146,11 @@ var (
 
 	// v0.16.5b: kernel-fingerprint workload key.
 	traceInferenceFingerprintKey         bool
+
+	// KV-cache lineage tracking knobs.
+	traceInferenceKVCacheLineage  bool
+	traceInferenceKVCacheTopN     int
+	traceInferenceKVCacheMaxPerPID int
 
 	// inferEngine is the per-workload step-duration baseline +
 	// classifier. Constructed only when --inference is set.
@@ -308,6 +314,12 @@ func init() {
 		"minimum NVIDIA memfrag IOCTL events between syncs to classify a low-launch step as decode (KV-cache pressure rule). Set to a large value to effectively disable.")
 	traceCmd.Flags().BoolVar(&traceInferenceFingerprintKey, "inference-fingerprint-key", false,
 		"v0.16.5b: include a per-step kernel-launch-sequence fingerprint in the inference WorkloadKey. Engage when a single (pid, stream) hosts multiple models / model versions and you want independent baselines per kernel sequence. Off by default to keep the LRU footprint at v0.16.4 levels.")
+	traceCmd.Flags().BoolVar(&traceInferenceKVCacheLineage, "inference-kvcache-lineage", false,
+		"track per-PID cudaMalloc / cudaFree lineage so decode-phase outliers carry top-N alloc ages (KV-cache fragmentation context). Adds the ingero.infer.kvcache.alloc_age_ms histogram and a kv_cache_top_alloc_ages_ms field on the UDS outlier envelope. Off by default - bounded memory cost (~64 KB per inference PID).")
+	traceCmd.Flags().IntVar(&traceInferenceKVCacheTopN, "inference-kvcache-top-n", 5,
+		"how many oldest live allocations to attach to a decode-phase outlier event. Caps the UDS / OTLP attribute set under fragmentation; 5 is enough to identify the stale-cache pattern without inflating the wire envelope.")
+	traceCmd.Flags().IntVar(&traceInferenceKVCacheMaxPerPID, "inference-kvcache-max-per-pid", 0,
+		"per-PID live-allocation tracking cap. Older entries LRU-evict on insert. 0 uses the kvcache package default (8192).")
 
 	// v0.16.2 engine /metrics scrape flags. When --inference is set
 	// and an engine (vLLM/TGI/SGLang/Triton) is detected on the host,
@@ -1000,6 +1012,35 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				if err := inferScraper.Run(ctx); err != nil &&
 					err != context.Canceled {
 					debugf("infer scrape Run: %v", err)
+				}
+			}()
+		}
+
+		// When KV-cache lineage is engaged the agent must keep the
+		// cudaMalloc / cudaFree BPF probes' watchdog gate open. The
+		// gate exists so memtrack-style remediation can stop tracking
+		// allocations when the orchestrator dies; here the agent
+		// itself is the consumer, so we self-heartbeat. 25 ms cadence
+		// stays well below the 50 ms staleness floor in
+		// common.bpf.h's watchdog_is_stale.
+		if traceInferenceKVCacheLineage && cudaTracer != nil {
+			go func() {
+				ticker := time.NewTicker(25 * time.Millisecond)
+				defer ticker.Stop()
+				// Fire once immediately so the first cudaMalloc /
+				// cudaFree after agent attach already passes the gate.
+				if err := cudaTracer.WriteWatchdogHeartbeat(); err != nil {
+					debugf("infer kvcache: initial watchdog heartbeat failed: %v", err)
+				}
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if err := cudaTracer.WriteWatchdogHeartbeat(); err != nil {
+							debugf("infer kvcache: watchdog heartbeat: %v", err)
+						}
+					}
 				}
 			}()
 		}
@@ -2649,6 +2690,14 @@ func handlePyLifecycle(evt events.Event, pyMaps []*ebpf.Map) {
 				debugf("py-walker: ClearPID[%d](%d) failed: %v", i, evt.PID, err)
 			}
 		}
+		// Clear KV-cache lineage state for the dead PID so the
+		// per-PID alloc-LRU doesn't leak across long-running agent
+		// sessions where many short-lived inference processes have
+		// come and gone. Nil-safe when --inference-kvcache-lineage is
+		// off.
+		if inferEngine != nil {
+			inferEngine.OnProcessExit(evt.PID)
+		}
 	}
 }
 
@@ -3011,6 +3060,19 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 						inferEngine.OnSyncEvent(evt, cgroupHash)
 					case events.CUDALaunchKernel:
 						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
+					case events.CUDAMalloc, events.CUDAMallocManaged:
+						// Feed the KV-cache lineage tracker. Args[0]
+						// is allocation size, Args[1] is the resolved
+						// devPtr (the BPF uretprobe reads it from the
+						// void** parameter). Older probes that left
+						// arg1 as the parameter address rather than
+						// the resolved pointer make every alloc key
+						// unique to that void**, which is fine - the
+						// tracker just gets less useful pairing.
+						inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
+					case events.CUDAFree:
+						// Args[0] = devPtr being freed.
+						inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
 					}
 					// NOTE on memcpy: events.CUDAMemcpy / CUDAMemcpyAsync
 					// carry byte count in Args[0], NOT stream handle, per
@@ -3682,6 +3744,19 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 						inferEngine.OnSyncEvent(evt, cgroupHash)
 					case events.CUDALaunchKernel:
 						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
+					case events.CUDAMalloc, events.CUDAMallocManaged:
+						// Feed the KV-cache lineage tracker. Args[0]
+						// is allocation size, Args[1] is the resolved
+						// devPtr (the BPF uretprobe reads it from the
+						// void** parameter). Older probes that left
+						// arg1 as the parameter address rather than
+						// the resolved pointer make every alloc key
+						// unique to that void**, which is fine - the
+						// tracker just gets less useful pairing.
+						inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
+					case events.CUDAFree:
+						// Args[0] = devPtr being freed.
+						inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
 					}
 				} else if evt.Source == events.SourceDriver &&
 					events.DriverOp(evt.Op) == events.DriverCtxSync {
@@ -4238,6 +4313,13 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 		// v0.16.5b: optional kernel-fingerprint dimension.
 		FingerprintKeyEnabled: traceInferenceFingerprintKey,
 	}
+	// Optional KV-cache lineage tracker.
+	if traceInferenceKVCacheLineage {
+		cfg.KVCacheTracker = kvcache.New(kvcache.Config{
+			MaxAllocsPerPID: traceInferenceKVCacheMaxPerPID,
+		})
+		cfg.KVCacheTopN = traceInferenceKVCacheTopN
+	}
 	if cfg.SamplerDegradeOn == "off" {
 		cfg.SamplerDegradeOn = infer.BucketNone
 	}
@@ -4411,21 +4493,22 @@ func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev 
 	// not enabled, udsServer is nil and we skip.
 	if udsServer != nil {
 		_ = udsServer.SendInferenceOutlier(remediate.InferenceOutlier{
-			Timestamp:           ev.At,
-			NodeID:              nodeID,
-			ClusterID:           clusterID,
-			EventID:             ev.EventID,
-			CGroupPathHash:      ev.Key.CGroupHash,
-			PID:                 ev.Key.PID,
-			StreamHandle:        ev.Key.StreamHandle,
-			Phase:               string(ev.Key.Phase),
-			StepDurationNs:      ev.StepDurationNs,
-			BaselineP95Ns:       ev.BaselineP95Ns,
-			BaselineMeanNs:      ev.BaselineMeanNs,
-			Bucket:              string(ev.Bucket),
-			MemfragEventsInStep: ev.MemfragEvents,
-			ThrottleReasons:     ev.ThrottleReasons,
-			MinSMClockMHz:       ev.MinSMClockMHz,
+			Timestamp:             ev.At,
+			NodeID:                nodeID,
+			ClusterID:             clusterID,
+			EventID:               ev.EventID,
+			CGroupPathHash:        ev.Key.CGroupHash,
+			PID:                   ev.Key.PID,
+			StreamHandle:          ev.Key.StreamHandle,
+			Phase:                 string(ev.Key.Phase),
+			StepDurationNs:        ev.StepDurationNs,
+			BaselineP95Ns:         ev.BaselineP95Ns,
+			BaselineMeanNs:        ev.BaselineMeanNs,
+			Bucket:                string(ev.Bucket),
+			MemfragEventsInStep:   ev.MemfragEvents,
+			ThrottleReasons:       ev.ThrottleReasons,
+			MinSMClockMHz:         ev.MinSMClockMHz,
+			KVCacheTopAllocAgesMs: ev.KVCacheTopAllocAgesMs,
 		})
 	}
 	// OTLP histogram + counter emission goes through the existing

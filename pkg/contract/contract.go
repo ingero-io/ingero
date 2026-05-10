@@ -154,6 +154,16 @@ const (
 	// "outlier coincided with a throttle" from "throttle elsewhere".
 	MetricInferThrottleActiveTotal = "ingero.infer.throttle_active_total"
 
+	// MetricInferKVCacheAllocAgeMs is the histogram of live cudaMalloc
+	// allocation ages (milliseconds) sampled at each decode-phase
+	// outlier. Long-tail mass on this histogram is the stale-KV-cache
+	// pattern - blocks that lived through hundreds of decode steps
+	// without eviction, the proximate cause of decode slowdowns under
+	// fragmentation. Cumulative across the agent process lifetime;
+	// the engine emits one observation per top-N alloc age on each
+	// fired decode outlier.
+	MetricInferKVCacheAllocAgeMs = "ingero.infer.kvcache.alloc_age_ms"
+
 	// v0.16.2 OTel GenAI semantic-convention metric names. The
 	// agent's engine /metrics scraper (internal/infer/scrape) maps
 	// engine-specific Prometheus names (vllm:time_to_first_token_seconds,

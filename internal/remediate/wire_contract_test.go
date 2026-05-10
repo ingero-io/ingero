@@ -111,6 +111,8 @@ var Contract = []TypeContract{
 			// consumers ignore unknown fields, so adding these does not
 			// constitute a contract break.
 			"memfrag_events_in_step", "throttle_reasons", "min_sm_clock_mhz",
+			// KV-cache alloc-age context (decode-phase outliers).
+			"kv_cache_top_alloc_ages_ms",
 		},
 		goType: reflect.TypeOf(inferenceOutlierMessage{}),
 	},

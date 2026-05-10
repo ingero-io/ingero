@@ -408,10 +408,18 @@ type InferWorkloadStats struct {
 // WorkloadsTracked feeds ingero.infer.workloads_tracked; OutliersTotal
 // feeds ingero.infer.outlier_total per bucket; ThrottleAtOutlier feeds
 // ingero.infer.throttle_active_total per bucket.
+//
+// KVCacheAllocAgeHist feeds ingero.infer.kvcache.alloc_age_ms - the
+// cumulative distribution of
+// live alloc ages sampled at decode-phase outliers. HasObservation is
+// false when no decode outliers have fired or the KVCacheTracker is
+// unconfigured; the exporter still emits the metric (zero count) so
+// the series is wired even before the first observation.
 type InferEngineStats struct {
-	WorkloadsTracked   int
-	OutliersTotal      map[string]uint64 // bucket ("1.5x"|"2x"|"3x") -> cumulative
-	ThrottleAtOutlier  map[string]uint64 // bucket -> cumulative outliers seen with non-zero throttle
+	WorkloadsTracked    int
+	OutliersTotal       map[string]uint64 // bucket ("1.5x"|"2x"|"3x") -> cumulative
+	ThrottleAtOutlier   map[string]uint64 // bucket -> cumulative outliers seen with non-zero throttle
+	KVCacheAllocAgeHist HistogramSnapshot
 }
 
 // InferSamplerState is the engine's sampler-degradation state for

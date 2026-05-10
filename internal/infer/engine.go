@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/correlate"
+	"github.com/ingero-io/ingero/internal/infer/kvcache"
 	"github.com/ingero-io/ingero/internal/sampling"
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/pkg/events"
@@ -37,6 +38,7 @@ const (
 	defaultLogMinInterval        = 60 * time.Second
 	defaultMaxStepDuration       = 60 * time.Second
 	defaultOutlierQueueCap       = 4096
+	defaultKVCacheTopN           = 5
 )
 
 // Config tunes Engine behavior. Zero values resolve to the defaults
@@ -107,6 +109,22 @@ type Config struct {
 	// kernel-launch sequence.
 	FingerprintKeyEnabled bool
 
+	// KVCacheTracker is the per-PID allocation tracker consulted on
+	// decode-phase outliers to surface KV-cache age context.
+	// Nil-safe: when unset (operator did not engage the feature, or
+	// memtrack-style allocations weren't visible), the engine simply
+	// omits the alloc-age fields from outlier events.
+	KVCacheTracker *kvcache.Tracker
+
+	// KVCacheTopN is the number of oldest live allocations the
+	// engine attaches to a decode-phase outlier event. Zero or
+	// negative resolves to defaultKVCacheTopN. The cap exists to
+	// keep the UDS envelope and OTLP attribute sets bounded - a
+	// fragmented KV cache might have thousands of live blocks; we
+	// only need the top of the age distribution to identify the
+	// stale-cache pattern.
+	KVCacheTopN int
+
 	// PhaseConfig holds the classifier thresholds. Empty fields
 	// resolve to LLM-tuned defaults via PhaseConfig.Resolved.
 	PhaseConfig PhaseConfig
@@ -146,6 +164,9 @@ func (c Config) resolved() Config {
 	if c.ObservableTTL <= 0 {
 		c.ObservableTTL = 5 * time.Minute
 	}
+	if c.KVCacheTopN <= 0 {
+		c.KVCacheTopN = defaultKVCacheTopN
+	}
 	c.PhaseConfig = c.PhaseConfig.Resolved()
 	return c
 }
@@ -173,6 +194,13 @@ type OutlierEvent struct {
 	MemfragEvents    uint32
 	ThrottleReasons  uint64
 	MinSMClockMHz    uint32
+
+	// KVCacheTopAllocAgesMs is the per-decode-outlier alloc-age
+	// context. Populated only when phase=decode AND a KVCacheTracker
+	// is configured AND at least one live allocation exists. Sorted
+	// oldest-first so consumers can read [0] for the "stalest cache
+	// block" age. Unit is milliseconds.
+	KVCacheTopAllocAgesMs []uint64
 }
 
 // SamplerDegradedEvent fires when the engine flips the store sampler
@@ -286,6 +314,12 @@ type Engine struct {
 	samplerLastCause        string
 	throttleAtOutlier       map[OutlierBucket]uint64
 
+	// KV-cache alloc-age histogram. Engine-level cumulative;
+	// observations folded in on each decode-phase outlier. The
+	// stats.Histogram has its own internal lock so we don't need to
+	// hold e.mu when calling Observe.
+	kvCacheAllocAgeHist *stats.Histogram
+
 	// v0.16.3 sampler-degraded event queue. Drained by Engine.DrainSampler
 	// at the same cadence as DrainOutliers. Bounded by samplerQueueCap
 	// so a flapping degrade loop does not grow unbounded.
@@ -331,17 +365,18 @@ func New(cfg Config, log *slog.Logger) *Engine {
 		cfg.SamplerDegradeOn = Bucket3x
 	}
 	return &Engine{
-		cfg:               cfg,
-		log:               log,
-		wmap:              newWorkloadMap(cfg.MaxWorkloads),
-		severity:          newSeverityGate(cfg.SeverityTTL),
-		lastSync:          make(map[observableKey]time.Time, cfg.MaxWorkloads),
-		observables:       newStepObservables(),
-		lastLogAt:         make(map[WorkloadKey]time.Time),
-		outliers:          make(map[OutlierBucket]uint64, 4),
-		phaseCounts:       make(map[Phase]uint64, 4),
-		throttleAtOutlier: make(map[OutlierBucket]uint64, 4),
-		pauseRank:         parseSeverity(cfg.PauseOnSeverity),
+		cfg:                 cfg,
+		log:                 log,
+		wmap:                newWorkloadMap(cfg.MaxWorkloads),
+		severity:            newSeverityGate(cfg.SeverityTTL),
+		lastSync:            make(map[observableKey]time.Time, cfg.MaxWorkloads),
+		observables:         newStepObservables(),
+		lastLogAt:           make(map[WorkloadKey]time.Time),
+		outliers:            make(map[OutlierBucket]uint64, 4),
+		phaseCounts:         make(map[Phase]uint64, 4),
+		throttleAtOutlier:   make(map[OutlierBucket]uint64, 4),
+		kvCacheAllocAgeHist: stats.NewHistogram(stats.DefaultInferKVCacheAllocAgeBoundsMs),
+		pauseRank:           parseSeverity(cfg.PauseOnSeverity),
 	}
 }
 
@@ -440,6 +475,35 @@ func (e *Engine) OnNCCLEvent(pid uint32, cgroupHash string, streamHandle uint64,
 		PID:          pid,
 		StreamHandle: streamHandle,
 	}, at)
+}
+
+// OnMallocEvent records a successful cudaMalloc / cudaMallocManaged.
+// Feeds the KV-cache lineage tracker so the engine can attach top-N
+// alloc ages to decode-phase outlier events. Nil-safe: no-op when
+// the operator did not configure a tracker.
+func (e *Engine) OnMallocEvent(pid uint32, devPtr, size uint64, at time.Time) {
+	if e.cfg.KVCacheTracker == nil {
+		return
+	}
+	e.cfg.KVCacheTracker.OnMalloc(pid, devPtr, size, at)
+}
+
+// OnFreeEvent records a cudaFree. Nil-safe.
+func (e *Engine) OnFreeEvent(pid uint32, devPtr uint64, at time.Time) {
+	if e.cfg.KVCacheTracker == nil {
+		return
+	}
+	e.cfg.KVCacheTracker.OnFree(pid, devPtr, at)
+}
+
+// OnProcessExit clears the KV-cache lineage state for a PID. Wired
+// to host_trace's sched_process_exit so dead processes don't leak
+// allocation tracking memory across long agent runs.
+func (e *Engine) OnProcessExit(pid uint32) {
+	if e.cfg.KVCacheTracker == nil {
+		return
+	}
+	e.cfg.KVCacheTracker.OnProcessExit(pid)
 }
 
 // OnMemfragEvent records one NVIDIA closed-driver IOCTL event for
@@ -647,17 +711,37 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 			throttleReasons |= r
 		}
 	}
+	// KV-cache lineage. Only attach for decode-phase outliers (and
+	// the unclassified case when phase classifier is off, so the
+	// classifier-disabled mode still gets the data); prefill /
+	// unknown / mixed outliers don't get the alloc-age hit because
+	// the signal isn't actionable there. The tracker is also nil
+	// when --inference-kvcache-lineage is off.
+	var kvAges []uint64
+	if e.cfg.KVCacheTracker != nil {
+		if !e.cfg.PhaseClassifierEnabled || phase == PhaseDecode {
+			kvAges = e.cfg.KVCacheTracker.TopAllocAgesMs(evt.PID, e.cfg.KVCacheTopN, now)
+			// Fold each age into the engine-level histogram so the
+			// OTLP/Prom exporters surface the cumulative distribution
+			// across decode outliers. Histogram.Observe takes its
+			// own lock; no need to hold e.mu here.
+			for _, a := range kvAges {
+				e.kvCacheAllocAgeHist.Observe(float64(a))
+			}
+		}
+	}
 	ev := OutlierEvent{
-		Key:             key,
-		StepDurationNs:  step.Nanoseconds(),
-		BaselineP95Ns:   int64(p95),
-		BaselineMeanNs:  int64(bl.Mean()),
-		Bucket:          bucket,
-		At:              now,
-		EventID:         newEventID(),
-		MemfragEvents:   obs.MemfragCount,
-		ThrottleReasons: throttleReasons,
-		MinSMClockMHz:   0, // reserved; SM clock plumbing deferred (see Batch 1 commit)
+		Key:                   key,
+		StepDurationNs:        step.Nanoseconds(),
+		BaselineP95Ns:         int64(p95),
+		BaselineMeanNs:        int64(bl.Mean()),
+		Bucket:                bucket,
+		At:                    now,
+		EventID:               newEventID(),
+		MemfragEvents:         obs.MemfragCount,
+		ThrottleReasons:       throttleReasons,
+		MinSMClockMHz:         0, // reserved; SM clock plumbing deferred (see Batch 1 commit)
+		KVCacheTopAllocAgesMs: kvAges,
 	}
 	e.enqueueOutlier(ev)
 	e.maybeLogOutlier(ev)
@@ -736,11 +820,19 @@ func (e *Engine) Snapshot() []workloadSnapshot {
 func (e *Engine) SnapshotForExport() ([]stats.InferWorkloadStats, stats.InferEngineStats, stats.InferSamplerState) {
 	rows := e.wmap.SnapshotForExport(e.cfg.WarmupSamples)
 
+	// kvHist: snapshot the histogram outside e.mu (it has its own
+	// internal lock).
+	var kvHist stats.HistogramSnapshot
+	if e.kvCacheAllocAgeHist != nil {
+		kvHist = e.kvCacheAllocAgeHist.Snapshot()
+	}
+
 	e.mu.Lock()
 	es := stats.InferEngineStats{
-		WorkloadsTracked:  e.wmap.Len(),
-		OutliersTotal:     make(map[string]uint64, len(e.outliers)),
-		ThrottleAtOutlier: make(map[string]uint64, len(e.throttleAtOutlier)),
+		WorkloadsTracked:    e.wmap.Len(),
+		OutliersTotal:       make(map[string]uint64, len(e.outliers)),
+		ThrottleAtOutlier:   make(map[string]uint64, len(e.throttleAtOutlier)),
+		KVCacheAllocAgeHist: kvHist,
 	}
 	for k, v := range e.outliers {
 		if k == BucketNone {

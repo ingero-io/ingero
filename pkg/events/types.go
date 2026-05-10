@@ -545,11 +545,20 @@ type Event struct {
 	Duration  time.Duration // how long the operation took (entry→return)
 	GPUID     uint32        // GPU device index (from CUDA)
 	// Args contains operation-specific arguments:
-	//   cudaMalloc:        Args[0] = allocation size (bytes), Args[1] = devPtr param address
-	//   cudaFree:          Args[0] = device pointer being freed, Args[1] = freed size in bytes (0 if unknown)
+	//   cudaMalloc:        Args[0] = allocation size (bytes),
+	//                      Args[1] = resolved devPtr (the value cudaMalloc
+	//                      wrote to its void** out-parameter); older BPF
+	//                      probes left Args[1] as the void** parameter
+	//                      address itself, repurposing the slot was safe
+	//                      because memtrack only reads Args[0]
+	//   cudaFree:          Args[0] = device pointer being freed,
+	//                      Args[1] = freed size in bytes (0 if unknown)
 	//   cudaMemcpy:        Args[0] = byte count, Args[1] = direction (cudaMemcpyKind)
-	//   cudaLaunchKernel:  Args[0] = kernel function pointer, Args[1] = cudaStream_t (v0.16.5a;
-	//                      0 on pre-v0.16.5a BPF builds, also valid for default stream)
+	//   cudaLaunchKernel:  Args[0] = kernel function pointer,
+	//                      Args[1] = cudaStream_t (0 on older BPF
+	//                      builds that didn't capture the stream;
+	//                      also a legitimate value for the CUDA
+	//                      default stream)
 	//   cudaStreamSync:    Args[0] = cudaStream_t handle, Args[1] = 0
 	//   Other ops:         operation-specific
 	Args [2]uint64

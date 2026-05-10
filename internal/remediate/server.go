@@ -381,6 +381,16 @@ type inferenceOutlierMessage struct {
 	MemfragEventsInStep uint32 `json:"memfrag_events_in_step,omitempty"`
 	ThrottleReasons     uint64 `json:"throttle_reasons,omitempty"`
 	MinSMClockMHz       uint32 `json:"min_sm_clock_mhz,omitempty"`
+
+	// KVCacheTopAllocAgesMs is the per-decode-outlier alloc-age
+	// context: top-N oldest live cudaMalloc ages in milliseconds,
+	// sorted oldest-first. Empty when the engine ran without
+	// --inference-kvcache-lineage, or for non-decode outliers, or
+	// when no live allocations were tracked for the PID (typical for
+	// the first few seconds of the workload before its first
+	// cudaMalloc). Backward-compatible: older consumers ignore unknown
+	// JSON fields.
+	KVCacheTopAllocAgesMs []uint64 `json:"kv_cache_top_alloc_ages_ms,omitempty"`
 }
 
 // inferenceSamplerDegradedMessage is the UDS envelope for the engine's
@@ -469,6 +479,12 @@ type InferenceOutlier struct {
 	MemfragEventsInStep uint32
 	ThrottleReasons     uint64
 	MinSMClockMHz       uint32
+
+	// KVCacheTopAllocAgesMs is the alloc-age context. See
+	// inferenceOutlierMessage.KVCacheTopAllocAgesMs for the wire
+	// shape. Empty for non-decode outliers and when the engine ran
+	// without --inference-kvcache-lineage.
+	KVCacheTopAllocAgesMs []uint64
 }
 
 // SendInferenceOutlier writes a per-workload step-duration outlier
@@ -488,22 +504,23 @@ func (s *Server) SendInferenceOutlier(o InferenceOutlier) error {
 	}
 
 	msg := inferenceOutlierMessage{
-		Type:                "inference_outlier",
-		NodeID:              o.NodeID,
-		ClusterID:           o.ClusterID,
-		Timestamp:           o.Timestamp,
-		EventID:             o.EventID,
-		CGroupPathHash:      o.CGroupPathHash,
-		PID:                 o.PID,
-		StreamHandle:        o.StreamHandle,
-		Phase:               o.Phase,
-		StepDurationNs:      o.StepDurationNs,
-		BaselineP95Ns:       o.BaselineP95Ns,
-		BaselineMeanNs:      o.BaselineMeanNs,
-		Bucket:              o.Bucket,
-		MemfragEventsInStep: o.MemfragEventsInStep,
-		ThrottleReasons:     o.ThrottleReasons,
-		MinSMClockMHz:       o.MinSMClockMHz,
+		Type:                  "inference_outlier",
+		NodeID:                o.NodeID,
+		ClusterID:             o.ClusterID,
+		Timestamp:             o.Timestamp,
+		EventID:               o.EventID,
+		CGroupPathHash:        o.CGroupPathHash,
+		PID:                   o.PID,
+		StreamHandle:          o.StreamHandle,
+		Phase:                 o.Phase,
+		StepDurationNs:        o.StepDurationNs,
+		BaselineP95Ns:         o.BaselineP95Ns,
+		BaselineMeanNs:        o.BaselineMeanNs,
+		Bucket:                o.Bucket,
+		MemfragEventsInStep:   o.MemfragEventsInStep,
+		ThrottleReasons:       o.ThrottleReasons,
+		MinSMClockMHz:         o.MinSMClockMHz,
+		KVCacheTopAllocAgesMs: o.KVCacheTopAllocAgesMs,
 	}
 	if s.worldSize > 0 {
 		msg.Rank = s.rank

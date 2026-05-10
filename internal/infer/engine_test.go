@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/correlate"
+	"github.com/ingero-io/ingero/internal/infer/kvcache"
 	"github.com/ingero-io/ingero/internal/sampling"
 	"github.com/ingero-io/ingero/pkg/events"
 )
@@ -682,6 +683,132 @@ func TestEngine_LegacyBPF_StreamZero_StaysUnclassifiedNotMisattributed(t *testin
 		t.Errorf("legacy default-stream path lost its observables; "+
 			"expected at least one decode step, got distribution %+v",
 			st.PhaseDistribution)
+	}
+}
+
+func TestEngine_KVCacheTopAllocAgesOnDecodeOutlier(t *testing.T) {
+	// When the engine has a KVCacheTracker AND a decode-phase outlier
+	// fires, the OutlierEvent.KVCacheTopAllocAgesMs slice carries the
+	// top-N oldest live alloc ages, oldest-first.
+	tracker := kvcache.New(kvcache.Config{})
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          5,
+		KVCacheTracker:         tracker,
+		KVCacheTopN:            3,
+		OutlierThresholdRatio:  3.0,
+	}
+	e := New(cfg, quietLogger())
+	pid := uint32(123)
+	stream := uint64(0xC0DEC0DE)
+	t0 := time.Now()
+
+	// Seed the tracker with 5 allocations spanning the previous second.
+	for i := 0; i < 5; i++ {
+		tracker.OnMalloc(pid, uint64(0xA000+i), 64*1024,
+			t0.Add(-time.Duration(1000-i*100)*time.Millisecond))
+	}
+
+	// Drive a decode-shape baseline: low launches per step, no NCCL.
+	now := t0
+	e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	for i := 0; i < 7; i++ {
+		for k := 0; k < 5; k++ {
+			lt := now.Add(time.Duration(k+1) * 100 * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(pid, stream, lt), "wl", 50*time.Microsecond)
+		}
+		now = now.Add(5 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	}
+	_ = e.Drain()
+	// Slow decode step (3x baseline = ~15 ms vs 5 ms baseline).
+	for k := 0; k < 5; k++ {
+		lt := now.Add(time.Duration(k+1) * 100 * time.Microsecond)
+		e.OnLaunchEvent(launchEvent(pid, stream, lt), "wl", 50*time.Microsecond)
+	}
+	now = now.Add(50 * time.Millisecond) // way over decode-p95
+	e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+
+	out := e.Drain()
+	if len(out) == 0 {
+		t.Fatal("expected an outlier on the slow decode step")
+	}
+	var decodeOutlier *OutlierEvent
+	for i := range out {
+		if out[i].Key.Phase == PhaseDecode {
+			decodeOutlier = &out[i]
+			break
+		}
+	}
+	if decodeOutlier == nil {
+		t.Fatalf("no decode-phase outlier found among %+v", out)
+	}
+	if got := len(decodeOutlier.KVCacheTopAllocAgesMs); got != 3 {
+		t.Errorf("KVCacheTopAllocAgesMs len = %d, want 3", got)
+	}
+	// Oldest first - first entry should be the alloc seeded ~1s before t0.
+	if len(decodeOutlier.KVCacheTopAllocAgesMs) > 0 {
+		oldest := decodeOutlier.KVCacheTopAllocAgesMs[0]
+		if oldest < 900 {
+			t.Errorf("oldest age = %d ms, want >= 900 (alloc seeded 1s before t0)", oldest)
+		}
+	}
+
+	// Engine-level histogram should have folded the 3 ages.
+	_, es, _ := e.SnapshotForExport()
+	if !es.KVCacheAllocAgeHist.HasObservation {
+		t.Error("KVCacheAllocAgeHist should have observations after decode outlier")
+	}
+	if got := es.KVCacheAllocAgeHist.Count; got != 3 {
+		t.Errorf("histogram Count = %d, want 3", got)
+	}
+}
+
+func TestEngine_KVCacheNotAttachedToPrefillOutlier(t *testing.T) {
+	// Prefill-phase outliers should NOT receive alloc-age context.
+	// The signal isn't actionable for prefill, and emitting it would
+	// inflate UDS / OTLP payload size for no value.
+	tracker := kvcache.New(kvcache.Config{})
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          2,
+		KVCacheTracker:         tracker,
+		KVCacheTopN:            5,
+		OutlierThresholdRatio:  3.0,
+	}
+	e := New(cfg, quietLogger())
+	pid := uint32(456)
+	stream := uint64(0xCAFE)
+	t0 := time.Now()
+	tracker.OnMalloc(pid, 0xa, 1024, t0.Add(-500*time.Millisecond))
+	tracker.OnMalloc(pid, 0xb, 1024, t0.Add(-300*time.Millisecond))
+
+	// Drive prefill-shape (250+ launches per step).
+	now := t0
+	e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	for i := 0; i < 4; i++ {
+		for k := 0; k < 250; k++ {
+			lt := now.Add(time.Duration(k+1) * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(pid, stream, lt), "wl", 100*time.Microsecond)
+		}
+		now = now.Add(20 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	}
+	_ = e.Drain()
+	// 3x slowdown.
+	for k := 0; k < 250; k++ {
+		lt := now.Add(time.Duration(k+1) * time.Microsecond)
+		e.OnLaunchEvent(launchEvent(pid, stream, lt), "wl", 100*time.Microsecond)
+	}
+	now = now.Add(100 * time.Millisecond)
+	e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+
+	out := e.Drain()
+	for _, ev := range out {
+		if ev.Key.Phase == PhasePrefill && len(ev.KVCacheTopAllocAgesMs) > 0 {
+			t.Errorf("prefill outlier should NOT have KV-cache ages, got %v",
+				ev.KVCacheTopAllocAgesMs)
+		}
 	}
 }
 
