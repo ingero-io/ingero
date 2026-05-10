@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,13 +28,24 @@ func newTestStore(t *testing.T) (*Store, string) {
 }
 
 func TestBuildRolledPath(t *testing.T) {
-	got := buildRolledPath("/var/lib/ingero/ingero.db", time.Date(2026, 5, 9, 14, 30, 55, 0, time.UTC))
-	want := "/var/lib/ingero/ingero.20260509T143055Z.db"
-	// On Windows the separator differs; comparing with ToSlash makes the
-	// test portable. The actual rollover code uses filepath.Join which
-	// is platform-correct.
-	if filepath.ToSlash(got) != want {
-		t.Errorf("buildRolledPath = %q, want %q", got, want)
+	// Format is: <stem>.<YYYYMMDDTHHMMSS.NNNNNNNNNZ>-<8 hex chars><ext>.
+	// The 4-byte random suffix means we can't compare for exact equality.
+	// Verify the deterministic prefix + length + that the trailing token
+	// is the embedded timestamp the validator recognizes.
+	got := filepath.ToSlash(buildRolledPath("/var/lib/ingero/ingero.db",
+		time.Date(2026, 5, 9, 14, 30, 55, 123456789, time.UTC)))
+	wantPrefix := "/var/lib/ingero/ingero.20260509T143055.123456789Z-"
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("buildRolledPath = %q, want prefix %q", got, wantPrefix)
+	}
+	if !strings.HasSuffix(got, ".db") {
+		t.Fatalf("buildRolledPath = %q, want .db suffix", got)
+	}
+	// Strip dir + stem-prefix + ext and verify the embedded timestamp
+	// matches the validator's recognised long form.
+	stamp := strings.TrimSuffix(strings.TrimPrefix(got, "/var/lib/ingero/ingero."), ".db")
+	if !looksLikeRolloverTimestamp(stamp) {
+		t.Errorf("embedded timestamp %q not recognised by looksLikeRolloverTimestamp", stamp)
 	}
 }
 
@@ -102,6 +114,7 @@ func TestLooksLikeRolloverTimestamp(t *testing.T) {
 		s    string
 		want bool
 	}{
+		// Pre-fix short form (kept accepted for backwards compat).
 		{"20260509T143055Z", true},
 		{"20260509T143055", false},  // missing Z
 		{"20260509T143055X", false}, // wrong terminator
@@ -109,6 +122,15 @@ func TestLooksLikeRolloverTimestamp(t *testing.T) {
 		{"", false},
 		{"abc", false},
 		{"20260509T14305aZ", false}, // non-digit
+
+		// Current long form: YYYYMMDDTHHMMSS.NNNNNNNNNZ-XXXXXXXX (35 chars).
+		{"20260509T143055.123456789Z-deadbeef", true},
+		{"20260509T143055.000000000Z-00000000", true},
+		{"20260509T143055.123456789Z-DEADBEEF", false}, // upper-case hex disallowed
+		{"20260509T143055.123456789Z-zzzzzzzz", false}, // non-hex chars
+		{"20260509T143055.12345678Z-deadbeef", false},  // too few ns digits
+		{"20260509T143055,123456789Z-deadbeef", false}, // wrong separator
+		{"20260509T143055.123456789-deadbeef", false},  // missing Z
 	}
 	for _, tc := range cases {
 		if got := looksLikeRolloverTimestamp(tc.s); got != tc.want {
@@ -173,14 +195,14 @@ func TestRollover_RetentionSweepKeepsN(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	s.SetRolloverConfig(RolloverConfig{MaxSize: 1, KeepFiles: 2})
 
-	// Force several rollovers in succession. Sleep 1.1s between rollovers
-	// so the timestamp-based filenames don't collide (resolution = 1
-	// second). Driven directly to avoid the Run-goroutine race window.
+	// Force several rollovers in succession. The rolled-filename format
+	// includes nanoseconds + a 4-byte random suffix so back-to-back
+	// rollovers cannot collide; no inter-rollover sleep is needed.
+	// Driven directly to avoid the Run-goroutine race window.
 	for i := 0; i < 5; i++ {
 		if err := s.MaybeRollover(); err != nil {
 			t.Fatalf("MaybeRollover #%d: %v", i, err)
 		}
-		time.Sleep(1100 * time.Millisecond)
 	}
 
 	dir := filepath.Dir(dbPath)
@@ -217,9 +239,14 @@ func TestRollover_FreshDBStillRecordable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.Run(ctx)
+	// Block until Run has set runActive and is about to enter its
+	// select loop. Without this, cancel() can race ahead of Run's
+	// first iteration; WaitDone would then return immediately
+	// (runActive still false) and the final-flush drain never runs.
+	s.WaitStarted()
 
 	// Drop the size threshold so subsequent flushes don't keep
-	// rolling — the freshly opened DB starts under 1 byte but
+	// rolling: the freshly opened DB starts under 1 byte but
 	// MaybeRollover would chase a 1-byte cap forever.
 	s.SetRolloverConfig(RolloverConfig{MaxSize: 1 << 30, KeepFiles: 6})
 
@@ -233,7 +260,10 @@ func TestRollover_FreshDBStillRecordable(t *testing.T) {
 			Duration:  time.Microsecond,
 		})
 	}
-	time.Sleep(300 * time.Millisecond)
+	// cancel triggers Run's ctx-done arm which drains insertCh into a
+	// final batch and flushes synchronously before returning. WaitDone
+	// blocks until that final flush completes, so no time-based sleep
+	// is needed.
 	cancel()
 	s.WaitDone()
 

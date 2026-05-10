@@ -1,7 +1,9 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -148,21 +150,40 @@ func (s *Store) RolloverNow(reason string, cfg *RolloverConfig) error {
 		newDB, openErr := sql.Open("sqlite", s.dbPath)
 		if openErr == nil {
 			s.db = newDB
-		} else {
-			// Catastrophic: we have no DB. Re-set s.db to a closed
-			// handle so subsequent operations error rather than
-			// dereferencing nil. The caller will log and likely exit.
-			s.db = oldDB
+			s.rolloverFailures.Add(1)
+			s.rolloverLog().Error("rollover: rename failed; reopened original path",
+				"src", s.dbPath, "dst", rolledPath, "err", err.Error())
+			return fmt.Errorf("rollover: rename %s -> %s: %w", s.dbPath, rolledPath, err)
 		}
+		// Catastrophic: rename failed AND reopen failed. The live handle
+		// is closed (line above) and we cannot resurrect a working DB.
+		// Leave s.db pointing at the closed handle so subsequent writes
+		// fail loudly with sql.ErrConnDone (caller logs via the same
+		// flushFailures path). Operators must restart the agent; emit
+		// a high-severity log so the operator log surfaces this.
+		s.db = oldDB
 		s.rolloverFailures.Add(1)
-		return fmt.Errorf("rollover: rename %s -> %s: %w", s.dbPath, rolledPath, err)
+		s.rolloverLog().Error("rollover: rename failed AND reopen failed; DB handle is closed; RESTART REQUIRED",
+			"src", s.dbPath, "dst", rolledPath,
+			"rename_err", err.Error(),
+			"reopen_err", openErr.Error())
+		return fmt.Errorf("rollover: rename %s -> %s failed: %w; reopen also failed: %v; RESTART REQUIRED",
+			s.dbPath, rolledPath, err, openErr)
 	}
 
 	// (4) Open fresh DB at the original path.
 	newDB, err := sql.Open("sqlite", s.dbPath)
 	if err != nil {
+		// The live DB is closed (oldDB.Close at line 131) and the on-disk
+		// file has already been renamed away. We cannot recover here; the
+		// agent must be restarted. Surface the broken state so subsequent
+		// flushes fail loudly via the same flushFailures path rather than
+		// using a closed handle.
+		s.db = oldDB
 		s.rolloverFailures.Add(1)
-		return fmt.Errorf("rollover: reopen: %w", err)
+		s.rolloverLog().Error("rollover: reopen failed; DB handle is closed; RESTART REQUIRED",
+			"path", s.dbPath, "err", err.Error())
+		return fmt.Errorf("rollover: reopen failed: %w; RESTART REQUIRED", err)
 	}
 	// Replicate the PRAGMAs from New() so the rolled-over DB has the
 	// same operational characteristics. Errors here are non-fatal —
@@ -173,17 +194,39 @@ func (s *Store) RolloverNow(reason string, cfg *RolloverConfig) error {
 	}
 	newDB.Exec("PRAGMA busy_timeout = 5000")
 
+	// Publish the new handle BEFORE schema-apply so a schema failure
+	// leaves a functional (if partially migrated) handle attached to
+	// the Store. New writes will land on it, and the next agent
+	// restart re-runs migrations idempotently. Holding the closed
+	// oldDB during applyAgentSchema would silently break every
+	// subsequent write with sql.ErrConnDone.
+	s.db = newDB
+
 	// (5) Re-apply the agent's schema sequence on the fresh DB.
 	// Delegates to applyAgentSchema which is the same helper New()
 	// uses, so the rolled-over DB cannot drift from a freshly created
 	// one.
 	if err := rolloverApplySchema(newDB); err != nil {
-		newDB.Close()
+		// Schema-fail is recoverable: the new DB is open and writable.
+		// applyAgentSchema is idempotent so the next agent restart
+		// re-runs and reaches a coherent state. Surface as Error so
+		// the operator log shows the partially-migrated state.
 		s.rolloverFailures.Add(1)
-		return fmt.Errorf("rollover: schema: %w", err)
+		s.rolloverLog().Error("rollover: schema apply failed; live DB attached but partially migrated; RESTART RECOMMENDED",
+			"path", s.dbPath, "err", err.Error())
+		return fmt.Errorf("rollover: schema: %w; RESTART RECOMMENDED", err)
 	}
 
-	s.db = newDB
+	// The read-only sibling pool's connections still point at the
+	// rolled-away inode (POSIX file handles survive rename). Close it
+	// and reopen against the fresh file so ExecuteReadOnly sees the
+	// post-rollover schema + (empty) data.
+	if s.roDB != nil {
+		s.roDB.Close()
+		s.roDB = nil
+	}
+	s.openReadOnlyDB()
+
 	s.rolloverCount.Add(1)
 	s.rolloverLog().Info("rollover complete",
 		"rolled_path", rolledPath,
@@ -211,15 +254,33 @@ func rolloverApplySchema(db *sql.DB) error {
 }
 
 // buildRolledPath produces the rolled filename:
-// `<dir>/<basename-stem>.<UTC-iso8601>.db`. The original extension
-// (.db) is preserved on the rolled file so operators recognize the
-// extension; the timestamp is inserted before it.
+// `<dir>/<basename-stem>.<UTC-iso8601-ns>-<rand4>.db`. The original
+// extension (.db) is preserved on the rolled file so operators
+// recognize the extension; the timestamp + random suffix is inserted
+// before it.
+//
+// Format: `20060102T150405.000000000Z-<8 hex chars>` — nanosecond
+// resolution covers same-second rollovers; the random suffix covers
+// NTP backwards drift (clock can step back below the previous nano)
+// and any future single-millisecond re-roll. 4 random bytes (8 hex
+// chars) gives 2^32 possible suffixes per timestamp, so two rollovers
+// landing on the same nanosecond would still collide only at a rate
+// of ~1 in 4 billion.
 func buildRolledPath(currentPath string, ts time.Time) string {
 	dir := filepath.Dir(currentPath)
 	base := filepath.Base(currentPath)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
-	return filepath.Join(dir, fmt.Sprintf("%s.%s%s", stem, ts.Format("20060102T150405Z"), ext))
+	stamp := ts.Format("20060102T150405.000000000Z")
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		// rand.Read on Linux essentially always succeeds. If it does
+		// fail, fall back to a fixed sentinel; the nanosecond stamp is
+		// already enough to differentiate rapid rollovers, so this
+		// degraded path is still collision-resistant in practice.
+		rnd = [4]byte{0xff, 0xff, 0xff, 0xff}
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s.%s-%s%s", stem, stamp, hex.EncodeToString(rnd[:]), ext))
 }
 
 // sweepOldRollovers finds rolled siblings of livePath, sorts by
@@ -269,31 +330,78 @@ func sweepOldRollovers(livePath string, keep int, log *slog.Logger) error {
 	return nil
 }
 
-// looksLikeRolloverTimestamp returns true when s matches the
-// 20060102T150405Z compact ISO 8601 form. We don't pull in time.Parse
+// looksLikeRolloverTimestamp returns true when s matches a rollover
+// timestamp suffix. Two forms are accepted:
+//
+//   - Pre-collision-fix:  YYYYMMDDTHHMMSSZ              (16 chars,  e.g. 20260510T191425Z)
+//   - Current:            YYYYMMDDTHHMMSS.NNNNNNNNNZ-RR (35 chars,  e.g. 20260510T191425.123456789Z-deadbeef)
+//
+// The pre-collision-fix form stays accepted so sweep + ListRolledFiles
+// continue to recognize legacy rolled files that operators may still
+// have on disk from earlier agent versions. We don't pull in time.Parse
 // because the volume of files in the dir at glob time is tiny and a
 // regex would need its own import; a small character-class check is
 // adequate.
 func looksLikeRolloverTimestamp(s string) bool {
-	// Required: YYYYMMDDTHHMMSSZ = 16 chars.
-	if len(s) != 16 {
-		return false
-	}
-	// 8 digits, 'T', 6 digits, 'Z'.
-	for i := 0; i < 8; i++ {
-		if s[i] < '0' || s[i] > '9' {
+	switch len(s) {
+	case 16:
+		// Pre-fix: YYYYMMDDTHHMMSSZ.
+		// 8 digits, 'T', 6 digits, 'Z'.
+		for i := 0; i < 8; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		if s[8] != 'T' {
 			return false
 		}
-	}
-	if s[8] != 'T' {
-		return false
-	}
-	for i := 9; i < 15; i++ {
-		if s[i] < '0' || s[i] > '9' {
+		for i := 9; i < 15; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		return s[15] == 'Z'
+
+	case 35:
+		// Current: YYYYMMDDTHHMMSS.NNNNNNNNNZ-XXXXXXXX.
+		// 8 digits, 'T', 6 digits, '.', 9 digits, 'Z', '-', 8 hex.
+		for i := 0; i < 8; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		if s[8] != 'T' {
 			return false
 		}
+		for i := 9; i < 15; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		if s[15] != '.' {
+			return false
+		}
+		for i := 16; i < 25; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		if s[25] != 'Z' || s[26] != '-' {
+			return false
+		}
+		for i := 27; i < 35; i++ {
+			c := s[i]
+			isDigit := c >= '0' && c <= '9'
+			isLowerHex := c >= 'a' && c <= 'f'
+			if !isDigit && !isLowerHex {
+				return false
+			}
+		}
+		return true
+
+	default:
+		return false
 	}
-	return s[15] == 'Z'
 }
 
 // rolloverLog returns the logger used for rollover operations. Today
