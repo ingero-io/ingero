@@ -319,3 +319,42 @@ func (s *Store) RolloverStats() RolloverStats {
 		Failures: s.rolloverFailures.Load(),
 	}
 }
+
+// ListRolledFiles returns the absolute paths of every rolled-over
+// sibling DB next to the live file, oldest-first. The live file
+// itself is excluded; only files matching the rollover timestamp
+// pattern (`<stem>.<YYYYMMDDTHHMMSSZ><ext>`) are included so a
+// hand-placed file like `<stem>.notes<ext>` doesn't accidentally
+// show up in query --include-rolled.
+//
+// Returns an empty slice when no rolled siblings exist or the dir
+// is unreadable. Standalone helper (not Glob'd from the rollover
+// sweeper because that one prunes too); callers consume the list
+// for read-only purposes like cross-rollover query.
+func ListRolledFiles(livePath string) ([]string, error) {
+	dir := filepath.Dir(livePath)
+	base := filepath.Base(livePath)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	pattern := filepath.Join(dir, stem+".*"+ext)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("glob %q: %w", pattern, err)
+	}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if m == livePath {
+			continue
+		}
+		mid := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(m), stem+"."), ext)
+		if !looksLikeRolloverTimestamp(mid) {
+			continue
+		}
+		out = append(out, m)
+	}
+	// Filename is lexicographically time-sortable thanks to the
+	// fixed-width compact-ISO timestamp, so a string sort is also a
+	// chronological sort. Oldest first.
+	sort.Strings(out)
+	return out, nil
+}

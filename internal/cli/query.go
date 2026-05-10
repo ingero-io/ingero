@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,18 +19,19 @@ import (
 )
 
 var (
-	queryDBPath    string
-	querySince     string
-	queryPIDs      []int
-	queryOp        string
-	queryJSON      bool
-	queryLimit     int
-	queryNodes     string
-	queryTimeout   string
-	queryCACert    string
-	queryClientCert string
-	queryClientKey  string
-	queryClockSkew  string
+	queryDBPath        string
+	querySince         string
+	queryPIDs          []int
+	queryOp            string
+	queryJSON          bool
+	queryLimit         int
+	queryNodes         string
+	queryTimeout       string
+	queryCACert        string
+	queryClientCert    string
+	queryClientKey     string
+	queryClockSkew     string
+	queryIncludeRolled bool
 )
 
 var queryCmd = &cobra.Command{
@@ -64,6 +66,7 @@ func init() {
 	queryCmd.Flags().StringVar(&queryClientCert, "client-cert", "", "client certificate for mTLS (optional)")
 	queryCmd.Flags().StringVar(&queryClientKey, "client-key", "", "client key for mTLS (optional)")
 	queryCmd.Flags().StringVar(&queryClockSkew, "clock-skew-threshold", "10ms", "clock skew warning threshold for fleet queries")
+	queryCmd.Flags().BoolVar(&queryIncludeRolled, "include-rolled", false, "also query rolled-over DB siblings (ingero.db.<TIMESTAMP>.db) of the live database. Useful when --since spans a rollover boundary. Cost: opens each rolled file briefly and runs the same Query, then merges + re-sorts in Go; expect linear time in the number of rolled files (default rollover keep-count is 6).")
 
 	rootCmd.AddCommand(queryCmd)
 }
@@ -120,7 +123,53 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("querying events: %w", err)
 	}
 
+	// Query rolled-over siblings when the operator asked for it. Each
+	// rolled DB is opened read-only-by-convention (the rollover sweep
+	// stops writing once the rename happens) and the same params run
+	// against it. Results are concatenated, re-sorted by timestamp
+	// descending, and clipped to queryLimit so the merged view matches
+	// the single-DB output shape.
+	if queryIncludeRolled {
+		rolled, lerr := store.ListRolledFiles(dbPath)
+		if lerr != nil {
+			debugf("query: list rolled files failed: %v", lerr)
+		}
+		debugf("query: include-rolled found %d rolled siblings", len(rolled))
+		for _, rp := range rolled {
+			rs, oerr := store.New(rp)
+			if oerr != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: opening rolled file %s: %v\n", rp, oerr)
+				continue
+			}
+			revts, qerr := rs.Query(params)
+			rs.Close()
+			if qerr != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: querying rolled file %s: %v\n", rp, qerr)
+				continue
+			}
+			debugf("query: rolled %s returned %d events", rp, len(revts))
+			evts = append(evts, revts...)
+		}
+		// Re-sort merged set newest-first to match Store.Query's
+		// single-DB ordering.
+		sort.Slice(evts, func(i, j int) bool {
+			return evts[i].Timestamp.After(evts[j].Timestamp)
+		})
+		// Re-apply the limit so the merged total matches what the
+		// caller asked for.
+		effLimit := queryLimit
+		if effLimit <= 0 {
+			effLimit = 10000
+		}
+		if len(evts) > effLimit {
+			evts = evts[:effLimit]
+		}
+	}
+
 	// Query aggregate totals for accurate event counts (selective storage).
+	// Aggregates remain live-DB only for now; --include-rolled does not
+	// fan out the aggregate query because the per-rolled-file aggregate
+	// shapes would need merge logic of their own.
 	aggTotals, _ := s.QueryAggregateTotals(params)
 	debugf("query: returned %d stored events (aggregates: %d total)", len(evts), aggTotals.TotalEvents)
 

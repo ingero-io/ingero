@@ -100,6 +100,7 @@ var (
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 	traceRemediateGid int           // Numeric GID for remediation socket group access. Mirrors fleet-push.
 	traceNode         string        // Node identity for multi-node correlation.
+	traceCluster      string        // Cluster identity (operator-supplied, shared across pods of one job).
 	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
 	traceRingBufSize  string        // Ring buffer size override (e.g., "32m", "8m").
 	traceSamplingRate uint32        // Fixed sampling rate (0 = adaptive).
@@ -252,6 +253,7 @@ func init() {
 	traceCmd.Flags().IntVar(&traceRemediateGid, "remediate-gid", 65532,
 		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
+	traceCmd.Flags().StringVar(&traceCluster, "cluster", "", "cluster identity shared across pods of one training/serving job. Emitted on every OTLP push as the ingero.cluster.id resource attribute so the Fleet processor can group cross-pod metrics by (cluster, model, phase) for peer-relative outlier detection. Empty leaves the attribute off the wire.")
 	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
 	traceCmd.Flags().StringVar(&traceRingBufSize, "ringbuf-size", "", "override ring buffer size for high-throughput probes (cuda, driver, host). Low-throughput probes (tcp, net, blockio, graph) keep their compiled defaults. Must be power of 2, min 4096.")
 	traceCmd.Flags().Uint32Var(&traceSamplingRate, "sampling-rate", 0, "event sampling rate (0 = adaptive, 1 = emit all, N > 1 = emit 1 in N). Adaptive mode auto-increases rate under sustained drop pressure.")
@@ -940,11 +942,13 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	var otlpExporter *export.OTLPExporter
 	if traceOTLP != "" {
 		otlpExporter = export.NewOTLP(export.OTLPConfig{
-			Endpoint: traceOTLP,
-			Insecure: true, // Default to insecure for localhost development.
-			DebugLog: debugf,
+			Endpoint:  traceOTLP,
+			Insecure:  true, // Default to insecure for localhost development.
+			NodeID:    nodeIdentity,
+			ClusterID: traceCluster,
+			DebugLog:  debugf,
 		})
-		debugf("OTLP: configured endpoint=%s", traceOTLP)
+		debugf("OTLP: configured endpoint=%s node=%s cluster=%s", traceOTLP, nodeIdentity, traceCluster)
 	}
 
 	var promSrv *export.PrometheusServer
@@ -1433,6 +1437,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 					emitInferSamplerDegraded(remediateSrv, traceNode, "", sd)
 				}
 				snap.InferWorkloads, snap.InferStats, snap.InferSampler = inferEngine.SnapshotForExport()
+				// Enrich each workload row with model + engine
+				// identity from the scraper. When the PID is a known
+				// inference engine (vLLM / TGI / SGLang / Triton) the
+				// scraper has the cmdline-extracted model id. The
+				// Fleet-side groupBy uses these labels to aggregate
+				// peer baselines across pods of the same job.
+				if inferScraper != nil {
+					for i := range snap.InferWorkloads {
+						pid := snap.InferWorkloads[i].PID
+						snap.InferWorkloads[i].ModelName = inferScraper.LookupModel(pid)
+						snap.InferWorkloads[i].EngineSystem = inferScraper.LookupEngine(pid)
+					}
+				}
 			}
 			if promSrv != nil {
 				promSrv.UpdateSnapshot(snap)
@@ -4433,6 +4450,7 @@ func configureInferenceScraper(targetPIDs []int) *scrape.Scraper {
 			Port:   det.Port,
 			Path:   det.Engine.MetricsPath(),
 			PID:    uint32(pid),
+			Model:  det.Model,
 		})
 		fmt.Fprintf(os.Stderr, "  Inference: detected %s (PID %d, scraping http://%s:%d/metrics)\n",
 			det.Engine, pid, host, det.Port)

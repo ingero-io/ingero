@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -33,6 +34,66 @@ func TestBuildRolledPath(t *testing.T) {
 	// is platform-correct.
 	if filepath.ToSlash(got) != want {
 		t.Errorf("buildRolledPath = %q, want %q", got, want)
+	}
+}
+
+func TestListRolledFiles(t *testing.T) {
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "ingero.db")
+
+	// Create the live file plus three rolled siblings (out of order
+	// chronologically) and a hand-placed sibling that doesn't match
+	// the rollover-timestamp pattern (must be skipped).
+	mustTouch := func(p string) {
+		t.Helper()
+		f, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	mustTouch(livePath)
+	mustTouch(filepath.Join(dir, "ingero.20260509T140000Z.db"))
+	mustTouch(filepath.Join(dir, "ingero.20260509T120000Z.db"))
+	mustTouch(filepath.Join(dir, "ingero.20260509T130000Z.db"))
+	// Hand-placed sibling that should NOT count as a rolled file.
+	mustTouch(filepath.Join(dir, "ingero.notes.db"))
+	// Sibling without the pattern - also skipped.
+	mustTouch(filepath.Join(dir, "ingero.backup.db"))
+
+	got, err := ListRolledFiles(livePath)
+	if err != nil {
+		t.Fatalf("ListRolledFiles: %v", err)
+	}
+	want := []string{
+		filepath.Join(dir, "ingero.20260509T120000Z.db"),
+		filepath.Join(dir, "ingero.20260509T130000Z.db"),
+		filepath.Join(dir, "ingero.20260509T140000Z.db"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ListRolledFiles: got %d, want %d (got=%v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("ListRolledFiles[%d] = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestListRolledFiles_NoRolled(t *testing.T) {
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "ingero.db")
+	f, err := os.Create(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got, err := ListRolledFiles(livePath)
+	if err != nil {
+		t.Fatalf("ListRolledFiles: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListRolledFiles on lone file = %v, want empty", got)
 	}
 }
 

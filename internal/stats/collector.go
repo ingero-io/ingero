@@ -396,12 +396,22 @@ type InferWorkloadStats struct {
 	// KernelFingerprint is non-zero only when the engine runs with
 	// --inference-fingerprint-key; the OTLP / Prometheus exporters
 	// emit it as a data point attribute so per-sequence baselines
-	// don't collapse into a single series. v0.16.5b.
+	// don't collapse into a single series.
 	KernelFingerprint uint64
-	MeanNs            float64
-	P95Ns             float64
-	Samples           int
-	Histogram         HistogramSnapshot
+	// ModelName and EngineSystem are populated when the workload's
+	// PID was detected as a known inference engine and the cmdline
+	// carried a --model / --model-id flag. Empty when the PID isn't
+	// a tracked inference engine (cli/trace.go enriches the snapshot
+	// from the scraper's target set after the engine produces the
+	// row). Surfaced as gen_ai.request.model and gen_ai.system
+	// attributes on the OTLP / Prometheus emission path so
+	// Fleet-side cross-pod aggregation can group by served model.
+	ModelName    string
+	EngineSystem string
+	MeanNs       float64
+	P95Ns        float64
+	Samples      int
+	Histogram    HistogramSnapshot
 }
 
 // InferEngineStats is the engine-level exporter view (v0.16.3).

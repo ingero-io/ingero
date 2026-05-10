@@ -381,13 +381,7 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		b.WriteString("# HELP ingero_infer_step_duration_ns Per-workload inference step duration distribution (cumulative)\n")
 		b.WriteString("# TYPE ingero_infer_step_duration_ns histogram\n")
 		for _, w := range rows {
-			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
-				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
-			// v0.16.5b: append fingerprint label only when non-zero
-			// so the default-off case keeps the v0.16.4 label set.
-			if w.KernelFingerprint != 0 {
-				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
-			}
+			labels := inferWorkloadLabels(w)
 			h := w.Histogram
 			cum := uint64(0)
 			for i, b1 := range h.ExplicitBounds {
@@ -405,22 +399,12 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		b.WriteString("# HELP ingero_infer_baseline_mean_ns Per-workload inference step EMA mean\n")
 		b.WriteString("# TYPE ingero_infer_baseline_mean_ns gauge\n")
 		for _, w := range rows {
-			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
-				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
-			if w.KernelFingerprint != 0 {
-				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
-			}
-			fmt.Fprintf(&b, "ingero_infer_baseline_mean_ns{%s} %g\n", labels, w.MeanNs)
+			fmt.Fprintf(&b, "ingero_infer_baseline_mean_ns{%s} %g\n", inferWorkloadLabels(w), w.MeanNs)
 		}
 		b.WriteString("# HELP ingero_infer_baseline_p95_ns Per-workload inference step P² p95 estimate\n")
 		b.WriteString("# TYPE ingero_infer_baseline_p95_ns gauge\n")
 		for _, w := range rows {
-			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
-				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
-			if w.KernelFingerprint != 0 {
-				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
-			}
-			fmt.Fprintf(&b, "ingero_infer_baseline_p95_ns{%s} %g\n", labels, w.P95Ns)
+			fmt.Fprintf(&b, "ingero_infer_baseline_p95_ns{%s} %g\n", inferWorkloadLabels(w), w.P95Ns)
 		}
 	}
 	if len(snap.InferWorkloads) > 0 || snap.InferStats.WorkloadsTracked > 0 ||
@@ -547,4 +531,26 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	}
 
 	fmt.Fprint(w, b.String())
+}
+
+// inferWorkloadLabels builds the Prometheus label set for one
+// per-workload inference data point. The base set is always
+// (cgroup_path_hash, pid, stream_handle, phase); kernel_fingerprint,
+// gen_ai_request_model, and gen_ai_system are appended only when the
+// workload row carries non-empty values, so a default-mode agent
+// (no fingerprint key, no inference scrape detection) keeps a tight
+// label set that doesn't churn series cardinality.
+func inferWorkloadLabels(w stats.InferWorkloadStats) string {
+	labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
+		w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
+	if w.KernelFingerprint != 0 {
+		labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
+	}
+	if w.ModelName != "" {
+		labels = fmt.Sprintf(`%s,gen_ai_request_model=%q`, labels, w.ModelName)
+	}
+	if w.EngineSystem != "" {
+		labels = fmt.Sprintf(`%s,gen_ai_system=%q`, labels, w.EngineSystem)
+	}
+	return labels
 }

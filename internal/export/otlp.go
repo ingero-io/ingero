@@ -41,6 +41,20 @@ type OTLPConfig struct {
 	ExportInterval int // seconds between pushes (default 10)
 	Headers        map[string]string
 
+	// Resource identity. Emitted as resource.attributes on every OTLP
+	// push so Fleet-side aggregation can group across nodes / pods of
+	// the same cluster. NodeID is typically the hostname or whatever
+	// --node was set to; ClusterID is the operator-supplied
+	// --cluster (k8s cluster name, fleet name, or any stable
+	// identifier shared across pods of the same training/serving
+	// run); Provider is the agent's best guess at the GPU cloud
+	// (Lambda / EC2 / GCP / Azure / CoreWeave) and is typically
+	// filled in Fleet-side via node_providers.yaml lookup if left
+	// empty here.
+	NodeID    string
+	ClusterID string
+	Provider  string
+
 	// DebugLog is called for debug messages when set (typically cli.debugf).
 	DebugLog func(format string, args ...any)
 }
@@ -525,12 +539,31 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: contract.AttrInferStreamHandle, Value: stringVal(strconv.FormatUint(w.StreamHandle, 10))},
 			{Key: contract.AttrInferPhase, Value: stringVal(w.Phase)},
 		}
-		// v0.16.5b: emit fingerprint attribute only when the feature
-		// is engaged (zero indicates "off" since FNV-1a never produces 0).
+		// Fingerprint attribute attaches only when the optional
+		// per-step kernel-launch-sequence dimension is engaged
+		// (zero indicates "off" since the FNV-1a fold never produces 0).
 		if w.KernelFingerprint != 0 {
 			attrs = append(attrs, otlpKeyValue{
 				Key:   contract.AttrInferKernelFingerprint,
 				Value: stringVal(strconv.FormatUint(w.KernelFingerprint, 16)),
+			})
+		}
+		// Layer 3 enabler attributes: serve as the cross-pod groupBy
+		// keys for the Fleet processor's peer-relative outlier
+		// detection. ModelName + EngineSystem are populated by the
+		// snapshot path from the scraper's target set when the PID is
+		// a recognized inference engine; absent when scraping is off
+		// or the engine cmdline didn't carry a --model flag.
+		if w.ModelName != "" {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrGenAIRequestModel,
+				Value: stringVal(w.ModelName),
+			})
+		}
+		if w.EngineSystem != "" {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrGenAISystem,
+				Value: stringVal(w.EngineSystem),
 			})
 		}
 		metrics = append(metrics,
@@ -619,13 +652,31 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	resourceAttrs := []otlpKeyValue{
+		{Key: "service.name", Value: stringVal("ingero")},
+		{Key: "service.version", Value: stringVal("0.8.0")},
+	}
+	// Identity attributes the cross-pod peer-MAD aggregator groups by.
+	// Empty strings are skipped so consumers don't see noise attributes.
+	if e.config.NodeID != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrNodeID, Value: stringVal(e.config.NodeID),
+		})
+	}
+	if e.config.ClusterID != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrClusterID, Value: stringVal(e.config.ClusterID),
+		})
+	}
+	if e.config.Provider != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrProvider, Value: stringVal(e.config.Provider),
+		})
+	}
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetrics{{
 			Resource: otlpResource{
-				Attributes: []otlpKeyValue{
-					{Key: "service.name", Value: stringVal("ingero")},
-					{Key: "service.version", Value: stringVal("0.8.0")},
-				},
+				Attributes: resourceAttrs,
 			},
 			ScopeMetrics: []otlpScopeMetrics{{
 				Scope: otlpScope{

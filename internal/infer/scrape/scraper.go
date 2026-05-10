@@ -46,6 +46,15 @@ type Target struct {
 	// Labels under the "ingero.engine.pid" key so consumers can
 	// correlate scraped metrics back to the eBPF-side workload.
 	PID uint32
+
+	// Model is the model identifier the engine is serving, parsed
+	// from the cmdline at detection time (--model / --model-id).
+	// May be empty when the engine doesn't report it on cmdline (the
+	// scraper's parsers also extract it from /metrics body labels in
+	// some cases). Forwarded into Layer 1 OTLP attributes so the
+	// Fleet processor can group cross-pod baselines by model when
+	// running peer-relative outlier detection.
+	Model string
 }
 
 // URL returns the http://host:port/path URL the scraper fetches.
@@ -211,6 +220,41 @@ func (s *Scraper) Targets() []Target {
 	return out
 }
 
+// LookupModel returns the served model identifier for the given PID,
+// or "" if no target is registered for that PID. Used by the agent's
+// inference snapshot path to enrich Layer 1 (per-workload) metric
+// data points with a gen_ai.request.model attribute so the Fleet
+// processor can group cross-pod baselines by model.
+func (s *Scraper) LookupModel(pid uint32) string {
+	if s == nil || pid == 0 {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.targets[pid]
+	if !ok {
+		return ""
+	}
+	return t.Model
+}
+
+// LookupEngine returns the served engine identifier (vllm / tgi /
+// sglang / triton) for the given PID, or "" when no target is
+// registered. Companion to LookupModel for the gen_ai.system
+// attribute.
+func (s *Scraper) LookupEngine(pid uint32) string {
+	if s == nil || pid == 0 {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.targets[pid]
+	if !ok {
+		return ""
+	}
+	return string(t.Engine)
+}
+
 // Run drives the scrape ticker. Blocks until ctx is cancelled.
 // Errors during individual scrapes are logged and counted but do
 // not propagate — the agent stays up regardless of engine health.
@@ -322,6 +366,7 @@ func (s *Scraper) tickRedetect() {
 				Port:   det.Port,
 				Path:   det.Engine.MetricsPath(),
 				PID:    pid,
+				Model:  det.Model,
 			}
 			s.AddTarget(newTarget)
 			s.log.Info("infer scrape: target replaced (engine identity changed)",
@@ -357,6 +402,7 @@ func (s *Scraper) tickRedetect() {
 			Port:   det.Port,
 			Path:   det.Engine.MetricsPath(),
 			PID:    pid,
+			Model:  det.Model,
 		})
 		s.log.Info("infer scrape: target discovered",
 			"pid", pid, "engine", det.Engine, "port", det.Port, "model", det.Model)

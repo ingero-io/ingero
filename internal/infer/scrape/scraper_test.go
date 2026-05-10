@@ -121,6 +121,63 @@ func TestScraper_EngineDown_Recovers(t *testing.T) {
 	}
 }
 
+func TestScraper_LookupModelAndEngine(t *testing.T) {
+	// Confirms the LookupModel / LookupEngine accessors return the
+	// values stamped on AddTarget. Used by the snapshot path to
+	// enrich Layer 1 inference metric data points with
+	// gen_ai.request.model / gen_ai.system attributes so the
+	// Fleet-side cross-pod groupBy can aggregate by served model.
+	s := NewScraper(Config{}, nil, quietLogger())
+	s.AddTarget(Target{
+		PID:    7,
+		Engine: enginedetect.VLLM,
+		Host:   "127.0.0.1",
+		Port:   8000,
+		Model:  "meta-llama/Llama-3-7b",
+	})
+	s.AddTarget(Target{
+		PID:    8,
+		Engine: enginedetect.TGI,
+		Host:   "127.0.0.1",
+		Port:   8080,
+		Model:  "bigcode/starcoder",
+	})
+
+	if got := s.LookupModel(7); got != "meta-llama/Llama-3-7b" {
+		t.Errorf("LookupModel(7) = %q, want meta-llama/Llama-3-7b", got)
+	}
+	if got := s.LookupEngine(7); got != "vllm" {
+		t.Errorf("LookupEngine(7) = %q, want vllm", got)
+	}
+	if got := s.LookupModel(8); got != "bigcode/starcoder" {
+		t.Errorf("LookupModel(8) = %q, want bigcode/starcoder", got)
+	}
+	// Unknown PID returns empty string, not panic.
+	if got := s.LookupModel(99); got != "" {
+		t.Errorf("LookupModel(unknown) = %q, want empty", got)
+	}
+	if got := s.LookupEngine(99); got != "" {
+		t.Errorf("LookupEngine(unknown) = %q, want empty", got)
+	}
+	// PID 0 is a sentinel that never matches.
+	if got := s.LookupModel(0); got != "" {
+		t.Errorf("LookupModel(0) = %q, want empty", got)
+	}
+}
+
+func TestScraper_LookupModelOnNilScraper(t *testing.T) {
+	// The cli/trace.go enrichment path calls these on the scraper
+	// pointer, which is nil when --inference-scrape=off. Both
+	// accessors must be nil-safe.
+	var s *Scraper
+	if got := s.LookupModel(1); got != "" {
+		t.Errorf("LookupModel on nil = %q, want empty", got)
+	}
+	if got := s.LookupEngine(1); got != "" {
+		t.Errorf("LookupEngine on nil = %q, want empty", got)
+	}
+}
+
 func TestScraper_AddRemoveTarget(t *testing.T) {
 	s := NewScraper(Config{}, nil, quietLogger())
 	s.AddTarget(Target{PID: 1, Engine: enginedetect.VLLM, Host: "x", Port: 1})
