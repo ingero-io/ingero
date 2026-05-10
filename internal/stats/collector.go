@@ -393,10 +393,15 @@ type InferWorkloadStats struct {
 	PID          uint32
 	StreamHandle uint64
 	Phase        string
-	MeanNs       float64
-	P95Ns        float64
-	Samples      int
-	Histogram    HistogramSnapshot
+	// KernelFingerprint is non-zero only when the engine runs with
+	// --inference-fingerprint-key; the OTLP / Prometheus exporters
+	// emit it as a data point attribute so per-sequence baselines
+	// don't collapse into a single series. v0.16.5b.
+	KernelFingerprint uint64
+	MeanNs            float64
+	P95Ns             float64
+	Samples           int
+	Histogram         HistogramSnapshot
 }
 
 // InferEngineStats is the engine-level exporter view (v0.16.3).

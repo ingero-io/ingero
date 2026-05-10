@@ -34,6 +34,15 @@ type WorkloadKey struct {
 	PID          uint32
 	StreamHandle uint64
 	Phase        Phase
+	// KernelFingerprint distinguishes workloads that share
+	// (cgroup, pid, stream, phase) but launch different kernel
+	// sequences - e.g. a serverless host running two models on the
+	// same engine, or a multi-tenant Triton with the same PID
+	// servicing different model deployments. v0.16.5b. Zero unless
+	// the operator engages --inference-fingerprint-key, in which
+	// case the engine reads the per-step KernelFingerprint accumulator
+	// from observables at sync-event time and includes it here.
+	KernelFingerprint uint64
 }
 
 // workloadEntry is the LRU map's value cell. The list element pointer
@@ -170,14 +179,15 @@ func (m *workloadMap) SnapshotForExport(warmupSamples int) []stats.InferWorkload
 			continue
 		}
 		out = append(out, stats.InferWorkloadStats{
-			CGroupHash:   k.CGroupHash,
-			PID:          k.PID,
-			StreamHandle: k.StreamHandle,
-			Phase:        string(k.Phase),
-			MeanNs:       e.bl.Mean(),
-			P95Ns:        e.bl.P95(),
-			Samples:      e.bl.Samples(),
-			Histogram:    e.bl.HistogramSnapshot(),
+			CGroupHash:        k.CGroupHash,
+			PID:               k.PID,
+			StreamHandle:      k.StreamHandle,
+			Phase:             string(k.Phase),
+			KernelFingerprint: k.KernelFingerprint,
+			MeanNs:            e.bl.Mean(),
+			P95Ns:             e.bl.P95(),
+			Samples:           e.bl.Samples(),
+			Histogram:         e.bl.HistogramSnapshot(),
 		})
 	}
 	return out

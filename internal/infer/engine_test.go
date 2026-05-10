@@ -272,6 +272,18 @@ func launchEvent(pid uint32, stream uint64, at time.Time) events.Event {
 	}
 }
 
+// launchEventWithFunc is the v0.16.5b variant where each call uses a
+// distinct kernel function pointer, so the engine's KernelFingerprint
+// fold actually distinguishes test inputs.
+func launchEventWithFunc(pid uint32, stream uint64, funcPtr uint64, at time.Time) events.Event {
+	return events.Event{
+		Timestamp: at,
+		PID:       pid,
+		Source:    events.SourceCUDA,
+		Op:        uint8(events.CUDALaunchKernel),
+		Args:      [2]uint64{funcPtr, stream},
+	}
+}
 
 // drivePhaseSteps simulates `count` steps of `step` duration on
 // `(pid, stream)`, prefixing each with `launches` cudaLaunchKernel
@@ -549,6 +561,91 @@ func TestEngine_TwoStreams_ProduceSeparateBaselines(t *testing.T) {
 	}
 	if phasesByStream[streamB] == PhasePrefill {
 		t.Errorf("stream B misclassified as prefill; expected decode")
+	}
+}
+
+func TestEngine_FingerprintKey_TwoSequences_TwoBaselines(t *testing.T) {
+	// v0.16.5b: with --inference-fingerprint-key engaged, two distinct
+	// kernel-launch sequences on the same (pid, stream) produce
+	// independent WorkloadKey entries (and independent baselines).
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		FingerprintKeyEnabled:  true,
+		WarmupSamples:          2,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	pid := uint32(99)
+	stream := uint64(0xCCC)
+
+	// Anchor sync.
+	e.OnSyncEvent(syncEvent(pid, stream, t0), "wl")
+
+	// Two distinct kernel-launch sequences, alternating per step:
+	//   Sequence A: 10 launches of {funcA1, funcA2, funcA3}
+	//   Sequence B: 10 launches of {funcB1, funcB2, funcB3}
+	now := t0
+	seqA := []uint64{0xA000A001, 0xA000A002, 0xA000A003}
+	seqB := []uint64{0xB000B001, 0xB000B002, 0xB000B003}
+	for i := 0; i < 6; i++ {
+		seq := seqA
+		if i%2 == 1 {
+			seq = seqB
+		}
+		for k := 0; k < 12; k++ {
+			fp := seq[k%len(seq)]
+			lt := now.Add(time.Duration(k+1) * 100 * time.Microsecond)
+			e.OnLaunchEvent(launchEventWithFunc(pid, stream, fp, lt), "wl", 100*time.Microsecond)
+		}
+		now = now.Add(5 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	}
+
+	rows := e.Snapshot()
+	fingerprints := make(map[uint64]bool)
+	for _, r := range rows {
+		fingerprints[r.Key.KernelFingerprint] = true
+	}
+	if len(fingerprints) < 2 {
+		t.Errorf("expected at least 2 distinct kernel fingerprints, got %d (rows: %+v)",
+			len(fingerprints), rows)
+	}
+	for fp := range fingerprints {
+		if fp == 0 {
+			t.Errorf("zero fingerprint observed with feature engaged; FNV fold should never produce 0")
+		}
+	}
+}
+
+func TestEngine_FingerprintKey_DefaultOff_NoFingerprintInKey(t *testing.T) {
+	// Default cfg has FingerprintKeyEnabled=false; even varied
+	// kernels should produce a single workload key (preserving the
+	// v0.16.4 LRU footprint).
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          2,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	pid := uint32(50)
+	stream := uint64(0xDDD)
+
+	e.OnSyncEvent(syncEvent(pid, stream, t0), "wl")
+	now := t0
+	for i := 0; i < 4; i++ {
+		fp := uint64(0xA0 + uint64(i))
+		for k := 0; k < 5; k++ {
+			lt := now.Add(time.Duration(k+1) * 100 * time.Microsecond)
+			e.OnLaunchEvent(launchEventWithFunc(pid, stream, fp, lt), "wl", 100*time.Microsecond)
+		}
+		now = now.Add(5 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, stream, now), "wl")
+	}
+	rows := e.Snapshot()
+	for _, r := range rows {
+		if r.Key.KernelFingerprint != 0 {
+			t.Errorf("default-off mode leaked a non-zero fingerprint: %x", r.Key.KernelFingerprint)
+		}
 	}
 }
 

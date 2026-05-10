@@ -296,6 +296,14 @@ const (
 	// so a single attribute string is enough for an operator to find
 	// the offending workload without scanning per-workload metrics.
 	AttrInferSamplerCause = "ingero.infer.sampler.cause"
+
+	// AttrInferKernelFingerprint identifies one kernel-launch sequence
+	// (FNV-1a fold over the per-step launch func-pointer set). v0.16.5b.
+	// Emitted only when --inference-fingerprint-key is engaged and the
+	// fingerprint is non-zero; absent on the default v0.16.x export
+	// surface so the LRU footprint stays at v0.16.4 levels for the
+	// common single-model deployment.
+	AttrInferKernelFingerprint = "ingero.infer.kernel_fingerprint"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:

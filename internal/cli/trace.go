@@ -143,6 +143,9 @@ var (
 	traceInferencePhaseMixedLaunchHigh   int
 	traceInferencePhaseMemfragDecodeMin  int
 
+	// v0.16.5b: kernel-fingerprint workload key.
+	traceInferenceFingerprintKey         bool
+
 	// inferEngine is the per-workload step-duration baseline +
 	// classifier. Constructed only when --inference is set.
 	inferEngine *infer.Engine
@@ -303,6 +306,8 @@ func init() {
 		"high end of the mixed-phase launch range (inclusive).")
 	traceCmd.Flags().IntVar(&traceInferencePhaseMemfragDecodeMin, "inference-phase-memfrag-decode-min", 1,
 		"minimum NVIDIA memfrag IOCTL events between syncs to classify a low-launch step as decode (KV-cache pressure rule). Set to a large value to effectively disable.")
+	traceCmd.Flags().BoolVar(&traceInferenceFingerprintKey, "inference-fingerprint-key", false,
+		"v0.16.5b: include a per-step kernel-launch-sequence fingerprint in the inference WorkloadKey. Engage when a single (pid, stream) hosts multiple models / model versions and you want independent baselines per kernel sequence. Off by default to keep the LRU footprint at v0.16.4 levels.")
 
 	// v0.16.2 engine /metrics scrape flags. When --inference is set
 	// and an engine (vLLM/TGI/SGLang/Triton) is detected on the host,
@@ -4230,6 +4235,8 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 		// heterogeneous-task streams without operator action.
 		PhaseClassifierEnabled: strings.ToLower(strings.TrimSpace(traceInferencePhaseClassifier)) != "off",
 		PhaseConfig:            buildPhaseConfig(),
+		// v0.16.5b: optional kernel-fingerprint dimension.
+		FingerprintKeyEnabled: traceInferenceFingerprintKey,
 	}
 	if cfg.SamplerDegradeOn == "off" {
 		cfg.SamplerDegradeOn = infer.BucketNone

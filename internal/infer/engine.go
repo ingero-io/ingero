@@ -98,6 +98,15 @@ type Config struct {
 	// single-baseline-per-stream behavior.
 	PhaseClassifierEnabled bool
 
+	// FingerprintKeyEnabled adds a per-step KernelFingerprint as the
+	// fifth WorkloadKey dimension (v0.16.5b). Off by default: most
+	// inference deployments serve a single model per (pid, stream)
+	// so the extra dimension just inflates the LRU. Engage it when
+	// the same process serves multiple models or model versions on
+	// the same stream and you want independent baselines per
+	// kernel-launch sequence.
+	FingerprintKeyEnabled bool
+
 	// PhaseConfig holds the classifier thresholds. Empty fields
 	// resolve to LLM-tuned defaults via PhaseConfig.Resolved.
 	PhaseConfig PhaseConfig
@@ -375,11 +384,13 @@ func (e *Engine) OnLaunchEvent(evt events.Event, cgroupHash string, kernelDurati
 	default:
 		return
 	}
+	// Args[0] is the kernel function pointer (per cuda_trace.bpf.c).
+	// Feeds the v0.16.5b KernelFingerprint fold inside AddLaunch.
 	e.observables.AddLaunch(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
 		StreamHandle: evt.Args[1],
-	}, kernelDuration, evt.Timestamp)
+	}, evt.Args[0], kernelDuration, evt.Timestamp)
 }
 
 // OnMemcpyEvent records a cudaMemcpy / cudaMemcpyAsync event. bytes
@@ -518,6 +529,9 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 			MemcpyBytes:        pidObs.MemcpyBytes,
 			MemfragCount:       pidObs.MemfragCount,
 			MaxThrottleReasons: streamObs.MaxThrottleReasons | pidObs.MaxThrottleReasons,
+			// v0.16.5b: fingerprint is per-stream (kernel launches
+			// belong to a stream), so it travels with streamObs.
+			KernelFingerprint: streamObs.KernelFingerprint,
 		}
 	} else {
 		// stream==0 sentinel (default stream OR pre-v0.16.5a BPF):
@@ -564,11 +578,20 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 		)
 	}
 
+	// v0.16.5b: KernelFingerprint becomes part of the WorkloadKey
+	// only when the feature is engaged. Off by default to preserve
+	// v0.16.4 LRU footprint; on, distinct kernel-launch sequences
+	// produce independent baselines (multi-model-per-process serving).
+	var fingerprint uint64
+	if e.cfg.FingerprintKeyEnabled {
+		fingerprint = obs.KernelFingerprint
+	}
 	key := WorkloadKey{
-		CGroupHash:   streamKey.CGroupHash,
-		PID:          streamKey.PID,
-		StreamHandle: streamKey.StreamHandle,
-		Phase:        phase,
+		CGroupHash:        streamKey.CGroupHash,
+		PID:               streamKey.PID,
+		StreamHandle:      streamKey.StreamHandle,
+		Phase:             phase,
+		KernelFingerprint: fingerprint,
 	}
 
 	e.mu.Lock()

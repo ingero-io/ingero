@@ -50,6 +50,15 @@ type stepObservables struct {
 // reason fired. v0.16.3 surface for thermal-context-on-outlier so a
 // step slowdown caused by HW_SLOWDOWN is visibly thermal in the JSON
 // envelope.
+//
+// KernelFingerprint is an FNV-1a-style fold over the kernel function
+// pointers launched during the step. v0.16.5b: when the agent runs
+// with --inference-fingerprint-key, this becomes part of the
+// WorkloadKey so the engine produces independent baselines for
+// distinct kernel-launch sequences (e.g. two models served by the
+// same process on the same stream). Order-dependent and stable across
+// repeated identical sequences. Zero when no launches were observed
+// in the step.
 type observableCounters struct {
 	LaunchCount        int
 	TotalKernelNs      time.Duration
@@ -57,8 +66,17 @@ type observableCounters struct {
 	NCCLCount          int
 	MemfragCount       uint32
 	MaxThrottleReasons uint64
+	KernelFingerprint  uint64
 	LastUpdate         time.Time
 }
+
+// FNV-1a 64-bit constants. Used to fold kernel function pointers into
+// KernelFingerprint. Order-dependent (kernel-launch order matters);
+// duplicate kernels do NOT cancel (unlike a plain XOR-fold).
+const (
+	fnv1aOffset64 uint64 = 0xcbf29ce484222325
+	fnv1aPrime64  uint64 = 0x100000001b3
+)
 
 // newStepObservables constructs an empty store. The Engine owns one
 // of these and drives all updates.
@@ -68,13 +86,25 @@ func newStepObservables() *stepObservables {
 	}
 }
 
-// AddLaunch increments the kernel-launch count for the workload key
-// and accumulates the kernel duration. Called from the Engine's
-// OnLaunchEvent, which itself runs on the trace event-loop hot path.
-func (s *stepObservables) AddLaunch(key observableKey, kernelDuration time.Duration, now time.Time) {
+// AddLaunch increments the kernel-launch count for the workload key,
+// accumulates the kernel duration, and folds the kernel function
+// pointer into the per-step KernelFingerprint (v0.16.5b). funcPtr=0
+// is allowed and skips the fingerprint fold so legacy / synthetic
+// callers without a kernel-pointer source don't poison the hash.
+//
+// Called from the Engine's OnLaunchEvent on the trace event-loop hot
+// path.
+func (s *stepObservables) AddLaunch(key observableKey, funcPtr uint64, kernelDuration time.Duration, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.getOrCreateLocked(key)
+	if c.LaunchCount == 0 {
+		c.KernelFingerprint = fnv1aOffset64
+	}
+	if funcPtr != 0 {
+		c.KernelFingerprint ^= funcPtr
+		c.KernelFingerprint *= fnv1aPrime64
+	}
 	c.LaunchCount++
 	c.TotalKernelNs += kernelDuration
 	c.LastUpdate = now
@@ -170,6 +200,7 @@ func (s *stepObservables) ResetAndRead(key observableKey, now time.Time) observa
 	c.NCCLCount = 0
 	c.MemfragCount = 0
 	c.MaxThrottleReasons = 0
+	c.KernelFingerprint = 0
 	c.LastUpdate = now
 	return out
 }

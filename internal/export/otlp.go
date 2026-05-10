@@ -525,6 +525,14 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{Key: contract.AttrInferStreamHandle, Value: stringVal(strconv.FormatUint(w.StreamHandle, 10))},
 			{Key: contract.AttrInferPhase, Value: stringVal(w.Phase)},
 		}
+		// v0.16.5b: emit fingerprint attribute only when the feature
+		// is engaged (zero indicates "off" since FNV-1a never produces 0).
+		if w.KernelFingerprint != 0 {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrInferKernelFingerprint,
+				Value: stringVal(strconv.FormatUint(w.KernelFingerprint, 16)),
+			})
+		}
 		metrics = append(metrics,
 			histogramMetric(contract.MetricInferStepDurationNs,
 				"Per-workload inference step duration distribution (cumulative)",

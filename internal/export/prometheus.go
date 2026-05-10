@@ -383,6 +383,11 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		for _, w := range rows {
 			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
 				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
+			// v0.16.5b: append fingerprint label only when non-zero
+			// so the default-off case keeps the v0.16.4 label set.
+			if w.KernelFingerprint != 0 {
+				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
+			}
 			h := w.Histogram
 			cum := uint64(0)
 			for i, b1 := range h.ExplicitBounds {
@@ -400,14 +405,22 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		b.WriteString("# HELP ingero_infer_baseline_mean_ns Per-workload inference step EMA mean\n")
 		b.WriteString("# TYPE ingero_infer_baseline_mean_ns gauge\n")
 		for _, w := range rows {
-			fmt.Fprintf(&b, "ingero_infer_baseline_mean_ns{cgroup_path_hash=%q,pid=\"%d\",stream_handle=\"%d\",phase=%q} %g\n",
-				w.CGroupHash, w.PID, w.StreamHandle, w.Phase, w.MeanNs)
+			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
+				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
+			if w.KernelFingerprint != 0 {
+				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
+			}
+			fmt.Fprintf(&b, "ingero_infer_baseline_mean_ns{%s} %g\n", labels, w.MeanNs)
 		}
 		b.WriteString("# HELP ingero_infer_baseline_p95_ns Per-workload inference step P² p95 estimate\n")
 		b.WriteString("# TYPE ingero_infer_baseline_p95_ns gauge\n")
 		for _, w := range rows {
-			fmt.Fprintf(&b, "ingero_infer_baseline_p95_ns{cgroup_path_hash=%q,pid=\"%d\",stream_handle=\"%d\",phase=%q} %g\n",
-				w.CGroupHash, w.PID, w.StreamHandle, w.Phase, w.P95Ns)
+			labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
+				w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
+			if w.KernelFingerprint != 0 {
+				labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
+			}
+			fmt.Fprintf(&b, "ingero_infer_baseline_p95_ns{%s} %g\n", labels, w.P95Ns)
 		}
 	}
 	if len(snap.InferWorkloads) > 0 || snap.InferStats.WorkloadsTracked > 0 ||
