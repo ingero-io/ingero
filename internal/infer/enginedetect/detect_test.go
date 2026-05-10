@@ -173,6 +173,49 @@ func TestDetect_SGLang(t *testing.T) {
 	if d.Port != 30000 {
 		t.Errorf("Port = %d, want 30000", d.Port)
 	}
+	// Model identifier comes from `--model-path`; the canonical SGLang
+	// flag. Without this assertion the original B-003 bug (extractModel
+	// reading `--model` only) was invisible to the test suite.
+	if d.Model != "Qwen/Qwen2-72B" {
+		t.Errorf("Model = %q, want Qwen/Qwen2-72B", d.Model)
+	}
+}
+
+func TestDetect_SGLang_ModelPathEqualsForm(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeCmdline(t, dir, 401,
+		"python", "-m", "sglang.launch_server",
+		"--model-path=Qwen/Qwen2-7B-Instruct",
+		"--port=30001")
+	d, ok := detectAt(dir, 401)
+	if !ok {
+		t.Fatal("expected SGLang detection")
+	}
+	if d.Engine != SGLang {
+		t.Errorf("Engine = %v, want %v", d.Engine, SGLang)
+	}
+	if d.Model != "Qwen/Qwen2-7B-Instruct" {
+		t.Errorf("Model = %q, want Qwen/Qwen2-7B-Instruct", d.Model)
+	}
+}
+
+func TestDetect_SGLang_LegacyModelFlag(t *testing.T) {
+	dir := t.TempDir()
+	// Older SGLang builds accept `--model` (no `-path` suffix); the
+	// extractor falls back to it after the canonical key returns no match.
+	writeFakeCmdline(t, dir, 402,
+		"python", "-m", "sglang.launch_server",
+		"--model", "meta-llama/Llama-3.1-8B")
+	d, ok := detectAt(dir, 402)
+	if !ok {
+		t.Fatal("expected SGLang detection")
+	}
+	if d.Engine != SGLang {
+		t.Errorf("Engine = %v, want %v", d.Engine, SGLang)
+	}
+	if d.Model != "meta-llama/Llama-3.1-8B" {
+		t.Errorf("Model = %q, want meta-llama/Llama-3.1-8B", d.Model)
+	}
 }
 
 func TestDetect_Triton(t *testing.T) {

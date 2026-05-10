@@ -66,10 +66,10 @@ type workloadEntry struct {
 // Shape mirrors internal/health/cgroup_cache.go (container/list +
 // map + mutex + eviction-flag). Capacity defaults to 1024.
 type workloadMap struct {
-	mu      sync.Mutex
-	entries map[WorkloadKey]*workloadEntry
-	order   *list.List // front = most recently updated; back = oldest
-	cap     int
+	mu       sync.Mutex
+	entries  map[WorkloadKey]*workloadEntry
+	order    *list.List // front = most recently updated; back = oldest
+	capacity int
 
 	// evictedThisCycle gates a once-per-tick WARN log so that a churn
 	// of short-lived workloads does not flood the agent's log. The
@@ -82,9 +82,9 @@ func newWorkloadMap(capacity int) *workloadMap {
 		capacity = 1024
 	}
 	return &workloadMap{
-		entries: make(map[WorkloadKey]*workloadEntry, capacity),
-		order:   list.New(),
-		cap:     capacity,
+		entries:  make(map[WorkloadKey]*workloadEntry, capacity),
+		order:    list.New(),
+		capacity: capacity,
 	}
 }
 
@@ -101,7 +101,7 @@ func (m *workloadMap) GetOrCreate(key WorkloadKey, now time.Time) *WorkloadBasel
 		m.order.MoveToFront(e.elem)
 		return e.bl
 	}
-	for m.order.Len() >= m.cap {
+	for m.order.Len() >= m.capacity {
 		oldest := m.order.Back()
 		if oldest == nil {
 			break

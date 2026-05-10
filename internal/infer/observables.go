@@ -136,14 +136,17 @@ func (s *stepObservables) AddNCCL(key observableKey, now time.Time) {
 }
 
 // AddMemfrag increments the memfrag IOCTL event count for the
-// workload key. v0.16.3 wiring of the v0.15 W1 memfrag kprobe into
-// the inference path; the phase classifier reads memfragCount to
+// workload key. The phase classifier reads memfragCount to
 // distinguish KV-cache-pressure decode steps (memfrag>0 + few
 // launches) from compute-bound work.
 func (s *stepObservables) AddMemfrag(key observableKey, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.getOrCreateLocked(key)
+	// Saturating add: never wrap. A sustained memfrag storm pegs at
+	// 4_294_967_295 rather than rolling back to 0, which would silently
+	// reset the phase classifier's "high pressure" rule mid-storm and
+	// surface as a misleading 0 in operator telemetry.
 	if c.MemfragCount < ^uint32(0) {
 		c.MemfragCount++
 	}

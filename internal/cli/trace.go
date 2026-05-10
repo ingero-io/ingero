@@ -1431,11 +1431,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// see a fresh view on every push.
 			if inferEngine != nil {
 				outliers := inferEngine.Drain()
+				// Use the resolved nodeIdentity (post --node defaulting +
+				// hostname fallback) and the operator-supplied --cluster
+				// flag rather than the raw flags. This keeps the UDS
+				// envelope's NodeID + ClusterID consistent with the OTLP
+				// resource attributes set above; without the resolved
+				// values, the orchestrator's per-node correlation map
+				// silently keys on empty strings.
 				for _, oe := range outliers {
-					emitInferOutlier(remediateSrv, traceNode, "", oe)
+					emitInferOutlier(remediateSrv, nodeIdentity, traceCluster, oe)
 				}
 				for _, sd := range inferEngine.DrainSampler() {
-					emitInferSamplerDegraded(remediateSrv, traceNode, "", sd)
+					emitInferSamplerDegraded(remediateSrv, nodeIdentity, traceCluster, sd)
 				}
 				snap.InferWorkloads, snap.InferStats, snap.InferSampler = inferEngine.SnapshotForExport()
 				// Enrich each workload row with model + engine
@@ -1672,7 +1679,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	if traceJSON {
-		loopErr = runJSONMode(ctx, merged, loopCfg, trackPID)
+		loopErr = runJSONMode(ctx, merged, loopCfg, corrPID, corr, trackPID)
 	} else {
 		loopErr = runTableMode(ctx, merged, loopCfg, corrPID, droppedFn, droppedDetailFn, corr, trackPID)
 	}
@@ -2893,6 +2900,167 @@ type eventLoopConfig struct {
 }
 
 // ---------------------------------------------------------------------------
+// Per-event routing helpers (shared by table + JSON modes)
+// ---------------------------------------------------------------------------
+
+// routeInferEvent feeds a single event into the inference engine. Called
+// from both runTableMode and runJSONMode after the cgroup / node-identity
+// enrichment so the inference engine sees the same input shape regardless
+// of the agent's output mode. No-op when inferEngine is nil
+// (i.e. --inference is not engaged).
+//
+// Note on memcpy: events.CUDAMemcpy / CUDAMemcpyAsync carry byte count in
+// Args[0], NOT a stream handle, per pkg/events/types.go:550. The infer
+// engine's per-stream observable keying needs the stream handle, which the
+// BPF probe does not yet emit for memcpy. Until the probe gains that
+// field, the classifier runs without memcpy_bytes input - launches +
+// NCCL + avg-kernel are sufficient to distinguish prefill / decode in
+// practice.
+func routeInferEvent(evt events.Event) {
+	if inferEngine == nil {
+		return
+	}
+	cgroupHash := ""
+	if inferCgroupCache != nil {
+		cgroupHash = inferCgroupCache.Resolve(evt.PID)
+	}
+	if evt.Source == events.SourceCUDA {
+		switch events.CUDAOp(evt.Op) {
+		case events.CUDAStreamSync, events.CUDADeviceSync:
+			inferEngine.OnSyncEvent(evt, cgroupHash)
+		case events.CUDALaunchKernel:
+			inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
+		case events.CUDAMalloc, events.CUDAMallocManaged:
+			// Args[0] is allocation size, Args[1] is the resolved
+			// devPtr (the BPF uretprobe reads it from the void**
+			// parameter). Older probes that left arg1 as the
+			// parameter address rather than the resolved pointer
+			// make every alloc key unique to that void**, which is
+			// fine - the tracker just gets less useful pairing.
+			inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
+		case events.CUDAFree:
+			inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
+		}
+	} else if evt.Source == events.SourceDriver &&
+		events.DriverOp(evt.Op) == events.DriverCtxSync {
+		inferEngine.OnSyncEvent(evt, cgroupHash)
+	}
+}
+
+// feedCorrelatorEvent feeds a single event into the causal-chain
+// correlator. Called from both runTableMode and runJSONMode so the
+// correlator sees the same input regardless of output mode. No-op when
+// corr is nil (correlator disabled).
+//
+// pidFilter follows the same nil-means-all convention as the trace event
+// loops; when non-nil, only PIDs in the map auto-register their cgroup
+// for noisy-neighbor detection.
+func feedCorrelatorEvent(corr *correlate.Engine, pidFilter map[uint32]bool, evt events.Event) {
+	if corr == nil {
+		return
+	}
+	switch evt.Source {
+	case events.SourceHost:
+		corr.RecordHost(evt)
+	case events.SourceIO, events.SourceTCP, events.SourceNet, events.SourceCUDAGraph:
+		corr.RecordEvent(evt)
+	}
+	if evt.CGroupID > 1 && pidFilter != nil && pidFilter[evt.PID] {
+		corr.SetTargetCGroup(evt.CGroupID)
+	}
+}
+
+// drainCorrelatorChains drains the per-tick correlator outputs for a
+// PID: AdvanceClock, SnapshotCorrelations, SnapshotCausalChains, the
+// inference-engine severity gate update, and the eventStore chain
+// persistence. Returns the same correlations + chains the table-mode
+// renderer wants; JSON mode discards them. Mirrors the per-tick block
+// in runTableMode so JSON daemon mode produces identical chain rows.
+//
+// Empty / no-op when corr is nil.
+func drainCorrelatorChains(corr *correlate.Engine, eventStore *store.Store, ops []stats.OpStats, corrPID uint32, now time.Time) ([]correlate.Correlation, []correlate.CausalChain) {
+	if corr == nil {
+		return nil, nil
+	}
+	corr.AdvanceClock(now)
+	corrs := corr.SnapshotCorrelations(ops, corrPID)
+	chains := corr.SnapshotCausalChains(ops, corrPID)
+	if inferEngine != nil {
+		inferEngine.OnChainSnapshot(chains, corrPID, now)
+	}
+	if eventStore != nil {
+		if len(chains) > 0 {
+			eventStore.RecordChains(chainsToStored(chains))
+		} else {
+			eventStore.ExpireChains(2 * time.Minute)
+		}
+	}
+	return corrs, chains
+}
+
+// drainK8sLifecycleEvents drains the K8s pod-lifecycle queue and
+// injects the events as synthetic host events into the collector,
+// correlator, and event store. Mirrors the table-mode pod-lifecycle
+// drain so JSON daemon mode emits identical synthetic events. No-op
+// when podCache is nil.
+func drainK8sLifecycleEvents(podCache *k8s.PodCache, collector *stats.Collector, corr *correlate.Engine, eventStore *store.Store) {
+	if podCache == nil {
+		return
+	}
+	for _, lce := range podCache.DrainLifecycleEvents() {
+		var op events.HostOp
+		switch lce.EventType {
+		case "restart":
+			op = events.HostPodRestart
+		case "eviction":
+			op = events.HostPodEviction
+		case "oom_kill":
+			op = events.HostPodOOMKill
+		default:
+			continue
+		}
+		syntheticEvt := events.Event{
+			Timestamp: lce.DetectedAt,
+			Source:    events.SourceHost,
+			Op:        uint8(op),
+		}
+		collector.Record(syntheticEvt)
+		if corr != nil {
+			corr.RecordHost(syntheticEvt)
+		}
+		if eventStore != nil {
+			eventStore.Record(syntheticEvt)
+		}
+		debugf("K8s lifecycle: %s/%s %s: %s", lce.Namespace, lce.PodName, lce.EventType, lce.Detail)
+	}
+}
+
+// drainCGroupSchedStats drains the per-cgroup off-CPU scheduling stats
+// and persists them via the event store. Mirrors the table-mode drain
+// so JSON daemon mode populates the same noisy-neighbor table.
+func drainCGroupSchedStats(corr *correlate.Engine, eventStore *store.Store, now time.Time) {
+	if corr == nil || eventStore == nil {
+		return
+	}
+	cgStats := corr.SnapshotCGroupSchedStats()
+	if len(cgStats) == 0 {
+		return
+	}
+	storeStats := make([]store.CGroupSchedStat, len(cgStats))
+	for i, cs := range cgStats {
+		storeStats[i] = store.CGroupSchedStat{
+			CGroupID:    cs.CGroupID,
+			P99OffCPU:   int64(cs.P99OffCPU),
+			TotalOffCPU: int64(cs.TotalOffCPU),
+			EventCount:  cs.EventCount,
+			WindowStart: cs.WindowStart.UnixNano(),
+			WindowEnd:   now.UnixNano(),
+		}
+	}
+	eventStore.RecordCGroupSchedStats(storeStats)
+}
+
+// ---------------------------------------------------------------------------
 // Table mode — live-updating stats display
 // ---------------------------------------------------------------------------
 
@@ -3075,50 +3243,12 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			recordMemcpyEvent(evt)
 
 			// v0.16 inference baseliner. Sync events drive the per-
-			// workload baseliner; v0.16.1 also feeds kernel-launch /
-			// memcpy / NCCL events into the phase classifier so the
-			// baseline split works (apples-to-apples comparison
-			// against the appropriate phase bucket). All hot-path
-			// methods short-circuit on non-relevant events.
-			if inferEngine != nil {
-				cgroupHash := ""
-				if inferCgroupCache != nil {
-					cgroupHash = inferCgroupCache.Resolve(evt.PID)
-				}
-				if evt.Source == events.SourceCUDA {
-					switch events.CUDAOp(evt.Op) {
-					case events.CUDAStreamSync, events.CUDADeviceSync:
-						inferEngine.OnSyncEvent(evt, cgroupHash)
-					case events.CUDALaunchKernel:
-						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
-					case events.CUDAMalloc, events.CUDAMallocManaged:
-						// Feed the KV-cache lineage tracker. Args[0]
-						// is allocation size, Args[1] is the resolved
-						// devPtr (the BPF uretprobe reads it from the
-						// void** parameter). Older probes that left
-						// arg1 as the parameter address rather than
-						// the resolved pointer make every alloc key
-						// unique to that void**, which is fine - the
-						// tracker just gets less useful pairing.
-						inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
-					case events.CUDAFree:
-						// Args[0] = devPtr being freed.
-						inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
-					}
-					// NOTE on memcpy: events.CUDAMemcpy / CUDAMemcpyAsync
-					// carry byte count in Args[0], NOT stream handle, per
-					// pkg/events/types.go:550. The infer engine's per-
-					// stream observable keying needs the stream handle,
-					// which the BPF probe does not yet emit for memcpy.
-					// Until the probe gains that field (v0.16.x followup),
-					// the classifier runs without memcpy_bytes input —
-					// launches + NCCL + avg-kernel are sufficient to
-					// distinguish prefill / decode in practice.
-				} else if evt.Source == events.SourceDriver &&
-					events.DriverOp(evt.Op) == events.DriverCtxSync {
-					inferEngine.OnSyncEvent(evt, cgroupHash)
-				}
-			}
+			// workload baseliner; kernel-launch / memcpy / NCCL events
+			// also feed the phase classifier so the baseline split
+			// works (apples-to-apples comparison against the
+			// appropriate phase bucket). All hot-path methods inside
+			// the helper short-circuit on non-relevant events.
+			routeInferEvent(evt)
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
@@ -3167,25 +3297,14 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 			}
 
 			// Resolve process name for non-host events (CUDA, Driver, IO, TCP, Net).
-			// Host events excluded — sched_switch fires for hundreds of irrelevant
+			// Host events excluded; sched_switch fires for hundreds of irrelevant
 			// system PIDs that would pollute the cache.
 			if procNames != nil && evt.Source != events.SourceHost {
 				procNames.Lookup(evt.PID)
 			}
 
 			// Feed events into correlation engine for causal chain analysis.
-			if corr != nil {
-				switch evt.Source {
-				case events.SourceHost:
-					corr.RecordHost(evt)
-				case events.SourceIO, events.SourceTCP, events.SourceNet, events.SourceCUDAGraph:
-					corr.RecordEvent(evt)
-				}
-				// Auto-register target cgroups for noisy neighbor detection.
-				if evt.CGroupID > 1 && pidFilter != nil && pidFilter[evt.PID] {
-					corr.SetTargetCGroup(evt.CGroupID)
-				}
-			}
+			feedCorrelatorEvent(corr, pidFilter, evt)
 
 			// Dynamic PID tracking: when a target process forks, auto-add child
 			// to eBPF target_pids (for host event collection). Do NOT inherit
@@ -3223,57 +3342,13 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 				}
 			}
 			// Drain K8s pod lifecycle events and inject as synthetic host events.
-			if podCache != nil {
-				for _, lce := range podCache.DrainLifecycleEvents() {
-					var op events.HostOp
-					switch lce.EventType {
-					case "restart":
-						op = events.HostPodRestart
-					case "eviction":
-						op = events.HostPodEviction
-					case "oom_kill":
-						op = events.HostPodOOMKill
-					default:
-						continue
-					}
-					syntheticEvt := events.Event{
-						Timestamp: lce.DetectedAt,
-						Source:    events.SourceHost,
-						Op:        uint8(op),
-					}
-					collector.Record(syntheticEvt)
-					if corr != nil {
-						corr.RecordHost(syntheticEvt)
-					}
-					if eventStore != nil {
-						eventStore.Record(syntheticEvt)
-					}
-					debugf("K8s lifecycle: %s/%s %s: %s", lce.Namespace, lce.PodName, lce.EventType, lce.Detail)
-				}
-			}
+			drainK8sLifecycleEvents(podCache, collector, corr, eventStore)
 
 			// Flush completed minute-buckets to SQLite.
 			flushAggregates(aggs, aggs5s, eventStore, time.Now())
 
 			// Flush per-cgroup scheduling stats for noisy neighbor detection.
-			if eventStore != nil && corr != nil {
-				cgStats := corr.SnapshotCGroupSchedStats()
-				if len(cgStats) > 0 {
-					storeStats := make([]store.CGroupSchedStat, len(cgStats))
-					now := time.Now()
-					for i, cs := range cgStats {
-						storeStats[i] = store.CGroupSchedStat{
-							CGroupID:    cs.CGroupID,
-							P99OffCPU:   int64(cs.P99OffCPU),
-							TotalOffCPU: int64(cs.TotalOffCPU),
-							EventCount:  cs.EventCount,
-							WindowStart: cs.WindowStart.UnixNano(),
-							WindowEnd:   now.UnixNano(),
-						}
-					}
-					eventStore.RecordCGroupSchedStats(storeStats)
-				}
-			}
+			drainCGroupSchedStats(corr, eventStore, time.Now())
 
 			snap := collector.Snapshot()
 			attachSysSnapshot(snap, sysColl)
@@ -3281,27 +3356,7 @@ func runTableMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLo
 				onSnapshot(snap)
 			}
 			if snap.TotalEvents > 0 || snap.System != nil {
-				var corrs []correlate.Correlation
-				var chains []correlate.CausalChain
-				if corr != nil {
-					corr.AdvanceClock(time.Now())
-					corrs = corr.SnapshotCorrelations(snap.Ops, corrPID)
-					chains = corr.SnapshotCausalChains(snap.Ops, corrPID)
-				}
-				// v0.16: feed chain severity into the per-workload
-				// baseliner so the severity gate pauses updates while
-				// a HIGH chain is active for this PID. No-op when
-				// --inference is not engaged.
-				if inferEngine != nil {
-					inferEngine.OnChainSnapshot(chains, uint32(corrPID), time.Now())
-				}
-				if eventStore != nil {
-					if len(chains) > 0 {
-						eventStore.RecordChains(chainsToStored(chains))
-					} else {
-						eventStore.ExpireChains(2 * time.Minute)
-					}
-				}
+				corrs, chains := drainCorrelatorChains(corr, eventStore, snap.Ops, corrPID, time.Now())
 				renderTable(snap, droppedFn(), droppedDetailFn(), &linesDrawn, false, corrs, chains)
 			}
 
@@ -3602,9 +3657,13 @@ type jsonEvent struct {
 }
 
 // runJSONMode streams events as newline-delimited JSON (JSONL).
-// cfg carries the ~16 shared dependencies. JSON mode has no corrPID /
-// correlator / drop-detail reporter (that's a table-UI concern).
-func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoopConfig, onFork ...func(uint32)) error {
+// cfg carries the ~16 shared dependencies; corrPID + corr drive the
+// causal-chain correlator. JSON daemon mode is the production shape
+// when --inference auto-sets traceJSON=true, so the correlator feeds +
+// chain drains have to mirror table mode for chain-of-evidence
+// persistence to work end-to-end. drop-detail reporting is omitted
+// (it is a table-UI concern).
+func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoopConfig, corrPID uint32, corr *correlate.Engine, onFork ...func(uint32)) error {
 	// Alias config fields to local names — see runTableMode comment.
 	collector := cfg.Collector
 	pidFilter := cfg.PIDFilter
@@ -3687,11 +3746,6 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 			return nil
 
 		case <-snapTicker.C:
-			if onSnapshot != nil {
-				snap := collector.Snapshot()
-				attachSysSnapshot(snap, sysColl)
-				onSnapshot(snap)
-			}
 			// Record system snapshot for post-hoc causal chain replay.
 			if eventStore != nil && sysColl != nil {
 				sys := sysColl.Snapshot()
@@ -3706,8 +3760,30 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 					})
 				}
 			}
+			// Drain K8s pod lifecycle events and inject as synthetic
+			// host events. Mirrors runTableMode so the synthetic
+			// events enter the correlator + event store identically.
+			drainK8sLifecycleEvents(podCache, collector, corr, eventStore)
+
 			// Flush completed minute-buckets to SQLite.
 			flushAggregates(aggs, aggs5s, eventStore, time.Now())
+
+			// Flush per-cgroup scheduling stats for noisy neighbor detection.
+			drainCGroupSchedStats(corr, eventStore, time.Now())
+
+			snap := collector.Snapshot()
+			attachSysSnapshot(snap, sysColl)
+			if onSnapshot != nil {
+				onSnapshot(snap)
+			}
+			// Drain the correlator on every snap-tick so chains
+			// land in the event store on the same cadence as table
+			// mode. JSON mode discards corrs / chains beyond the
+			// chain-of-evidence persistence; renderTable is a TUI
+			// concern that does not apply here.
+			if snap.TotalEvents > 0 || snap.System != nil {
+				_, _ = drainCorrelatorChains(corr, eventStore, snap.Ops, corrPID, time.Now())
+			}
 
 		case evt, ok := <-eventCh:
 			if !ok {
@@ -3756,44 +3832,10 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 			// v0.14 item C: per-direction memcpy aggregator.
 			recordMemcpyEvent(evt)
 
-			// v0.16 inference baseliner. Mirror of the hook in the
-			// other event loop above (~line 2978). Both loops feed
-			// the same engine because the agent runs ONE loop per
-			// invocation (chosen at startup based on stack-tracing
-			// configuration); without this duplication the engine
-			// silently sees zero sync events on the --json / no-
-			// stack-trace path. Surfaced during AWS validation
-			// 2026-05-09.
-			if inferEngine != nil {
-				cgroupHash := ""
-				if inferCgroupCache != nil {
-					cgroupHash = inferCgroupCache.Resolve(evt.PID)
-				}
-				if evt.Source == events.SourceCUDA {
-					switch events.CUDAOp(evt.Op) {
-					case events.CUDAStreamSync, events.CUDADeviceSync:
-						inferEngine.OnSyncEvent(evt, cgroupHash)
-					case events.CUDALaunchKernel:
-						inferEngine.OnLaunchEvent(evt, cgroupHash, evt.Duration)
-					case events.CUDAMalloc, events.CUDAMallocManaged:
-						// Feed the KV-cache lineage tracker. Args[0]
-						// is allocation size, Args[1] is the resolved
-						// devPtr (the BPF uretprobe reads it from the
-						// void** parameter). Older probes that left
-						// arg1 as the parameter address rather than
-						// the resolved pointer make every alloc key
-						// unique to that void**, which is fine - the
-						// tracker just gets less useful pairing.
-						inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
-					case events.CUDAFree:
-						// Args[0] = devPtr being freed.
-						inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
-					}
-				} else if evt.Source == events.SourceDriver &&
-					events.DriverOp(evt.Op) == events.DriverCtxSync {
-					inferEngine.OnSyncEvent(evt, cgroupHash)
-				}
-			}
+			// v0.16 inference baseliner. Mirror of runTableMode's hook
+			// via the shared routeInferEvent helper so both modes feed
+			// the same engine without per-loop drift.
+			routeInferEvent(evt)
 
 			// Memory balance tracker (--remediate): inline consumer, nil when inactive.
 			if memTracker != nil {
@@ -3841,8 +3883,14 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 				mismatchCheck.Check(evt.PID)
 			}
 
-			// Dynamic PID tracking: fork child → eBPF target_pids only.
-			// Do NOT inherit cudaPIDs — only actual CUDA/Driver events add PIDs.
+			// Feed events into correlation engine for causal chain analysis.
+			// Mirrors runTableMode so JSON daemon mode produces identical
+			// chain rows; without this hook, the chain table stays empty
+			// even though the agent is otherwise running.
+			feedCorrelatorEvent(corr, pidFilter, evt)
+
+			// Dynamic PID tracking: fork child -> eBPF target_pids only.
+			// Do NOT inherit cudaPIDs; only actual CUDA/Driver events add PIDs.
 			if evt.Source == events.SourceHost && events.HostOp(evt.Op) == events.HostProcessFork {
 				childPID := uint32(evt.Args[1])
 				if childPID > 0 && len(onFork) > 0 && onFork[0] != nil {

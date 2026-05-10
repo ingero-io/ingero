@@ -250,6 +250,11 @@ func extractModel(args []string, engine Engine) string {
 	switch engine {
 	case TGI:
 		keys = []string{"--model-id"}
+	case SGLang:
+		// SGLang's launch flag is `--model-path`; older builds
+		// accept `--model` as an alias. Canonical form first so a
+		// process passing both wins via the right key.
+		keys = []string{"--model-path", "--model"}
 	case Triton:
 		// Triton uses --model-repository (a directory), which is
 		// not a model identifier. Skip.

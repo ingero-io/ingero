@@ -2,8 +2,10 @@ package infer
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -334,12 +336,11 @@ type Engine struct {
 }
 
 // samplerCooldownDuration is the duration the sampler stays in
-// "degraded" state after a triggering outlier. Mirrors
-// sampling.DefaultCooldownDuration so an operator who never tunes the
-// sampler config sees the same value here as on the sampler itself.
-// Used only by the observability fields (samplerDegradedUntil); the
-// underlying sampling.Sampler owns its own decay clock.
-const samplerCooldownDuration = 30 * time.Second
+// "degraded" state after a triggering outlier. Reuses
+// sampling.DefaultCooldownDuration so the observability surface here
+// stays in lockstep with the sampler's own decay clock; updating the
+// canonical constant in one place propagates to both.
+const samplerCooldownDuration = sampling.DefaultCooldownDuration
 
 // samplerQueueCap bounds the in-engine queue of SamplerDegradedEvent
 // drained on each snapshot tick. Mirrors OutlierQueueCap but smaller
@@ -569,12 +570,20 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	}
 	now := evt.Timestamp
 
+	// Hold e.mu across both the lastSync swap and the observables
+	// ResetAndRead so the swap-prev / read-counters pair is atomic
+	// against any concurrent OnSyncEvent for the same streamKey.
+	// In the production agent the BPF ringbuf consumer is
+	// single-threaded so the race is theoretical; the lock merge
+	// makes the invariant explicit and survives a future refactor
+	// that fans out the consumer. observables has its own internal
+	// mutex; nesting is e.mu (outer) -> observables.mu (inner) which
+	// no other site reverses.
 	e.mu.Lock()
 	prev, hadPrev := e.lastSync[streamKey]
 	e.lastSync[streamKey] = now
-	e.mu.Unlock()
 
-	// Always reset observables on a sync, even on the first sync —
+	// Always reset observables on a sync, even on the first sync;
 	// otherwise launch/memcpy/NCCL events that arrived before the
 	// first sync would leak into the second step's classification.
 	// streamObs carries the per-stream counters (launches, NCCL);
@@ -599,11 +608,12 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 		}
 	} else {
 		// stream==0 sentinel (default stream OR pre-v0.16.5a BPF):
-		// pidObs and streamObs are the same bucket - reading twice
+		// pidObs and streamObs are the same bucket; reading twice
 		// would double-reset and zero out the counters before they
 		// were used. Fall back to the single-bucket read.
 		obs = streamObs
 	}
+	e.mu.Unlock()
 
 	if !hadPrev {
 		return
@@ -737,7 +747,7 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 		BaselineMeanNs:        int64(bl.Mean()),
 		Bucket:                bucket,
 		At:                    now,
-		EventID:               newEventID(),
+		EventID:               newEventID(key.PID, key.StreamHandle, now.UnixNano()),
 		MemfragEvents:         obs.MemfragCount,
 		ThrottleReasons:       throttleReasons,
 		MinSMClockMHz:         0, // reserved; SM clock plumbing deferred (see Batch 1 commit)
@@ -886,6 +896,22 @@ func (e *Engine) Stats() EngineStats {
 	}
 	for k, v := range e.throttleAtOutlier {
 		out.ThrottleAtOutlier[k] = v
+	}
+
+	// Prune lastLogAt entries past the rate-limit window so a churn
+	// of short-lived workloads does not grow the map without bound.
+	// LRU eviction on the workload map (wmap) drops the OutlierEvent
+	// trail; without a parallel sweep here, lastLogAt accumulates
+	// orphaned entries forever. Cutoff = 2 * LogMinInterval gives one
+	// full window of headroom past the last possible log emission for
+	// any active workload key.
+	if e.cfg.LogMinInterval > 0 {
+		cutoff := now.Add(-2 * e.cfg.LogMinInterval)
+		for k, t := range e.lastLogAt {
+			if t.Before(cutoff) {
+				delete(e.lastLogAt, k)
+			}
+		}
 	}
 	e.mu.Unlock()
 
@@ -1063,14 +1089,26 @@ func isSyncEvent(evt events.Event) bool {
 // cross-channel correlation. We don't pull in github.com/google/uuid
 // because the rest of the agent uses a similar approach via
 // crypto/rand for the existing alerter dedup_key generator.
-func newEventID() string {
+//
+// On crypto/rand failure (rare on Linux; possible under sandboxes
+// with /dev/urandom denied), the fallback derives a deterministic
+// 16-byte digest from (pid, streamHandle, tsNanos) via FNV-128a.
+// The fallback is collision-resistant within one process across
+// distinct outliers because the timestamp moves forward and the
+// (pid, stream) tuple is unique per workload. Returning the
+// historical all-zeros sentinel instead would collapse every
+// outlier emitted during the failure window into one downstream
+// row (Tempo / OTel collectors dedupe on TraceID-shaped fields).
+func newEventID(pid uint32, streamHandle uint64, tsNanos int64) string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Fallback: use a fixed sentinel rather than fail the
-		// outlier emission. The event is still meaningful without
-		// a globally unique ID; cross-channel correlation just
-		// becomes harder for these specific events.
-		return "00000000-0000-0000-0000-000000000000"
+		h := fnv.New128a()
+		var buf [20]byte
+		binary.BigEndian.PutUint32(buf[0:4], pid)
+		binary.BigEndian.PutUint64(buf[4:12], streamHandle)
+		binary.BigEndian.PutUint64(buf[12:20], uint64(tsNanos))
+		h.Write(buf[:])
+		h.Sum(b[:0])
 	}
 	// Set version (4) and variant (10xx) bits per RFC 4122.
 	b[6] = (b[6] & 0x0f) | 0x40

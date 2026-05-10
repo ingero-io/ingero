@@ -262,7 +262,7 @@ func runSyntheticScenario(ctx context.Context, s *synth.Scenario, loop bool) err
 	var err error
 	demoCfg := &eventLoopConfig{Collector: collector}
 	if demoJSON {
-		err = runJSONMode(ctx, ch, demoCfg)
+		err = runJSONMode(ctx, ch, demoCfg, 0, correlator)
 	} else {
 		err = runTableMode(ctx, ch, demoCfg, 0, noDrops, nil, correlator)
 	}
@@ -501,7 +501,7 @@ func runGPUScenario(ctx context.Context, s *synth.Scenario) error {
 		CUDAPIDs:  demoPIDFilter,
 	}
 	if demoJSON {
-		runJSONMode(workloadCtx, merged, workloadCfg, trackPID)
+		runJSONMode(workloadCtx, merged, workloadCfg, uint32(targetPID), corr, trackPID)
 	} else {
 		runTableMode(workloadCtx, merged, workloadCfg, uint32(targetPID), droppedFn, nil, corr, trackPID)
 	}
