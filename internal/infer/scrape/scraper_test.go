@@ -179,6 +179,172 @@ func TestScraper_BodySizeCappedAt16MiB(t *testing.T) {
 	}
 }
 
+func TestScraper_Redetect_DiscoverViaPIDLister(t *testing.T) {
+	// v0.16.4 #10: the PIDLister returns a freshly-launched engine PID.
+	// On the first re-detection tick the scraper should add it as a
+	// target. Detector is injected so we don't need a real /proc.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, vllmFixture)
+	}))
+	defer srv.Close()
+	host, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	port, _ := strconv.Atoi(portStr)
+	_ = host
+
+	var listed []uint32
+	listMu := sync.Mutex{}
+	lister := func() []uint32 {
+		listMu.Lock()
+		defer listMu.Unlock()
+		return listed
+	}
+	detector := func(pid uint32) (enginedetect.Detection, bool) {
+		if pid == 4242 {
+			return enginedetect.Detection{Engine: enginedetect.VLLM, Port: uint16(port)}, true
+		}
+		return enginedetect.Detection{}, false
+	}
+
+	s := NewScraper(Config{
+		Interval:               50 * time.Millisecond,
+		RedetectInterval:       30 * time.Millisecond,
+		RedetectStableInterval: 30 * time.Millisecond,
+		PIDLister:              lister,
+		Detector:               detector,
+	}, nil, quietLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = s.Run(ctx) }()
+
+	// Initially: no PIDs visible. No targets registered.
+	time.Sleep(70 * time.Millisecond)
+	if got := len(s.Targets()); got != 0 {
+		t.Errorf("targets before lister returns anything = %d, want 0", got)
+	}
+
+	// "Engine starts up": expose its PID via the lister.
+	listMu.Lock()
+	listed = []uint32{4242}
+	listMu.Unlock()
+
+	// Wait for at least one re-detect tick.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(s.Targets()) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+
+	if got := len(s.Targets()); got != 1 {
+		t.Fatalf("targets after engine startup = %d, want 1", got)
+	}
+	target := s.Targets()[0]
+	if target.PID != 4242 || target.Engine != enginedetect.VLLM {
+		t.Errorf("target = %+v, want PID=4242 engine=vllm", target)
+	}
+	if target.Port != uint16(port) {
+		t.Errorf("target.Port = %d, want %d", target.Port, port)
+	}
+}
+
+func TestScraper_Redetect_RemovesDeadPID(t *testing.T) {
+	// v0.16.4 #10: a registered PID that no longer matches a known
+	// engine (process died, PID gone) should be removed on the next
+	// re-detection tick.
+	alive := make(map[uint32]bool)
+	aliveMu := sync.Mutex{}
+	aliveMu.Lock()
+	alive[7] = true
+	aliveMu.Unlock()
+	detector := func(pid uint32) (enginedetect.Detection, bool) {
+		aliveMu.Lock()
+		defer aliveMu.Unlock()
+		if alive[pid] {
+			return enginedetect.Detection{Engine: enginedetect.VLLM, Port: 8000}, true
+		}
+		return enginedetect.Detection{}, false
+	}
+	// Install a lister so re-detection runs; both intervals tight
+	// so the test doesn't wait the production cadence.
+	s := NewScraper(Config{
+		Interval:               200 * time.Millisecond,
+		RedetectInterval:       30 * time.Millisecond,
+		RedetectStableInterval: 30 * time.Millisecond,
+		PIDLister:              func() []uint32 { return []uint32{7} },
+		Detector:               detector,
+	}, nil, quietLogger())
+	s.AddTarget(Target{PID: 7, Engine: enginedetect.VLLM, Host: "127.0.0.1", Port: 8000, Path: "/metrics"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = s.Run(ctx) }()
+	time.Sleep(80 * time.Millisecond)
+
+	// Engine "dies": detector now returns false for PID 7.
+	aliveMu.Lock()
+	alive[7] = false
+	aliveMu.Unlock()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(s.Targets()) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if got := len(s.Targets()); got != 0 {
+		t.Errorf("dead PID still registered, target count = %d", got)
+	}
+}
+
+func TestScraper_Redetect_ReplacesOnEngineIdentityChange(t *testing.T) {
+	// v0.16.4 #10: PID recycled to a different engine (k8s pod swap
+	// reusing the same PID) should be replaced, not duplicated.
+	current := enginedetect.Detection{Engine: enginedetect.VLLM, Port: 8000}
+	curMu := sync.Mutex{}
+	detector := func(pid uint32) (enginedetect.Detection, bool) {
+		curMu.Lock()
+		defer curMu.Unlock()
+		return current, true
+	}
+	s := NewScraper(Config{
+		Interval:               200 * time.Millisecond,
+		RedetectInterval:       30 * time.Millisecond,
+		RedetectStableInterval: 30 * time.Millisecond,
+		PIDLister:              func() []uint32 { return []uint32{9} },
+		Detector:               detector,
+	}, nil, quietLogger())
+	s.AddTarget(Target{PID: 9, Engine: enginedetect.VLLM, Host: "127.0.0.1", Port: 8000, Path: "/metrics"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = s.Run(ctx) }()
+	time.Sleep(80 * time.Millisecond)
+
+	// Engine identity changes on PID 9: now it's TGI on a different port.
+	curMu.Lock()
+	current = enginedetect.Detection{Engine: enginedetect.TGI, Port: 8080}
+	curMu.Unlock()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ts := s.Targets()
+		if len(ts) == 1 && ts[0].Engine == enginedetect.TGI {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	ts := s.Targets()
+	if len(ts) != 1 {
+		t.Fatalf("target count = %d, want 1 (replaced not duplicated)", len(ts))
+	}
+	if ts[0].Engine != enginedetect.TGI || ts[0].Port != 8080 {
+		t.Errorf("target after identity change = %+v, want TGI/8080", ts[0])
+	}
+}
+
 // atomic_int wraps a uint64 for tests; uses sync.Mutex rather than
 // sync/atomic to keep the test imports light.
 type atomic_int struct {

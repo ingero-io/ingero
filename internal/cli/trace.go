@@ -159,6 +159,13 @@ var (
 	traceInferenceScrapeInterval time.Duration
 	traceInferenceScrapeHost     string // override of localhost for non-typical pod topologies
 
+	// v0.16.4 #10: continuous engine re-detection cadence. The
+	// scraper polls this interval (when no engine known) to walk
+	// /proc and pick up engines that started after the agent;
+	// once at least one engine is registered the cadence drops to
+	// the internal slow constant (5m) automatically.
+	traceInferenceScrapeRedetectInterval time.Duration
+
 	// inferScraper is the periodic engine /metrics scraper. Active
 	// only when --inference is set AND scrape mode is "auto" AND
 	// at least one engine PID is detected on the host.
@@ -309,6 +316,8 @@ func init() {
 		"how often to scrape an engine's /metrics endpoint.")
 	traceCmd.Flags().StringVar(&traceInferenceScrapeHost, "inference-scrape-host", "127.0.0.1",
 		"host to scrape engine /metrics from. Defaults to 127.0.0.1 (engine in same pod). Set to a remote host only for sidecar-on-different-host topologies.")
+	traceCmd.Flags().DurationVar(&traceInferenceScrapeRedetectInterval, "inference-scrape-redetect-interval", 30*time.Second,
+		"how often the scraper re-walks /proc to discover newly-booted engines and re-confirm registered targets. Drops to a slower internal cadence (5m) once at least one engine is found.")
 
 	rootCmd.AddCommand(traceCmd)
 }
@@ -4256,13 +4265,13 @@ func configureInferenceEngine(eventStore *store.Store) (*infer.Engine, *sampling
 
 // configureInferenceScraper constructs the periodic engine /metrics
 // scraper when --inference is set AND --inference-scrape is "auto".
-// The scraper auto-detects vLLM/TGI/SGLang/Triton against the
-// agent's target PID set; engines that aren't running yet at agent
-// startup are picked up on the next periodic re-scan (handled
-// elsewhere in this file).
+// The scraper auto-detects vLLM/TGI/SGLang/Triton against the agent's
+// target PID set when --pid is explicit, or walks /proc continuously
+// when running system-wide (v0.16.4 #10). Engines that boot after the
+// agent are picked up on the next re-detection tick.
 //
-// Returns nil + nil when scraping is disabled. Caller is responsible
-// for invoking Run() on a goroutine.
+// Returns nil when scraping is disabled. Caller is responsible for
+// invoking Run() on a goroutine.
 func configureInferenceScraper(targetPIDs []int) *scrape.Scraper {
 	if !traceInference {
 		return nil
@@ -4283,24 +4292,44 @@ func configureInferenceScraper(targetPIDs []int) *scrape.Scraper {
 		// internal/export/otlp.go is the natural home but its
 		// extension is non-trivial). For now the sink logs at
 		// Debug-level so operators with --debug see the canonical
-		// names flowing — confirms the scraper is alive. Production
-		// emission lands in v0.16.3.
+		// names flowing — confirms the scraper is alive.
 		debugf("infer scrape: %s %d samples (PID %d, engine %s)",
 			target.URL(), len(samples), target.PID, target.Engine)
+	}
+
+	// PIDLister: when --pid is explicit, the candidate set is the
+	// declared PIDs (re-detection still catches engine swap on a
+	// recycled PID). Without --pid, walk /proc to find every running
+	// engine on the host so the scraper picks up engines that started
+	// after the agent.
+	var pidLister scrape.PIDLister
+	if len(targetPIDs) > 0 {
+		fixed := make([]uint32, 0, len(targetPIDs))
+		for _, pid := range targetPIDs {
+			if pid > 0 {
+				fixed = append(fixed, uint32(pid))
+			}
+		}
+		pidLister = func() []uint32 { return fixed }
+	} else {
+		pidLister = func() []uint32 { return enginedetect.ListEnginePIDs("") }
 	}
 
 	cfg := scrape.Config{
 		Interval: traceInferenceScrapeInterval,
 		// Timeout = min(interval/2, 5s) so the scraper never blocks
 		// past half its own interval.
-		Timeout: capDuration(traceInferenceScrapeInterval/2, 5*time.Second),
+		Timeout:          capDuration(traceInferenceScrapeInterval/2, 5*time.Second),
+		RedetectInterval: traceInferenceScrapeRedetectInterval,
+		PIDLister:        pidLister,
 	}
 	s := scrape.NewScraper(cfg, sink, slog.Default())
 
-	// Detect engines on the configured target PIDs. When --pid is
-	// not set, targetPIDs is empty and no scraping happens; the
-	// scraper still runs (idle) so dynamic re-detection in a
-	// follow-up commit doesn't need to construct it on the fly.
+	// Eager initial detection so the agent's startup banner reflects
+	// engines that are already running. The scraper's own first
+	// re-detection tick (fired immediately on Run) reproduces this on
+	// the goroutine side, but doing it here too means the operator-
+	// visible banner has the right data.
 	for _, pid := range targetPIDs {
 		if pid <= 0 {
 			continue

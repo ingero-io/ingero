@@ -38,6 +38,47 @@ func itoa(n uint32) string {
 	return string(buf[i:])
 }
 
+func TestListEnginePIDs_FindsKnownEngines(t *testing.T) {
+	// v0.16.4 #10: ListEnginePIDs walks /proc and returns PIDs whose
+	// cmdline matches a known engine. Unknown PIDs and non-numeric
+	// /proc entries are skipped.
+	dir := t.TempDir()
+	writeFakeCmdline(t, dir, 100, "python", "-m", "vllm.entrypoints.openai.api_server", "--port", "8000")
+	writeFakeCmdline(t, dir, 200, "text-generation-launcher", "--port", "8080")
+	writeFakeCmdline(t, dir, 300, "/usr/bin/bash") // not an engine
+	writeFakeCmdline(t, dir, 400, "tritonserver")
+
+	// Put a non-numeric directory in /proc to confirm it's skipped.
+	if err := os.MkdirAll(filepath.Join(dir, "self"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := ListEnginePIDs(dir)
+	want := map[uint32]bool{100: true, 200: true, 400: true}
+	if len(got) != len(want) {
+		t.Errorf("got %d pids, want %d (got=%v)", len(got), len(want), got)
+	}
+	for _, pid := range got {
+		if !want[pid] {
+			t.Errorf("unexpected PID %d in result", pid)
+		}
+		delete(want, pid)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing PIDs: %v", want)
+	}
+}
+
+func TestListEnginePIDs_EmptyOrMissingProc(t *testing.T) {
+	if got := ListEnginePIDs("/this/does/not/exist"); got != nil {
+		t.Errorf("missing /proc should return nil, got %v", got)
+	}
+	dir := t.TempDir()
+	if got := ListEnginePIDs(dir); got != nil {
+		t.Errorf("empty /proc should return nil, got %v", got)
+	}
+}
+
 func TestDetect_VLLM_Modulestyle(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeCmdline(t, dir, 100,

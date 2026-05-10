@@ -106,6 +106,44 @@ func readCmdlineArgs(procPath string, pid uint32) []string {
 	return out
 }
 
+// ListEnginePIDs scans /proc and returns the PIDs of every running
+// process whose cmdline matches a known inference engine. Used by
+// the v0.16.4 continuous re-detection loop in the scrape package
+// when the agent runs system-wide (no --pid filter); the loop calls
+// this on each tick to discover engines that started after the agent.
+//
+// procPath defaults to "/proc" when empty (test injection point,
+// matches Detect's contract). The function is best-effort: any
+// /proc/<pid> that becomes inaccessible mid-walk is silently skipped.
+// Returns nil on a missing /proc or an empty result; allocates the
+// slice only when at least one match is found.
+func ListEnginePIDs(procPath string) []uint32 {
+	if procPath == "" {
+		procPath = "/proc"
+	}
+	entries, err := os.ReadDir(procPath)
+	if err != nil {
+		return nil
+	}
+	var out []uint32
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// PIDs are decimal; reject non-numeric entries cheaply.
+		pid64, err := strconv.ParseUint(name, 10, 32)
+		if err != nil {
+			continue
+		}
+		pid := uint32(pid64)
+		if _, ok := detectAt(procPath, pid); ok {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
 // Detect classifies a process by cmdline. Reads /proc/[pid]/cmdline
 // and matches against the known engine patterns. procPath defaults
 // to /proc when empty (test injection point).
