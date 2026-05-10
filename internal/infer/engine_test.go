@@ -260,15 +260,18 @@ func TestEngine_StatsCountsByBucket(t *testing.T) {
 }
 
 // launchEvent constructs a CUDALaunchKernel event on the given stream.
+// v0.16.5a layout: Args[0] = kernel function pointer (sentinel here),
+// Args[1] = cudaStream_t.
 func launchEvent(pid uint32, stream uint64, at time.Time) events.Event {
 	return events.Event{
 		Timestamp: at,
 		PID:       pid,
 		Source:    events.SourceCUDA,
 		Op:        uint8(events.CUDALaunchKernel),
-		Args:      [2]uint64{stream, 0},
+		Args:      [2]uint64{0xfeedfacedeadbeef, stream},
 	}
 }
+
 
 // drivePhaseSteps simulates `count` steps of `step` duration on
 // `(pid, stream)`, prefixing each with `launches` cudaLaunchKernel
@@ -472,6 +475,116 @@ func TestEngine_SnapshotForExport_ReturnsWarmedWorkloads(t *testing.T) {
 	}
 	if ss.Degraded {
 		t.Error("sampler should NOT be degraded with no outliers")
+	}
+}
+
+func TestEngine_TwoStreams_ProduceSeparateBaselines(t *testing.T) {
+	// v0.16.5a: with the BPF probe putting stream in launch event
+	// Args[1], two streams of the same PID should bucket into
+	// distinct WorkloadKey entries even though their launches arrive
+	// interleaved. Pre-v0.16.5a behavior would have merged both into
+	// the (pid, 0) PID-level bucket.
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          2,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	pid := uint32(42)
+	streamA := uint64(0xAAA)
+	streamB := uint64(0xBBB)
+
+	// Anchor syncs on each stream so lastSync exists.
+	e.OnSyncEvent(syncEvent(pid, streamA, t0), "wl")
+	e.OnSyncEvent(syncEvent(pid, streamB, t0), "wl")
+
+	// 5 alternating steps: stream A "prefill-shape" (250 launches),
+	// stream B "decode-shape" (5 launches). Per-stream bucketing
+	// should classify A as prefill, B as decode independently.
+	now := t0
+	for i := 0; i < 5; i++ {
+		// Stream A: many launches, prefill shape.
+		for k := 0; k < 250; k++ {
+			lt := now.Add(time.Duration(k+1) * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(pid, streamA, lt), "wl", 100*time.Microsecond)
+		}
+		now = now.Add(20 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, streamA, now), "wl")
+
+		// Stream B: few launches, decode shape.
+		for k := 0; k < 5; k++ {
+			lt := now.Add(time.Duration(k+1) * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(pid, streamB, lt), "wl", 50*time.Microsecond)
+		}
+		now = now.Add(2 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, streamB, now), "wl")
+	}
+
+	st := e.Stats()
+	if st.PhaseDistribution[PhasePrefill] < 3 {
+		t.Errorf("expected >=3 prefill steps from stream A, got distribution %+v",
+			st.PhaseDistribution)
+	}
+	if st.PhaseDistribution[PhaseDecode] < 3 {
+		t.Errorf("expected >=3 decode steps from stream B, got distribution %+v",
+			st.PhaseDistribution)
+	}
+
+	// Confirm the two streams produced distinct workload keys.
+	rows := e.Snapshot()
+	streams := make(map[uint64]bool)
+	phasesByStream := make(map[uint64]Phase)
+	for _, r := range rows {
+		streams[r.Key.StreamHandle] = true
+		phasesByStream[r.Key.StreamHandle] = r.Key.Phase
+	}
+	if !streams[streamA] {
+		t.Errorf("stream A (%x) missing from workload keys; got %v", streamA, streams)
+	}
+	if !streams[streamB] {
+		t.Errorf("stream B (%x) missing from workload keys; got %v", streamB, streams)
+	}
+	if phasesByStream[streamA] == PhaseDecode {
+		t.Errorf("stream A misclassified as decode; expected prefill")
+	}
+	if phasesByStream[streamB] == PhasePrefill {
+		t.Errorf("stream B misclassified as prefill; expected decode")
+	}
+}
+
+func TestEngine_LegacyBPF_StreamZero_StaysUnclassifiedNotMisattributed(t *testing.T) {
+	// v0.16.5a backward-compat path: when BPF puts 0 in launch
+	// Args[1] (pre-v0.16.5a build, OR a real default-stream
+	// workload), launches and the (default-stream) sync share the
+	// same (pid, 0) bucket and produce a single coherent baseline -
+	// no double-reset, no zeroed classifier inputs. This protects
+	// the v0.16.4 single-stream pod use case from regression.
+	cfg := Config{
+		PhaseClassifierEnabled: true,
+		WarmupSamples:          2,
+	}
+	e := New(cfg, quietLogger())
+	t0 := time.Now()
+	pid := uint32(7)
+	defaultStream := uint64(0) // legacy / default-stream sentinel
+
+	// Initial anchor sync.
+	e.OnSyncEvent(syncEvent(pid, defaultStream, t0), "wl")
+	now := t0
+	for i := 0; i < 4; i++ {
+		// "Decode-shape" step: 10 launches.
+		for k := 0; k < 10; k++ {
+			lt := now.Add(time.Duration(k+1) * 100 * time.Microsecond)
+			e.OnLaunchEvent(launchEvent(pid, defaultStream, lt), "wl", 50*time.Microsecond)
+		}
+		now = now.Add(5 * time.Millisecond)
+		e.OnSyncEvent(syncEvent(pid, defaultStream, now), "wl")
+	}
+	st := e.Stats()
+	if st.PhaseDistribution[PhaseDecode] == 0 {
+		t.Errorf("legacy default-stream path lost its observables; "+
+			"expected at least one decode step, got distribution %+v",
+			st.PhaseDistribution)
 	}
 }
 

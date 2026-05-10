@@ -351,16 +351,14 @@ func (e *Engine) SetThrottleReader(fn func() uint64) {
 }
 
 // OnLaunchEvent records a cudaLaunchKernel event between syncs.
-// Observable counters accumulate at the (cgroup, pid) level —
-// stream=0 sentinel — because today's BPF probe puts the kernel
-// function pointer in Args[0], NOT the stream handle (per
-// bpf/cuda_trace.bpf.c:368). cudaMemcpy similarly carries byte
-// count (Args[0]) and direction (Args[1]) but no stream. Until a
-// BPF extension threads the stream through these events, phase
-// classification is per-PID rather than per-stream — a documented
-// v0.16.x limitation that's acceptable for the common case
-// (single inference engine per pod) and degraded but functional
-// for multi-stream serving.
+//
+// v0.16.5a: the BPF probe now captures the cudaStream_t arg into
+// evt.Args[1] (was 0 on v0.16.4 and earlier). Observable counters
+// bucket by the actual (cgroup, pid, stream) tuple - apples-to-apples
+// with the sync event's lookup. Pre-v0.16.5a BPF builds left Args[1]
+// at 0; that maps to the same single (pid, 0) bucket the v0.16.4
+// engine used, so an old probe + new agent degrade gracefully to the
+// v0.16.4 behavior without misattribution.
 //
 // Hot path; no allocations beyond map insert on first event for a
 // new key. No-op when the engine's phase classifier is disabled.
@@ -380,15 +378,19 @@ func (e *Engine) OnLaunchEvent(evt events.Event, cgroupHash string, kernelDurati
 	e.observables.AddLaunch(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
-		StreamHandle: 0, // PID-level aggregation; see func comment
+		StreamHandle: evt.Args[1],
 	}, kernelDuration, evt.Timestamp)
 }
 
 // OnMemcpyEvent records a cudaMemcpy / cudaMemcpyAsync event. bytes
-// is taken from the BPF event's Args[0] (per cuda_trace.bpf.c). No
-// direction differentiation — the phase classifier only checks
-// total bytes moved per step. Aggregates at PID level for the same
-// reason as OnLaunchEvent (no stream in the BPF event today).
+// is taken from the BPF event's Args[0] (per cuda_trace.bpf.c).
+//
+// Memcpy still aggregates at PID level (StreamHandle=0) because the
+// BPF probe layout has only two arg slots and they're already used
+// for byte count + direction; capturing the stream too needs a
+// re-shape that's deferred. In practice, memcpy_bytes is a much
+// weaker phase signal than launch_count anyway, so the per-stream
+// gap here barely affects classification accuracy.
 func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64) {
 	if !e.cfg.PhaseClassifierEnabled {
 		return
@@ -405,7 +407,7 @@ func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64)
 	e.observables.AddMemcpy(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
-		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
+		StreamHandle: 0, // PID-level aggregation; memcpy stream not yet captured
 	}, bytes, evt.Timestamp)
 }
 
@@ -413,19 +415,19 @@ func (e *Engine) OnMemcpyEvent(evt events.Event, cgroupHash string, bytes int64)
 // a step. The classifier treats any non-zero NCCL count as a strong
 // prefill signal (rule 1).
 //
-// streamHandle parameter is accepted but currently dropped — see
-// OnLaunchEvent comment for the rationale (PID-level observable
-// aggregation in v0.16.x). When the BPF probe extension lands, this
-// reverts to per-stream attribution.
+// v0.16.5a: NCCL events already carry stream_handle (the ncclprobe
+// has captured it since v0.12). The engine now buckets per-stream so
+// a tensor-parallel allreduce on stream X correctly classifies the
+// X-stream sync as PhasePrefill without polluting the Y-stream
+// baseline.
 func (e *Engine) OnNCCLEvent(pid uint32, cgroupHash string, streamHandle uint64, at time.Time) {
-	_ = streamHandle
 	if !e.cfg.PhaseClassifierEnabled {
 		return
 	}
 	e.observables.AddNCCL(observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          pid,
-		StreamHandle: 0, // PID-level aggregation; see OnLaunchEvent
+		StreamHandle: streamHandle,
 	}, at)
 }
 
@@ -478,11 +480,13 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 		PID:          evt.PID,
 		StreamHandle: evt.Args[0],
 	}
-	// pidKey is the PID-level observable bucket — that's where
-	// OnLaunchEvent / OnMemcpyEvent / OnNCCLEvent accumulate today,
-	// since the BPF probes for those events don't carry the stream.
-	// When the BPF probe is extended (v0.16.x followup), this folds
-	// back into streamKey.
+	// pidKey is the PID-level fallback bucket. v0.16.5a moved
+	// launches and NCCL onto streamKey (BPF now captures the stream
+	// for cudaLaunchKernel; ncclprobe has carried the stream since
+	// v0.12). Memcpy and memfrag still bucket at PID level - the
+	// memcpy BPF arg slots are full and memfrag is a process-wide
+	// signal by nature - so this second bucket is read in parallel
+	// and its counts merged into the per-step observable view.
 	pidKey := observableKey{
 		CGroupHash:   cgroupHash,
 		PID:          evt.PID,
@@ -498,8 +502,30 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	// Always reset observables on a sync, even on the first sync —
 	// otherwise launch/memcpy/NCCL events that arrived before the
 	// first sync would leak into the second step's classification.
-	// Read from the PID-level bucket where launches accumulated.
-	obs := e.observables.ResetAndRead(pidKey, now)
+	// streamObs carries the per-stream counters (launches, NCCL);
+	// pidObs carries the PID-level remainder (memcpy, memfrag,
+	// throttle). When an old BPF leaves stream=0 on launches, the two
+	// buckets coincide and the classifier sees v0.16.4-equivalent
+	// inputs without misattribution.
+	streamObs := e.observables.ResetAndRead(streamKey, now)
+	var obs observableCounters
+	if streamKey != pidKey {
+		pidObs := e.observables.ResetAndRead(pidKey, now)
+		obs = observableCounters{
+			LaunchCount:        streamObs.LaunchCount,
+			TotalKernelNs:      streamObs.TotalKernelNs,
+			NCCLCount:          streamObs.NCCLCount,
+			MemcpyBytes:        pidObs.MemcpyBytes,
+			MemfragCount:       pidObs.MemfragCount,
+			MaxThrottleReasons: streamObs.MaxThrottleReasons | pidObs.MaxThrottleReasons,
+		}
+	} else {
+		// stream==0 sentinel (default stream OR pre-v0.16.5a BPF):
+		// pidObs and streamObs are the same bucket - reading twice
+		// would double-reset and zero out the counters before they
+		// were used. Fall back to the single-bucket read.
+		obs = streamObs
+	}
 
 	if !hadPrev {
 		return

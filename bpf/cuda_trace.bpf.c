@@ -359,14 +359,57 @@ int uretprobe_cuda_free(struct pt_regs *ctx)
 
 // ---- cudaLaunchKernel uprobes ----
 // arg0 = GPU kernel function pointer
-
+// arg1 = cudaStream_t handle (v0.16.5a; was 0 in v0.16.4 and earlier)
+//
+// Function signature:
+//   cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim,
+//                                dim3 blockDim, void** args,
+//                                size_t sharedMem, cudaStream_t stream);
+//
+// dim3 is 12 bytes; the SysV/AAPCS ABIs split each into 2 eightbytes
+// that consume 2 GPRs. Slot allocation differs per arch:
+//
+//   x86-64 SysV:
+//     RDI = func, RSI/RDX = gridDim, RCX/R8 = blockDim, R9 = args.
+//     sharedMem and stream spill to the caller stack:
+//       [rsp+ 8] = sharedMem
+//       [rsp+16] = stream  ← PARM6+ on x86, requires bpf_probe_read_user
+//
+//   arm64 AAPCS:
+//     X0 = func, X1/X2 = gridDim, X3/X4 = blockDim, X5 = args,
+//     X6 = sharedMem, X7 = stream  ← still in a register.
+//
+// Older BPF builds left arg1 = 0; the agent treats arg1 = 0 either as
+// "default stream" (a real stream value in CUDA) or as "old BPF" — both
+// map to a single (pid, 0) workload bucket on the agent side, which is
+// the v0.16.4 behavior. New BPF + new agent get true per-stream
+// observable bucketing automatically.
 SEC("uprobe/cudaLaunchKernel")
 int uprobe_cuda_launch_kernel(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 func_ptr = (__u64)PT_REGS_PARM1(ctx);
+	__u64 stream = 0;
 
-	save_entry(tid, CUDA_OP_LAUNCH_KERNEL, func_ptr, 0);
+#if defined(__TARGET_ARCH_x86)
+	/* Stack layout at function entry (after CALL pushed return address):
+	 *   [rsp+ 0] = return address
+	 *   [rsp+ 8] = sharedMem  (size_t)
+	 *   [rsp+16] = stream     (cudaStream_t)
+	 * Read the 8-byte stream value. bpf_probe_read_user is the
+	 * verifier-safe accessor; failure leaves stream at the 0
+	 * sentinel which falls back to PID-level bucketing.
+	 */
+	void *stream_addr = (void *)(PT_REGS_SP(ctx) + 16);
+	(void)bpf_probe_read_user(&stream, sizeof(stream), stream_addr);
+#elif defined(__TARGET_ARCH_arm64)
+	/* arm64 AAPCS keeps stream in X7. user_pt_regs.regs[7] is the
+	 * cross-arch shape declared in common.bpf.h.
+	 */
+	stream = ((struct user_pt_regs *)ctx)->regs[7];
+#endif
+
+	save_entry(tid, CUDA_OP_LAUNCH_KERNEL, func_ptr, stream);
 	return 0;
 }
 
