@@ -432,6 +432,49 @@ type InferEngineStats struct {
 	KVCacheAllocAgeHist HistogramSnapshot
 }
 
+// OutlierSpan is one classified-outlier event in a wire shape the
+// OTLP /v1/traces emitter consumes. Plain types so internal/export
+// can encode without an internal/infer import (which would cycle
+// through internal/cli on the way back).
+//
+// The producer (cli/trace.go's onSnapshot callback) converts each
+// drained infer.OutlierEvent into one OutlierSpan with workload-key
+// fields, baseline ratios, contextual signals (memfrag, throttle,
+// KV-cache age), and engine identity (model + system) enriched from
+// the scraper. The consumer (export.OTLPExporter.PushSpans) emits
+// each as a self-contained INTERNAL-kind span with status=ERROR.
+//
+// Why not parent-child traces: keeping each outlier in its own trace
+// avoids needing an out-of-band correlation rule for spans that
+// arrive across snapshot ticks. Operators correlate spans across an
+// incident via the workload-key attribute set instead, which is the
+// same key the metric and UDS surfaces use. Future revisions may add
+// Span Links between samples of the same workload if a downstream
+// tool (Tempo, Honeycomb) shows that grouping in the UI.
+type OutlierSpan struct {
+	EventID        string
+	Bucket         string
+	StepStart      time.Time
+	StepEnd        time.Time
+	StepDurationNs int64
+	BaselineP95Ns  int64
+	BaselineMeanNs int64
+
+	CGroupHash        string
+	PID               uint32
+	StreamHandle      uint64
+	Phase             string
+	KernelFingerprint uint64
+
+	MemfragEvents         uint32
+	ThrottleReasons       uint64
+	MinSMClockMHz         uint32
+	KVCacheTopAllocAgesMs []uint64
+
+	ModelName    string
+	EngineSystem string
+}
+
 // InferSamplerState is the engine's sampler-degradation state for
 // ingero.infer.sampler.* metric emission (v0.16.3). Cause is a single
 // human-friendly string ("3x:cgroup=<hash>,pid=<n>,phase=<p>") that

@@ -1430,7 +1430,8 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			// triple is captured here so the OTLP/Prometheus exporters
 			// see a fresh view on every push.
 			if inferEngine != nil {
-				for _, oe := range inferEngine.Drain() {
+				outliers := inferEngine.Drain()
+				for _, oe := range outliers {
 					emitInferOutlier(remediateSrv, traceNode, "", oe)
 				}
 				for _, sd := range inferEngine.DrainSampler() {
@@ -1448,6 +1449,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 						pid := snap.InferWorkloads[i].PID
 						snap.InferWorkloads[i].ModelName = inferScraper.LookupModel(pid)
 						snap.InferWorkloads[i].EngineSystem = inferScraper.LookupEngine(pid)
+					}
+				}
+				// Per-outlier OTLP spans. Push on every snapshot tick
+				// where at least one outlier was drained so operators
+				// can jump from a slow request in Tempo / Honeycomb
+				// straight to the workload-key context. Each outlier
+				// becomes a self-contained span (own trace_id) with
+				// status=ERROR; cross-outlier correlation lives on the
+				// workload-key attribute set, not on parent_span_id.
+				if otlpExporter != nil && len(outliers) > 0 {
+					spans := buildOutlierSpans(outliers, inferScraper)
+					if err := otlpExporter.PushSpans(spans); err != nil {
+						debugf("OTLP traces: push error: %v", err)
 					}
 				}
 			}
@@ -4533,6 +4547,46 @@ func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev 
 	// stats / export pipelines on the next snapshot tick. The infer
 	// engine's SnapshotForExport is read by the snapshot builder
 	// below; no per-outlier OTLP push is needed here.
+}
+
+// buildOutlierSpans converts a drained slice of OutlierEvent into the
+// stats.OutlierSpan wire shape consumed by the OTLP /v1/traces emit
+// path. Walks the scraper (when available) once per outlier to
+// enrich with model + engine identity so spans carry the same
+// gen_ai.* attributes the metric path emits.
+func buildOutlierSpans(outliers []infer.OutlierEvent, scraper *scrape.Scraper) []stats.OutlierSpan {
+	if len(outliers) == 0 {
+		return nil
+	}
+	out := make([]stats.OutlierSpan, 0, len(outliers))
+	for _, oe := range outliers {
+		var model, engine string
+		if scraper != nil {
+			model = scraper.LookupModel(oe.Key.PID)
+			engine = scraper.LookupEngine(oe.Key.PID)
+		}
+		out = append(out, stats.OutlierSpan{
+			EventID:               oe.EventID,
+			Bucket:                string(oe.Bucket),
+			StepStart:             oe.At.Add(-time.Duration(oe.StepDurationNs)),
+			StepEnd:               oe.At,
+			StepDurationNs:        oe.StepDurationNs,
+			BaselineP95Ns:         oe.BaselineP95Ns,
+			BaselineMeanNs:        oe.BaselineMeanNs,
+			CGroupHash:            oe.Key.CGroupHash,
+			PID:                   oe.Key.PID,
+			StreamHandle:          oe.Key.StreamHandle,
+			Phase:                 string(oe.Key.Phase),
+			KernelFingerprint:     oe.Key.KernelFingerprint,
+			MemfragEvents:         oe.MemfragEvents,
+			ThrottleReasons:       oe.ThrottleReasons,
+			MinSMClockMHz:         oe.MinSMClockMHz,
+			KVCacheTopAllocAgesMs: oe.KVCacheTopAllocAgesMs,
+			ModelName:             model,
+			EngineSystem:          engine,
+		})
+	}
+	return out
 }
 
 // emitInferSamplerDegraded publishes one sampler-degraded edge event
