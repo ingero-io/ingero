@@ -3738,14 +3738,14 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 	// Cgroup cache: cgroup_id → container_id (lazy, populated on first event).
 	cgroupCache := make(map[uint64]string)
 
-	// System context collector — needed for exporter snapshots and for
-	// recording system snapshots to SQLite (post-hoc causal chain replay).
-	var sysColl *sysinfo.Collector
-	if onSnapshot != nil || eventStore != nil {
-		sysColl = sysinfo.New()
-		sysColl.Start()
-		defer sysColl.Stop()
-	}
+	// System context collector — needed for exporter snapshots, for
+	// recording system snapshots to SQLite (post-hoc causal chain replay),
+	// AND for the unconditional attachSysSnapshot call in the snap-tick
+	// below. Initialized always (matches runTableMode); the cost is one
+	// /proc-polling goroutine per JSON-mode run, negligible.
+	sysColl := sysinfo.New()
+	sysColl.Start()
+	defer sysColl.Stop()
 
 	// Periodic snapshot for exporters (OTLP, Prometheus) — every 1s, same as table mode.
 	snapTicker := time.NewTicker(1 * time.Second)
@@ -3767,7 +3767,7 @@ func runJSONMode(ctx context.Context, eventCh <-chan events.Event, cfg *eventLoo
 
 		case <-snapTicker.C:
 			// Record system snapshot for post-hoc causal chain replay.
-			if eventStore != nil && sysColl != nil {
+			if eventStore != nil {
 				sys := sysColl.Snapshot()
 				if snapFilter.ShouldEmit(sys.CPUPercent, sys.MemUsedPct, sys.MemAvailMB, sys.SwapUsedMB, sys.LoadAvg1) {
 					eventStore.RecordSnapshot(store.SystemSnapshot{
