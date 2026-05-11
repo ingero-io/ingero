@@ -95,7 +95,7 @@ func NewInCluster() (*Client, error) {
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{
 					RootCAs:    caPool,
-					MinVersion: tls.VersionTLS12,
+					MinVersion: tls.VersionTLS13,
 				},
 			},
 		},

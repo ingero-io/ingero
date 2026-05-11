@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -40,6 +41,12 @@ type Config struct {
 	CACert     string        // path to CA cert for mTLS (empty = plain HTTP)
 	ClientCert string        // path to client cert for mTLS
 	ClientKey  string        // path to client key for mTLS
+
+	// RequireTLS refuses construction when no TLS material is configured
+	// AND any node is non-loopback. Set true on every production code path
+	// (operator CLI, MCP fan-out). Loopback http:// stays allowed because
+	// the operator-controls-host model removes the network observer.
+	RequireTLS bool
 }
 
 // Client is an HTTP fan-out client for fleet queries.
@@ -67,7 +74,7 @@ func New(cfg Config) (*Client, error) {
 
 	if cfg.CACert != "" || cfg.ClientCert != "" {
 		scheme = "https"
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 
 		if cfg.CACert != "" {
 			caPEM, err := os.ReadFile(cfg.CACert)
@@ -92,6 +99,14 @@ func New(cfg Config) (*Client, error) {
 		transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}
 
+	if cfg.RequireTLS && scheme == "http" {
+		for _, node := range cfg.Nodes {
+			if !isLoopbackNode(node) {
+				return nil, fmt.Errorf("fleet: RequireTLS is set but node %q is non-loopback and no TLS material (--ca-cert / --client-cert) was provided; SQL queries and rows would travel plaintext on the wire", node)
+			}
+		}
+	}
+
 	return &Client{
 		nodes:   cfg.Nodes,
 		timeout: timeout,
@@ -99,6 +114,28 @@ func New(cfg Config) (*Client, error) {
 		http:    &http.Client{Transport: transport},
 		scheme:  scheme,
 	}, nil
+}
+
+// isLoopbackNode returns true if node (a "host:port" or bare-host string)
+// resolves to a loopback interface. Mirrors cli.IsLoopback; duplicated here
+// because the fleet package sits below internal/cli in the dependency graph.
+func isLoopbackNode(node string) bool {
+	host := node
+	// Strip "scheme://" if present (rare; node specs are usually host:port).
+	if idx := strings.Index(node, "://"); idx >= 0 {
+		host = node[idx+3:]
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // QueryResult holds the merged result of a fan-out SQL query.

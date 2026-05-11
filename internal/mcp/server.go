@@ -134,12 +134,17 @@ func (s *Server) pagerDutyBackend() *alerter.PagerDuty {
 
 // getFleetClient returns the fleet client, creating it lazily on first use.
 // Thread-safe via sync.Once — concurrent query_fleet calls are safe.
+//
+// RequireTLS is always set because the MCP listener itself runs over TLS 1.3;
+// its outbound fan-out cannot drop to plaintext without negating the inbound
+// guarantee. Loopback fleet nodes (single-host setups) are still permitted.
 func (s *Server) getFleetClient() (*fleet.Client, error) {
 	s.fleetOnce.Do(func() {
 		s.fleetClient, s.fleetErr = fleet.New(fleet.Config{
-			Nodes:   s.fleetNodes,
-			Timeout: fleet.DefaultTimeout,
-			Limit:   fleet.DefaultLimit,
+			Nodes:      s.fleetNodes,
+			Timeout:    fleet.DefaultTimeout,
+			Limit:      fleet.DefaultLimit,
+			RequireTLS: true,
 		})
 	})
 	return s.fleetClient, s.fleetErr
@@ -1347,9 +1352,10 @@ func (s *Server) fleetSQL(ctx context.Context, fc *fleet.Client, sql string, lim
 
 	// Override limit on the client for this call.
 	sqlClient, err := fleet.New(fleet.Config{
-		Nodes:   s.fleetNodes,
-		Timeout: fleet.DefaultTimeout,
-		Limit:   limit,
+		Nodes:      s.fleetNodes,
+		Timeout:    fleet.DefaultTimeout,
+		Limit:      limit,
+		RequireTLS: true,
 	})
 	if err != nil {
 		return "", err

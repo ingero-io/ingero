@@ -338,3 +338,96 @@ func TestSeveritySort(t *testing.T) {
 		}
 	}
 }
+
+func TestRequireTLS_RefusesNonLoopbackPlaintext(t *testing.T) {
+	_, err := New(Config{
+		Nodes:      []string{"prod-01.example.com:8080", "127.0.0.1:8443"},
+		RequireTLS: true,
+	})
+	if err == nil {
+		t.Fatal("New(RequireTLS=true, non-loopback node) = nil; want refusal")
+	}
+	if !strings.Contains(err.Error(), "prod-01.example.com:8080") {
+		t.Errorf("error %q does not name the offending node", err)
+	}
+	if !strings.Contains(err.Error(), "RequireTLS") {
+		t.Errorf("error %q does not name the RequireTLS knob", err)
+	}
+}
+
+func TestRequireTLS_AllowsLoopbackPlaintext(t *testing.T) {
+	tests := []string{
+		"127.0.0.1:8080",
+		"localhost:8080",
+		"[::1]:8080",
+	}
+	for _, node := range tests {
+		_, err := New(Config{
+			Nodes:      []string{node},
+			RequireTLS: true,
+		})
+		if err != nil {
+			t.Errorf("New(RequireTLS=true, %q) = %v; want nil (loopback exception)", node, err)
+		}
+	}
+}
+
+func TestRequireTLS_AllowsWhenTLSMaterialPresent(t *testing.T) {
+	// CACert path is missing-on-disk; the loader will fail with a
+	// CA-read error. The test only asserts that the RequireTLS gate
+	// does NOT fire before that point (i.e. presence of CACert opts
+	// out of the loopback check), so the failure path comes from CA
+	// loading, not from the RequireTLS refusal.
+	_, err := New(Config{
+		Nodes:      []string{"prod-01.example.com:8443"},
+		CACert:     "/no/such/ca.pem",
+		RequireTLS: true,
+	})
+	if err == nil {
+		t.Fatal("expected an error (CA file missing); the test path validates the error is NOT a RequireTLS refusal")
+	}
+	if strings.Contains(err.Error(), "RequireTLS") {
+		t.Errorf("error %q indicates RequireTLS gate fired when it should have been bypassed by CACert presence", err)
+	}
+	if !strings.Contains(err.Error(), "reading CA cert") {
+		t.Errorf("expected CA-read error, got %q", err)
+	}
+}
+
+func TestRequireTLS_OffByDefault(t *testing.T) {
+	// Zero-value Config.RequireTLS preserves backward-compat for callers
+	// that haven't been audited yet (cli/export.go, cli/explain.go).
+	_, err := New(Config{
+		Nodes: []string{"prod-01.example.com:8080"},
+	})
+	if err != nil {
+		t.Errorf("New(RequireTLS=false, non-loopback) = %v; want nil (default permits plaintext)", err)
+	}
+}
+
+func TestIsLoopbackNode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"127.0.0.1", true},
+		{"127.42.0.1:8080", true},
+		{"localhost", true},
+		{"localhost:9090", true},
+		{"[::1]:8080", true},
+		{"::1", true},
+		{"http://127.0.0.1:8080", true},
+		{"https://localhost:8443", true},
+		{"prod-01.example.com:8080", false},
+		{"10.0.0.5:8080", false},
+		{"0.0.0.0:8080", false},
+		{":8080", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := isLoopbackNode(tc.in); got != tc.want {
+			t.Errorf("isLoopbackNode(%q) = %v; want %v", tc.in, got, tc.want)
+		}
+	}
+}

@@ -64,6 +64,18 @@ func dashboardRunE(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--tls-cert and --tls-key must be specified together")
 	}
 
+	// Refuse the bearer-token-over-plaintext footgun: --token on a
+	// non-loopback HTTP listener sends the secret in clear on every
+	// request, and the no-TLS path also disables the hostGuard
+	// DNS-rebinding defense. Loopback HTTP stays allowed (operator
+	// runs a local browser; no wire exposure).
+	if dashNoTLS && !IsLoopback(dashAddr) {
+		if dashToken != "" {
+			return fmt.Errorf("--no-tls with non-loopback bind %q and --token sends the bearer token in plaintext on every request; either drop --no-tls (use TLS) or remove --token (loopback-only deployment)", dashAddr)
+		}
+		return fmt.Errorf("--no-tls is only allowed for loopback binds (got %q); the dashboard payload contains workload identity. Use --tls-cert/--tls-key for non-loopback dashboards", dashAddr)
+	}
+
 	dbPath := dashDBPath
 	if dbPath == "" {
 		dbPath = store.DefaultDBPath()

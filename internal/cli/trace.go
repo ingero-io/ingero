@@ -66,6 +66,8 @@ var (
 	traceJSON         bool
 	traceVerbose      bool
 	traceOTLP         string // OTLP endpoint (e.g., "localhost:4317"). Empty = disabled.
+	traceOTLPInsecure bool   // Send OTLP over plaintext HTTP. Default false (TLS).
+	traceOTLPAllowNonLoopback bool // Permit --otlp-insecure with a non-loopback endpoint.
 	traceProm         string // Prometheus listen addr (e.g., ":9090"). Empty = disabled.
 	traceRecord       bool   // Record events to SQLite (default true).
 	traceRecordAll    bool   // Store every event (disable selective storage).
@@ -233,8 +235,10 @@ func init() {
 	traceCmd.Flags().DurationVarP(&traceDuration, "duration", "d", 0, "stop after duration (e.g., 30s, 5m). 0 = run until Ctrl+C")
 	traceCmd.Flags().BoolVar(&traceJSON, "json", false, "output events as JSON lines (for piping to jq, scripts, MCP)")
 	traceCmd.Flags().BoolVarP(&traceVerbose, "verbose", "v", false, "show verbose table output (extra columns in TUI mode)")
-	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (HTTP JSON, POST /v1/metrics; default port 4318, e.g., localhost:4318). Disabled by default. Compatible with OpenTelemetry Collector, Grafana Alloy/Cloud, Datadog Agent, New Relic, and any OTLP-HTTP receiver. Metrics: gpu.cuda.operation.{duration,count}, system.{cpu,memory}.utilization, ingero.anomaly.count. See docs/otlp.md.")
-	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default. Same metric names as --otlp. See docs/otlp.md.")
+	traceCmd.Flags().StringVar(&traceOTLP, "otlp", "", "OTLP endpoint for metric export (HTTP JSON, POST /v1/metrics; default port 4318, e.g., localhost:4318). Disabled by default. Compatible with OpenTelemetry Collector, Grafana Alloy/Cloud, Datadog Agent, New Relic, and any OTLP-HTTP receiver. Metrics: gpu.cuda.operation.{duration,count}, system.{cpu,memory}.utilization, ingero.anomaly.count. Defaults to HTTPS; pass --otlp-insecure for plaintext (loopback only unless --otlp-insecure-allow-non-loopback). See docs/otlp.md.")
+	traceCmd.Flags().BoolVar(&traceOTLPInsecure, "otlp-insecure", false, "Send OTLP metrics + spans over plaintext HTTP instead of HTTPS. Refused for non-loopback endpoints unless --otlp-insecure-allow-non-loopback is also passed; the payload includes per-PID workload fingerprints (model names, kernel-launch sequences, cgroup hashes) that an in-path observer can scrape.")
+	traceCmd.Flags().BoolVar(&traceOTLPAllowNonLoopback, "otlp-insecure-allow-non-loopback", false, "Override the non-loopback refusal that pairs with --otlp-insecure. Required when intentionally exporting plaintext OTLP to a remote collector (e.g. a sidecar pod on a service-mesh-mTLS network).")
+	traceCmd.Flags().StringVar(&traceProm, "prometheus", "", "Prometheus /metrics listen address (e.g., :9090). Disabled by default. Same metric names as --otlp. The listener has no authentication; non-loopback binds log a startup warning. See docs/otlp.md.")
 	traceCmd.Flags().BoolVar(&traceRecord, "record", true, "record events to SQLite (default true, use --record=false to disable)")
 	traceCmd.Flags().BoolVar(&traceRecordAll, "record-all", false, "store every event individually (disables selective storage, larger DB)")
 	traceCmd.Flags().BoolVar(&traceStack, "stack", true, "capture userspace stack traces (0.4-0.6% overhead, use --stack=false to disable)")
@@ -941,18 +945,34 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// Step 4b: Create OTEL exporters (disabled by default).
 	var otlpExporter *export.OTLPExporter
 	if traceOTLP != "" {
+		// Refuse plaintext OTLP on non-loopback endpoints unless the operator
+		// explicitly opts in. The payload contains per-PID workload identity;
+		// any in-path observer reads it without authentication.
+		if traceOTLPInsecure && !IsLoopback(traceOTLP) && !traceOTLPAllowNonLoopback {
+			return fmt.Errorf("--otlp-insecure with non-loopback endpoint %q refused; payload includes workload fingerprints. Pass --otlp-insecure-allow-non-loopback to override or drop --otlp-insecure to use HTTPS", traceOTLP)
+		}
 		otlpExporter = export.NewOTLP(export.OTLPConfig{
 			Endpoint:  traceOTLP,
-			Insecure:  true, // Default to insecure for localhost development.
+			Insecure:  traceOTLPInsecure,
 			NodeID:    nodeIdentity,
 			ClusterID: traceCluster,
 			DebugLog:  debugf,
 		})
-		debugf("OTLP: configured endpoint=%s node=%s cluster=%s", traceOTLP, nodeIdentity, traceCluster)
+		debugf("OTLP: configured endpoint=%s node=%s cluster=%s insecure=%v", traceOTLP, nodeIdentity, traceCluster, traceOTLPInsecure)
 	}
 
 	var promSrv *export.PrometheusServer
 	if traceProm != "" {
+		// The /metrics body emits per-PID workload identity (model names,
+		// kernel-launch fingerprints, cgroup hashes, NCCL comm metadata).
+		// On a non-loopback bind, every host on the network can scrape it
+		// without authentication. The listener stays plaintext-no-auth by
+		// design (Prometheus scrape convention); the caller is responsible
+		// for fronting it with TLS+auth or restricting reachability.
+		if !IsLoopback(traceProm) {
+			fmt.Fprintf(os.Stderr, "  WARNING: --prometheus %s binds to a non-loopback interface and exposes per-PID workload identity unauthenticated.\n", traceProm)
+			fmt.Fprintf(os.Stderr, "  Restrict to loopback (e.g. --prometheus 127.0.0.1:9090), front with TLS+auth (Prometheus Agent / OTLP collector), or firewall the port.\n")
+		}
 		promSrv = export.NewPrometheus(traceProm)
 	}
 

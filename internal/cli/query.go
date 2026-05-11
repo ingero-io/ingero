@@ -32,6 +32,7 @@ var (
 	queryClientKey     string
 	queryClockSkew     string
 	queryIncludeRolled bool
+	queryRequireTLS    bool
 )
 
 var queryCmd = &cobra.Command{
@@ -67,6 +68,7 @@ func init() {
 	queryCmd.Flags().StringVar(&queryClientKey, "client-key", "", "client key for mTLS (optional)")
 	queryCmd.Flags().StringVar(&queryClockSkew, "clock-skew-threshold", "10ms", "clock skew warning threshold for fleet queries")
 	queryCmd.Flags().BoolVar(&queryIncludeRolled, "include-rolled", false, "also query rolled-over DB siblings (ingero.db.<TIMESTAMP>.db) of the live database. Useful when --since spans a rollover boundary. Cost: opens each rolled file briefly and runs the same Query, then merges + re-sorts in Go; expect linear time in the number of rolled files (default rollover keep-count is 6).")
+	queryCmd.Flags().BoolVar(&queryRequireTLS, "fleet-require-tls", true, "refuse to fan out to a non-loopback node when no TLS material (--ca-cert / --client-cert) is configured. SQL bodies and row payloads include workload identity; plaintext on a multi-host fleet is a leak surface. Set false to permit plaintext (e.g. service-mesh-mTLS-fronted deployments).")
 
 	rootCmd.AddCommand(queryCmd)
 }
@@ -198,6 +200,7 @@ func queryFleetSQL(ctx context.Context, nodes []string, sql string) error {
 		CACert:     queryCACert,
 		ClientCert: queryClientCert,
 		ClientKey:  queryClientKey,
+		RequireTLS: queryRequireTLS,
 	})
 	if err != nil {
 		return fmt.Errorf("creating fleet client: %w", err)

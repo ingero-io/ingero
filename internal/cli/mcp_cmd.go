@@ -75,8 +75,8 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpTLSCert, "tls-cert", "", "TLS certificate file (PEM). If omitted with --http, a self-signed cert is generated")
 	mcpCmd.Flags().StringVar(&mcpTLSKey, "tls-key", "", "TLS private key file (PEM). Required if --tls-cert is set")
 	mcpCmd.Flags().StringVar(&mcpLogPath, "log", "", "write log output to file (append, no rotation)")
-	mcpCmd.Flags().StringVar(&mcpBearerToken, "mcp-bearer-token", "", "require Authorization: Bearer <token> for /mcp requests when set with --http. Constant-time compared. Empty disables auth (loopback-only deployments).")
-	mcpCmd.Flags().String("pagerduty-routing-key", "", "PagerDuty Events v2 routing key (enables pagerduty_trigger MCP tool). Overrides alerter.pagerduty.routing_key in --config when explicitly set.")
+	mcpCmd.Flags().StringVar(&mcpBearerToken, "mcp-bearer-token", "", "DEPRECATED — leaks via /proc/<pid>/cmdline. Set the token via the INGERO_MCP_BEARER_TOKEN environment variable. The flag is now refused at startup if non-empty.")
+	mcpCmd.Flags().String("pagerduty-routing-key", "", "DEPRECATED — leaks via /proc/<pid>/cmdline. Set the routing key via the INGERO_PAGERDUTY_KEY environment variable or alerter.pagerduty.routing_key in --config. The flag is now refused at startup if non-empty.")
 	rootCmd.AddCommand(mcpCmd)
 }
 
@@ -97,23 +97,34 @@ func pagerDutyMCPEnabled(httpAddr, bearerToken string) bool {
 }
 
 // resolvePagerDutyRoutingKey composes the PagerDuty routing key from the
-// parsed YAML and the CLI flag. The CLI flag overrides only when explicitly
-// set on the command line; an unset flag inherits the YAML value. Empty
-// string return means PagerDuty is not configured (the MCP tool stays
-// registered but returns "not configured" at call time).
+// parsed YAML and the INGERO_PAGERDUTY_KEY environment variable. The env var
+// wins over YAML so operators can override the on-disk config without
+// re-deploying the YAML. Empty string return means PagerDuty is not
+// configured (the MCP tool stays registered but returns "not configured" at
+// call time).
+//
+// The CLI flag is refused: --pagerduty-routing-key on the command line
+// leaks the secret via /proc/<pid>/cmdline. Refusal is loud (a startup
+// error) rather than silent because a routing key that survives in shell
+// history defeats the entire point of constant-time compare downstream.
 //
 // Returned as a standalone function so the override-resolution logic is
 // unit-testable without spinning up the MCP server.
-func resolvePagerDutyRoutingKey(cfg *config.AgentConfig, cmd *cobra.Command) string {
+func resolvePagerDutyRoutingKey(cfg *config.AgentConfig, cmd *cobra.Command) (string, error) {
 	routingKey := ""
 	if cfg != nil && cfg.Alerter.PagerDuty != nil {
 		routingKey = cfg.Alerter.PagerDuty.RoutingKey
 	}
-	if cmd.Flags().Changed("pagerduty-routing-key") {
+	if cmd != nil && cmd.Flags().Changed("pagerduty-routing-key") {
 		flagVal, _ := cmd.Flags().GetString("pagerduty-routing-key")
-		routingKey = flagVal
+		if _, err := ResolveSecret("pagerduty-routing-key", "INGERO_PAGERDUTY_KEY", flagVal); err != nil {
+			return "", err
+		}
 	}
-	return routingKey
+	if envKey := os.Getenv("INGERO_PAGERDUTY_KEY"); envKey != "" {
+		routingKey = envKey
+	}
+	return routingKey, nil
 }
 
 func mcpRunE(cmd *cobra.Command, args []string) error {
@@ -130,6 +141,14 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 	// Validate TLS flags: both or neither.
 	if (mcpTLSCert == "") != (mcpTLSKey == "") {
 		return fmt.Errorf("--tls-cert and --tls-key must be specified together")
+	}
+
+	// Bearer token resolution: env-only. Refuses --mcp-bearer-token to keep
+	// the value out of /proc/<pid>/cmdline. Resolved into a local so the
+	// package-level mcpBearerToken stays empty for the rest of the run.
+	bearerToken, err := ResolveSecret("mcp-bearer-token", "INGERO_MCP_BEARER_TOKEN", mcpBearerToken)
+	if err != nil {
+		return err
 	}
 
 	dbPath := mcpDBPath
@@ -172,7 +191,10 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config %s: %w", cfgPath, err)
 	}
-	pdKey := resolvePagerDutyRoutingKey(agentCfg, cmd)
+	pdKey, err := resolvePagerDutyRoutingKey(agentCfg, cmd)
+	if err != nil {
+		return err
+	}
 	if pdKey != "" {
 		pd := alerter.NewPagerDuty(&alerter.PagerDutyConfig{RoutingKey: pdKey}, 5*time.Second, slog.Default())
 		srv.SetPagerDuty(pd)
@@ -180,13 +202,13 @@ func mcpRunE(cmd *cobra.Command, args []string) error {
 		debugf("mcp: pagerduty backend configured")
 	}
 
-	pagerDutyEnabled := pagerDutyMCPEnabled(mcpHTTPAddr, mcpBearerToken)
+	pagerDutyEnabled := pagerDutyMCPEnabled(mcpHTTPAddr, bearerToken)
 	srv.SetPagerDutyMCPEnabled(pagerDutyEnabled)
 	debugf("mcp: pagerduty_trigger enabled=%v (http=%q bearer_set=%v)",
-		pagerDutyEnabled, mcpHTTPAddr, mcpBearerToken != "")
+		pagerDutyEnabled, mcpHTTPAddr, bearerToken != "")
 
 	if mcpHTTPAddr != "" {
-		return srv.RunHTTP(ctx, mcpHTTPAddr, mcpTLSCert, mcpTLSKey, mcpBearerToken)
+		return srv.RunHTTP(ctx, mcpHTTPAddr, mcpTLSCert, mcpTLSKey, bearerToken)
 	}
 	return srv.Run(ctx)
 }
