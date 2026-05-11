@@ -56,7 +56,12 @@ func (VLLMParser) Parse(body []byte) ([]ScrapedSample, error) {
 // histogram lines it strips the _bucket/_sum/_count suffix before
 // looking up the map.
 func mapVLLMLine(name string) (string, string, SampleKind, bool) {
-	// Histogram-suffix forms.
+	// Histogram-suffix forms. Early-return on first match is safe today
+	// because the histogram map and gauge map do not overlap. If a
+	// future engine emits a counter or gauge whose name happens to end
+	// in `_count` / `_sum` / `_bucket`, that name would be incorrectly
+	// classified as histogram-shaped and silently dropped here; revisit
+	// if such a metric appears in a new map.
 	for _, suf := range []string{"_bucket", "_sum", "_count"} {
 		if strings.HasSuffix(name, suf) {
 			base := strings.TrimSuffix(name, suf)

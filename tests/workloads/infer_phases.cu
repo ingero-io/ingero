@@ -61,6 +61,12 @@ int main(int argc, char **argv) {
     int prefill_kernel_iters = 500;
     int prefill_period = 5;      // every 5th step is prefill, rest decode
     int step_delay_ms = 100;     // pause between steps so trace can attach + steps are slow enough to be meaningful
+    // Slow-decode injection duration. Default 150ms is calibrated against
+    // the v0.16 agent's decode-phase p95; if the agent's threshold drifts
+    // above this value the injection will silently stop tripping outlier
+    // detection. Override --slow-decode-us when validating against a
+    // tuned baseline (e.g. 3× the local agent's current p95).
+    int slow_decode_us = 150 * 1000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
@@ -71,6 +77,8 @@ int main(int argc, char **argv) {
             prefill_period = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--step-delay-ms") && i + 1 < argc) {
             step_delay_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--slow-decode-us") && i + 1 < argc) {
+            slow_decode_us = atoi(argv[++i]);
         }
     }
 
@@ -112,7 +120,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < decode_launches; k++) {
                 decode_kernel<<<8, 128>>>(d_out, N);
             }
-            usleep(150 * 1000); // 150ms — well over decode-phase p95
+            usleep((useconds_t)slow_decode_us);
             slow_count++;
             fprintf(stderr, "infer_phases: step %d injected slow decode\n", s);
         } else {

@@ -112,8 +112,8 @@ func resolveInferenceConfig(cfg *config.AgentConfig, cmd *cobra.Command, cfgPath
 			cfgPath, out.PauseOnSeverity)
 	}
 
-	maxDBSet := cmd.Flags().Changed("max-db") &&
-		strings.TrimSpace(traceMaxDB) != "" && traceMaxDB != "0"
+	mdb := strings.TrimSpace(traceMaxDB)
+	maxDBSet := cmd.Flags().Changed("max-db") && mdb != "" && mdb != "0"
 	rolloverSet := strings.TrimSpace(out.DBRolloverSize) != ""
 	if maxDBSet && rolloverSet {
 		return resolvedInference{}, errors.New("--max-db and --db-rollover-size are mutually exclusive: --max-db prunes rows in place; --db-rollover-size rotates the DB file")

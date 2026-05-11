@@ -10,10 +10,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/user"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,8 +189,13 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 	// would pick peaks from the entire DB history.
 	snapshotParams := params
 	if explainLast > 0 && len(evts) > 0 {
-		snapshotParams.From = evts[0].Timestamp
-		snapshotParams.To = evts[len(evts)-1].Timestamp
+		// store.Query returns events ORDER BY timestamp DESC, so evts[0]
+		// is the newest and evts[len-1] is the oldest. From must be the
+		// oldest bound and To the newest, otherwise the snapshot query
+		// produces an empty range and the system-context line drops out
+		// of the chain output.
+		snapshotParams.From = evts[len(evts)-1].Timestamp
+		snapshotParams.To = evts[0].Timestamp
 	}
 	snapshots, _ := s.QuerySnapshots(snapshotParams)
 	if len(snapshots) > 0 {
@@ -697,20 +705,62 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse %q — expected format: '2006-01-02 15:04' or '15:04'", s)
 }
 
-// resolvePIDsForUser finds all PIDs owned by the given username.
+// resolvePIDsForUser finds all CUDA-using PIDs owned by the given username.
+// Resolves the username via /etc/passwd, then filters discover.FindCUDAProcesses
+// by the real UID extracted from /proc/<pid>/status. A PID that has exited
+// between FindCUDAProcesses and the status read is silently skipped (the
+// trace command treats "no matching processes" as a soft warning anyway).
 func resolvePIDsForUser(username string) ([]int, error) {
-	// Read /etc/passwd to resolve username → UID, then scan /proc.
-	// For simplicity, use os/user.Lookup if available.
+	u, err := user.Lookup(username)
+	if err != nil {
+		return nil, fmt.Errorf("user lookup %q: %w", username, err)
+	}
+	targetUID, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return nil, fmt.Errorf("user %q has non-numeric UID %q: %w", username, u.Uid, err)
+	}
 	procs, err := discover.FindCUDAProcesses()
 	if err != nil {
 		return nil, err
 	}
-
 	var pids []int
 	for _, p := range procs {
-		// In a full implementation, we'd check /proc/<pid>/status for Uid.
-		// For now, include all CUDA processes when --user is specified.
-		pids = append(pids, p.PID)
+		uid, ok := readPIDRealUID(p.PID)
+		if !ok {
+			continue
+		}
+		if uid == targetUID {
+			pids = append(pids, p.PID)
+		}
 	}
 	return pids, nil
+}
+
+// readPIDRealUID returns the real UID from /proc/<pid>/status. The Uid:
+// line has four space-separated values (real, effective, saved-set,
+// filesystem); we want the first. Returns (0, false) if the status file
+// is unreadable (PID exited) or the line is missing/malformed.
+func readPIDRealUID(pid int) (int, bool) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "Uid:") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "Uid:"))
+		if len(fields) == 0 {
+			return 0, false
+		}
+		uid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			return 0, false
+		}
+		return uid, true
+	}
+	return 0, false
 }

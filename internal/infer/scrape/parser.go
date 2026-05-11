@@ -129,10 +129,13 @@ func parseLabels(s string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, 4)
-	// Labels are k="v" comma-separated. Values may contain commas
-	// in escaped form (\,), but engines we cover don't do that —
-	// we use a simple state machine that handles only the common
-	// quoted-string case.
+	// Labels are k="v" comma-separated. The Prometheus exposition
+	// format allows escape sequences inside the quoted value (\\, \",
+	// \n), but no engine in scope (vLLM, SGLang, TGI, Triton) emits
+	// labels with embedded quotes or newlines. This state machine
+	// reads up to the next unescaped `"` and is intentionally simple;
+	// a future engine that needs full escape handling will silently
+	// truncate values containing `"` until that handling is added.
 	i := 0
 	for i < len(s) {
 		// skip whitespace + commas

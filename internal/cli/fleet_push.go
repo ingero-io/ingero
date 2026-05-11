@@ -396,28 +396,12 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		log.Info("remediate UDS server started", "socket", fleetPushRemediateSock)
 	}
 
-	// Optional GET-endpoint poller (Story 3.2). Only started when the
-	// operator configures a threshold URL distinct from the OTLP endpoint.
+	// Optional GET-endpoint poller (Story 3.2). Construction is deferred
+	// to the post-ctx block below so the single NewPoller call captures
+	// any TLS-material errors (the previous shape constructed twice and
+	// the second pass discarded its error with _, returning a nil poller
+	// that the goroutine then called Run on).
 	var pollerWg sync.WaitGroup
-	if strings.TrimSpace(fleetPushThresholdURL) != "" {
-		pollerCfg := health.PollerConfig{
-			BaseURL:   fleetPushThresholdURL,
-			ClusterID: fleetPushClusterID,
-			Interval:  fleetPushPollInterval,
-			Timeout:   fleetPushTimeout,
-			Insecure:  fleetPushInsecure,
-		}
-		poller, perr := health.NewPoller(pollerCfg, thresholdCache, log)
-		if perr != nil {
-			return fmt.Errorf("poller: %w", perr)
-		}
-		// Start the poller after the loop ctx is available (see below).
-		defer func() { pollerWg.Wait() }()
-		log.Info("threshold poller configured", "url", fleetPushThresholdURL, "interval", fleetPushPollInterval.String())
-		// Deferred start (ctx is created below); capture via closure.
-		defer func(p *health.Poller) {}(poller)
-		_ = poller // actual start happens after ctx
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -487,7 +471,7 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loop: %w", err)
 	}
 
-	// Now that ctx exists, start the poller (if configured) on a goroutine.
+	// Now that ctx exists, construct and start the poller (if configured).
 	if strings.TrimSpace(fleetPushThresholdURL) != "" {
 		pollerCfg := health.PollerConfig{
 			BaseURL:   fleetPushThresholdURL,
@@ -511,14 +495,19 @@ func runFleetPush(cmd *cobra.Command, args []string) error {
 			}
 			pollerCfg.TLSConfig = tlsCfg
 		}
-		poller, _ := health.NewPoller(pollerCfg, thresholdCache, log)
+		poller, perr := health.NewPoller(pollerCfg, thresholdCache, log)
+		if perr != nil {
+			return fmt.Errorf("poller: %w", perr)
+		}
+		log.Info("threshold poller configured", "url", fleetPushThresholdURL, "interval", fleetPushPollInterval.String())
 		pollerWg.Add(1)
 		go func() {
 			defer pollerWg.Done()
-			if perr := poller.Run(ctx); perr != nil && !errors.Is(perr, context.Canceled) {
-				log.Debug("threshold poller exited", "err", perr.Error())
+			if rerr := poller.Run(ctx); rerr != nil && !errors.Is(rerr, context.Canceled) {
+				log.Debug("threshold poller exited", "err", rerr.Error())
 			}
 		}()
+		defer pollerWg.Wait()
 	}
 
 	log.Info("fleet-push starting",

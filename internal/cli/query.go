@@ -126,11 +126,13 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Query rolled-over siblings when the operator asked for it. Each
-	// rolled DB is opened read-only-by-convention (the rollover sweep
-	// stops writing once the rename happens) and the same params run
-	// against it. Results are concatenated, re-sorted by timestamp
-	// descending, and clipped to queryLimit so the merged view matches
-	// the single-DB output shape.
+	// rolled DB is opened via NewReadOnly so the file's mtime, schema
+	// version, and on-disk bytes are not perturbed by schema migrations
+	// or session-row writes. Operators expect frozen files; the previous
+	// store.New(rp) path silently rewrote them on every query.
+	// Results are concatenated, re-sorted by timestamp descending, and
+	// clipped to queryLimit so the merged view matches the single-DB
+	// output shape.
 	if queryIncludeRolled {
 		rolled, lerr := store.ListRolledFiles(dbPath)
 		if lerr != nil {
@@ -138,7 +140,7 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 		}
 		debugf("query: include-rolled found %d rolled siblings", len(rolled))
 		for _, rp := range rolled {
-			rs, oerr := store.New(rp)
+			rs, oerr := store.NewReadOnly(rp)
 			if oerr != nil {
 				fmt.Fprintf(os.Stderr, "  Warning: opening rolled file %s: %v\n", rp, oerr)
 				continue

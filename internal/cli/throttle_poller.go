@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ingero-io/ingero/internal/nvml"
@@ -67,6 +68,8 @@ func resetThrottleState() {
 	throttleLogMu.Lock()
 	throttleNotSupportedLogged = nil
 	throttleLogMu.Unlock()
+	throttleConsecFailures.Store(0)
+	updateCurrentThrottleReasons(0)
 }
 
 // startThrottlePoller spawns the goroutine that polls NVML throttle reasons
@@ -105,6 +108,18 @@ func startThrottlePoller(ctx context.Context, interval time.Duration, run nvml.R
 	}()
 }
 
+// throttleConsecFailures counts top-level nvml failures since the last
+// successful query. After throttleStaleThreshold consecutive failures the
+// poller zeroes the shared bitmap so the inference outlier path cannot
+// attach a stale "throttle was active" context to a fresh outlier.
+var throttleConsecFailures atomic.Uint32
+
+// throttleStaleThreshold is the consecutive-failure count after which the
+// shared bitmap is forced to zero. Three ticks (~15s at the 5s default poll
+// interval) covers transient nvidia-smi hiccups (driver restart, GPU reset)
+// without flapping the bitmap on every transient.
+const throttleStaleThreshold = 3
+
 // pollOnce runs one nvidia-smi query and pushes the decoded readings into
 // throttleBuf. Errors are logged at debug; "[Not Supported]" rows are logged
 // once per UUID at info to surface the consumer-GPU degraded mode without
@@ -113,8 +128,14 @@ func pollOnce(ctx context.Context, run nvml.Runner, log *slog.Logger) {
 	readings, err := nvml.GetCurrentClocksThrottleReasons(ctx, run)
 	if err != nil {
 		log.Debug("throttle poller: query failed", "err", err)
+		if throttleConsecFailures.Add(1) == throttleStaleThreshold {
+			updateCurrentThrottleReasons(0)
+			log.Warn("throttle poller: clearing stale bitmap after consecutive failures",
+				"failures", throttleStaleThreshold, "err", err)
+		}
 		return
 	}
+	throttleConsecFailures.Store(0)
 	var orFolded uint64
 	for _, r := range readings {
 		if r.Err != nil {

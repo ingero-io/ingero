@@ -136,8 +136,11 @@ func (t *Tracker) OnMalloc(pid uint32, devPtr, size uint64, at time.Time) {
 // matching tracked cudaMalloc) is silently ignored - happens
 // regularly because (a) startup-time allocations may have been
 // LRU-evicted and (b) the agent may have started after the workload.
-func (t *Tracker) OnFree(pid uint32, devPtr uint64, at time.Time) {
-	_ = at
+//
+// Free-time is not tracked: alloc-age is computed at read time in
+// TopAllocAgesMs, so the caller's free timestamp would be discarded.
+// Dropping it keeps the signature honest.
+func (t *Tracker) OnFree(pid uint32, devPtr uint64) {
 	if devPtr == 0 {
 		return
 	}

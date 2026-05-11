@@ -2959,7 +2959,7 @@ func routeInferEvent(evt events.Event) {
 			// fine - the tracker just gets less useful pairing.
 			inferEngine.OnMallocEvent(evt.PID, evt.Args[1], evt.Args[0], evt.Timestamp)
 		case events.CUDAFree:
-			inferEngine.OnFreeEvent(evt.PID, evt.Args[0], evt.Timestamp)
+			inferEngine.OnFreeEvent(evt.PID, evt.Args[0])
 		}
 	} else if evt.Source == events.SourceDriver &&
 		events.DriverOp(evt.Op) == events.DriverCtxSync {
@@ -4591,6 +4591,12 @@ func emitInferOutlier(udsServer *remediate.Server, nodeID, clusterID string, ev 
 	// UDS publish (FOSS-side only — consumers, including the EE
 	// orchestrator, react however they choose). When the socket is
 	// not enabled, udsServer is nil and we skip.
+	//
+	// Send-return is intentionally discarded: per-send drops are
+	// counted on the server side via bumpDropLocked and surfaced
+	// through DroppedByReason() so observability lives in one place
+	// rather than at every emitter. Mirrors the established
+	// fire-and-forget convention at internal/straggler/detector.go.
 	if udsServer != nil {
 		_ = udsServer.SendInferenceOutlier(remediate.InferenceOutlier{
 			Timestamp:             ev.At,
@@ -4660,7 +4666,9 @@ func buildOutlierSpans(outliers []infer.OutlierEvent, scraper *scrape.Scraper) [
 // emitInferSamplerDegraded publishes one sampler-degraded edge event
 // to the UDS socket. v0.16.3 sibling of emitInferOutlier; OTLP /
 // Prometheus emission goes through the snapshot path via
-// InferSamplerState gauges + Sum.
+// InferSamplerState gauges + Sum. Same fire-and-forget UDS-send
+// convention as emitInferOutlier; drops are visible via the server's
+// DroppedByReason counter rather than per-emitter logging.
 func emitInferSamplerDegraded(udsServer *remediate.Server, nodeID, clusterID string, ev infer.SamplerDegradedEvent) {
 	if udsServer == nil {
 		return

@@ -487,12 +487,13 @@ func (e *Engine) OnMallocEvent(pid uint32, devPtr, size uint64, at time.Time) {
 	e.cfg.KVCacheTracker.OnMalloc(pid, devPtr, size, at)
 }
 
-// OnFreeEvent records a cudaFree. Nil-safe.
-func (e *Engine) OnFreeEvent(pid uint32, devPtr uint64, at time.Time) {
+// OnFreeEvent records a cudaFree. Nil-safe. The event timestamp is not
+// recorded; alloc-age is derived at read time from the malloc timestamp.
+func (e *Engine) OnFreeEvent(pid uint32, devPtr uint64) {
 	if e.cfg.KVCacheTracker == nil {
 		return
 	}
-	e.cfg.KVCacheTracker.OnFree(pid, devPtr, at)
+	e.cfg.KVCacheTracker.OnFree(pid, devPtr)
 }
 
 // OnProcessExit clears the KV-cache lineage state for a PID. Wired

@@ -12,7 +12,7 @@ func TestTracker_MallocFreePair(t *testing.T) {
 	if got := tr.LiveAllocations(7); got != 1 {
 		t.Errorf("after one malloc: live=%d, want 1", got)
 	}
-	tr.OnFree(7, 0xdead0001, t0.Add(time.Millisecond))
+	tr.OnFree(7, 0xdead0001)
 	if got := tr.LiveAllocations(7); got != 0 {
 		t.Errorf("after matching free: live=%d, want 0", got)
 	}
@@ -20,11 +20,10 @@ func TestTracker_MallocFreePair(t *testing.T) {
 
 func TestTracker_FreeWithoutMallocIsNoop(t *testing.T) {
 	tr := New(Config{})
-	t0 := time.Now()
 	// Common production case: agent attached after the workload had
 	// already allocated. cudaFree without a tracked malloc should
 	// silently drop, not panic / not leak state.
-	tr.OnFree(7, 0xdead0002, t0)
+	tr.OnFree(7, 0xdead0002)
 	if got := tr.LiveAllocations(7); got != 0 {
 		t.Errorf("free without malloc should be no-op, live=%d", got)
 	}
@@ -34,7 +33,7 @@ func TestTracker_DevPtrZeroDropped(t *testing.T) {
 	tr := New(Config{})
 	t0 := time.Now()
 	tr.OnMalloc(7, 0, 1024, t0)
-	tr.OnFree(7, 0, t0)
+	tr.OnFree(7, 0)
 	if got := tr.LiveAllocations(7); got != 0 {
 		t.Errorf("devPtr=0 should drop, live=%d", got)
 	}
@@ -122,7 +121,7 @@ func TestTracker_PIDIsolation(t *testing.T) {
 	if got := tr.LiveAllocations(2); got != 1 {
 		t.Errorf("PID 2 live=%d, want 1", got)
 	}
-	tr.OnFree(1, 0xa, t0)
+	tr.OnFree(1, 0xa)
 	if got := tr.LiveAllocations(1); got != 0 {
 		t.Errorf("PID 1 free isolated, live=%d", got)
 	}

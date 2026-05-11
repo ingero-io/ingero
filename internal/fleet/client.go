@@ -33,6 +33,13 @@ const DefaultTimeout = 5 * time.Second
 // DefaultLimit is the max rows returned per node.
 const DefaultLimit = 1000
 
+// maxFleetResponseBytes bounds the response body the fan-out client will
+// read from a single node. 32 MiB is far above any legitimate fleet
+// response (a 1000-row query at DefaultLimit is typically <1 MiB) but
+// well below the heap pressure a malicious or compromised node could
+// inflict by streaming a multi-gigabyte body.
+const maxFleetResponseBytes = 32 << 20
+
 // Config configures the fleet client.
 type Config struct {
 	Nodes      []string      // host:port addresses
@@ -278,9 +285,13 @@ func (c *Client) QueryEndpoint(ctx context.Context, path string) (*GenericResult
 				return
 			}
 
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxFleetResponseBytes))
 			if err != nil {
 				results[idx] = nodeGenericResult{node: addr, err: fmt.Errorf("reading body: %w", err)}
+				return
+			}
+			if int64(len(body)) >= maxFleetResponseBytes {
+				results[idx] = nodeGenericResult{node: addr, err: fmt.Errorf("response body exceeds %d bytes; suspected hostile or misconfigured node", maxFleetResponseBytes)}
 				return
 			}
 			results[idx] = nodeGenericResult{node: addr, data: json.RawMessage(body)}
@@ -329,7 +340,7 @@ func (c *Client) queryNode(ctx context.Context, addr, sql string) nodeResult {
 	}
 
 	var qr queryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxFleetResponseBytes)).Decode(&qr); err != nil {
 		return nodeResult{node: addr, err: fmt.Errorf("decoding response: %w", err)}
 	}
 
@@ -362,7 +373,7 @@ func (c *Client) queryNodeChains(ctx context.Context, addr, since string) nodeCh
 	}
 
 	var cr chainAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxFleetResponseBytes)).Decode(&cr); err != nil {
 		return nodeChainResult{node: addr, err: fmt.Errorf("decoding response: %w", err)}
 	}
 
