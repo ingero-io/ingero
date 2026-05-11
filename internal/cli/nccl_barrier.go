@@ -13,10 +13,16 @@ package cli
 //     record (pid, stream_handle) -> {entry_ts, exit_ts, comm_id_hash,
 //     op_type, rank, nranks, datatype, reduce_op, count_bytes}.
 //   - On every cudaStreamSynchronize event for the same (pid, stream),
-//     compute barrier_wait = (sync.exit_ts - sync.entry_ts) since the
-//     NCCL collective is enqueued before the sync and the entire sync
-//     duration is the barrier wait. Emit as a NCCLDataPoint flagged so
-//     the OTLP encoder produces metric `nccl.collective.barrier_wait_ms`.
+//     compute barrier_wait = (sync.entry_ts - NCCL.exit_ts) — the wall
+//     time between this rank's collective enqueue and the host reaching
+//     the matching sync. A larger gap on one rank vs. its peers signals
+//     collective-issue skew, which downstream Fleet processors aggregate
+//     into per-rank straggler scores. The actual computation lives at
+//     line 148: barrier_wait = sync.exit - NCCL.entry - sync.duration,
+//     which simplifies to sync.entry - NCCL.entry (the algebra is
+//     T3 - T1 - (T3 - T2) = T2 - T1 with T1=NCCL.entry, T2=sync.entry,
+//     T3=sync.exit). Emit as a NCCLDataPoint flagged so the OTLP encoder
+//     produces metric `nccl.collective.barrier_wait_ms`.
 //   - Pending entries expire after barrierExpiry (5 min default) so a
 //     missed sync doesn't leak memory.
 //

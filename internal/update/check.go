@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/user"
@@ -228,7 +229,9 @@ func writeState(path string, st stateFile) {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return
 	}
-	os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		slog.Default().Debug("update: rename state file failed", "tmp", tmp, "dest", path, "err", err.Error())
+	}
 	chownForSudoUser(path)
 }
 
@@ -245,9 +248,19 @@ func chownForSudoUser(path string) {
 	if err != nil {
 		return
 	}
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
-	os.Chown(path, uid, gid)
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		slog.Default().Debug("update: parsing sudo user UID failed", "uid", u.Uid, "err", err.Error())
+		return
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		slog.Default().Debug("update: parsing sudo user GID failed", "gid", u.Gid, "err", err.Error())
+		return
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		slog.Default().Debug("update: chown state file failed", "path", path, "err", err.Error())
+	}
 }
 
 // githubRelease is the minimal GitHub API response we need.

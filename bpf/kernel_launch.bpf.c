@@ -41,12 +41,17 @@ char LICENSE[] SEC("license") = "GPL";
 #define INGERO_PARM6(ctx) ((__u64)0)
 #endif
 
+// Naming convention matches the rest of the BPF tree (ingero_event_hdr
+// in common.bpf.h): pid is the userspace PID (kernel tgid); tid is the
+// kernel TID. The wire bytes are unchanged from v0.15; only the labels
+// were swapped so the per-process kernel-launch aggregates downstream
+// no longer fragment one Python rank into per-thread series.
 struct kernel_launch_event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	__u64 func_handle;
-	__u32 pid;
-	__u32 tgid;
+	__u32 tid;       // kernel TID (low 32 bits of pid_tgid)
+	__u32 pid;       // userspace PID (high 32 bits of pid_tgid)
 	__u32 grid_x;
 	__u32 grid_y;
 	__u32 grid_z;
@@ -75,8 +80,8 @@ int uprobe_cu_launch_kernel(struct pt_regs *ctx)
 	pid_tgid = bpf_get_current_pid_tgid();
 	ev->timestamp_ns = bpf_ktime_get_ns();
 	ev->cgroup_id    = bpf_get_current_cgroup_id();
-	ev->pid          = (__u32)pid_tgid;
-	ev->tgid         = (__u32)(pid_tgid >> 32);
+	ev->tid          = (__u32)pid_tgid;
+	ev->pid          = (__u32)(pid_tgid >> 32);
 	ev->func_handle  = (__u64)PT_REGS_PARM1(ctx);
 	ev->grid_x       = (__u32)PT_REGS_PARM2(ctx);
 	ev->grid_y       = (__u32)PT_REGS_PARM3(ctx);

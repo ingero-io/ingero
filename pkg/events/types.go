@@ -63,12 +63,14 @@ func KtimeToWallClock(ktimeNs uint64) time.Time {
 type Source uint8
 
 const (
-	SourceCUDA   Source = 1
-	SourceNvidia Source = 2
-	SourceHost   Source = 3
-	SourceDriver Source = 4
-	SourceIO     Source = 5
-	SourceTCP    Source = 6
+	SourceCUDA Source = 1
+	// 2 was SourceNvidia, reserved for an unimplemented nvidia.ko driver
+	// tracer. Kept as a hole so existing on-the-wire records that may
+	// still carry source==2 are routed to the unknown(2) string.
+	SourceHost      Source = 3
+	SourceDriver    Source = 4
+	SourceIO        Source = 5
+	SourceTCP       Source = 6
 	SourceNet       Source = 7
 	SourceCUDAGraph Source = 8
 )
@@ -78,8 +80,6 @@ func (s Source) String() string {
 	switch s {
 	case SourceCUDA:
 		return "cuda"
-	case SourceNvidia:
-		return "nvidia"
 	case SourceHost:
 		return "host"
 	case SourceDriver:
@@ -545,10 +545,22 @@ type Event struct {
 	Duration  time.Duration // how long the operation took (entry→return)
 	GPUID     uint32        // GPU device index (from CUDA)
 	// Args contains operation-specific arguments:
-	//   cudaMalloc:  Args[0] = allocation size (bytes), Args[1] = devPtr param address
-	//   cudaFree:    Args[0] = device pointer being freed, Args[1] = freed size in bytes (0 if unknown)
-	//   cudaMemcpy:  Args[0] = byte count, Args[1] = direction (cudaMemcpyKind)
-	//   Other ops:   operation-specific
+	//   cudaMalloc:        Args[0] = allocation size (bytes),
+	//                      Args[1] = resolved devPtr (the value cudaMalloc
+	//                      wrote to its void** out-parameter); older BPF
+	//                      probes left Args[1] as the void** parameter
+	//                      address itself, repurposing the slot was safe
+	//                      because memtrack only reads Args[0]
+	//   cudaFree:          Args[0] = device pointer being freed,
+	//                      Args[1] = freed size in bytes (0 if unknown)
+	//   cudaMemcpy:        Args[0] = byte count, Args[1] = direction (cudaMemcpyKind)
+	//   cudaLaunchKernel:  Args[0] = kernel function pointer,
+	//                      Args[1] = cudaStream_t (0 on older BPF
+	//                      builds that didn't capture the stream;
+	//                      also a legitimate value for the CUDA
+	//                      default stream)
+	//   cudaStreamSync:    Args[0] = cudaStream_t handle, Args[1] = 0
+	//   Other ops:         operation-specific
 	Args [2]uint64
 	RetCode   int32         // CUDA return code (0 = success)
 	Stack     []StackFrame  // userspace stack trace (nil when --stack not enabled)

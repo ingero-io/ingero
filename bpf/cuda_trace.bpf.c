@@ -286,18 +286,29 @@ int uretprobe_cuda_malloc(struct pt_regs *ctx)
 		return 0;
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
+
+	// Read the resolved device pointer (the value cudaMalloc wrote to
+	// the void** parameter) and stamp it into entry->arg1 BEFORE
+	// emit_event, so the emitted CUDAMalloc event carries
+	//   arg0 = size, arg1 = actual devPtr
+	// instead of arg1 = the void** parameter address. The userspace
+	// kvcache lineage tracker uses this devPtr as the key paired
+	// with cudaFree's arg0 (which already carries the devPtr being
+	// freed). memtrack only reads arg0 so this change is wire-safe.
+	__u64 dev_ptr = 0;
+	if (ret == 0 && entry->arg1 != 0) {
+		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
+		entry->arg1 = dev_ptr;
+	}
+
 	emit_event(ctx, pid, tid, entry, ret);
 
 	// Record allocation in alloc_sizes map for net balance tracking.
 	// Only record successful allocations (cudaSuccess == 0).
-	if (ret == 0 && entry->arg1 != 0) {
-		__u64 dev_ptr = 0;
-		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
-		if (dev_ptr != 0) {
-			struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
-			__u64 alloc_size = entry->arg0;
-			bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
-		}
+	if (ret == 0 && dev_ptr != 0) {
+		struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
+		__u64 alloc_size = entry->arg0;
+		bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
 	}
 
 	bpf_map_delete_elem(&entry_map, &tid);
@@ -359,14 +370,57 @@ int uretprobe_cuda_free(struct pt_regs *ctx)
 
 // ---- cudaLaunchKernel uprobes ----
 // arg0 = GPU kernel function pointer
-
+// arg1 = cudaStream_t handle (v0.16.5a; was 0 in v0.16.4 and earlier)
+//
+// Function signature:
+//   cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim,
+//                                dim3 blockDim, void** args,
+//                                size_t sharedMem, cudaStream_t stream);
+//
+// dim3 is 12 bytes; the SysV/AAPCS ABIs split each into 2 eightbytes
+// that consume 2 GPRs. Slot allocation differs per arch:
+//
+//   x86-64 SysV:
+//     RDI = func, RSI/RDX = gridDim, RCX/R8 = blockDim, R9 = args.
+//     sharedMem and stream spill to the caller stack:
+//       [rsp+ 8] = sharedMem
+//       [rsp+16] = stream  ← PARM6+ on x86, requires bpf_probe_read_user
+//
+//   arm64 AAPCS:
+//     X0 = func, X1/X2 = gridDim, X3/X4 = blockDim, X5 = args,
+//     X6 = sharedMem, X7 = stream  ← still in a register.
+//
+// Older BPF builds left arg1 = 0; the agent treats arg1 = 0 either as
+// "default stream" (a real stream value in CUDA) or as "old BPF" — both
+// map to a single (pid, 0) workload bucket on the agent side, which is
+// the v0.16.4 behavior. New BPF + new agent get true per-stream
+// observable bucketing automatically.
 SEC("uprobe/cudaLaunchKernel")
 int uprobe_cuda_launch_kernel(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 func_ptr = (__u64)PT_REGS_PARM1(ctx);
+	__u64 stream = 0;
 
-	save_entry(tid, CUDA_OP_LAUNCH_KERNEL, func_ptr, 0);
+#if defined(__TARGET_ARCH_x86)
+	/* Stack layout at function entry (after CALL pushed return address):
+	 *   [rsp+ 0] = return address
+	 *   [rsp+ 8] = sharedMem  (size_t)
+	 *   [rsp+16] = stream     (cudaStream_t)
+	 * Read the 8-byte stream value. bpf_probe_read_user is the
+	 * verifier-safe accessor; failure leaves stream at the 0
+	 * sentinel which falls back to PID-level bucketing.
+	 */
+	void *stream_addr = (void *)(PT_REGS_SP(ctx) + 16);
+	(void)bpf_probe_read_user(&stream, sizeof(stream), stream_addr);
+#elif defined(__TARGET_ARCH_arm64)
+	/* arm64 AAPCS keeps stream in X7. user_pt_regs.regs[7] is the
+	 * cross-arch shape declared in common.bpf.h.
+	 */
+	stream = ((struct user_pt_regs *)ctx)->regs[7];
+#endif
+
+	save_entry(tid, CUDA_OP_LAUNCH_KERNEL, func_ptr, stream);
 	return 0;
 }
 
@@ -532,19 +586,25 @@ int uretprobe_cuda_malloc_managed(struct pt_regs *ctx)
 		return 0;
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
+
+	// Same arg1 = actual devPtr rewrite as cudaMalloc above so the
+	// emitted CUDAMallocManaged event carries the devPtr the kvcache
+	// tracker can later pair with cudaFree.
+	__u64 dev_ptr = 0;
+	if (ret == 0 && entry->arg1 != 0) {
+		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
+		entry->arg1 = dev_ptr;
+	}
+
 	emit_event(ctx, pid, tid, entry, ret);
 
 	// Record managed allocation in alloc_sizes for net balance tracking.
 	// Without this, cudaFree on managed-memory pointers emits freed_bytes=0,
 	// causing monotonic balance drift for Unified Memory workloads.
-	if (ret == 0 && entry->arg1 != 0) {
-		__u64 dev_ptr = 0;
-		bpf_probe_read_user(&dev_ptr, sizeof(dev_ptr), (void *)entry->arg1);
-		if (dev_ptr != 0) {
-			struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
-			__u64 alloc_size = entry->arg0;
-			bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
-		}
+	if (ret == 0 && dev_ptr != 0) {
+		struct alloc_key akey = { .pid = pid, ._pad = 0, .dev_ptr = dev_ptr };
+		__u64 alloc_size = entry->arg0;
+		bpf_map_update_elem(&alloc_sizes, &akey, &alloc_size, BPF_ANY);
 	}
 
 	bpf_map_delete_elem(&entry_map, &tid);

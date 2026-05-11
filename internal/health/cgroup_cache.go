@@ -166,3 +166,36 @@ func (c *cgroupCache) Len() int {
 	defer c.mu.Unlock()
 	return len(c.entries)
 }
+
+// PIDCGroupHashCache is the exported, package-public face of the
+// internal cgroupCache. The trace command's --inference path uses it
+// to resolve per-event cgroup_path_hash values without rewriting the
+// LRU machinery. Construction is via NewPIDCGroupHashCache.
+//
+// Thread-safe; the underlying type holds a mutex.
+type PIDCGroupHashCache struct{ inner *cgroupCache }
+
+// NewPIDCGroupHashCache constructs a fresh PID->cgroup_path_hash LRU
+// cache. capacity <= 0 falls back to the package default (1024).
+// Resolves cgroup paths via internal/cgroup.ReadCGroupPath and
+// SHA256-truncates them to 16 hex chars (same encoding as the
+// emitter's contract.AttrCgroupPathHash data-point attribute).
+func NewPIDCGroupHashCache(capacity int) *PIDCGroupHashCache {
+	return &PIDCGroupHashCache{inner: newCGroupCache(capacity)}
+}
+
+// Resolve returns the cached cgroup_path_hash for pid, computing it
+// on a miss. Empty string on resolution failure (no /proc, root
+// cgroup, etc.) — matches the emitter's fallback behavior so the
+// "unattributable" bucket is identifiable across the metric stream.
+func (c *PIDCGroupHashCache) Resolve(pid uint32) string {
+	return c.inner.Resolve(pid)
+}
+
+// HashCGroupPath returns the SHA256-truncated-16 hex digest of a
+// cgroup path string. Exported so callers that already have the path
+// (e.g. from a sibling /proc read) can produce the same hash the
+// emitter emits.
+func HashCGroupPath(path string) string {
+	return hashCGroupPath(path)
+}

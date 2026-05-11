@@ -307,7 +307,16 @@ int BPF_KPROBE(uprobe_nccl_comm_init_rank,
                void *comm_out_ptr, int nranks, void *commId, int rank)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	/* Filter on the calling PID before any user-memory dereference or
+	 * entry-state allocation. On a multi-tenant node where
+	 * nccl_target_pids is populated, untargeted tenants' NCCL calls hit
+	 * this gate without paying the 128-byte commId user-read below.
+	 */
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_COMM_INIT_RANK;
@@ -331,7 +340,6 @@ int BPF_KPROBE(uprobe_nccl_comm_init_rank,
 		st.op = 0; /* signal to uretprobe: skip the map update */
 	}
 
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -424,14 +432,17 @@ SEC("uprobe/ncclCommInitAll")
 int BPF_KPROBE(uprobe_nccl_comm_init_all, void *comms_array, int nranks, void *devlist)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_COMM_INIT_ALL;
 	st.comm_out_ptr = (__u64)comms_array;
 	st.nranks_arg = nranks;
 
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -522,12 +533,15 @@ SEC("uprobe/ncclCommDestroy")
 int BPF_KPROBE(uprobe_nccl_comm_destroy, void *comm)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_COMM_DESTROY;
 	st.comm_ptr = (__u64)comm;
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -595,7 +609,11 @@ SEC("uprobe/ncclAllReduce")
 int uprobe_nccl_all_reduce(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_ALL_REDUCE;
@@ -605,7 +623,6 @@ int uprobe_nccl_all_reduce(struct pt_regs *ctx)
 	st.comm_ptr = ingero_pt_regs_arg6(ctx);
 	st.stream = ingero_pt_regs_arg7(ctx);
 
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -638,7 +655,11 @@ SEC("uprobe/ncclAllGather")
 int uprobe_nccl_all_gather(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_ALL_GATHER;
@@ -647,7 +668,6 @@ int uprobe_nccl_all_gather(struct pt_regs *ctx)
 	st.reduce_op = 0;
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.stream = ingero_pt_regs_arg6(ctx);
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -674,7 +694,11 @@ SEC("uprobe/ncclReduceScatter")
 int uprobe_nccl_reduce_scatter(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_REDUCE_SCATTER;
@@ -683,7 +707,6 @@ int uprobe_nccl_reduce_scatter(struct pt_regs *ctx)
 	st.reduce_op = (__u32)PT_REGS_PARM5_CORE(ctx);
 	st.comm_ptr = ingero_pt_regs_arg6(ctx);
 	st.stream = ingero_pt_regs_arg7(ctx);
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -713,7 +736,11 @@ SEC("uprobe/ncclBcast")
 int uprobe_nccl_bcast(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
 
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_BCAST;
@@ -723,7 +750,6 @@ int uprobe_nccl_bcast(struct pt_regs *ctx)
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -756,7 +782,12 @@ SEC("uprobe/ncclSend")
 int uprobe_nccl_send(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
+
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_SEND;
 	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
@@ -765,7 +796,6 @@ int uprobe_nccl_send(struct pt_regs *ctx)
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }
@@ -788,7 +818,12 @@ SEC("uprobe/ncclRecv")
 int uprobe_nccl_recv(struct pt_regs *ctx)
 {
 	__u64 pid_tid = bpf_get_current_pid_tgid();
+	__u32 pid = (__u32)(pid_tid >> 32);
 	__u32 tid = (__u32)pid_tid;
+
+	if (!nccl_should_trace(pid))
+		return 0;
+
 	struct nccl_entry_state st = {};
 	st.op = NCCL_OP_RECV;
 	st.count = (__u64)PT_REGS_PARM2_CORE(ctx);
@@ -797,7 +832,6 @@ int uprobe_nccl_recv(struct pt_regs *ctx)
 	st.comm_ptr = (__u64)PT_REGS_PARM5_CORE(ctx);
 	st.reduce_op = 0;
 	st.stream = ingero_pt_regs_arg6(ctx);
-	if (!nccl_should_trace((__u32)(bpf_get_current_pid_tgid() >> 32))) return 0;
 	save_entry(tid, &st);
 	return 0;
 }

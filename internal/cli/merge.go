@@ -135,12 +135,11 @@ func mergeRunE(cmd *cobra.Command, args []string) error {
 		srcDB.Close()
 	}
 
-	// Validation.
-	var dupeCount int
-	outDB.QueryRow("SELECT COUNT(*) FROM (SELECT id FROM events GROUP BY id HAVING COUNT(*) > 1)").Scan(&dupeCount)
-	if dupeCount > 0 {
-		fmt.Fprintf(os.Stderr, "  WARNING: %d duplicate event IDs found in merged database\n", dupeCount)
-	}
+	// INSERT OR IGNORE deduplicates at insert time, so the prior
+	// GROUP BY HAVING COUNT(*)>1 sanity check was structurally
+	// incapable of finding surviving duplicates (any duplicate input
+	// row was already collapsed by the INSERT OR IGNORE collision
+	// path). Dropped.
 
 	fmt.Fprintf(os.Stderr, "\n  Merged %d database(s) → %s: %d events, %d chains, %d unique stacks\n",
 		len(args), mergeOutput, totalEvents, totalChains, totalStacks)
@@ -322,11 +321,16 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 			worldSizeVal = worldSize.Int64
 		}
 
-		stmt.Exec(idStr, timestamp, pid, tid, source, op, duration, gpuID, arg0, arg1, retCode, stackHash, cgroupID, node, rankVal, localRankVal, worldSizeVal, comm)
+		if _, eerr := stmt.Exec(idStr, timestamp, pid, tid, source, op, duration, gpuID, arg0, arg1, retCode, stackHash, cgroupID, node, rankVal, localRankVal, worldSizeVal, comm); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting event %s: %v\n", idStr, eerr)
+			continue
+		}
 		count++
 
 		if count%500 == 0 {
-			tx.Commit()
+			if cerr := tx.Commit(); cerr != nil {
+				return count, fmt.Errorf("commit at row %d: %w", count, cerr)
+			}
 			var txErr error
 			tx, txErr = dst.Begin()
 			if txErr != nil {
@@ -343,7 +347,9 @@ func copyEvents(src, dst *sql.DB, hasNode bool, forceNode string, seqCounter *in
 		}
 	}
 
-	tx.Commit()
+	if cerr := tx.Commit(); cerr != nil {
+		return count, fmt.Errorf("final events commit: %w", cerr)
+	}
 	return count, rows.Err()
 }
 
@@ -400,11 +406,16 @@ func copyChains(src, dst *sql.DB, hasNode bool, forceNode string) (int, error) {
 			node = forceNode
 		}
 
-		stmt.Exec(id, detectedAt, severity, summary, rootCause, explanation, recommendations, cudaOp, cudaP99, cudaP50, tailRatio, timeline, node)
+		if _, eerr := stmt.Exec(id, detectedAt, severity, summary, rootCause, explanation, recommendations, cudaOp, cudaP99, cudaP50, tailRatio, timeline, node); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting chain %s: %v\n", id, eerr)
+			continue
+		}
 		count++
 	}
 
-	tx.Commit()
+	if cerr := tx.Commit(); cerr != nil {
+		return count, fmt.Errorf("chains commit: %w", cerr)
+	}
 	return count, rows.Err()
 }
 
@@ -448,14 +459,19 @@ func copyStacks(src, dst *sql.DB, cache map[int64]bool) (int, error) {
 			continue
 		}
 
-		stmt.Exec(hash, ips, frames)
+		if _, eerr := stmt.Exec(hash, ips, frames); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting stack_traces hash=%d: %v\n", hash, eerr)
+			continue
+		}
 		count++
 	}
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "    WARNING: skipped %d stack_traces rows with oversized frames/ips (>%d bytes)\n", skipped, maxFramesSize)
 	}
 
-	tx.Commit()
+	if cerr := tx.Commit(); cerr != nil {
+		return count, fmt.Errorf("stack_traces commit: %w", cerr)
+	}
 	return count, rows.Err()
 }
 
@@ -515,14 +531,16 @@ func copySessions(src, dst *sql.DB, hasNode bool, forceNode string) {
 			worldSizeVal = worldSize.Int64
 		}
 
-		dst.Exec(`INSERT INTO sessions
+		if _, eerr := dst.Exec(`INSERT INTO sessions
 			(started_at, stopped_at, gpu_model, gpu_driver, cpu_model, cpu_cores, mem_total,
 			 kernel, os_release, cuda_ver, python_ver, ingero_ver, pid_filter, flags,
 			 node, rank, local_rank, world_size)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			startedAt, stoppedAt, gpuModel, gpuDriver, cpuModel, cpuCores, memTotal,
 			kernel, osRelease, cudaVer, pythonVer, ingeroVer, pidFilter, flags,
-			node, rankVal, localRankVal, worldSizeVal)
+			node, rankVal, localRankVal, worldSizeVal); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting session row (node=%s): %v\n", node, eerr)
+		}
 	}
 }
 
@@ -540,8 +558,10 @@ func copySnapshots(src, dst *sql.DB) {
 		if err := rows.Scan(&ts, &cpuPct, &memPct, &memAvail, &swapMB, &loadAvg); err != nil {
 			continue
 		}
-		dst.Exec("INSERT OR IGNORE INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg) VALUES (?, ?, ?, ?, ?, ?)",
-			ts, cpuPct, memPct, memAvail, swapMB, loadAvg)
+		if _, eerr := dst.Exec("INSERT OR IGNORE INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg) VALUES (?, ?, ?, ?, ?, ?)",
+			ts, cpuPct, memPct, memAvail, swapMB, loadAvg); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting system_snapshot ts=%d: %v\n", ts, eerr)
+		}
 	}
 }
 
@@ -559,7 +579,9 @@ func copyProcessNames(src, dst *sql.DB) {
 		if err := rows.Scan(&pid, &name, &seenAt); err != nil {
 			continue
 		}
-		dst.Exec("INSERT OR IGNORE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)", pid, name, seenAt)
+		if _, eerr := dst.Exec("INSERT OR IGNORE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)", pid, name, seenAt); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting process_name pid=%d: %v\n", pid, eerr)
+		}
 	}
 }
 
@@ -576,7 +598,9 @@ func copyCGroupMetadata(src, dst *sql.DB) {
 		if err := rows.Scan(&cgroupID, &containerID, &cgroupPath, &podName, &namespace); err != nil {
 			continue
 		}
-		dst.Exec("INSERT OR IGNORE INTO cgroup_metadata (cgroup_id, container_id, cgroup_path, pod_name, namespace) VALUES (?, ?, ?, ?, ?)",
-			cgroupID, containerID, cgroupPath, podName, namespace)
+		if _, eerr := dst.Exec("INSERT OR IGNORE INTO cgroup_metadata (cgroup_id, container_id, cgroup_path, pod_name, namespace) VALUES (?, ?, ?, ?, ?)",
+			cgroupID, containerID, cgroupPath, podName, namespace); eerr != nil {
+			fmt.Fprintf(os.Stderr, "    WARNING: inserting cgroup_metadata cgroup_id=%d: %v\n", cgroupID, eerr)
+		}
 	}
 }

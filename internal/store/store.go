@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -468,7 +469,20 @@ type Store struct {
 	insertCh   chan events.Event
 	snapshotCh chan SystemSnapshot
 	runDone    chan struct{} // closed when Run() exits
+	runStarted chan struct{} // closed when Run() has set runActive and is about to enter the select loop
 	runActive  atomic.Bool  // true once Run() is called
+
+	// roDB is a sibling read-only connection pool used by ExecuteReadOnly
+	// to enforce read-only access at the SQLite engine level (the
+	// `query_only` PRAGMA, set via DSN parameter `_query_only=1`). Without
+	// this, an authenticated MCP `run_sql` caller can bypass the
+	// keyword-substring filter via writable CTEs with non-space whitespace
+	// (e.g. `WITH x AS (DELETE\tFROM events RETURNING *) SELECT 1`).
+	// Opened in New() and re-opened after RolloverNow swaps the on-disk
+	// file. nil when the underlying file path cannot be reopened
+	// read-only (e.g. some in-memory configurations); ExecuteReadOnly
+	// then falls back to the main pool with the substring filter only.
+	roDB *sql.DB
 
 	// stackCache tracks which stack hashes are already in the stack_traces
 	// table, avoiding redundant INSERTs and JSON serialization. Only accessed
@@ -498,6 +512,39 @@ type Store struct {
 	// droppedBySampler counts events rejected by the sampler. Read via
 	// ReadStats() once a metric is wired in a later slice.
 	droppedBySampler atomic.Uint64
+
+	// droppedByBuffer counts events / snapshots dropped by Record() and
+	// RecordSnapshot() when their internal channel is full. Without this,
+	// operators cannot distinguish "trace ran fine but the agent silently
+	// dropped events under load" from "everything was captured." Exposed
+	// via Stats() so it can be wired into Prometheus alongside the
+	// sampler-drop counter.
+	droppedByBuffer atomic.Uint64
+
+	// flushFailures counts every silent return out of a write method
+	// (flushBatch, RecordChains, recordAggregatesInto, ...). Without this,
+	// a closed DB handle (post-rollover failure) leaves the agent
+	// appearing healthy from the outside while every event is dropped on
+	// the floor. lastFlushLogNs rate-limits the matching slog.Error so a
+	// closed-DB scenario logs once every 5 seconds instead of thousands
+	// of times per second.
+	flushFailures atomic.Uint64
+	lastFlushLogNs atomic.Int64
+
+	// Rollover state — installed via SetRolloverConfig and consumed by
+	// MaybeRollover/RolloverNow (defined in rollover.go). When
+	// rolloverCfg.Load() returns nil, all rollover paths are no-ops
+	// and pre-rollover behavior is preserved.
+	//
+	// rolloverMu coordinates the file swap with concurrent readers.
+	// External read APIs (Query, QueryRich, ExecuteReadOnly) take
+	// RLock() so they wait for an in-flight rollover to publish the
+	// fresh handle rather than racing against a closed *sql.DB.
+	rolloverCfg      atomic.Pointer[RolloverConfig]
+	rolloverMu       sync.RWMutex
+	rolloverInFlight atomic.Bool
+	rolloverCount    atomic.Uint64
+	rolloverFailures atomic.Uint64
 
 	mu      sync.Mutex
 	closed  bool
@@ -726,185 +773,12 @@ func New(dbPath string) (*Store, error) {
 			dbPath, onDiskVersion, CurrentUserVersion)
 	}
 
-	// Create schema.
-	if _, err := db.Exec(schema); err != nil {
+	// Create schema and run all idempotent migrations. Extracted into
+	// applyAgentSchema so the rollover path (rollover.go) re-applies
+	// the exact same sequence on the freshly-opened DB without drift.
+	if err := applyAgentSchema(db, onDiskVersion); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("creating schema: %w", err)
-	}
-
-	// Schema migrations for backward compatibility with older databases.
-	// Both ALTER TABLEs are idempotent — they fail silently if the column
-	// already exists. New databases get stack_hash from the schema and
-	// stack_ips from this migration (unused but harmless — 0 bytes overhead).
-	db.Exec(migrateAddStackHash)
-	db.Exec(migrateAddStackIPs)
-
-	// Create stack_traces table (deduplicated stack interning).
-	if _, err := db.Exec(stackTracesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating stack_traces table: %w", err)
-	}
-
-	// Add resolved frames column. Idempotent — no-op if column exists.
-	db.Exec(migrateAddFramesColumn)
-
-	// Migrate: if there are events with inline stack_ips, intern them into
-	// the stack_traces table. No-op for new databases.
-	migrateInlineStacks(db)
-
-	// Create causal_chains table.
-	if _, err := db.Exec(chainsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating causal_chains table: %w", err)
-	}
-
-	// Create and populate static lookup tables (sources, ops, schema_info).
-	if _, err := db.Exec(lookupSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating lookup tables: %w", err)
-	}
-	populateLookupTables(db)
-
-	// Ensure schema_info reflects the running binary, even for databases
-	// created by an older version (populateLookupTables skips inserts when
-	// tables are already populated).
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
-
-	// v0.8 migration: add new sources and ops for existing databases.
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (5, 'IO', 'Block I/O events')")
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (6, 'TCP', 'TCP events')")
-	db.Exec("INSERT OR IGNORE INTO sources (id, name, description) VALUES (7, 'NET', 'Network socket events')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (1, 8, 'cudaMallocManaged', 'Unified Memory allocation')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (4, 6, 'cuMemAllocManaged', 'Unified Memory allocation via driver API')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 1, 'block_read', 'Block device read request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 2, 'block_write', 'Block device write request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (5, 3, 'block_discard', 'Block device discard/trim request')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (6, 1, 'tcp_retransmit', 'TCP segment retransmission')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 1, 'net_send', 'Socket send/sendto syscall')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (7, 2, 'net_recv', 'Socket recv/recvfrom syscall')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 10, 'pod_restart', 'K8s pod container restart detected')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 11, 'pod_eviction', 'K8s pod eviction detected')")
-	db.Exec("INSERT OR IGNORE INTO ops (source_id, op_id, name, description) VALUES (3, 12, 'pod_oom_kill', 'K8s pod OOM kill detected')")
-	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('sessions_note', 'One row per ingero trace invocation. Correlate with events via time range.')")
-	db.Exec("INSERT OR IGNORE INTO schema_info (key, value) VALUES ('process_names_note', 'PID-to-name mapping populated during trace. JOIN with events.pid for query enrichment.')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('event_aggregates_note', 'Per-minute aggregates. sum_arg0 tracks mm_page_alloc total bytes (chain engine threshold: >1GB). count-stored = discarded count.')")
-	// Upgrade: replace old stack_ips_note with stack_traces_note for pre-interning DBs.
-	db.Exec("DELETE FROM schema_info WHERE key = 'stack_ips_note'")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('stack_traces_note', 'Deduplicated stacks: events.stack_hash → stack_traces.hash. frames column has resolved symbols. Use get_stacks MCP tool for call stack analysis.')")
-
-	// Composite index for get_stacks MCP tool (GROUP BY source,op,stack_hash).
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_source_op_stack ON events(source, op, stack_hash)")
-
-	// Drop redundant idx_events_source_op — the composite idx_events_source_op_stack
-	// covers all (source, op) queries via SQLite leftmost-prefix matching.
-	// Old DBs created before this optimization carry the redundant index (~10MB/1M events).
-	db.Exec("DROP INDEX IF EXISTS idx_events_source_op")
-
-	// Create system_snapshots table (metrics sampled every 1s during recording).
-	if _, err := db.Exec(snapshotsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating system_snapshots table: %w", err)
-	}
-	// Migrate pre-dedup databases: add unique index, drop redundant non-unique index.
-	db.Exec(snapshotsMigration)
-
-	// Create sessions table (one row per 'ingero trace' invocation).
-	if _, err := db.Exec(sessionsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating sessions table: %w", err)
-	}
-
-	// Create process_names table (PID→name mapping for query enrichment).
-	if _, err := db.Exec(processNamesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating process_names table: %w", err)
-	}
-
-	// Create event_aggregates table (selective storage minute-buckets).
-	if _, err := db.Exec(aggregatesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating event_aggregates table: %w", err)
-	}
-
-	// Create event_aggregates_5s table (sub-minute health signal buckets).
-	if _, err := db.Exec(aggregates5sSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating event_aggregates_5s table: %w", err)
-	}
-
-	// Add sum_arg0 column for mm_page_alloc total bytes. Idempotent.
-	db.Exec(migrateAddSumArg0)
-
-	// v0.7: Add cgroup_id column to events table. Idempotent.
-	db.Exec(migrateAddCGroupID)
-
-	// Partial index on cgroup_id — only indexes non-zero values (container events).
-	// Sparse: bare-metal events (cgroup_id=0) don't bloat the index.
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_events_cgroup ON events(cgroup_id) WHERE cgroup_id != 0")
-
-	// v0.7: Create cgroup_metadata table (cgroup_id → container_id + pod metadata).
-	if _, err := db.Exec(cgroupMetadataSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating cgroup_metadata table: %w", err)
-	}
-
-	// v0.7: Add pod_name/namespace columns to cgroup_metadata. Idempotent —
-	// no-op for new DBs (schema already has them), adds columns for old DBs.
-	db.Exec(migrateAddPodName)
-	db.Exec(migrateAddNamespace)
-
-	// v0.8: Create cgroup_schedstat table for noisy neighbor detection.
-	if _, err := db.Exec(cgroupSchedstatSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating cgroup_schedstat table: %w", err)
-	}
-
-	// Update schema version to 0.8.
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id → container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
-
-	// v0.9: Add node identity and rank columns. Idempotent — no-op for new DBs.
-	db.Exec(migrateAddEventsNode)
-	db.Exec(migrateAddEventsRank)
-	db.Exec(migrateAddEventsLocalRank)
-	db.Exec(migrateAddEventsWorldSize)
-	db.Exec(migrateAddSessionsNode)
-	db.Exec(migrateAddSessionsRank)
-	db.Exec(migrateAddSessionsLocalRank)
-	db.Exec(migrateAddSessionsWorldSize)
-	db.Exec(migrateAddChainsNode)
-
-	// Update schema version to 0.9.
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.9')")
-	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('node_note', 'Node identity for multi-node correlation. events.id format: {node}:{seq}. causal_chains.id format: {node}:{descriptor}.')")
-
-	// v0.10: Add comm column to events table (PID hardening).
-	// Captured kernel-side via bpf_get_current_comm() at event emission time —
-	// immune to PID reuse and process exit, unlike the lazy /proc-based
-	// process_names table (which is preserved as a read-side fallback).
-	// Idempotent — no-op for new DBs that already have it from schema.
-	//
-	// Migration error gating: ALTER TABLE may silently fail on read-only DBs,
-	// disk full, or other I/O errors. We bump schema_info to 0.10 ONLY after
-	// confirming via PRAGMA that the column actually exists — protects against
-	// inconsistent state where the version says 0.10 but the column is missing.
-	db.Exec(migrateAddComm)
-
-	if hasEventsCommColumn(db) {
-		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.10')")
-		db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('comm_note', 'events.comm captured kernel-side at event time. Empty for pre-v0.10 rows (fall back to process_names LEFT JOIN for legacy display).')")
-	}
-	// On read-only DBs the version stays at 0.9 — read paths must use
-	// hasColumn() guards if they want to be tolerant of either schema.
-
-	// Ratchet PRAGMA user_version forward to the current binary's level.
-	// Only advances; pragma syntax does not accept parameters so the int
-	// value is formatted in. Runs only when the on-disk value is behind
-	// us so a concurrent downgrade-and-upgrade cycle on the same file
-	// doesn't flap the marker. If the DB is read-only this silently
-	// fails, matching how the schema_info writes above behave.
-	if onDiskVersion < CurrentUserVersion {
-		db.Exec(fmt.Sprintf("PRAGMA user_version = %d", CurrentUserVersion))
+		return nil, err
 	}
 
 	// When running as root via sudo, chown the DB file to the invoking
@@ -919,8 +793,18 @@ func New(dbPath string) (*Store, error) {
 		insertCh:   make(chan events.Event, DefaultBatchSize*2),
 		snapshotCh: make(chan SystemSnapshot, 64), // 1 snapshot/sec, 64 = ~1 min buffer
 		runDone:    make(chan struct{}),
+		runStarted: make(chan struct{}),
 		stackCache: make(map[uint64]bool),
 	}
+
+	// Open a sibling read-only connection pool. ExecuteReadOnly uses
+	// this so the SQLite engine itself rejects every write attempt,
+	// closing the writable-CTE-with-tab-whitespace bypass that the
+	// keyword-substring filter alone cannot catch. Best-effort:
+	// failure here leaves s.roDB nil and ExecuteReadOnly falls back to
+	// the main pool with the substring filter — strictly worse but
+	// keeps the agent functional in degenerate setups.
+	s.openReadOnlyDB()
 
 	// Seed eventSeq from existing events so reopening a DB doesn't
 	// restart the counter at 0 and generate duplicate IDs.
@@ -934,6 +818,82 @@ func New(dbPath string) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+// buildReadOnlyDSN returns the DSN to use for the sibling read-only
+// connection pool, tailored to handle the in-memory shared-cache mode
+// the same way the main connection in New does.
+//
+// Returns the empty string when no sensible read-only DSN exists for
+// the underlying path. Callers should treat empty as "no sibling pool"
+// and fall back to the main connection with the substring filter only.
+func buildReadOnlyDSN(dbPath string) string {
+	if dbPath == "" {
+		return ""
+	}
+	if dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:") {
+		// Share the cache so this read-only pool sees the same
+		// schema + rows as the writable pool. Without cache=shared,
+		// the second sql.Open creates a brand-new in-memory DB with
+		// no tables.
+		return "file::memory:?cache=shared&_query_only=1"
+	}
+	return "file:" + dbPath + "?_query_only=1"
+}
+
+// openReadOnlyDB initialises s.roDB with a read-only SQLite pool
+// against the same underlying database file as s.db. Best-effort:
+// logs a warning on failure and leaves s.roDB nil so callers fall
+// back to the main pool with the substring filter only.
+//
+// Safe to call from New() and from RolloverNow's success path. The
+// caller is responsible for closing any previous *roDB before invoking.
+func (s *Store) openReadOnlyDB() {
+	dsn := buildReadOnlyDSN(s.dbPath)
+	if dsn == "" {
+		return
+	}
+	roDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		slog.Default().Warn("store: read-only sibling pool unavailable; ExecuteReadOnly will fall back to substring filter",
+			"path", s.dbPath, "err", err.Error())
+		return
+	}
+	if err := roDB.Ping(); err != nil {
+		roDB.Close()
+		slog.Default().Warn("store: read-only sibling pool ping failed; ExecuteReadOnly will fall back to substring filter",
+			"path", s.dbPath, "err", err.Error())
+		return
+	}
+	s.roDB = roDB
+}
+
+// recordWriteError centralises the response to silent write failures
+// in flushBatch, RecordChains, recordAggregatesInto, and friends.
+// Increments flushFailures (exposed via Stats) and emits a
+// rate-limited slog.Error so operators see "store write failed" in
+// the agent log instead of the historical silent return.
+//
+// The single 5-second rate limit is intentionally coarse: a closed
+// DB handle (post-rollover failure) would otherwise log thousands of
+// times per second and drown out every other line in the agent log.
+// One log every 5s + the flushFailures counter together give
+// operators enough signal to alert on the broken state.
+func (s *Store) recordWriteError(method string, err error) {
+	s.flushFailures.Add(1)
+	if err == nil {
+		return
+	}
+	const minLogIntervalNs = int64(5 * time.Second)
+	nowNs := time.Now().UnixNano()
+	last := s.lastFlushLogNs.Load()
+	if nowNs-last < minLogIntervalNs {
+		return
+	}
+	if !s.lastFlushLogNs.CompareAndSwap(last, nowNs) {
+		return
+	}
+	slog.Default().Error("store: write failed", "method", method, "err", err.Error())
 }
 
 // NewReadOnly opens an existing SQLite database in read-only mode. The DB
@@ -967,16 +927,20 @@ func NewReadOnly(dbPath string) (*Store, error) {
 		insertCh:   nil, // no writes
 		snapshotCh: nil,
 		runDone:    make(chan struct{}),
+		runStarted: make(chan struct{}),
 		stackCache: nil,
 	}
-	close(s.runDone) // Run() is never called on read-only stores.
+	// Run() is never called on read-only stores; close both signals so
+	// any caller using WaitDone or WaitStarted does not deadlock.
+	close(s.runDone)
+	close(s.runStarted)
 	return s, nil
 }
 
 // WaitDone blocks until Run() has finished its final flush and returned.
 // Call this after ctx cancellation but before StopSession/Close to ensure
 // all pending batch writes are committed. Safe to call if Run() was never
-// started (returns immediately) — this avoids deadlocks in query/explain/MCP
+// started (returns immediately); this avoids deadlocks in query/explain/MCP
 // code paths that use Store without Run().
 func (s *Store) WaitDone() {
 	if !s.runActive.Load() {
@@ -985,7 +949,17 @@ func (s *Store) WaitDone() {
 	<-s.runDone
 }
 
-// Record enqueues an event for async writing. Non-blocking — drops if buffer full.
+// WaitStarted blocks until Run() has been scheduled and is about to enter
+// its select loop. Tests use this after `go s.Run(ctx)` to eliminate the
+// goroutine-startup race that would otherwise let cancel() fire before
+// runActive flips true (in which case WaitDone returns immediately and
+// the final-flush drain is skipped). No-op if Run was never called; the
+// channel is closed by Run on first invocation.
+func (s *Store) WaitStarted() {
+	<-s.runStarted
+}
+
+// Record enqueues an event for async writing. Non-blocking; drops if buffer full.
 func (s *Store) Record(evt events.Event) {
 	// Optional sampler gate: inference workloads attach a Sampler via
 	// SetSampler so the high-rate event stream is admitted at a small
@@ -997,7 +971,10 @@ func (s *Store) Record(evt events.Event) {
 	select {
 	case s.insertCh <- evt:
 	default:
-		// Buffer full — drop event rather than block the caller.
+		// Buffer full; drop event rather than block the caller. The
+		// counter lets operators alert on "trace coverage degraded
+		// under load" instead of the historical silent loss.
+		s.droppedByBuffer.Add(1)
 	}
 }
 
@@ -1025,6 +1002,11 @@ func (s *Store) Run(ctx context.Context) {
 	// re-insert stacks that already exist from a previous trace.
 	s.loadStackCache()
 
+	// Signal that Run is about to enter the select loop. Tests block on
+	// WaitStarted() to ensure cancel() doesn't race ahead of the first
+	// iteration; production callers ignore this channel.
+	close(s.runStarted)
+
 	flushTicker := time.NewTicker(DefaultFlushInterval)
 	defer flushTicker.Stop()
 
@@ -1043,6 +1025,9 @@ func (s *Store) Run(ctx context.Context) {
 			if len(batch) >= DefaultBatchSize {
 				s.flushBatch(batch)
 				batch = batch[:0]
+				if err := s.MaybeRollover(); err != nil {
+					slog.Default().Warn("store: rollover after batch flush failed", "err", err.Error())
+				}
 			}
 
 		case snap := <-s.snapshotCh:
@@ -1052,10 +1037,19 @@ func (s *Store) Run(ctx context.Context) {
 			if len(batch) > 0 {
 				s.flushBatch(batch)
 				batch = batch[:0]
+				if err := s.MaybeRollover(); err != nil {
+					slog.Default().Warn("store: rollover after timed flush failed", "err", err.Error())
+				}
 			}
 
 		case <-pruneTicker.C:
 			s.prune()
+			// Tick-driven rollover so a low-write daemon still rotates
+			// when the file size has slowly crept past MaxSize via
+			// background activity (e.g. snapshot writes).
+			if err := s.MaybeRollover(); err != nil {
+				slog.Default().Warn("store: rollover on prune tick failed", "err", err.Error())
+			}
 
 		case <-ctx.Done():
 			// Final flush.
@@ -1091,6 +1085,7 @@ func (s *Store) flushBatch(batch []events.Event) {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.recordWriteError("flushBatch.Begin", err)
 		return
 	}
 
@@ -1099,17 +1094,19 @@ func (s *Store) flushBatch(batch []events.Event) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("flushBatch.Prepare(events)", err)
 		return
 	}
 	defer evtStmt.Close()
 
 	// Prepare: stack insert uses INSERT OR REPLACE so that stacks from older
 	// sessions (which had empty frames) get upgraded with resolved symbols.
-	// REPLACE is a DELETE+INSERT in SQLite — safe because stack_traces has no
+	// REPLACE is a DELETE+INSERT in SQLite; safe because stack_traces has no
 	// foreign key constraints (events reference stack_hash by value, not FK).
 	stackStmt, err := tx.Prepare(`INSERT OR REPLACE INTO stack_traces (hash, ips, frames) VALUES (?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("flushBatch.Prepare(stack_traces)", err)
 		return
 	}
 	defer stackStmt.Close()
@@ -1164,7 +1161,10 @@ func (s *Store) flushBatch(batch []events.Event) {
 		)
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.recordWriteError("flushBatch.Commit", err)
+		return
+	}
 
 	// Check size limit after every flush. Cheap when under the limit
 	// (3 stat() calls, early return). When over, prunes oldest data
@@ -1330,14 +1330,28 @@ type Stats struct {
 	// across all tracked tables since the process started. Monotonic;
 	// does NOT reset when pruneBySize has no work to do.
 	PrunedRows uint64
+	// DroppedByBuffer is the cumulative count of events + snapshots
+	// dropped at Record() / RecordSnapshot() because the internal
+	// channel was full. Distinct from DroppedBySampler (intentional
+	// admission) and from FlushFailures (write-side errors after
+	// admission).
+	DroppedByBuffer uint64
+	// FlushFailures is the cumulative count of write-side errors
+	// silently swallowed by flushBatch and friends. A non-zero value
+	// against a healthy-looking agent typically means rollover left
+	// s.db pointing at a closed handle; matching slog.Error lines in
+	// the agent log carry the underlying error.
+	FlushFailures uint64
 }
 
 // ReadStats returns a point-in-time snapshot of the Store's disk + prune
 // counters. Safe to call from any goroutine.
 func (s *Store) ReadStats() Stats {
 	return Stats{
-		DiskBytes:  s.diskUsage(),
-		PrunedRows: s.prunedRows.Load(),
+		DiskBytes:       s.diskUsage(),
+		PrunedRows:      s.prunedRows.Load(),
+		DroppedByBuffer: s.droppedByBuffer.Load(),
+		FlushFailures:   s.flushFailures.Load(),
 	}
 }
 
@@ -1545,6 +1559,12 @@ func (s *Store) Query(q QueryParams) ([]events.Event, error) {
 		args = append(args, limit)
 	}
 
+	// Block readers from racing against an in-flight rollover; rolloverMu
+	// is Lock()'d in RolloverNow across the file swap so reads either
+	// wait or see a coherent *sql.DB pointer.
+	s.rolloverMu.RLock()
+	defer s.rolloverMu.RUnlock()
+
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying events: %w", err)
@@ -1701,6 +1721,10 @@ func (s *Store) QueryRich(q QueryParams) ([]RichEvent, error) {
 		args = append(args, limit)
 	}
 
+	// See Query() for the rolloverMu rationale.
+	s.rolloverMu.RLock()
+	defer s.rolloverMu.RUnlock()
+
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying events (rich): %w", err)
@@ -1843,6 +1867,10 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 
+	if s.roDB != nil {
+		s.roDB.Close()
+		s.roDB = nil
+	}
 	err := s.db.Close()
 
 	// Chown WAL/SHM files that SQLite created during this session.
@@ -1900,11 +1928,16 @@ func (s *Store) Compact() error {
 // the column names, row data, and whether the result was truncated by maxRows.
 //
 // Validation layers (defense-in-depth):
-//  1. First keyword must be SELECT, WITH, or EXPLAIN
-//  2. Write keywords (INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/REPLACE)
-//     rejected anywhere in the query — blocks writable CTEs like
-//     WITH x AS (...) DELETE FROM events RETURNING *
-//  3. Multi-statement queries rejected (semicolon + non-whitespace)
+//  1. SQLite engine-level read-only enforcement via a sibling connection
+//     pool opened with `_query_only=1`. This is the AUTHORITATIVE check;
+//     every write attempt fails with "attempt to write a readonly database"
+//     regardless of the SQL form, including writable CTEs that use
+//     non-space whitespace to bypass the keyword filter.
+//  2. First keyword must be SELECT, WITH, or EXPLAIN (friendly error).
+//  3. Write keywords (INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/REPLACE)
+//     rejected anywhere in the query as a fast pre-check; this is
+//     defense-in-depth, not the security boundary.
+//  4. Multi-statement queries rejected (semicolon + non-whitespace).
 //
 // maxRows caps returned rows (default 1000, max 10000). Fetches maxRows+1
 // internally to detect truncation accurately.
@@ -1962,7 +1995,25 @@ func (s *Store) ExecuteReadOnly(ctx context.Context, query string, maxRows int) 
 		}
 	}
 
-	rows, err := s.db.QueryContext(ctx, trimmed)
+	// Block readers from racing against an in-flight rollover. RLock
+	// here is paired with rolloverMu.Lock in RolloverNow so the swap
+	// is published atomically from a reader's perspective.
+	s.rolloverMu.RLock()
+	defer s.rolloverMu.RUnlock()
+
+	// Prefer the read-only sibling pool: SQLite's `query_only` PRAGMA
+	// (set on connect via the DSN parameter) makes every write attempt
+	// fail at the engine level, regardless of SQL form. This closes
+	// the writable-CTE-with-tab bypass that the keyword filter cannot
+	// catch alone. Fall back to the main pool only when the sibling
+	// pool failed to open at New() time (rare; in-memory shared-cache
+	// mishap or filesystem permission edge case) - the substring
+	// filter above is then the only line of defense.
+	queryDB := s.roDB
+	if queryDB == nil {
+		queryDB = s.db
+	}
+	rows, err := queryDB.QueryContext(ctx, trimmed)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("query execution failed: %w", err)
 	}
@@ -2041,7 +2092,9 @@ type TimelineEntry struct {
 // chains don't persist indefinitely in the dashboard.
 func (s *Store) ExpireChains(maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
-	s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff)
+	if _, err := s.db.Exec("DELETE FROM causal_chains WHERE detected_at < ?", cutoff); err != nil {
+		s.recordWriteError("ExpireChains.Exec", err)
+	}
 }
 
 // RecordChains upserts causal chains into the database.
@@ -2053,6 +2106,7 @@ func (s *Store) RecordChains(chains []StoredChain) {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.recordWriteError("RecordChains.Begin", err)
 		return
 	}
 
@@ -2061,6 +2115,7 @@ func (s *Store) RecordChains(chains []StoredChain) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("RecordChains.Prepare", err)
 		return
 	}
 	defer stmt.Close()
@@ -2093,7 +2148,9 @@ func (s *Store) RecordChains(chains []StoredChain) {
 		)
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.recordWriteError("RecordChains.Commit", err)
+	}
 }
 
 // QueryChains retrieves causal chains, optionally filtered by time range.
@@ -2141,14 +2198,17 @@ func (s *Store) RecordSnapshot(snap SystemSnapshot) {
 	select {
 	case s.snapshotCh <- snap:
 	default:
-		// Buffer full — drop snapshot rather than block.
+		// Buffer full; drop snapshot rather than block. Counted
+		// alongside event drops so operators see the same "load
+		// shed" signal regardless of which channel saturated.
+		s.droppedByBuffer.Add(1)
 	}
 }
 
 // writeSnapshot inserts a single system snapshot. Called from Run() goroutine
 // to serialize with event batch writes and avoid SQLite write contention.
 func (s *Store) writeSnapshot(snap SystemSnapshot) {
-	s.db.Exec(`INSERT OR IGNORE INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg)
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO system_snapshots (timestamp, cpu_pct, mem_pct, mem_avail, swap_mb, load_avg)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		snap.Timestamp.UnixNano(),
 		snap.CPUPercent,
@@ -2156,7 +2216,9 @@ func (s *Store) writeSnapshot(snap SystemSnapshot) {
 		snap.MemAvailMB,
 		snap.SwapUsedMB,
 		snap.LoadAvg1,
-	)
+	); err != nil {
+		s.recordWriteError("writeSnapshot.Exec", err)
+	}
 }
 
 // CGroupSchedStat holds per-cgroup off-CPU scheduling statistics.
@@ -2177,6 +2239,7 @@ func (s *Store) RecordCGroupSchedStats(stats []CGroupSchedStat) {
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.recordWriteError("RecordCGroupSchedStats.Begin", err)
 		return
 	}
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO cgroup_schedstat
@@ -2184,13 +2247,16 @@ func (s *Store) RecordCGroupSchedStats(stats []CGroupSchedStat) {
 		VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("RecordCGroupSchedStats.Prepare", err)
 		return
 	}
 	for _, st := range stats {
 		stmt.Exec(st.CGroupID, st.P99OffCPU, st.TotalOffCPU, st.EventCount, st.WindowStart, st.WindowEnd)
 	}
 	stmt.Close()
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.recordWriteError("RecordCGroupSchedStats.Commit", err)
+	}
 }
 
 // QuerySnapshots retrieves system snapshots, optionally filtered by time range.
@@ -2269,14 +2335,16 @@ func (s *Store) StopSession(id int64, stoppedAt time.Time) error {
 	return nil
 }
 
-// RecordProcessName stores a PID→name mapping for query-time enrichment.
+// RecordProcessName stores a PID->name mapping for query-time enrichment.
 // Uses INSERT OR REPLACE so the most recent name wins if a PID is reused.
 func (s *Store) RecordProcessName(pid uint32, name string) {
-	s.db.Exec("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)",
-		pid, name, time.Now().UnixNano())
+	if _, err := s.db.Exec("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)",
+		pid, name, time.Now().UnixNano()); err != nil {
+		s.recordWriteError("RecordProcessName.Exec", err)
+	}
 }
 
-// RecordProcessNames batch-inserts PID→name mappings in a single transaction.
+// RecordProcessNames batch-inserts PID->name mappings in a single transaction.
 // Called at shutdown to persist names discovered at runtime via /proc/[pid]/comm.
 // Skips empty names. Uses INSERT OR REPLACE so the most recent name wins.
 func (s *Store) RecordProcessNames(names map[uint32]string) {
@@ -2286,12 +2354,14 @@ func (s *Store) RecordProcessNames(names map[uint32]string) {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.recordWriteError("RecordProcessNames.Begin", err)
 		return
 	}
 
 	stmt, err := tx.Prepare("INSERT OR REPLACE INTO process_names (pid, name, seen_at) VALUES (?, ?, ?)")
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("RecordProcessNames.Prepare", err)
 		return
 	}
 	defer stmt.Close()
@@ -2304,7 +2374,9 @@ func (s *Store) RecordProcessNames(names map[uint32]string) {
 		stmt.Exec(pid, name, now)
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.recordWriteError("RecordProcessNames.Commit", err)
+	}
 }
 
 // RecordAggregates batch-inserts aggregate rows (one per minute-bucket per op).
@@ -2339,6 +2411,7 @@ func (s *Store) recordAggregatesInto(table string, aggs []Aggregate) {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.recordWriteError("recordAggregatesInto.Begin("+table+")", err)
 		return
 	}
 
@@ -2347,6 +2420,7 @@ func (s *Store) recordAggregatesInto(table string, aggs []Aggregate) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
+		s.recordWriteError("recordAggregatesInto.Prepare("+table+")", err)
 		return
 	}
 	defer stmt.Close()
@@ -2355,7 +2429,9 @@ func (s *Store) recordAggregatesInto(table string, aggs []Aggregate) {
 		stmt.Exec(a.Bucket, a.Source, a.Op, a.PID, a.Count, a.Stored, a.SumDur, a.MinDur, a.MaxDur, a.SumArg0)
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.recordWriteError("recordAggregatesInto.Commit("+table+")", err)
+	}
 }
 
 // QueryAggregateTotals returns summarized event counts from the aggregates table

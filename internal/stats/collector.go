@@ -366,6 +366,124 @@ type Snapshot struct {
 	ThrottleEvents ThrottleEventCounters
 	// v0.15 item M: per-PID kernel-launch aggregates.
 	KernelLaunches []KernelLaunchSnapshot
+
+	// v0.16.3 inference exporter surface. Populated by the
+	// cli/trace.go onSnapshot callback from infer.Engine when the
+	// --inference umbrella is engaged; nil/empty otherwise. The OTLP
+	// + Prometheus exporters fan these out as ingero.infer.* metrics
+	// so operators get the same workload-key view they already get on
+	// the UDS socket.
+	InferWorkloads []InferWorkloadStats
+	InferStats     InferEngineStats
+	InferSampler   InferSamplerState
+}
+
+// InferWorkloadStats is the per-workload exporter view of one entry
+// in the infer.Engine LRU. v0.16.3 surface for ingero.infer.* metric
+// emission. Plain types (no time.Duration / no internal/infer types)
+// so the export package can read this without an import cycle.
+//
+// Phase is the v0.16.1 classifier verdict ("prefill" | "decode" |
+// "mixed" | "unknown" | "" when classifier disabled); used as a data
+// point attribute. Histogram is a frozen view of the per-workload
+// step-duration histogram (the same Histogram type as memcpy /
+// kernel-launch elsewhere in this package).
+type InferWorkloadStats struct {
+	CGroupHash   string
+	PID          uint32
+	StreamHandle uint64
+	Phase        string
+	// KernelFingerprint is non-zero only when the engine runs with
+	// --inference-fingerprint-key; the OTLP / Prometheus exporters
+	// emit it as a data point attribute so per-sequence baselines
+	// don't collapse into a single series.
+	KernelFingerprint uint64
+	// ModelName and EngineSystem are populated when the workload's
+	// PID was detected as a known inference engine and the cmdline
+	// carried a --model / --model-id flag. Empty when the PID isn't
+	// a tracked inference engine (cli/trace.go enriches the snapshot
+	// from the scraper's target set after the engine produces the
+	// row). Surfaced as gen_ai.request.model and gen_ai.system
+	// attributes on the OTLP / Prometheus emission path so
+	// Fleet-side cross-pod aggregation can group by served model.
+	ModelName    string
+	EngineSystem string
+	MeanNs       float64
+	P95Ns        float64
+	Samples      int
+	Histogram    HistogramSnapshot
+}
+
+// InferEngineStats is the engine-level exporter view (v0.16.3).
+// WorkloadsTracked feeds ingero.infer.workloads_tracked; OutliersTotal
+// feeds ingero.infer.outlier_total per bucket; ThrottleAtOutlier feeds
+// ingero.infer.throttle_active_total per bucket.
+//
+// KVCacheAllocAgeHist feeds ingero.infer.kvcache.alloc_age_ms - the
+// cumulative distribution of
+// live alloc ages sampled at decode-phase outliers. HasObservation is
+// false when no decode outliers have fired or the KVCacheTracker is
+// unconfigured; the exporter still emits the metric (zero count) so
+// the series is wired even before the first observation.
+type InferEngineStats struct {
+	WorkloadsTracked    int
+	OutliersTotal       map[string]uint64 // bucket ("1.5x"|"2x"|"3x") -> cumulative
+	ThrottleAtOutlier   map[string]uint64 // bucket -> cumulative outliers seen with non-zero throttle
+	KVCacheAllocAgeHist HistogramSnapshot
+}
+
+// OutlierSpan is one classified-outlier event in a wire shape the
+// OTLP /v1/traces emitter consumes. Plain types so internal/export
+// can encode without an internal/infer import (which would cycle
+// through internal/cli on the way back).
+//
+// The producer (cli/trace.go's onSnapshot callback) converts each
+// drained infer.OutlierEvent into one OutlierSpan with workload-key
+// fields, baseline ratios, contextual signals (memfrag, throttle,
+// KV-cache age), and engine identity (model + system) enriched from
+// the scraper. The consumer (export.OTLPExporter.PushSpans) emits
+// each as a self-contained INTERNAL-kind span with status=ERROR.
+//
+// Why not parent-child traces: keeping each outlier in its own trace
+// avoids needing an out-of-band correlation rule for spans that
+// arrive across snapshot ticks. Operators correlate spans across an
+// incident via the workload-key attribute set instead, which is the
+// same key the metric and UDS surfaces use. Future revisions may add
+// Span Links between samples of the same workload if a downstream
+// tool (Tempo, Honeycomb) shows that grouping in the UI.
+type OutlierSpan struct {
+	EventID        string
+	Bucket         string
+	StepStart      time.Time
+	StepEnd        time.Time
+	StepDurationNs int64
+	BaselineP95Ns  int64
+	BaselineMeanNs int64
+
+	CGroupHash        string
+	PID               uint32
+	StreamHandle      uint64
+	Phase             string
+	KernelFingerprint uint64
+
+	MemfragEvents         uint32
+	ThrottleReasons       uint64
+	MinSMClockMHz         uint32
+	KVCacheTopAllocAgesMs []uint64
+
+	ModelName    string
+	EngineSystem string
+}
+
+// InferSamplerState is the engine's sampler-degradation state for
+// ingero.infer.sampler.* metric emission (v0.16.3). Cause is a single
+// human-friendly string ("3x:cgroup=<hash>,pid=<n>,phase=<p>") that
+// becomes the AttrInferSamplerCause attribute on the gauge. Empty
+// when no degradation has fired yet.
+type InferSamplerState struct {
+	Degraded          bool
+	DegradationsTotal uint64
+	LastCause         string
 }
 
 // ThrottleReading is one decoded NVML clock-throttle sample for one GPU,

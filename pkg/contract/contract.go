@@ -92,6 +92,142 @@ const (
 	// Prometheus *_bucket / *_sum / *_count). Bucket layout:
 	// stats.DefaultMemcpyDurationBoundsMs.
 	MetricGPUMemcpyDurationMS = "gpu.memcpy.duration_ms"
+
+	// v0.16 inference-umbrella metrics. Active only when
+	// `ingero trace --inference` is set. The agent's per-workload
+	// step-duration baseliner (internal/infer) populates these.
+
+	// MetricInferStepDurationNs is the per-workload distribution of
+	// inference step durations in nanoseconds. OTel Histogram with
+	// attributes ingero.cgroup_path_hash, pid,
+	// ingero.infer.stream_handle. A "step" is the wall-clock interval
+	// between consecutive cudaStreamSynchronize / cudaDeviceSync /
+	// driver ctxSync events on the same (pid, stream); for
+	// continuous-batching servers (vLLM, SGLang, TGI) each step is one
+	// engine iteration, NOT one user-facing HTTP request.
+	MetricInferStepDurationNs = "ingero.infer.step_duration_ns"
+
+	// MetricInferOutlierTotal is the cumulative count of step durations
+	// classified as outliers (>=1.5x of the workload's running p95).
+	// OTel Sum (monotonic, cumulative) with the same workload-key
+	// attributes as MetricInferStepDurationNs plus
+	// ingero.infer.outlier_bucket ("1.5x" | "2x" | "3x"). Buckets are
+	// mutually exclusive — a step that crosses 3x increments the "3x"
+	// bucket only.
+	MetricInferOutlierTotal = "ingero.infer.outlier_total"
+
+	// MetricInferBaselineMeanNs is the current EMA mean of step
+	// durations for one workload, in nanoseconds. Gauge.
+	MetricInferBaselineMeanNs = "ingero.infer.baseline_mean_ns"
+
+	// MetricInferBaselineP95Ns is the current p95 estimate (P²
+	// algorithm) of step durations for one workload, in nanoseconds.
+	// The classifier compares each step against this value to decide
+	// outlier bucket membership. Gauge.
+	MetricInferBaselineP95Ns = "ingero.infer.baseline_p95_ns"
+
+	// MetricInferWorkloadsTracked is the count of distinct
+	// (cgroup_path_hash, pid, stream_handle) workloads currently held
+	// in the agent's bounded LRU. Gauge, no per-workload attributes.
+	MetricInferWorkloadsTracked = "ingero.infer.workloads_tracked"
+
+	// MetricInferSamplerDegraded is a 0/1 gauge that tracks the
+	// store-sampler degraded state. The infer engine flips the
+	// sampler to admit 100% of events when an outlier crosses the
+	// configured bucket threshold (default 3x); without observability
+	// operators cannot tell which workload triggered the storage
+	// pressure. Value 1 while degraded; 0 once the cooldown elapses.
+	MetricInferSamplerDegraded = "ingero.infer.sampler.degraded"
+
+	// MetricInferSamplerDegradationsTotal is the cumulative count of
+	// times the sampler entered degraded state since agent start. OTel
+	// Sum (monotonic, cumulative). Gauge edge-counts are lossy because
+	// a back-to-back degrade re-arms the cooldown without a 0
+	// transition; this counter is the lossless edge count.
+	MetricInferSamplerDegradationsTotal = "ingero.infer.sampler.degradations_total"
+
+	// MetricInferThrottleActiveTotal is the cumulative count of
+	// inference-step outliers observed while at least one NVML clock
+	// throttle reason was active. OTel Sum (monotonic, cumulative)
+	// labeled by ingero.infer.outlier_bucket. Pairs with
+	// gpu.throttle.{power,thermal,sw,hw}.event_total to tell apart
+	// "outlier coincided with a throttle" from "throttle elsewhere".
+	MetricInferThrottleActiveTotal = "ingero.infer.throttle_active_total"
+
+	// MetricInferKVCacheAllocAgeMs is the histogram of live cudaMalloc
+	// allocation ages (milliseconds) sampled at each decode-phase
+	// outlier. Long-tail mass on this histogram is the stale-KV-cache
+	// pattern - blocks that lived through hundreds of decode steps
+	// without eviction, the proximate cause of decode slowdowns under
+	// fragmentation. Cumulative across the agent process lifetime;
+	// the engine emits one observation per top-N alloc age on each
+	// fired decode outlier.
+	MetricInferKVCacheAllocAgeMs = "ingero.infer.kvcache.alloc_age_ms"
+
+	// v0.16.2 OTel GenAI semantic-convention metric names. The
+	// agent's engine /metrics scraper (internal/infer/scrape) maps
+	// engine-specific Prometheus names (vllm:time_to_first_token_seconds,
+	// tgi_request_duration, sglang_request_latency, etc.) into these
+	// canonical names so any downstream consumer (Datadog, Grafana,
+	// Honeycomb, Arize) sees a unified TTFT/TPOT surface regardless
+	// of which engine is running locally.
+	//
+	// Pinned to OTel semconv v1.37 (2026-05). A CI test in
+	// pkg/contract/contract_test.go flags drift if the upstream spec
+	// renames any of these. When OTel GA lands, retest and bump.
+	// Source: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+
+	// MetricGenAITTFT is the histogram of Time-To-First-Token in
+	// seconds. The user-perceived prefill SLO for chat completions.
+	MetricGenAITTFT = "gen_ai.client.operation.time_to_first_token"
+
+	// MetricGenAITPOT is the histogram of Time-Per-Output-Token in
+	// seconds. The user-perceived decode SLO; memory-bandwidth-bound.
+	MetricGenAITPOT = "gen_ai.server.time_per_output_token"
+
+	// MetricGenAIRequestDuration is the histogram of end-to-end
+	// request latency in seconds. From request arrival to final
+	// token delivered.
+	MetricGenAIRequestDuration = "gen_ai.client.operation.duration"
+
+	// MetricGenAIPrefillDuration is the histogram of prefill-phase
+	// latency in seconds. Operator-diagnostic per-phase split.
+	MetricGenAIPrefillDuration = "gen_ai.server.request.duration.prefill"
+
+	// MetricGenAIDecodeDuration is the histogram of decode-phase
+	// latency in seconds. Operator-diagnostic per-phase split.
+	MetricGenAIDecodeDuration = "gen_ai.server.request.duration.decode"
+
+	// MetricGenAITokenUsage is the histogram of input + output token
+	// counts per request. v0.16.2 maps engine-specific counters
+	// (vllm:prompt_tokens_total, vllm:generation_tokens_total) to
+	// the corresponding .input / .output sub-metric.
+	MetricGenAITokenUsage = "gen_ai.client.token.usage"
+)
+
+// OTel GenAI semantic-convention attribute keys. Pinned to v1.37.
+const (
+	// AttrGenAISystem identifies the inference engine ("vllm" |
+	// "tgi" | "sglang" | "triton") on every gen_ai.* sample.
+	AttrGenAISystem = "gen_ai.system"
+
+	// AttrGenAIRequestModel and AttrGenAIResponseModel carry the
+	// model identifier the engine reports. Often the same value;
+	// some engines (NIM, Triton) distinguish requested vs served
+	// model.
+	AttrGenAIRequestModel  = "gen_ai.request.model"
+	AttrGenAIResponseModel = "gen_ai.response.model"
+
+	// AttrGenAIOperationName labels the operation kind ("chat",
+	// "completion", "embedding"). Mostly informational at the
+	// scraper layer; engines don't always emit it.
+	AttrGenAIOperationName = "gen_ai.operation.name"
+
+	// AttrIngeroEnginePID is the agent-emitted attribute that ties
+	// scraped gen_ai.* samples back to the eBPF-side workload key
+	// (the (cgroup, pid, stream) tuple the infer engine baselines).
+	// Custom (ingero-prefixed) — not a semconv attribute.
+	AttrIngeroEnginePID = "ingero.engine.pid"
 )
 
 // OTLP straggler-event data-point attribute keys (Story 3.4).
@@ -140,6 +276,83 @@ const (
 	// MemcpyDirection* constants below. Namespaced to align with the
 	// other Attr* constants in this package.
 	AttrMemcpyDirection = "ingero.memcpy.direction"
+
+	// AttrInferStreamHandle labels MetricInfer* data points with the
+	// CUDA stream handle the workload's syncs were observed on. Stored
+	// as a string-encoded uint64 so the wire format matches other
+	// pointer-shaped attributes in this package.
+	AttrInferStreamHandle = "ingero.infer.stream_handle"
+
+	// AttrInferOutlierBucket labels MetricInferOutlierTotal data points
+	// with the largest baseline-p95 multiplier the step crossed.
+	// Allowed values: "1.5x" | "2x" | "3x". Buckets are mutually
+	// exclusive at emission; SLO-style "exceeded 1.5x or higher" math
+	// happens at PromQL/Grafana time over the cumulative counter sums.
+	AttrInferOutlierBucket = "ingero.infer.outlier_bucket"
+
+	// AttrInferPhase labels MetricInfer* data points with the
+	// observed phase of the step. Allowed values: "prefill" |
+	// "decode" | "mixed" | "unknown". v0.16.1: per-phase baselines
+	// split the per-(cgroup, pid, stream) baseline so a slow decode
+	// is compared against the decode-phase p95 (not a mixed-bucket
+	// p95 absorbed by prefill steps). When the phase classifier is
+	// disabled (operator passes --inference-phase-classifier=off),
+	// the attribute is the empty string.
+	AttrInferPhase = "ingero.infer.phase"
+
+	// AttrInferSamplerCause labels MetricInferSamplerDegraded* data
+	// points with the workload identity that triggered the most
+	// recent flip. Format is "<bucket>:cgroup=<hash>,pid=<n>,phase=<p>"
+	// so a single attribute string is enough for an operator to find
+	// the offending workload without scanning per-workload metrics.
+	AttrInferSamplerCause = "ingero.infer.sampler.cause"
+
+	// AttrInferKernelFingerprint identifies one kernel-launch sequence
+	// (FNV-1a fold over the per-step launch func-pointer set). v0.16.5b.
+	// Emitted only when --inference-fingerprint-key is engaged and the
+	// fingerprint is non-zero; absent on the default v0.16.x export
+	// surface so the LRU footprint stays at v0.16.4 levels for the
+	// common single-model deployment.
+	AttrInferKernelFingerprint = "ingero.infer.kernel_fingerprint"
+
+	// AttrInferStepDurationNs / AttrInferBaselineP95Ns /
+	// AttrInferBaselineMeanNs label per-outlier span attributes that
+	// expose the step's measured duration and the workload's running
+	// baselines. Names mirror the per-workload OTLP metric names so
+	// dashboards can join span attrs against metric values without
+	// renaming.
+	AttrInferStepDurationNs = "ingero.infer.step_duration_ns"
+	AttrInferBaselineP95Ns  = "ingero.infer.baseline_p95_ns"
+	AttrInferBaselineMeanNs = "ingero.infer.baseline_mean_ns"
+
+	// AttrInferMemfragEventsInStep counts memfrag IOCTL events that
+	// occurred during the outlier step. AttrInferThrottleReasons is
+	// the uint64 NVML throttle bitmap encoded as a decimal string.
+	// AttrInferKVCacheOldestAllocAgeMs surfaces the oldest live
+	// cudaMalloc allocation age at the outlier (dominant signal for
+	// stale-KV-cache; the full distribution lives on the histogram
+	// metric).
+	AttrInferMemfragEventsInStep     = "ingero.infer.memfrag_events_in_step"
+	AttrInferThrottleReasons         = "ingero.infer.throttle_reasons"
+	AttrInferKVCacheOldestAllocAgeMs = "ingero.infer.kvcache.oldest_alloc_age_ms"
+)
+
+// Bare data-point attribute keys. These pre-date the contract package and
+// are kept on the wire as plain identifiers ("pid", "comm", "gpu.uuid",
+// etc.) for backwards compatibility with existing dashboards. New attrs
+// SHOULD use the namespaced ingero.* / nccl.* / gen_ai.* / gpu.* form;
+// these constants exist so the OTLP exporter can reference the contract
+// package as the single source of truth for every wire key without
+// changing the wire bytes.
+const (
+	AttrPID             = "pid"
+	AttrComm            = "comm"
+	AttrLibNCCLPath     = "libnccl_path"
+	AttrLibNCCLVersion  = "libnccl_version"
+	AttrGPUUUID         = "gpu.uuid"
+	AttrSource          = "source"
+	AttrOperation       = "operation"
+	AttrPercentile      = "percentile"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:
@@ -160,7 +373,11 @@ const (
 	AttrWorkloadType  = "ingero.workload_type"
 	AttrWorldSize     = "ingero.world_size"
 	AttrNodeRank      = "ingero.node.rank"
-	AttrDetectionMode = "mode"
+	// AttrDetectionMode previously emitted as the bare key "mode"; the
+	// "ingero." namespacing aligns with every other Attr* constant in this
+	// package and keeps Grafana / PromQL filters consistent
+	// (`{ingero_detection_mode=...}` instead of `{mode=...}`).
+	AttrDetectionMode = "ingero.detection_mode"
 )
 
 // NCCL collective metric names. Emitted by the agent's ncclprobe and

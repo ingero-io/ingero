@@ -134,3 +134,40 @@ var DefaultMemcpyDurationBoundsMs = []float64{
 func IsFinite(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
+
+// DefaultInferStepDurationBoundsNs is the bucket layout for
+// ingero.infer.step_duration_ns. Geometric progression covering
+// inference engine iterations from sub-millisecond decodes to
+// multi-second stalls. Calibrated against the v0.16.1 phase classifier
+// regimes (vLLM/TGI/SGLang serving): decode p50 ~5 ms, prefill p95
+// ~500 ms on 70B serving, and a long tail to 10 s for stuck steps.
+//
+// Why nanoseconds, not milliseconds: the metric name and the OTel
+// histogram both carry the "ns" unit, so consumers don't need a
+// conversion step. Bucket widths span 100us (sub-decode) to 10s
+// (deep stall) so a single histogram covers every realistic regime.
+var DefaultInferStepDurationBoundsNs = []float64{
+	100_000, 250_000, 500_000,
+	1_000_000, 2_500_000, 5_000_000,
+	10_000_000, 25_000_000, 50_000_000,
+	100_000_000, 250_000_000, 500_000_000,
+	1_000_000_000, 2_500_000_000, 5_000_000_000,
+	10_000_000_000,
+}
+
+// DefaultInferKVCacheAllocAgeBoundsMs is the bucket layout for
+// ingero.infer.kvcache.alloc_age_ms. Geometric progression spanning
+// "fresh allocation" (< 10 ms) to "decade-old straggler" (> 10
+// minutes). The interesting band for KV-cache stalls is 100 ms - 60
+// s: a stale block that's lived through hundreds of decode steps
+// without eviction. Anything older than 10 minutes is almost
+// certainly a model-weight tensor that was never meant to age out;
+// keeping the bucket in the layout (vs clipping) preserves the
+// signal "yes there ARE old allocs, here's how old".
+var DefaultInferKVCacheAllocAgeBoundsMs = []float64{
+	10, 25, 50,
+	100, 250, 500,
+	1_000, 2_500, 5_000,
+	10_000, 30_000, 60_000,
+	120_000, 300_000, 600_000,
+}

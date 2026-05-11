@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/ingero-io/ingero/pkg/contract"
 )
 
@@ -40,6 +41,20 @@ type OTLPConfig struct {
 	Insecure       bool
 	ExportInterval int // seconds between pushes (default 10)
 	Headers        map[string]string
+
+	// Resource identity. Emitted as resource.attributes on every OTLP
+	// push so Fleet-side aggregation can group across nodes / pods of
+	// the same cluster. NodeID is typically the hostname or whatever
+	// --node was set to; ClusterID is the operator-supplied
+	// --cluster (k8s cluster name, fleet name, or any stable
+	// identifier shared across pods of the same training/serving
+	// run); Provider is the agent's best guess at the GPU cloud
+	// (Lambda / EC2 / GCP / Azure / CoreWeave) and is typically
+	// filled in Fleet-side via node_providers.yaml lookup if left
+	// empty here.
+	NodeID    string
+	ClusterID string
+	Provider  string
 
 	// DebugLog is called for debug messages when set (typically cli.debugf).
 	DebugLog func(format string, args ...any)
@@ -92,7 +107,11 @@ func (e *OTLPExporter) Start(ctx context.Context) error {
 
 // Push sends a stats snapshot as OTLP metrics via HTTP JSON.
 // Called every ExportInterval seconds from the watch loop.
-func (e *OTLPExporter) Push(snap *stats.Snapshot) error {
+//
+// ctx is honored for the request and the body read so a shutdown signal
+// mid-push aborts the HTTP round trip instead of waiting for the
+// client's own 10s timeout.
+func (e *OTLPExporter) Push(ctx context.Context, snap *stats.Snapshot) error {
 	if e == nil {
 		return nil
 	}
@@ -112,7 +131,7 @@ func (e *OTLPExporter) Push(snap *stats.Snapshot) error {
 	e.debugf("OTLP: pushing %d bytes to %s (%d metrics)",
 		len(body), url, countMetrics(payload))
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		e.mu.Lock()
 		e.errors++
@@ -336,8 +355,8 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		source := op.Source.String()
 
 		labels := []otlpKeyValue{
-			{Key: "source", Value: stringVal(source)},
-			{Key: "operation", Value: stringVal(op.Op)},
+			{Key: contract.AttrSource, Value: stringVal(source)},
+			{Key: contract.AttrOperation, Value: stringVal(op.Op)},
 		}
 
 		// Duration percentiles (gauge, microseconds).
@@ -350,7 +369,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{"p99", op.P99},
 		} {
 			pctLabels := append(append([]otlpKeyValue{}, labels...), otlpKeyValue{
-				Key: "percentile", Value: stringVal(pct.name),
+				Key: contract.AttrPercentile, Value: stringVal(pct.name),
 			})
 			metrics = append(metrics, gaugeMetric(
 				"gpu.cuda.operation.duration",
@@ -397,19 +416,19 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	for _, p := range snap.NCCLDataPoints {
 		ts := fmt.Sprintf("%d", p.TimestampUnixNano)
 		attrs := []otlpKeyValue{
-			{Key: "nccl.op_type", Value: stringVal(p.OpType)},
-			{Key: "nccl.comm_id_hash", Value: stringVal(p.CommIDHash)},
-			{Key: "nccl.rank", Value: otlpValue{IntValue: int64Ptr(int64(p.Rank))}},
-			{Key: "nccl.nranks", Value: otlpValue{IntValue: int64Ptr(int64(p.NRanks))}},
-			{Key: "nccl.datatype", Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
-			{Key: "nccl.reduce_op", Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
+			{Key: contract.AttrNCCLOpType, Value: stringVal(p.OpType)},
+			{Key: contract.AttrNCCLCommIDHash, Value: stringVal(p.CommIDHash)},
+			{Key: contract.AttrNCCLRank, Value: otlpValue{IntValue: int64Ptr(int64(p.Rank))}},
+			{Key: contract.AttrNCCLNRanks, Value: otlpValue{IntValue: int64Ptr(int64(p.NRanks))}},
+			{Key: contract.AttrNCCLDatatype, Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
+			{Key: contract.AttrNCCLReduceOp, Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
 		}
 		// v0.12.2: peer_rank attribute only on ncclSend/ncclRecv
 		// (collectives leave PeerRank=0). Topology-mapping for
 		// pipeline-parallel workloads.
 		if p.PeerRank != 0 {
 			attrs = append(attrs, otlpKeyValue{
-				Key:   "nccl.peer_rank",
+				Key:   contract.AttrNCCLPeerRank,
 				Value: otlpValue{IntValue: int64Ptr(int64(p.PeerRank))},
 			})
 		}
@@ -437,10 +456,10 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	if snap.NCCLProcessReadings != nil {
 		for _, r := range snap.NCCLProcessReadings {
 			attrs := []otlpKeyValue{
-				{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
-				{Key: "comm", Value: stringVal(r.Comm)},
-				{Key: "libnccl_path", Value: stringVal(r.LibPath)},
-				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
+				{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
+				{Key: contract.AttrComm, Value: stringVal(r.Comm)},
+				{Key: contract.AttrLibNCCLPath, Value: stringVal(r.LibPath)},
+				{Key: contract.AttrLibNCCLVersion, Value: stringVal(r.LibVersion)},
 			}
 			metrics = append(metrics,
 				gaugeMetricInt(contract.MetricGPUNCCLProcessLoaded,
@@ -460,7 +479,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// GPU labelled with gpu.uuid.
 	for _, r := range snap.MemFragReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+			{Key: contract.AttrGPUUUID, Value: stringVal(r.UUID)},
 		}
 		metrics = append(metrics,
 			gaugeMetricInt("gpu.memory.used", "GPU memory currently allocated (NVML poll)", "By",
@@ -476,8 +495,8 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	}
 	for _, p := range snap.MemFragProcessReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(p.UUID)},
-			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
+			{Key: contract.AttrGPUUUID, Value: stringVal(p.UUID)},
+			{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
 		}
 		metrics = append(metrics,
 			gaugeMetricInt(contract.MetricGPUMemoryProcessAllocated,
@@ -492,7 +511,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// are h2h / h2d / d2h / d2d / default / unknown.
 	for _, m := range snap.MemcpyDirReadings {
 		attrs := []otlpKeyValue{
-			{Key: "direction", Value: stringVal(m.Direction)},
+			{Key: contract.AttrMemcpyDirection, Value: stringVal(m.Direction)},
 		}
 		metrics = append(metrics,
 			sumMetric(contract.MetricGPUMemcpyBytesTotal,
@@ -504,13 +523,123 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	// v0.16.3 inference exporter surface. Three groups of metrics:
+	//
+	//   1. Per-workload baseline shape: histogram, mean, p95.
+	//      Attributes: cgroup_path_hash, pid, stream_handle, phase.
+	//   2. Engine-level cumulative counters: outlier total per bucket,
+	//      throttle-at-outlier per bucket, workloads tracked.
+	//   3. Sampler observability: degraded gauge, degradations total,
+	//      cause label.
+	//
+	// All emit only when the snapshot carries non-empty inference data
+	// (i.e. --inference is engaged AND the engine has at least one
+	// warmed workload). Pre-v0.16.3 collectors that don't recognize
+	// these names ignore them; consumers that do receive a complete
+	// view of the agent's inference baseline state.
+	for _, w := range snap.InferWorkloads {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrCgroupPathHash, Value: stringVal(w.CGroupHash)},
+			{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(w.PID))}},
+			{Key: contract.AttrInferStreamHandle, Value: stringVal(strconv.FormatUint(w.StreamHandle, 10))},
+			{Key: contract.AttrInferPhase, Value: stringVal(w.Phase)},
+		}
+		// Fingerprint attribute attaches only when the optional
+		// per-step kernel-launch-sequence dimension is engaged
+		// (zero indicates "off" since the FNV-1a fold never produces 0).
+		if w.KernelFingerprint != 0 {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrInferKernelFingerprint,
+				Value: stringVal(strconv.FormatUint(w.KernelFingerprint, 16)),
+			})
+		}
+		// Layer 3 enabler attributes: serve as the cross-pod groupBy
+		// keys for the Fleet processor's peer-relative outlier
+		// detection. ModelName + EngineSystem are populated by the
+		// snapshot path from the scraper's target set when the PID is
+		// a recognized inference engine; absent when scraping is off
+		// or the engine cmdline didn't carry a --model flag.
+		if w.ModelName != "" {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrGenAIRequestModel,
+				Value: stringVal(w.ModelName),
+			})
+		}
+		if w.EngineSystem != "" {
+			attrs = append(attrs, otlpKeyValue{
+				Key:   contract.AttrGenAISystem,
+				Value: stringVal(w.EngineSystem),
+			})
+		}
+		metrics = append(metrics,
+			histogramMetric(contract.MetricInferStepDurationNs,
+				"Per-workload inference step duration distribution (cumulative)",
+				"ns", nowNano, "", w.Histogram, attrs),
+			gaugeMetric(contract.MetricInferBaselineMeanNs,
+				"Per-workload inference step EMA mean", "ns",
+				nowNano, w.MeanNs, attrs),
+			gaugeMetric(contract.MetricInferBaselineP95Ns,
+				"Per-workload inference step P² p95 estimate", "ns",
+				nowNano, w.P95Ns, attrs),
+		)
+	}
+	if len(snap.InferWorkloads) > 0 || snap.InferStats.WorkloadsTracked > 0 ||
+		len(snap.InferStats.OutliersTotal) > 0 || snap.InferSampler.DegradationsTotal > 0 {
+		metrics = append(metrics, gaugeMetricInt(
+			contract.MetricInferWorkloadsTracked,
+			"Distinct (cgroup,pid,stream,phase) workloads currently tracked by the infer engine",
+			"1", nowNano, int64(snap.InferStats.WorkloadsTracked), nil))
+	}
+	for bucket, count := range snap.InferStats.OutliersTotal {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrInferOutlierBucket, Value: stringVal(bucket)},
+		}
+		metrics = append(metrics, sumMetric(
+			contract.MetricInferOutlierTotal,
+			"Cumulative inference step-duration outliers per bucket",
+			"1", nowNano, int64(count), attrs))
+	}
+	for bucket, count := range snap.InferStats.ThrottleAtOutlier {
+		attrs := []otlpKeyValue{
+			{Key: contract.AttrInferOutlierBucket, Value: stringVal(bucket)},
+		}
+		metrics = append(metrics, sumMetric(
+			contract.MetricInferThrottleActiveTotal,
+			"Cumulative inference outliers observed while NVML throttle reasons were active",
+			"1", nowNano, int64(count), attrs))
+	}
+	// KV-cache alloc-age histogram. Engine-wide cumulative;
+	// per-decode-outlier per-PID attribution lives on the UDS path.
+	if snap.InferStats.KVCacheAllocAgeHist.HasObservation {
+		metrics = append(metrics, histogramMetric(
+			contract.MetricInferKVCacheAllocAgeMs,
+			"Live cudaMalloc allocation ages sampled at decode-phase outliers",
+			"ms", nowNano, "", snap.InferStats.KVCacheAllocAgeHist, nil))
+	}
+	if snap.InferSampler.DegradationsTotal > 0 || snap.InferSampler.Degraded {
+		samplerAttrs := []otlpKeyValue{}
+		if snap.InferSampler.LastCause != "" {
+			samplerAttrs = append(samplerAttrs, otlpKeyValue{
+				Key: contract.AttrInferSamplerCause, Value: stringVal(snap.InferSampler.LastCause),
+			})
+		}
+		metrics = append(metrics,
+			gaugeMetric(contract.MetricInferSamplerDegraded,
+				"Inference sampler degraded state (1=admitting 100% of events)", "1",
+				nowNano, boolToFloat(snap.InferSampler.Degraded), samplerAttrs),
+			sumMetric(contract.MetricInferSamplerDegradationsTotal,
+				"Cumulative inference sampler flip-to-degraded transitions", "1",
+				nowNano, int64(snap.InferSampler.DegradationsTotal), samplerAttrs),
+		)
+	}
+
 	// NVML clock-throttle reasons (v0.12.10 W2-poller). Four gauges per
 	// GPU, labelled with gpu.uuid; value 1 when the bucket is active and
 	// 0 when it is not. Polling-based, so a throttle event shorter than
 	// the poll interval may be missed; see CHANGELOG for the floor caveat.
 	for _, r := range snap.ThrottleReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+			{Key: contract.AttrGPUUUID, Value: stringVal(r.UUID)},
 		}
 		metrics = append(metrics,
 			gaugeMetric("gpu.throttle.power_active",
@@ -528,18 +657,36 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		)
 	}
 
+	resourceAttrs := []otlpKeyValue{
+		{Key: "service.name", Value: stringVal("ingero")},
+		{Key: "service.version", Value: stringVal(version.Version())},
+	}
+	// Identity attributes the cross-pod peer-MAD aggregator groups by.
+	// Empty strings are skipped so consumers don't see noise attributes.
+	if e.config.NodeID != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrNodeID, Value: stringVal(e.config.NodeID),
+		})
+	}
+	if e.config.ClusterID != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrClusterID, Value: stringVal(e.config.ClusterID),
+		})
+	}
+	if e.config.Provider != "" {
+		resourceAttrs = append(resourceAttrs, otlpKeyValue{
+			Key: contract.AttrProvider, Value: stringVal(e.config.Provider),
+		})
+	}
 	return otlpPayload{
 		ResourceMetrics: []otlpResourceMetrics{{
 			Resource: otlpResource{
-				Attributes: []otlpKeyValue{
-					{Key: "service.name", Value: stringVal("ingero")},
-					{Key: "service.version", Value: stringVal("0.8.0")},
-				},
+				Attributes: resourceAttrs,
 			},
 			ScopeMetrics: []otlpScopeMetrics{{
 				Scope: otlpScope{
 					Name:    "ingero",
-					Version: "0.8.0",
+					Version: version.Version(),
 				},
 				Metrics: metrics,
 			}},

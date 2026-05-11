@@ -1,6 +1,7 @@
 package export
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -446,7 +447,7 @@ func TestOTLP_Interval(t *testing.T) {
 
 func TestOTLPPush_NilSafe(t *testing.T) {
 	var e *OTLPExporter
-	if err := e.Push(&stats.Snapshot{}); err != nil {
+	if err := e.Push(context.Background(), &stats.Snapshot{}); err != nil {
 		t.Errorf("nil exporter Push should return nil, got %v", err)
 	}
 }
@@ -729,7 +730,7 @@ func TestOTLP_PushToServer(t *testing.T) {
 		},
 	}
 
-	err := e.Push(snap)
+	err := e.Push(context.Background(), snap)
 	if err != nil {
 		t.Fatalf("Push returned error: %v", err)
 	}
@@ -773,7 +774,7 @@ func TestOTLP_PushServerError(t *testing.T) {
 	defer srv.Close()
 
 	e := NewOTLP(OTLPConfig{Endpoint: srv.URL})
-	err := e.Push(&stats.Snapshot{AnomalyEvents: 0})
+	err := e.Push(context.Background(), &stats.Snapshot{AnomalyEvents: 0})
 	if err == nil {
 		t.Error("expected error on 500 response")
 	}
@@ -789,7 +790,7 @@ func TestOTLP_PushConnectionRefused(t *testing.T) {
 		Endpoint: "http://localhost:1", // nothing listening
 		Insecure: true,
 	})
-	err := e.Push(&stats.Snapshot{AnomalyEvents: 0})
+	err := e.Push(context.Background(), &stats.Snapshot{AnomalyEvents: 0})
 	if err == nil {
 		t.Error("expected error on connection refused")
 	}
@@ -813,7 +814,7 @@ func TestOTLP_PushWithHeaders(t *testing.T) {
 		Headers:  map[string]string{"Authorization": "Bearer test-token"},
 	})
 
-	err := e.Push(&stats.Snapshot{})
+	err := e.Push(context.Background(), &stats.Snapshot{})
 	if err != nil {
 		t.Fatalf("Push error: %v", err)
 	}

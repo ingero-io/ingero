@@ -356,6 +356,121 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 		fmt.Fprintf(&b, "gpu_throttle_hw_event_total %d\n", te.HWEvents)
 	}
 
+	// v0.16.3 inference exporter surface. Mirrors the OTLP block:
+	// per-workload histogram + mean + p95 gauges, engine-level
+	// cumulative counters, and sampler observability. Empty when
+	// --inference is not engaged.
+	if len(snap.InferWorkloads) > 0 {
+		// Determinism: sort by (cgroup, pid, stream, phase) so
+		// successive scrapes produce stable line ordering.
+		rows := make([]stats.InferWorkloadStats, len(snap.InferWorkloads))
+		copy(rows, snap.InferWorkloads)
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].CGroupHash != rows[j].CGroupHash {
+				return rows[i].CGroupHash < rows[j].CGroupHash
+			}
+			if rows[i].PID != rows[j].PID {
+				return rows[i].PID < rows[j].PID
+			}
+			if rows[i].StreamHandle != rows[j].StreamHandle {
+				return rows[i].StreamHandle < rows[j].StreamHandle
+			}
+			return rows[i].Phase < rows[j].Phase
+		})
+
+		b.WriteString("# HELP ingero_infer_step_duration_ns Per-workload inference step duration distribution (cumulative)\n")
+		b.WriteString("# TYPE ingero_infer_step_duration_ns histogram\n")
+		for _, w := range rows {
+			labels := inferWorkloadLabels(w)
+			h := w.Histogram
+			cum := uint64(0)
+			for i, b1 := range h.ExplicitBounds {
+				cum += h.BucketCounts[i]
+				fmt.Fprintf(&b, "ingero_infer_step_duration_ns_bucket{%s,le=\"%g\"} %d\n", labels, b1, cum)
+			}
+			if len(h.BucketCounts) > 0 {
+				cum += h.BucketCounts[len(h.BucketCounts)-1]
+			}
+			fmt.Fprintf(&b, "ingero_infer_step_duration_ns_bucket{%s,le=\"+Inf\"} %d\n", labels, cum)
+			fmt.Fprintf(&b, "ingero_infer_step_duration_ns_sum{%s} %g\n", labels, h.Sum)
+			fmt.Fprintf(&b, "ingero_infer_step_duration_ns_count{%s} %d\n", labels, h.Count)
+		}
+
+		b.WriteString("# HELP ingero_infer_baseline_mean_ns Per-workload inference step EMA mean\n")
+		b.WriteString("# TYPE ingero_infer_baseline_mean_ns gauge\n")
+		for _, w := range rows {
+			fmt.Fprintf(&b, "ingero_infer_baseline_mean_ns{%s} %g\n", inferWorkloadLabels(w), w.MeanNs)
+		}
+		b.WriteString("# HELP ingero_infer_baseline_p95_ns Per-workload inference step P² p95 estimate\n")
+		b.WriteString("# TYPE ingero_infer_baseline_p95_ns gauge\n")
+		for _, w := range rows {
+			fmt.Fprintf(&b, "ingero_infer_baseline_p95_ns{%s} %g\n", inferWorkloadLabels(w), w.P95Ns)
+		}
+	}
+	if len(snap.InferWorkloads) > 0 || snap.InferStats.WorkloadsTracked > 0 ||
+		len(snap.InferStats.OutliersTotal) > 0 || snap.InferSampler.DegradationsTotal > 0 {
+		b.WriteString("# HELP ingero_infer_workloads_tracked Distinct (cgroup,pid,stream,phase) workloads currently tracked\n")
+		b.WriteString("# TYPE ingero_infer_workloads_tracked gauge\n")
+		fmt.Fprintf(&b, "ingero_infer_workloads_tracked %d\n", snap.InferStats.WorkloadsTracked)
+	}
+	if len(snap.InferStats.OutliersTotal) > 0 {
+		buckets := make([]string, 0, len(snap.InferStats.OutliersTotal))
+		for k := range snap.InferStats.OutliersTotal {
+			buckets = append(buckets, k)
+		}
+		sort.Strings(buckets)
+		b.WriteString("# HELP ingero_infer_outlier_total Cumulative inference step-duration outliers per bucket\n")
+		b.WriteString("# TYPE ingero_infer_outlier_total counter\n")
+		for _, bk := range buckets {
+			fmt.Fprintf(&b, "ingero_infer_outlier_total{bucket=%q} %d\n", bk, snap.InferStats.OutliersTotal[bk])
+		}
+	}
+	if len(snap.InferStats.ThrottleAtOutlier) > 0 {
+		buckets := make([]string, 0, len(snap.InferStats.ThrottleAtOutlier))
+		for k := range snap.InferStats.ThrottleAtOutlier {
+			buckets = append(buckets, k)
+		}
+		sort.Strings(buckets)
+		b.WriteString("# HELP ingero_infer_throttle_active_total Cumulative inference outliers observed while NVML throttle reasons were active\n")
+		b.WriteString("# TYPE ingero_infer_throttle_active_total counter\n")
+		for _, bk := range buckets {
+			fmt.Fprintf(&b, "ingero_infer_throttle_active_total{bucket=%q} %d\n", bk, snap.InferStats.ThrottleAtOutlier[bk])
+		}
+	}
+	// KV-cache alloc-age histogram. Engine-wide cumulative.
+	if snap.InferStats.KVCacheAllocAgeHist.HasObservation {
+		h := snap.InferStats.KVCacheAllocAgeHist
+		b.WriteString("# HELP ingero_infer_kvcache_alloc_age_ms Live cudaMalloc allocation ages sampled at decode-phase outliers\n")
+		b.WriteString("# TYPE ingero_infer_kvcache_alloc_age_ms histogram\n")
+		cum := uint64(0)
+		for i, bound := range h.ExplicitBounds {
+			cum += h.BucketCounts[i]
+			fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_bucket{le=\"%g\"} %d\n", bound, cum)
+		}
+		if len(h.BucketCounts) > 0 {
+			cum += h.BucketCounts[len(h.BucketCounts)-1]
+		}
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_bucket{le=\"+Inf\"} %d\n", cum)
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_sum %g\n", h.Sum)
+		fmt.Fprintf(&b, "ingero_infer_kvcache_alloc_age_ms_count %d\n", h.Count)
+	}
+	if snap.InferSampler.DegradationsTotal > 0 || snap.InferSampler.Degraded {
+		causeLabel := ""
+		if snap.InferSampler.LastCause != "" {
+			causeLabel = fmt.Sprintf(`{cause=%q}`, snap.InferSampler.LastCause)
+		}
+		b.WriteString("# HELP ingero_infer_sampler_degraded Inference sampler degraded state (1=admitting 100%)\n")
+		b.WriteString("# TYPE ingero_infer_sampler_degraded gauge\n")
+		degraded := 0
+		if snap.InferSampler.Degraded {
+			degraded = 1
+		}
+		fmt.Fprintf(&b, "ingero_infer_sampler_degraded%s %d\n", causeLabel, degraded)
+		b.WriteString("# HELP ingero_infer_sampler_degradations_total Cumulative inference sampler flip-to-degraded transitions\n")
+		b.WriteString("# TYPE ingero_infer_sampler_degradations_total counter\n")
+		fmt.Fprintf(&b, "ingero_infer_sampler_degradations_total%s %d\n", causeLabel, snap.InferSampler.DegradationsTotal)
+	}
+
 	// v0.15 item K: per-cmd memfrag IOCTL event counters. cmd is
 	// the raw nvidia_unlocked_ioctl cmd field; operators decode
 	// against open-gpu-kernel-modules nv-ioctl-numbers.h /
@@ -416,4 +531,26 @@ func (p *PrometheusServer) handleMetrics(w http.ResponseWriter, r *http.Request)
 	}
 
 	fmt.Fprint(w, b.String())
+}
+
+// inferWorkloadLabels builds the Prometheus label set for one
+// per-workload inference data point. The base set is always
+// (cgroup_path_hash, pid, stream_handle, phase); kernel_fingerprint,
+// gen_ai_request_model, and gen_ai_system are appended only when the
+// workload row carries non-empty values, so a default-mode agent
+// (no fingerprint key, no inference scrape detection) keeps a tight
+// label set that doesn't churn series cardinality.
+func inferWorkloadLabels(w stats.InferWorkloadStats) string {
+	labels := fmt.Sprintf(`cgroup_path_hash=%q,pid="%d",stream_handle="%d",phase=%q`,
+		w.CGroupHash, w.PID, w.StreamHandle, w.Phase)
+	if w.KernelFingerprint != 0 {
+		labels = fmt.Sprintf(`%s,kernel_fingerprint="%016x"`, labels, w.KernelFingerprint)
+	}
+	if w.ModelName != "" {
+		labels = fmt.Sprintf(`%s,gen_ai_request_model=%q`, labels, w.ModelName)
+	}
+	if w.EngineSystem != "" {
+		labels = fmt.Sprintf(`%s,gen_ai_system=%q`, labels, w.EngineSystem)
+	}
+	return labels
 }

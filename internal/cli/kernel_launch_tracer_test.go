@@ -93,3 +93,30 @@ func TestResetKernelLaunchCounters_Clears(t *testing.T) {
 		t.Errorf("post-reset snapshot should be nil; got %+v", got)
 	}
 }
+
+// TestRecordKernelLaunchEvent_DistinctTIDsMergeIntoOnePID guards the
+// v0.15 BPF struct-field rename (was: pid carried the kernel TID;
+// now: pid is the userspace process ID). A multi-threaded CUDA
+// workload (DDP, NCCL helper threads, DataLoader workers) emits
+// launches from many TIDs under one PID; the per-process aggregate
+// must consolidate them into a single Prometheus series, not
+// fragment per-thread.
+func TestRecordKernelLaunchEvent_DistinctTIDsMergeIntoOnePID(t *testing.T) {
+	resetKernelLaunchCounters()
+	defer resetKernelLaunchCounters()
+
+	recordKernelLaunchEvent(kernellaunch.Event{PID: 1000, TID: 1001, GridX: 1, BlockX: 32})
+	recordKernelLaunchEvent(kernellaunch.Event{PID: 1000, TID: 1002, GridX: 1, BlockX: 32})
+	recordKernelLaunchEvent(kernellaunch.Event{PID: 1000, TID: 1003, GridX: 1, BlockX: 32})
+
+	got := snapshotKernelLaunchCounters()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 PID entry (kernel TIDs must consolidate under PID); got %d entries: %+v", len(got), got)
+	}
+	if got[0].PID != 1000 {
+		t.Errorf("snapshot PID = %d, want 1000 (the userspace PID)", got[0].PID)
+	}
+	if got[0].Count != 3 {
+		t.Errorf("count for PID 1000 = %d, want 3 (one per TID)", got[0].Count)
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/ingero-io/ingero/pkg/events"
+	"golang.org/x/sys/unix"
 )
 
 // lookupMapField returns a *ebpf.Map field on the given map-bundle struct by
@@ -499,6 +500,31 @@ func (t *Tracer) PyDebugStatsMap() *ebpf.Map {
 // ProbeCount returns the number of attached probes.
 func (t *Tracer) ProbeCount() int {
 	return len(t.links)
+}
+
+// WriteWatchdogHeartbeat writes the current CLOCK_BOOTTIME nanosecond
+// timestamp into the ingero_watchdog map. The cudaMalloc and cudaFree
+// uprobes consult this value at firing time and silently drop events
+// when the heartbeat is older than 50 ms (see common.bpf.h
+// watchdog_is_stale). The watchdog was originally written by the
+// out-of-process remediation orchestrator; this method lets the agent
+// itself heartbeat the gate when its own subsystems (KV-cache
+// lineage) consume cudaMalloc / cudaFree events without an
+// orchestrator attached.
+//
+// Returns an error if the map is missing or the update fails. Safe
+// to call from any goroutine.
+func (t *Tracer) WriteWatchdogHeartbeat() error {
+	if t.objs.IngeroWatchdog == nil {
+		return fmt.Errorf("watchdog map not loaded")
+	}
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return fmt.Errorf("clock_gettime CLOCK_BOOTTIME: %w", err)
+	}
+	now := uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
+	var key uint32 = 0
+	return t.objs.IngeroWatchdog.Update(&key, &now, ebpf.UpdateAny)
 }
 
 // Dropped returns the number of events dropped due to a full channel.

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -32,6 +33,13 @@ const DefaultTimeout = 5 * time.Second
 // DefaultLimit is the max rows returned per node.
 const DefaultLimit = 1000
 
+// maxFleetResponseBytes bounds the response body the fan-out client will
+// read from a single node. 32 MiB is far above any legitimate fleet
+// response (a 1000-row query at DefaultLimit is typically <1 MiB) but
+// well below the heap pressure a malicious or compromised node could
+// inflict by streaming a multi-gigabyte body.
+const maxFleetResponseBytes = 32 << 20
+
 // Config configures the fleet client.
 type Config struct {
 	Nodes      []string      // host:port addresses
@@ -40,6 +48,12 @@ type Config struct {
 	CACert     string        // path to CA cert for mTLS (empty = plain HTTP)
 	ClientCert string        // path to client cert for mTLS
 	ClientKey  string        // path to client key for mTLS
+
+	// RequireTLS refuses construction when no TLS material is configured
+	// AND any node is non-loopback. Set true on every production code path
+	// (operator CLI, MCP fan-out). Loopback http:// stays allowed because
+	// the operator-controls-host model removes the network observer.
+	RequireTLS bool
 }
 
 // Client is an HTTP fan-out client for fleet queries.
@@ -67,7 +81,7 @@ func New(cfg Config) (*Client, error) {
 
 	if cfg.CACert != "" || cfg.ClientCert != "" {
 		scheme = "https"
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 
 		if cfg.CACert != "" {
 			caPEM, err := os.ReadFile(cfg.CACert)
@@ -92,6 +106,14 @@ func New(cfg Config) (*Client, error) {
 		transport = &http.Transport{TLSClientConfig: tlsCfg}
 	}
 
+	if cfg.RequireTLS && scheme == "http" {
+		for _, node := range cfg.Nodes {
+			if !isLoopbackNode(node) {
+				return nil, fmt.Errorf("fleet: RequireTLS is set but node %q is non-loopback and no TLS material (--ca-cert / --client-cert) was provided; SQL queries and rows would travel plaintext on the wire", node)
+			}
+		}
+	}
+
 	return &Client{
 		nodes:   cfg.Nodes,
 		timeout: timeout,
@@ -99,6 +121,28 @@ func New(cfg Config) (*Client, error) {
 		http:    &http.Client{Transport: transport},
 		scheme:  scheme,
 	}, nil
+}
+
+// isLoopbackNode returns true if node (a "host:port" or bare-host string)
+// resolves to a loopback interface. Mirrors cli.IsLoopback; duplicated here
+// because the fleet package sits below internal/cli in the dependency graph.
+func isLoopbackNode(node string) bool {
+	host := node
+	// Strip "scheme://" if present (rare; node specs are usually host:port).
+	if idx := strings.Index(node, "://"); idx >= 0 {
+		host = node[idx+3:]
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // QueryResult holds the merged result of a fan-out SQL query.
@@ -241,9 +285,13 @@ func (c *Client) QueryEndpoint(ctx context.Context, path string) (*GenericResult
 				return
 			}
 
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxFleetResponseBytes))
 			if err != nil {
 				results[idx] = nodeGenericResult{node: addr, err: fmt.Errorf("reading body: %w", err)}
+				return
+			}
+			if int64(len(body)) >= maxFleetResponseBytes {
+				results[idx] = nodeGenericResult{node: addr, err: fmt.Errorf("response body exceeds %d bytes; suspected hostile or misconfigured node", maxFleetResponseBytes)}
 				return
 			}
 			results[idx] = nodeGenericResult{node: addr, data: json.RawMessage(body)}
@@ -292,7 +340,7 @@ func (c *Client) queryNode(ctx context.Context, addr, sql string) nodeResult {
 	}
 
 	var qr queryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxFleetResponseBytes)).Decode(&qr); err != nil {
 		return nodeResult{node: addr, err: fmt.Errorf("decoding response: %w", err)}
 	}
 
@@ -325,7 +373,7 @@ func (c *Client) queryNodeChains(ctx context.Context, addr, since string) nodeCh
 	}
 
 	var cr chainAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxFleetResponseBytes)).Decode(&cr); err != nil {
 		return nodeChainResult{node: addr, err: fmt.Errorf("decoding response: %w", err)}
 	}
 

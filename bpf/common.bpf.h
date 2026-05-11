@@ -27,9 +27,10 @@ struct user_pt_regs {
 
 /* Shared event types for all eBPF programs */
 
-/* Event source identifiers */
+/* Event source identifiers. Code 2 is reserved (was EVENT_SRC_NVIDIA for an
+ * unimplemented nvidia.ko driver tracer); the userspace Source enum keeps
+ * 2 as a hole so any old wire records map to unknown(2). */
 #define EVENT_SRC_CUDA    1
-#define EVENT_SRC_NVIDIA  2
 #define EVENT_SRC_HOST    3
 #define EVENT_SRC_DRIVER  4
 #define EVENT_SRC_IO      5
@@ -179,15 +180,6 @@ struct cuda_event {
 	__u32 gpu_id;
 };
 
-/* nvidia.ko driver event */
-struct nvidia_event {
-	struct ingero_event_hdr hdr;
-	__u64 duration_ns;
-	__u64 dma_size;
-	__u32 gpu_id;
-	__u32 context_id;
-};
-
 /* Host kernel event (64 bytes, was 48 in v0.9, 40 in v0.6) */
 struct host_event {
 	struct ingero_event_hdr hdr;
@@ -281,13 +273,16 @@ struct graph_entry_state {
 /* CUDA Graph lifecycle event (88 bytes).
  *
  * Layout:
- *   offset  0: hdr              (48 bytes — ingero_event_hdr)
+ *   offset  0: hdr              (48 bytes -- ingero_event_hdr)
  *   offset 48: duration_ns      (8)
- *   offset 56: stream_handle    (8) — stream for BeginCapture/EndCapture/Launch
- *   offset 64: graph_handle     (8) — graph for EndCapture/Instantiate
- *   offset 72: exec_handle      (8) — executable for Instantiate/Launch
- *   offset 80: capture_mode     (4) — for BeginCapture (0=global, 1=thread_local, 2=relaxed)
- *   offset 84: return_code      (4) — cudaError_t
+ *   offset 56: stream_handle    (8) -- stream for BeginCapture/EndCapture/Launch
+ *   offset 64: graph_handle     (8) -- graph for EndCapture (read from *pGraph
+ *                                      at uretprobe), Instantiate (input arg)
+ *   offset 72: exec_handle      (8) -- executable for Instantiate (read from
+ *                                      *pGraphExec at uretprobe), Launch
+ *                                      (input arg)
+ *   offset 80: capture_mode     (4) -- for BeginCapture (0=global, 1=thread_local, 2=relaxed)
+ *   offset 84: return_code      (4) -- cudaError_t
  */
 struct cuda_graph_event {
 	struct ingero_event_hdr hdr;
@@ -458,13 +453,14 @@ struct cuda_event_stack_py {
  * v0.8 noisy-neighbor detection (per-cgroup scheduler latency).
  */
 
-// Watchdog heartbeat map -- external remediation service writes timestamp
-// Probes check staleness to bypass remediation if the service is dead
+// Watchdog heartbeat map: external remediation service writes a CLOCK_BOOTTIME
+// nanosecond timestamp. Probes check staleness to bypass remediation if the
+// service is dead.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, __u64);  // nanosecond timestamp from bpf_ktime_get_ns()
+	__type(value, __u64);  // CLOCK_BOOTTIME ns; matches bpf_ktime_get_boot_ns()
 } ingero_watchdog SEC(".maps");
 
 // ---- Watchdog: remediation service liveness check ----
@@ -474,9 +470,16 @@ struct {
 #define WATCHDOG_STALE_NS 50000000ULL
 
 /*
- * watchdog_is_stale -- returns 1 if orchestrator heartbeat is missing or expired.
- * Reads ingero_watchdog[0] (defined above).
- * Both this and the remediation service use CLOCK_BOOTTIME (bpf_ktime_get_ns).
+ * watchdog_is_stale: returns 1 if the orchestrator heartbeat is missing or
+ * expired. Reads ingero_watchdog[0] (defined above).
+ *
+ * Uses bpf_ktime_get_boot_ns (CLOCK_BOOTTIME) so the probe-side clock matches
+ * the producer-side clock_gettime(CLOCK_BOOTTIME) in
+ * orchestrator/src/watchdog.rs and ingero/internal/ebpf/cuda/cuda.go. The
+ * older bpf_ktime_get_ns helper returns CLOCK_MONOTONIC, which excludes
+ * suspend time and would underflow `delta` after any host suspend, marking
+ * the gate stale forever. bpf_ktime_get_boot_ns is available since Linux
+ * 5.7 (BPF helper id 125), already a hard dep elsewhere in the agent.
  */
 static __always_inline int watchdog_is_stale(void)
 {
@@ -485,7 +488,7 @@ static __always_inline int watchdog_is_stale(void)
 	if (!last_hb || *last_hb == 0)
 		return 1;  /* no heartbeat ever written -> bypass */
 
-	__u64 now = bpf_ktime_get_ns();
+	__u64 now = bpf_ktime_get_boot_ns();
 	__u64 delta = now - *last_hb;
 	return delta > WATCHDOG_STALE_NS;
 }
