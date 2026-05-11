@@ -25,11 +25,15 @@ const kprobeTarget = "nvidia_unlocked_ioctl"
 const EventSize = 32
 
 // Event is the userspace mirror of struct memfrag_ioctl_event.
+//
+// PID is the userspace process ID (kernel tgid); TID is the kernel
+// thread ID. Field order matches the BPF struct after the v0.15
+// label swap; the wire bytes did not change.
 type Event struct {
 	TimestampNs uint64
 	CgroupID    uint64
-	PID         uint32
-	TGID        uint32
+	TID         uint32 // kernel TID
+	PID         uint32 // userspace PID
 	Cmd         uint32 // raw IOCTL cmd from nvidia_unlocked_ioctl
 	Pad0        uint32
 }

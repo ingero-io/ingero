@@ -27,7 +27,7 @@ func TestNewReturnsTracer(t *testing.T) {
 
 func TestHandleRawSample_Forwards(t *testing.T) {
 	tr := New()
-	in := Event{TimestampNs: 1000, CgroupID: 42, PID: 100, TGID: 100, Cmd: 0xC0184601}
+	in := Event{TimestampNs: 1000, CgroupID: 42, TID: 101, PID: 100, Cmd: 0xC0184601}
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.LittleEndian, &in)
 	tr.handleRawSample(buf.Bytes())

@@ -334,7 +334,11 @@ const (
 	AttrWorkloadType  = "ingero.workload_type"
 	AttrWorldSize     = "ingero.world_size"
 	AttrNodeRank      = "ingero.node.rank"
-	AttrDetectionMode = "mode"
+	// AttrDetectionMode previously emitted as the bare key "mode"; the
+	// "ingero." namespacing aligns with every other Attr* constant in this
+	// package and keeps Grafana / PromQL filters consistent
+	// (`{ingero_detection_mode=...}` instead of `{mode=...}`).
+	AttrDetectionMode = "ingero.detection_mode"
 )
 
 // NCCL collective metric names. Emitted by the agent's ncclprobe and

@@ -17,8 +17,8 @@ type memfragKprobeMemfragIoctlEvent struct {
 	_           structs.HostLayout
 	TimestampNs uint64
 	CgroupId    uint64
+	Tid         uint32
 	Pid         uint32
-	Tgid        uint32
 	Cmd         uint32
 	Pad0        uint32
 }

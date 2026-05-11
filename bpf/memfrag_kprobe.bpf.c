@@ -33,11 +33,18 @@ char LICENSE[] SEC("license") = "GPL";
 // Event shape: fixed-width fields so the Go side reads via
 // binary.LittleEndian without a CO-RE bridge. Mirrored at
 // internal/ebpf/memfrag/memfrag.go:Event.
+//
+// Naming convention matches the rest of the BPF tree
+// (ingero_event_hdr in common.bpf.h): pid is the userspace PID
+// (kernel tgid); tid is the kernel TID. The wire bytes are unchanged
+// from the v0.15 layout; only the field labels were swapped to
+// stop propagating kernel-TID values under the name `pid` to
+// userspace metric labels.
 struct memfrag_ioctl_event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
-	__u32 pid;
-	__u32 tgid;
+	__u32 tid;       // kernel TID (low 32 bits of pid_tgid)
+	__u32 pid;       // userspace PID (high 32 bits of pid_tgid)
 	__u32 cmd;       // raw IOCTL cmd from nvidia_unlocked_ioctl
 	__u32 _pad0;
 };
@@ -66,8 +73,8 @@ int BPF_KPROBE(nvidia_unlocked_ioctl_enter, struct file *filp, unsigned int cmd,
 	pid_tgid = bpf_get_current_pid_tgid();
 	ev->timestamp_ns = bpf_ktime_get_ns();
 	ev->cgroup_id    = bpf_get_current_cgroup_id();
-	ev->pid          = (__u32)pid_tgid;
-	ev->tgid         = (__u32)(pid_tgid >> 32);
+	ev->tid          = (__u32)pid_tgid;
+	ev->pid          = (__u32)(pid_tgid >> 32);
 	ev->cmd          = cmd;
 	ev->_pad0        = 0;
 

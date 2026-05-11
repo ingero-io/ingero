@@ -166,8 +166,16 @@ int uprobe_graph_end_capture(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	__u64 stream = (__u64)PT_REGS_PARM1(ctx);
+	__u64 p_graph = (__u64)PT_REGS_PARM2(ctx);
 
-	graph_save_entry(tid, GRAPH_OP_END_CAPTURE, stream, 0, 0, 0);
+	/* Stash the user-pointer in the graph_handle slot of the entry state.
+	 * The uretprobe dereferences it after retval==0 to recover the actual
+	 * cudaGraph_t handle the runtime stored at *pGraph; otherwise the
+	 * EndCapture event's graph_handle would always be 0 and the
+	 * Begin -> End -> Instantiate -> Launch correlation chain would break
+	 * at the End hop.
+	 */
+	graph_save_entry(tid, GRAPH_OP_END_CAPTURE, stream, p_graph, 0, 0);
 	return 0;
 }
 
@@ -183,7 +191,17 @@ int uretprobe_graph_end_capture(struct pt_regs *ctx)
 		return 0;
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
-	graph_emit_event(pid, tid, entry, ret, 0, 0);
+	__u64 out_graph = 0;
+	if (ret == 0 && entry->graph_handle != 0) {
+		bpf_probe_read_user(&out_graph, sizeof(out_graph),
+				    (void *)entry->graph_handle);
+	}
+	/* Pass the dereferenced handle as the override; graph_emit_event's
+	 * `handle ? handle : entry->handle` pattern at the helper falls back
+	 * to the saved pointer value when read fails so consumers can still
+	 * see the call happened.
+	 */
+	graph_emit_event(pid, tid, entry, ret, out_graph, 0);
 
 	bpf_map_delete_elem(&graph_entry_map, &tid);
 	return 0;
@@ -197,9 +215,17 @@ SEC("uprobe/cudaGraphInstantiate")
 int uprobe_graph_instantiate(struct pt_regs *ctx)
 {
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	__u64 p_exec = (__u64)PT_REGS_PARM1(ctx);
 	__u64 graph = (__u64)PT_REGS_PARM2(ctx);
 
-	graph_save_entry(tid, GRAPH_OP_INSTANTIATE, 0, graph, 0, 0);
+	/* Stash the user-pointer in the exec_handle slot. Same pattern as
+	 * EndCapture above: the uretprobe dereferences it on success so the
+	 * Instantiate event carries the actual cudaGraphExec_t handle.
+	 * Without this, every Instantiate event has exec_handle==0 and a
+	 * later Launch (which carries the exec correctly via PARM1) cannot
+	 * be matched back to the Instantiate that produced it.
+	 */
+	graph_save_entry(tid, GRAPH_OP_INSTANTIATE, 0, graph, p_exec, 0);
 	return 0;
 }
 
@@ -215,7 +241,12 @@ int uretprobe_graph_instantiate(struct pt_regs *ctx)
 		return 0;
 
 	__s32 ret = (__s32)PT_REGS_RC(ctx);
-	graph_emit_event(pid, tid, entry, ret, 0, 0);
+	__u64 out_exec = 0;
+	if (ret == 0 && entry->exec_handle != 0) {
+		bpf_probe_read_user(&out_exec, sizeof(out_exec),
+				    (void *)entry->exec_handle);
+	}
+	graph_emit_event(pid, tid, entry, ret, 0, out_exec);
 
 	bpf_map_delete_elem(&graph_entry_map, &tid);
 	return 0;

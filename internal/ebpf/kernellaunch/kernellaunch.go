@@ -18,12 +18,16 @@ import (
 const EventSize = 56
 
 // Event is the userspace mirror of struct kernel_launch_event.
+//
+// PID is the userspace process ID (kernel tgid); TID is the kernel
+// thread ID. Field order matches the BPF struct after the v0.15
+// label swap; the wire bytes did not change.
 type Event struct {
 	TimestampNs uint64
 	CgroupID    uint64
 	FuncHandle  uint64
-	PID         uint32
-	TGID        uint32
+	TID         uint32 // kernel TID
+	PID         uint32 // userspace PID
 	GridX       uint32
 	GridY       uint32
 	GridZ       uint32

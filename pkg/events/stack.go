@@ -6,7 +6,10 @@ import (
 )
 
 // ParseStackIPs extracts stack frames from the stack section of a cuda_event_stack.
-// The stack section starts at baseOffset (byte 64 for CUDA/driver events):
+// baseOffset is the byte offset of the stack section within the surrounding
+// event struct; callers should pass unsafe.Sizeof of their bpf2go-generated
+// CUDA/driver event type so the offset tracks future struct growth without
+// requiring a doc-comment edit here. Layout from baseOffset:
 //
 //	offset baseOffset+0: stack_depth (uint16 LE) — number of valid IPs
 //	offset baseOffset+2: _stack_pad[3] (6 bytes)

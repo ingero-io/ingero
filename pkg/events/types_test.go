@@ -11,7 +11,7 @@ func TestSourceString(t *testing.T) {
 		want   string
 	}{
 		{SourceCUDA, "cuda"},
-		{SourceNvidia, "nvidia"},
+		{Source(2), "unknown(2)"}, // formerly SourceNvidia, now an unused source code
 		{SourceHost, "host"},
 		{SourceDriver, "driver"},
 		{SourceIO, "io"},
@@ -173,7 +173,7 @@ func TestEventOpName(t *testing.T) {
 		{"graph instantiate", SourceCUDAGraph, uint8(GraphInstantiate), "graphInstantiate"},
 		{"graph launch", SourceCUDAGraph, uint8(GraphLaunch), "graphLaunch"},
 		{"graph unknown", SourceCUDAGraph, 99, "graph_op(99)"},
-		{"nvidia unknown", SourceNvidia, 1, "op(1)"},
+		{"unknown source", Source(2), 1, "op(1)"}, // formerly the nvidia.ko stub
 	}
 
 	for _, tt := range tests {

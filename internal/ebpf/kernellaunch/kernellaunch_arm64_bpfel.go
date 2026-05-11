@@ -18,8 +18,8 @@ type kernelLaunchKernelLaunchEvent struct {
 	TimestampNs uint64
 	CgroupId    uint64
 	FuncHandle  uint64
+	Tid         uint32
 	Pid         uint32
-	Tgid        uint32
 	GridX       uint32
 	GridY       uint32
 	GridZ       uint32

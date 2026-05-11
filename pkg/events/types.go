@@ -63,12 +63,14 @@ func KtimeToWallClock(ktimeNs uint64) time.Time {
 type Source uint8
 
 const (
-	SourceCUDA   Source = 1
-	SourceNvidia Source = 2
-	SourceHost   Source = 3
-	SourceDriver Source = 4
-	SourceIO     Source = 5
-	SourceTCP    Source = 6
+	SourceCUDA Source = 1
+	// 2 was SourceNvidia, reserved for an unimplemented nvidia.ko driver
+	// tracer. Kept as a hole so existing on-the-wire records that may
+	// still carry source==2 are routed to the unknown(2) string.
+	SourceHost      Source = 3
+	SourceDriver    Source = 4
+	SourceIO        Source = 5
+	SourceTCP       Source = 6
 	SourceNet       Source = 7
 	SourceCUDAGraph Source = 8
 )
@@ -78,8 +80,6 @@ func (s Source) String() string {
 	switch s {
 	case SourceCUDA:
 		return "cuda"
-	case SourceNvidia:
-		return "nvidia"
 	case SourceHost:
 		return "host"
 	case SourceDriver:
