@@ -100,7 +100,7 @@ func TestPushSpans_RoundtripDecodeMatchesInput(t *testing.T) {
 		ModelName:    "meta-llama/Llama-3-7b",
 		EngineSystem: "vllm",
 	}
-	if err := exp.PushSpans([]stats.OutlierSpan{in}); err != nil {
+	if err := exp.PushSpans(context.Background(), []stats.OutlierSpan{in}); err != nil {
 		t.Fatalf("PushSpans: %v", err)
 	}
 
@@ -203,10 +203,11 @@ func TestPushSpans_EmptyInputIsNoop(t *testing.T) {
 	defer srv.Close()
 
 	exp := NewOTLP(OTLPConfig{Endpoint: srv.URL, Insecure: true})
-	if err := exp.PushSpans(nil); err != nil {
+	ctx := context.Background()
+	if err := exp.PushSpans(ctx, nil); err != nil {
 		t.Errorf("nil input: %v", err)
 	}
-	if err := exp.PushSpans([]stats.OutlierSpan{}); err != nil {
+	if err := exp.PushSpans(ctx, []stats.OutlierSpan{}); err != nil {
 		t.Errorf("empty input: %v", err)
 	}
 	if called != 0 {
@@ -215,8 +216,11 @@ func TestPushSpans_EmptyInputIsNoop(t *testing.T) {
 }
 
 func TestNewTraceAndSpanIDs_DistinctEachCall(t *testing.T) {
-	t1, s1 := newTraceAndSpanIDs()
-	t2, s2 := newTraceAndSpanIDs()
+	// Random path: distinct PID/Stream/timestamp on each call ensures the
+	// crypto/rand outputs differ; even on rand failure the FNV-128a
+	// fallback would still differ because the timestamp moves forward.
+	t1, s1 := newTraceAndSpanIDs(1, 100, time.Now().UnixNano())
+	t2, s2 := newTraceAndSpanIDs(1, 100, time.Now().UnixNano()+1)
 	if t1 == t2 {
 		t.Error("two consecutive trace ids collided")
 	}

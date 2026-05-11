@@ -1467,7 +1467,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				// workload-key attribute set, not on parent_span_id.
 				if otlpExporter != nil && len(outliers) > 0 {
 					spans := buildOutlierSpans(outliers, inferScraper)
-					if err := otlpExporter.PushSpans(spans); err != nil {
+					if err := otlpExporter.PushSpans(ctx, spans); err != nil {
 						debugf("OTLP traces: push error: %v", err)
 					}
 				}
@@ -1478,7 +1478,7 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			if otlpExporter != nil {
 				otlpPushCount++
 				if otlpPushCount%otlpExporter.Interval() == 0 {
-					if err := otlpExporter.Push(snap); err != nil {
+					if err := otlpExporter.Push(ctx, snap); err != nil {
 						debugf("OTLP: push error: %v", err)
 					}
 				}

@@ -314,6 +314,45 @@ const (
 	// surface so the LRU footprint stays at v0.16.4 levels for the
 	// common single-model deployment.
 	AttrInferKernelFingerprint = "ingero.infer.kernel_fingerprint"
+
+	// AttrInferStepDurationNs / AttrInferBaselineP95Ns /
+	// AttrInferBaselineMeanNs label per-outlier span attributes that
+	// expose the step's measured duration and the workload's running
+	// baselines. Names mirror the per-workload OTLP metric names so
+	// dashboards can join span attrs against metric values without
+	// renaming.
+	AttrInferStepDurationNs = "ingero.infer.step_duration_ns"
+	AttrInferBaselineP95Ns  = "ingero.infer.baseline_p95_ns"
+	AttrInferBaselineMeanNs = "ingero.infer.baseline_mean_ns"
+
+	// AttrInferMemfragEventsInStep counts memfrag IOCTL events that
+	// occurred during the outlier step. AttrInferThrottleReasons is
+	// the uint64 NVML throttle bitmap encoded as a decimal string.
+	// AttrInferKVCacheOldestAllocAgeMs surfaces the oldest live
+	// cudaMalloc allocation age at the outlier (dominant signal for
+	// stale-KV-cache; the full distribution lives on the histogram
+	// metric).
+	AttrInferMemfragEventsInStep     = "ingero.infer.memfrag_events_in_step"
+	AttrInferThrottleReasons         = "ingero.infer.throttle_reasons"
+	AttrInferKVCacheOldestAllocAgeMs = "ingero.infer.kvcache.oldest_alloc_age_ms"
+)
+
+// Bare data-point attribute keys. These pre-date the contract package and
+// are kept on the wire as plain identifiers ("pid", "comm", "gpu.uuid",
+// etc.) for backwards compatibility with existing dashboards. New attrs
+// SHOULD use the namespaced ingero.* / nccl.* / gen_ai.* / gpu.* form;
+// these constants exist so the OTLP exporter can reference the contract
+// package as the single source of truth for every wire key without
+// changing the wire bytes.
+const (
+	AttrPID             = "pid"
+	AttrComm            = "comm"
+	AttrLibNCCLPath     = "libnccl_path"
+	AttrLibNCCLVersion  = "libnccl_version"
+	AttrGPUUUID         = "gpu.uuid"
+	AttrSource          = "source"
+	AttrOperation       = "operation"
+	AttrPercentile      = "percentile"
 )
 
 // cudaMemcpyKind direction values, mapped from the BPF arg1 byte:

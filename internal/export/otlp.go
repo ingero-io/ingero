@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/stats"
+	"github.com/ingero-io/ingero/internal/version"
 	"github.com/ingero-io/ingero/pkg/contract"
 )
 
@@ -106,7 +107,11 @@ func (e *OTLPExporter) Start(ctx context.Context) error {
 
 // Push sends a stats snapshot as OTLP metrics via HTTP JSON.
 // Called every ExportInterval seconds from the watch loop.
-func (e *OTLPExporter) Push(snap *stats.Snapshot) error {
+//
+// ctx is honored for the request and the body read so a shutdown signal
+// mid-push aborts the HTTP round trip instead of waiting for the
+// client's own 10s timeout.
+func (e *OTLPExporter) Push(ctx context.Context, snap *stats.Snapshot) error {
 	if e == nil {
 		return nil
 	}
@@ -126,7 +131,7 @@ func (e *OTLPExporter) Push(snap *stats.Snapshot) error {
 	e.debugf("OTLP: pushing %d bytes to %s (%d metrics)",
 		len(body), url, countMetrics(payload))
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		e.mu.Lock()
 		e.errors++
@@ -350,8 +355,8 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 		source := op.Source.String()
 
 		labels := []otlpKeyValue{
-			{Key: "source", Value: stringVal(source)},
-			{Key: "operation", Value: stringVal(op.Op)},
+			{Key: contract.AttrSource, Value: stringVal(source)},
+			{Key: contract.AttrOperation, Value: stringVal(op.Op)},
 		}
 
 		// Duration percentiles (gauge, microseconds).
@@ -364,7 +369,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			{"p99", op.P99},
 		} {
 			pctLabels := append(append([]otlpKeyValue{}, labels...), otlpKeyValue{
-				Key: "percentile", Value: stringVal(pct.name),
+				Key: contract.AttrPercentile, Value: stringVal(pct.name),
 			})
 			metrics = append(metrics, gaugeMetric(
 				"gpu.cuda.operation.duration",
@@ -411,19 +416,19 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	for _, p := range snap.NCCLDataPoints {
 		ts := fmt.Sprintf("%d", p.TimestampUnixNano)
 		attrs := []otlpKeyValue{
-			{Key: "nccl.op_type", Value: stringVal(p.OpType)},
-			{Key: "nccl.comm_id_hash", Value: stringVal(p.CommIDHash)},
-			{Key: "nccl.rank", Value: otlpValue{IntValue: int64Ptr(int64(p.Rank))}},
-			{Key: "nccl.nranks", Value: otlpValue{IntValue: int64Ptr(int64(p.NRanks))}},
-			{Key: "nccl.datatype", Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
-			{Key: "nccl.reduce_op", Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
+			{Key: contract.AttrNCCLOpType, Value: stringVal(p.OpType)},
+			{Key: contract.AttrNCCLCommIDHash, Value: stringVal(p.CommIDHash)},
+			{Key: contract.AttrNCCLRank, Value: otlpValue{IntValue: int64Ptr(int64(p.Rank))}},
+			{Key: contract.AttrNCCLNRanks, Value: otlpValue{IntValue: int64Ptr(int64(p.NRanks))}},
+			{Key: contract.AttrNCCLDatatype, Value: otlpValue{IntValue: int64Ptr(int64(p.Datatype))}},
+			{Key: contract.AttrNCCLReduceOp, Value: otlpValue{IntValue: int64Ptr(int64(p.ReduceOp))}},
 		}
 		// v0.12.2: peer_rank attribute only on ncclSend/ncclRecv
 		// (collectives leave PeerRank=0). Topology-mapping for
 		// pipeline-parallel workloads.
 		if p.PeerRank != 0 {
 			attrs = append(attrs, otlpKeyValue{
-				Key:   "nccl.peer_rank",
+				Key:   contract.AttrNCCLPeerRank,
 				Value: otlpValue{IntValue: int64Ptr(int64(p.PeerRank))},
 			})
 		}
@@ -451,10 +456,10 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	if snap.NCCLProcessReadings != nil {
 		for _, r := range snap.NCCLProcessReadings {
 			attrs := []otlpKeyValue{
-				{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
-				{Key: "comm", Value: stringVal(r.Comm)},
-				{Key: "libnccl_path", Value: stringVal(r.LibPath)},
-				{Key: "libnccl_version", Value: stringVal(r.LibVersion)},
+				{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(r.PID))}},
+				{Key: contract.AttrComm, Value: stringVal(r.Comm)},
+				{Key: contract.AttrLibNCCLPath, Value: stringVal(r.LibPath)},
+				{Key: contract.AttrLibNCCLVersion, Value: stringVal(r.LibVersion)},
 			}
 			metrics = append(metrics,
 				gaugeMetricInt(contract.MetricGPUNCCLProcessLoaded,
@@ -474,7 +479,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// GPU labelled with gpu.uuid.
 	for _, r := range snap.MemFragReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+			{Key: contract.AttrGPUUUID, Value: stringVal(r.UUID)},
 		}
 		metrics = append(metrics,
 			gaugeMetricInt("gpu.memory.used", "GPU memory currently allocated (NVML poll)", "By",
@@ -490,8 +495,8 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	}
 	for _, p := range snap.MemFragProcessReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(p.UUID)},
-			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
+			{Key: contract.AttrGPUUUID, Value: stringVal(p.UUID)},
+			{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(p.PID))}},
 		}
 		metrics = append(metrics,
 			gaugeMetricInt(contract.MetricGPUMemoryProcessAllocated,
@@ -506,7 +511,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// are h2h / h2d / d2h / d2d / default / unknown.
 	for _, m := range snap.MemcpyDirReadings {
 		attrs := []otlpKeyValue{
-			{Key: "direction", Value: stringVal(m.Direction)},
+			{Key: contract.AttrMemcpyDirection, Value: stringVal(m.Direction)},
 		}
 		metrics = append(metrics,
 			sumMetric(contract.MetricGPUMemcpyBytesTotal,
@@ -535,7 +540,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	for _, w := range snap.InferWorkloads {
 		attrs := []otlpKeyValue{
 			{Key: contract.AttrCgroupPathHash, Value: stringVal(w.CGroupHash)},
-			{Key: "pid", Value: otlpValue{IntValue: int64Ptr(int64(w.PID))}},
+			{Key: contract.AttrPID, Value: otlpValue{IntValue: int64Ptr(int64(w.PID))}},
 			{Key: contract.AttrInferStreamHandle, Value: stringVal(strconv.FormatUint(w.StreamHandle, 10))},
 			{Key: contract.AttrInferPhase, Value: stringVal(w.Phase)},
 		}
@@ -634,7 +639,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 	// the poll interval may be missed; see CHANGELOG for the floor caveat.
 	for _, r := range snap.ThrottleReadings {
 		attrs := []otlpKeyValue{
-			{Key: "gpu.uuid", Value: stringVal(r.UUID)},
+			{Key: contract.AttrGPUUUID, Value: stringVal(r.UUID)},
 		}
 		metrics = append(metrics,
 			gaugeMetric("gpu.throttle.power_active",
@@ -654,7 +659,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 
 	resourceAttrs := []otlpKeyValue{
 		{Key: "service.name", Value: stringVal("ingero")},
-		{Key: "service.version", Value: stringVal("0.8.0")},
+		{Key: "service.version", Value: stringVal(version.Version())},
 	}
 	// Identity attributes the cross-pod peer-MAD aggregator groups by.
 	// Empty strings are skipped so consumers don't see noise attributes.
@@ -681,7 +686,7 @@ func (e *OTLPExporter) buildMetricsPayload(snap *stats.Snapshot) otlpPayload {
 			ScopeMetrics: []otlpScopeMetrics{{
 				Scope: otlpScope{
 					Name:    "ingero",
-					Version: "0.8.0",
+					Version: version.Version(),
 				},
 				Metrics: metrics,
 			}},

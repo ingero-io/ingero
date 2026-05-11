@@ -2,10 +2,8 @@ package infer
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -1102,13 +1100,10 @@ func isSyncEvent(evt events.Event) bool {
 func newEventID(pid uint32, streamHandle uint64, tsNanos int64) string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		h := fnv.New128a()
-		var buf [20]byte
-		binary.BigEndian.PutUint32(buf[0:4], pid)
-		binary.BigEndian.PutUint64(buf[4:12], streamHandle)
-		binary.BigEndian.PutUint64(buf[12:20], uint64(tsNanos))
-		h.Write(buf[:])
-		h.Sum(b[:0])
+		// Salt 0x01 keeps the EventID digest distinct from the OTel
+		// TraceID / SpanID digests in internal/export, which use the
+		// same primitive with different salts on the same workload key.
+		b = events.DeterministicID(pid, streamHandle, tsNanos, 0x01)
 	}
 	// Set version (4) and variant (10xx) bits per RFC 4122.
 	b[6] = (b[6] & 0x0f) | 0x40
