@@ -122,7 +122,7 @@ int handle_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx)
 	evt->hdr._pad = 0;
 	evt->hdr._pad2 = 0;
 	evt->hdr.cgroup_id = val->cgroup_id; // captured at issue time (complete runs in IRQ context)
-	__builtin_memcpy(&evt->hdr.comm, val->comm, sizeof(evt->hdr.comm)); // ditto
+	bpf_probe_read_kernel(&evt->hdr.comm, sizeof(evt->hdr.comm), val->comm); // ditto
 	evt->duration_ns = duration_ns;
 	evt->dev = ctx->dev;
 	evt->nr_sector = val->nr_sector;
