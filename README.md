@@ -172,7 +172,7 @@ Every scenario prints a GPU auto-detect header showing GPU model and driver vers
 
 Download a pre-built binary from [GitHub Releases](https://github.com/ingero-io/ingero/releases/latest).
 
-Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`. Replace `VERSION` below with the latest release (e.g., `0.10.0`):
+Archive filenames include the version: `ingero_<version>_linux_<arch>.tar.gz`.
 
 ```bash
 # Linux amd64
@@ -326,14 +326,14 @@ Validated on 6 GPU models (GH200, A100 SXM4, A10, H100 PCIe/SXM5, RTX 4090, RTX 
 
 | GPU Problem | Severity | How Ingero detects it |
 |-|-|-|
-| NCCL hangs & distributed-training deadlocks | CRITICAL | Direct `ncclAllReduce` / `ncclSend` / `ncclRecv` uprobes (v0.12.0+) measure per-collective wall time with rank / `comm_id_hash` / `nranks` correlation; `sched_switch` + TCP retransmit as cross-checks. |
+| NCCL hangs & distributed-training deadlocks | CRITICAL | Direct `ncclAllReduce` / `ncclSend` / `ncclRecv` uprobes measure per-collective wall time with rank / `comm_id_hash` / `nranks` correlation; `sched_switch` + TCP retransmit as cross-checks. |
 | GPU underutilization / data pipeline starvation | CRITICAL | Host scheduler + `cudaStreamSync` + `cudaMemcpy` pipeline-bubble diagnosis; block-I/O shows DataLoader disk bottleneck. |
 | CUDA OOM & memory fragmentation | CRITICAL | `cudaMalloc` / `cuMemAlloc` allocation patterns; managed-memory over-subscription via `cudaMallocManaged`. |
 | KV-cache pressure & preemption cascades | CRITICAL | `cudaMalloc` patterns + `cudaStreamSync` spikes during preemption; managed-memory page-fault detection. |
 | CPU bottleneck in GPU serving | HIGH | `sched_switch` on inference process + `cudaStreamSync` idle gaps. |
 | Multi-process GPU contention (RAG, multi-tenant) | HIGH | Per-process CUDA API breakdown (`explain --per-process`); per-cgroup `sched_switch`. |
 | GPU memory leaks in long-running services | HIGH | `cudaMalloc` / `cudaFree` imbalance tracking, per-container via cgroup. |
-| GPU scheduling & orchestration failures | HIGH | Per-cgroup `sched_switch` + multi-orchestrator metadata: K8s, Slurm, ECS, Docker / containerd (v0.12.3+). |
+| GPU scheduling & orchestration failures | HIGH | Per-cgroup `sched_switch` + multi-orchestrator metadata: K8s, Slurm, ECS, Docker / containerd. |
 
 Full list of detected issues: [`docs/detections.md`](docs/detections.md)
 
@@ -367,19 +367,17 @@ Yes. On interactive commands (`trace`, `demo`, `explain`, `check`), ingero check
 </details>
 
 <details>
-<summary>Known issues + Walker roadmap</summary>
+<summary>Known issues</summary>
 
-- **Multiprocess CUDA via `fork()`.** NVIDIA's CUDA driver doesn't support `fork()` after the parent has initialized a CUDA context — children can't use CUDA. The eBPF walker inherits the parent's walker state to the child synchronously on fork, but a child that can't call CUDA won't trigger the walker regardless. For multiprocess CUDA workloads, use `torch.multiprocessing.set_start_method('spawn')` (or Ray/torchrun spawn equivalents); fresh spawn-style processes initialize their own CUDA context and get full walker coverage through the normal dynamic-PID path.
+- **Multiprocess CUDA via `fork()`.** NVIDIA's CUDA driver doesn't support `fork()` after the parent has initialized a CUDA context: children can't use CUDA. The eBPF walker inherits the parent's walker state to the child synchronously on fork, but a child that can't call CUDA won't trigger the walker regardless. For multiprocess CUDA workloads, use `torch.multiprocessing.set_start_method('spawn')` (or Ray/torchrun spawn equivalents); fresh spawn-style processes initialize their own CUDA context and get full walker coverage through the normal dynamic-PID path.
 
-- **Ubuntu 24.04 + distro-patched CPython 3.12 on the userspace walker.** Ubuntu's patched CPython has struct offsets that differ from upstream, and Ubuntu 24.04 doesn't ship `python3.12-dbgsym` in the main archive. The userspace walker falls back to hardcoded upstream offsets and produces garbage frame data. The **eBPF walker sidesteps this via its runtime offset harvester** — use `--py-walker=ebpf` on Ubuntu 24.04 until dbgsym becomes readily available. (Installing `python3.12-dbgsym` from `ddebs.ubuntu.com` also resolves the userspace-walker path.)
+- **Ubuntu 24.04 + distro-patched CPython 3.12 on the userspace walker.** Ubuntu's patched CPython has struct offsets that differ from upstream, and Ubuntu 24.04 doesn't ship `python3.12-dbgsym` in the main archive. The userspace walker falls back to hardcoded upstream offsets and produces garbage frame data. The **eBPF walker sidesteps this via its runtime offset harvester**: use `--py-walker=ebpf` on Ubuntu 24.04. (Installing `python3.12-dbgsym` from `ddebs.ubuntu.com` also resolves the userspace-walker path.)
 
-- **Trace-all mode at `kernel.yama.ptrace_scope=3`.** The eBPF walker works at ptrace_scope=3 with an explicit `--pid X` target (PID-specific uprobe attach). Without `--pid` (trace-all / dynamic-discovery mode), cuda/driver uprobes may not fire — a startup warning is logged. Workarounds: pass `--pid X` or lower `kernel.yama.ptrace_scope` to `1` (the Ubuntu default).
+- **Trace-all mode at `kernel.yama.ptrace_scope=3`.** The eBPF walker works at ptrace_scope=3 with an explicit `--pid X` target (PID-specific uprobe attach). Without `--pid` (trace-all / dynamic-discovery mode), cuda/driver uprobes may not fire: a startup warning is logged. Workarounds: pass `--pid X` or lower `kernel.yama.ptrace_scope` to `1` (the Ubuntu default).
 
-### Walker roadmap — userspace walker deprecation
+### Python walker recommendation
 
-The in-kernel eBPF walker (`--py-walker=ebpf`) is now the strategic path forward. It has runtime offset harvesting for patched distro builds (including Ubuntu 24.04 CPython 3.12), multi-library libcudart coverage, per-CUDA-tracer state broadcast, fork-inheritance for multiprocess workloads, and runs at any `ptrace_scope` value with `--pid`.
-
-The **userspace walker — the current default — will be deprecated in an upcoming release.** Once the remaining items above are either fixed or accepted as narrow trade-offs, the eBPF walker will be promoted to the `auto` default. If you're setting up new deployments, prefer `--py-walker=ebpf` today. The `userspace` mode will remain available (via `--py-walker=userspace`) after the default flips, until the deprecation window closes.
+The in-kernel eBPF walker (`--py-walker=ebpf`) is the recommended Python walker. It carries runtime offset harvesting for patched distro builds (including Ubuntu 24.04 CPython 3.12), multi-library libcudart coverage, per-CUDA-tracer state broadcast, fork-inheritance for multiprocess workloads, and runs at any `ptrace_scope` value with `--pid`. Prefer `--py-walker=ebpf` for new deployments. The userspace walker remains available via `--py-walker=userspace`.
 
 </details>
 
