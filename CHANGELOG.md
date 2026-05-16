@@ -8,6 +8,68 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-11
+
+The inference release. `ingero trace --inference` adds an observability
+mode for GPU serving workloads alongside the existing training-focused
+tracing.
+
+### Added
+
+- **`ingero trace --inference` mode.** An umbrella mode that builds
+  per-workload baselines for inference serving and flags outliers
+  against them. Baselines are phase-aware: prefill and decode are
+  measured separately, so a decode-heavy interval is not compared
+  against a prefill baseline.
+- **Inference engine detection.** The agent identifies the serving
+  engine (vLLM, SGLang, TGI, Triton) and scrapes its metrics
+  endpoint, re-detecting continuously so an engine that starts after
+  the agent is still picked up.
+- **KV-cache lineage tracking.** Follows KV-cache block allocations
+  and emits an allocation-age histogram.
+- **`ingero.infer.*` OTLP and Prometheus metrics**, labelled with
+  `cluster_id` and `model` so cluster-side rollups can group by
+  workload.
+- **Per-outlier OTLP trace spans.** Inference outliers emit spans on
+  the OTLP `/v1/traces` endpoint, with deterministic TraceID and
+  EventID derivation.
+- **Kernel-fingerprint workload key.** `cudaLaunchKernel` stream
+  handles are captured so a workload can optionally be keyed by its
+  kernel fingerprint.
+- **Remediation server.** `internal/remediate` exposes a wire
+  contract for remediation actions, with a UDS outlier protocol for
+  local consumers.
+- **Database rollover.** The local store rolls over on a size or age
+  bound, with schema setup handled at rotation.
+- **JSON daemon mode** wires the correlator and node identity into
+  `--json` output.
+
+### Changed
+
+- Read-only SQL access is enforced at the engine level rather than by
+  a query-string filter.
+- `pkg/contract` gains a drift-guard and shared constants; export
+  paths adopt the contract constants and propagate context.
+- BPF probes: PID/TID naming, graph output handles, watchdog clock
+  alignment.
+
+### Security
+
+- Safe defaults on external surfaces: secrets are read from the
+  environment, TLS is required, and listeners bind to loopback unless
+  configured otherwise.
+
+### Fixed
+
+- `demo --json` no longer panics: the system collector is initialized
+  unconditionally in JSON mode.
+- SGLang model extraction and `--inference` event routing corrected
+  against real-engine validation.
+
+### Dependencies
+
+- Go 1.26.3; `golang.org/x/net` 0.53.0.
+
 ## [0.15.0] - 2026-05-07
 
 ### Added
