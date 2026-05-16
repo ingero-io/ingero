@@ -259,6 +259,12 @@ type straggleMessage struct {
 	// (worldSize > 0). Absent (omitempty) for non-distributed deployments.
 	Rank      int `json:"rank,omitempty"`
 	WorldSize int `json:"world_size,omitempty"`
+	// GPUID is the device index most recently observed launching kernels
+	// for this PID. Lets the orchestrator pin the workload to GPU-local
+	// NUMA cores instead of hardcoding GPU 0. Encoded as 0 when the
+	// detector has not yet seen a CUDA/Driver event for this PID — the
+	// consumer treats that as "unknown GPU" and falls back to GPU 0.
+	GPUID uint32 `json:"gpu_id"`
 }
 
 // SendStraggle serializes a StraggleState as NDJSON with type "straggle" and
@@ -284,6 +290,7 @@ func (s *Server) SendStraggle(ss straggler.StraggleState) error {
 		TimestampNs:       ss.TimestampNs,
 		Sustained:         ss.Sustained,
 		EventID:           uuid.NewString(),
+		GPUID:             ss.GPUID,
 	}
 	if s.worldSize > 0 {
 		msg.Rank = s.rank

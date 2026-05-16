@@ -38,6 +38,11 @@ type StraggleState struct {
 	PreemptingPIDs    []uint32 `json:"preempting_pids"`
 	TimestampNs       int64    `json:"timestamp_ns"`
 	Sustained         bool     `json:"sustained"`
+	// GPUID is the device index most recently observed launching kernels
+	// for this PID, captured from the CUDA/Driver event stream. Carried
+	// so the orchestrator can pin the straggler's affinity to the right
+	// NUMA-local cores instead of always GPU 0.
+	GPUID uint32 `json:"gpu_id"`
 }
 
 // Sink receives StraggleState emissions. Implemented by remediate.Server.
@@ -106,6 +111,12 @@ type pidState struct {
 	// CUDA/Driver event captures (sched_switch events use ctx->next_comm which
 	// is also propagated). Empty string until first observation.
 	comm string
+
+	// Most recent GPU device index seen launching kernels for this PID.
+	// Populated from events.Event.GPUID on CUDA/Driver launchKernel events.
+	// Host (sched_switch) events do not carry a GPU id and leave this field
+	// untouched. Defaults to 0 (matching pre-v0.17 behavior).
+	gpuID uint32
 }
 
 // Detector watches for correlated throughput drops and CPU scheduling contention.
@@ -153,6 +164,7 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		if evt.Comm != "" {
 			ps.comm = evt.Comm
 		}
+		ps.gpuID = evt.GPUID
 		d.mu.Unlock()
 
 	case events.SourceDriver:
@@ -165,6 +177,7 @@ func (d *Detector) ProcessEvent(evt events.Event) {
 		if evt.Comm != "" {
 			ps.comm = evt.Comm
 		}
+		ps.gpuID = evt.GPUID
 		d.mu.Unlock()
 
 	case events.SourceHost:
@@ -319,9 +332,10 @@ func (d *Detector) checkAt(now time.Time) {
 				PreemptingPIDs:    preemptingPIDs,
 				TimestampNs:       now.UnixNano(),
 				Sustained:         false,
+				GPUID:             ps.gpuID,
 			}
-			log.Printf("INFO: straggler: detected pid=%d comm=%q drop=%.1f%% sched_switches=%d preemptors=%v",
-				pid, ps.comm, dropPct, schedCount, preemptingPIDs)
+			log.Printf("INFO: straggler: detected pid=%d comm=%q gpu=%d drop=%.1f%% sched_switches=%d preemptors=%v",
+				pid, ps.comm, ps.gpuID, dropPct, schedCount, preemptingPIDs)
 			emissions = append(emissions, state)
 		} else if contention && ps.emitted {
 			// Sustained re-emission: sched_switch still elevated after initial
@@ -334,9 +348,10 @@ func (d *Detector) checkAt(now time.Time) {
 				PreemptingPIDs:    preemptingPIDs,
 				TimestampNs:       now.UnixNano(),
 				Sustained:         true,
+				GPUID:             ps.gpuID,
 			}
-			log.Printf("INFO: straggler: sustained pid=%d comm=%q drop=%.1f%% sched_switches=%d",
-				pid, ps.comm, dropPct, schedCount)
+			log.Printf("INFO: straggler: sustained pid=%d comm=%q gpu=%d drop=%.1f%% sched_switches=%d",
+				pid, ps.comm, ps.gpuID, dropPct, schedCount)
 			emissions = append(emissions, state)
 		} else {
 			// No detection and no sustained contention — update EMA baseline.

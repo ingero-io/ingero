@@ -77,7 +77,7 @@ var Contract = []TypeContract{
 		Stability: Stable,
 		Required: []string{
 			"type", "pid", "throughput_drop_pct", "sched_switch_count",
-			"preempting_pids", "timestamp_ns", "sustained",
+			"preempting_pids", "timestamp_ns", "sustained", "gpu_id",
 		},
 		Optional: []string{"comm"},
 		goType:   reflect.TypeOf(straggleMessage{}),

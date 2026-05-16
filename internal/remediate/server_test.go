@@ -405,6 +405,32 @@ func TestServer(t *testing.T) {
 		}
 	})
 
+	t.Run("gpu_id_stamped_on_straggle", func(t *testing.T) {
+		// GPUID on StraggleState must propagate to the gpu_id JSON field
+		// so the orchestrator can pin to the right GPU's NUMA cores.
+		srv, path := startServer(t)
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		if err := srv.SendStraggle(straggler.StraggleState{PID: 1234, GPUID: 3}); err != nil {
+			t.Fatalf("SendStraggle: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["gpu_id"] != float64(3) {
+			t.Errorf("gpu_id=%v, want 3 (raw=%v)", raw["gpu_id"], raw)
+		}
+	})
+
 	t.Run("rank_world_size_absent_by_default", func(t *testing.T) {
 		// Without SetRankWorldSize, neither field appears on the wire.
 		srv, path := startServer(t)
