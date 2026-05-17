@@ -1199,6 +1199,18 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go tcpTracer.Run(ctx)
 		tcpEventCh = tcpTracer.Events()
 	}
+	// driverEventCh is the driver tracer's channel routed through the
+	// extraChs path (instead of mergeAllEventChannels' positional
+	// `driverTracer` arg) so the Theme 3 cuLaunchKernel idle-watcher
+	// tee can sit between the raw tracer and the merged stream. We
+	// pass nil for `driverTracer` to mergeAllEventChannels below to
+	// avoid double-consuming the same channel. When remediate is off,
+	// the variable carries driverTracer.Events() unchanged and the
+	// append is a same-latency pass-through.
+	var driverEventCh <-chan events.Event
+	if driverTracer != nil {
+		driverEventCh = driverTracer.Events()
+	}
 	if netTracer != nil {
 		go netTracer.Run(ctx)
 		extraChs = append(extraChs, netTracer.Events())
@@ -1337,10 +1349,34 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		extraChs = append(extraChs, tcpEventCh)
 	}
 
+	// cuLaunchKernel idle watcher (Theme 3): tee the driver tracer
+	// stream through the per-PID cuidle sustain tracker and publish
+	// inference_process_hang signals when a PID stops launching
+	// kernels for longer than the threshold while still alive on
+	// the host. Off when --remediate is disabled or the driver
+	// tracer never attached; in either case driverEventCh is
+	// appended unchanged below.
+	if driverEventCh != nil && traceRemediate && remediateSrv != nil {
+		driverEventCh = startCuLaunchIdleWatcher(ctx, driverEventCh, remediateSrv, nodeIdentity, traceCluster)
+	}
+	if driverEventCh != nil {
+		extraChs = append(extraChs, driverEventCh)
+	}
+
+	// Zombie GPU reconciler (Theme 3): periodic poll of
+	// nvidia-smi --query-compute-apps cross-referenced with
+	// kill(pid, 0) liveness; publish zombie_gpu_allocation signals
+	// for orphan VRAM allocations. Independent of any event tracer
+	// — runs on a fixed ticker mirroring the memfrag poller cadence.
+	if traceRemediate && remediateSrv != nil {
+		startZombieGpuWatcher(ctx, 5*time.Second, nvml.NewComputeAppsRunner(), remediateSrv, nodeIdentity, traceCluster)
+	}
+
 	// Fan-in: merge all event channels into one. Deferred until
-	// here so the (optional) tcp sustain tracker tee inserted above
-	// participates in the merged stream.
-	merged := mergeAllEventChannels(ctx, cudaCh, hostTracer, driverTracer, extraChs...)
+	// here so the (optional) tee-wrapped channels above participate
+	// in the merged stream. Driver tracer is passed as nil because
+	// driverEventCh handles the merge path via extraChs.
+	merged := mergeAllEventChannels(ctx, cudaCh, hostTracer, nil, extraChs...)
 
 	// Start Prometheus server if configured.
 	if promSrv != nil {

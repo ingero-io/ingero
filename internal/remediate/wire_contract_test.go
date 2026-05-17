@@ -151,6 +151,26 @@ var Contract = []TypeContract{
 		Optional: []string{"event_id", "rank", "world_size"},
 		goType:   reflect.TypeOf(tcpRetransmitStormMessage{}),
 	},
+	{
+		Name:      "inference_process_hang",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "idle_ms", "gpu_id",
+		},
+		Optional: []string{"event_id", "rank", "world_size"},
+		goType:   reflect.TypeOf(inferenceProcessHangMessage{}),
+	},
+	{
+		Name:      "zombie_gpu_allocation",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "gpu_id", "allocated_bytes",
+		},
+		Optional: []string{"event_id", "rank", "world_size"},
+		goType:   reflect.TypeOf(zombieGpuAllocationMessage{}),
+	},
 }
 
 // TestWireContract_FieldsDeclared fails the build if any type's struct

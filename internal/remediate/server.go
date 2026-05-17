@@ -734,6 +734,123 @@ func (s *Server) SendTcpRetransmitStorm(storm TcpRetransmitStorm, nodeID, cluste
 	return s.writeLocked(msg)
 }
 
+// inferenceProcessHangMessage is the UDS envelope for a per-PID
+// cuLaunchKernel-idle signal detected by internal/cuidle. The
+// orchestrator's InferenceProcessHang chain
+// (gpu_context_reset -> process_recycle) dispatches against this
+// signal: SIGKILL the hung PID to release its CUDA context, or
+// fall back to process_recycle's graceful path when
+// gpu_context_reset is not opted in.
+type inferenceProcessHangMessage struct {
+	Type      string    `json:"type"`
+	NodeID    string    `json:"node_id"`
+	ClusterID string    `json:"cluster_id"`
+	Timestamp time.Time `json:"timestamp"`
+	EventID   string    `json:"event_id,omitempty"`
+	PID       uint32    `json:"pid"`
+	IdleMs    uint64    `json:"idle_ms"`
+	GPUID     uint32    `json:"gpu_id"`
+	Rank      int       `json:"rank,omitempty"`
+	WorldSize int       `json:"world_size,omitempty"`
+}
+
+// InferenceProcessHang is the producer-facing input for a per-PID
+// hang publication.
+type InferenceProcessHang struct {
+	PID    uint32
+	GPUID  uint32
+	IdleMs uint64
+}
+
+// SendInferenceProcessHang writes a per-PID hang notification to the
+// UDS consumer. Non-blocking; same drop semantics as
+// SendInferenceOutlier. The agent's node/cluster identity is passed
+// separately because the cuidle package is kernel-event-only and
+// does not carry that identity.
+func (s *Server) SendInferenceProcessHang(hang InferenceProcessHang, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	msg := inferenceProcessHangMessage{
+		Type:      "inference_process_hang",
+		NodeID:    nodeID,
+		ClusterID: clusterID,
+		Timestamp: time.Now().UTC(),
+		EventID:   uuid.NewString(),
+		PID:       hang.PID,
+		IdleMs:    hang.IdleMs,
+		GPUID:     hang.GPUID,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
+// zombieGpuAllocationMessage is the UDS envelope for one orphan VRAM
+// allocation reported by internal/zombiegpu. The driver still
+// reports the PID owning compute memory but the kernel has no such
+// PID. Routed through the ZombieGpuAllocation chain
+// (gpu_context_reset -> pod_drain).
+type zombieGpuAllocationMessage struct {
+	Type           string    `json:"type"`
+	NodeID         string    `json:"node_id"`
+	ClusterID      string    `json:"cluster_id"`
+	Timestamp      time.Time `json:"timestamp"`
+	EventID        string    `json:"event_id,omitempty"`
+	PID            uint32    `json:"pid"`
+	GPUID          uint32    `json:"gpu_id"`
+	AllocatedBytes uint64    `json:"allocated_bytes"`
+	Rank           int       `json:"rank,omitempty"`
+	WorldSize      int       `json:"world_size,omitempty"`
+}
+
+// ZombieGpuAllocation is the producer-facing input for a per-orphan
+// publication.
+type ZombieGpuAllocation struct {
+	PID            uint32
+	GPUID          uint32
+	AllocatedBytes uint64
+}
+
+// SendZombieGpuAllocation writes an orphan-VRAM notification to the
+// UDS consumer. Non-blocking; same drop semantics as the other
+// Send* paths. gpu_id is the orchestrator-side enumeration index;
+// the FOSS reconciler reports gpu_uuid and the caller maps that to
+// an index before publishing (same convention as the throttle
+// poller's hardware_fault gpu_id).
+func (s *Server) SendZombieGpuAllocation(zg ZombieGpuAllocation, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	msg := zombieGpuAllocationMessage{
+		Type:           "zombie_gpu_allocation",
+		NodeID:         nodeID,
+		ClusterID:      clusterID,
+		Timestamp:      time.Now().UTC(),
+		EventID:        uuid.NewString(),
+		PID:            zg.PID,
+		GPUID:          zg.GPUID,
+		AllocatedBytes: zg.AllocatedBytes,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
 // SendFleetStragglerResolved writes a straggler->healthy edge
 // notification. Same non-blocking semantics as SendFleetStragglerState.
 // eventID is per-recovery-edge; consumers may correlate it with the OTLP
