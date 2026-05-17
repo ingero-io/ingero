@@ -1415,7 +1415,13 @@ func TestDiskUsageIncludesWAL(t *testing.T) {
 }
 
 // TestPruneBySizeAutoTrigger verifies that pruneBySize fires automatically
-// after flushBatch when the DB exceeds maxDBSize — the actual production path.
+// after flushBatch when the DB exceeds maxDBSize: the actual production path.
+//
+// It polls for each milestone rather than sleeping a fixed duration. A fixed
+// time.Sleep was the source of flakiness here: the background Run loop's
+// flush timing is not bounded by any fixed wait, so on a slow or -race CI
+// runner the size baseline could be measured before the initial events were
+// flushed, or the assertion could run before the prune fired.
 func TestPruneBySizeAutoTrigger(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "auto-prune.db")
 	s, err := New(dbPath)
@@ -1430,40 +1436,70 @@ func TestPruneBySizeAutoTrigger(t *testing.T) {
 		s.Run(ctx)
 		close(done)
 	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
 
-	// Insert events to grow the DB.
+	// waitFor polls a condition rather than sleeping a fixed duration, so the
+	// test stays deterministic under -race and on slow CI runners.
+	waitFor := func(msg string, timeout time.Duration, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out after %s waiting for: %s", timeout, msg)
+	}
+	countWhere := func(where string, args ...any) int64 {
+		var n int64
+		s.db.QueryRow("SELECT COUNT(*) FROM events "+where, args...).Scan(&n)
+		return n
+	}
+
+	// Insert events with old timestamps so a later size-prune has a clear
+	// time range to cut.
 	baseTime := time.Now().Add(-10 * time.Minute)
 	for i := 0; i < 2000; i++ {
 		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
 		evt.Timestamp = baseTime.Add(time.Duration(i) * time.Millisecond)
 		s.Record(evt)
 	}
-	time.Sleep(500 * time.Millisecond)
+	// Wait for all 2000 to be flushed before measuring size: maxDBSize must
+	// be computed off a fully written DB, not a partial one.
+	waitFor("initial 2000 events flushed", 30*time.Second, func() bool {
+		return countWhere("") >= 2000
+	})
 
-	// Checkpoint so diskUsage reflects writes.
+	// Checkpoint so diskUsage reflects writes, then set a limit below the
+	// current size. The next flush must auto-prune.
 	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	sizeBefore := s.diskUsage()
+	s.SetMaxDBSize(s.diskUsage() / 3)
 
-	// Set a small limit — below current size. The next flush should auto-prune.
-	s.SetMaxDBSize(sizeBefore / 3)
-
-	// Insert more events to trigger a flushBatch, which calls pruneBySize.
+	// Insert more events with current timestamps. These trigger a flushBatch,
+	// which calls pruneBySize; the old 2000 events are the prune target.
 	for i := 0; i < DefaultBatchSize+1; i++ {
 		evt := makeEvt(events.SourceCUDA, uint8(events.CUDAMalloc), 1*time.Millisecond)
 		evt.Timestamp = time.Now()
 		s.Record(evt)
 	}
-	time.Sleep(500 * time.Millisecond)
 
-	// Verify events were pruned automatically (not by direct pruneBySize call).
+	// The prune is confirmed by the old cluster disappearing. Polling for the
+	// old events to reach zero distinguishes "prune fired" from "new events
+	// not flushed yet" (the latter also leaves the total below the cap).
+	oldCutoff := baseTime.Add(5 * time.Minute).UnixNano()
+	waitFor("auto-prune to delete the old events", 30*time.Second, func() bool {
+		return countWhere("WHERE timestamp < ?", oldCutoff) == 0
+	})
+
 	count, _ := s.Count()
 	if count >= 2000+DefaultBatchSize {
 		t.Errorf("expected auto-pruning to reduce events, got %d", count)
 	}
 	t.Logf("auto-prune: %d events remain (started with %d+%d)", count, 2000, DefaultBatchSize+1)
-
-	cancel()
-	<-done
 }
 
 // TestPruneBySizeStackCacheRebuild verifies that stacks deleted during pruning
