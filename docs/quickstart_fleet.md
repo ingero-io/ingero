@@ -2,7 +2,7 @@
 
 Ingero is a single-node agent. To detect cluster-wide stragglers in real time
 (rather than fanning queries out across nodes after the fact), pair the agent
-with the **Ingero Fleet collector** — a small custom OpenTelemetry Collector
+with the [**Ingero Fleet collector**](https://github.com/ingero-io/ingero-fleet) — a small custom OpenTelemetry Collector
 distribution that aggregates per-node health scores and computes a peer-relative
 threshold the agents read back.
 

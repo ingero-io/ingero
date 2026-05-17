@@ -111,7 +111,7 @@ together to avoid false positives.
 - Re-emitted periodically while contention persists, so downstream consumers
   that require periodic signals (e.g., within a 2s window) receive updates.
 
-### `straggler_state` — Fleet peer-relative straggler (experimental)
+### `straggler_state` — [Fleet](https://github.com/ingero-io/ingero-fleet) peer-relative straggler (experimental)
 
 Emitted by `ingero fleet-push` when a node's health score crosses the
 Fleet-derived threshold downward (healthy → straggler transition). The

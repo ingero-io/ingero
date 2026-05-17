@@ -6,7 +6,7 @@
 
 # Per-cohort straggler detection, per-cgroup CUDA metrics, OTLP traces
 
-> **TL;DR:** Run one Ingero Fleet collector across many workloads
+> **TL;DR:** Run one [Ingero Fleet collector](https://github.com/ingero-io/ingero-fleet) across many workloads
 > without one noisy cohort polluting another, attribute every CUDA
 > kernel launch and CPU-stall sample to the originating cgroup, and
 > emit OTLP trace spans on detection edges. Two CLI surfaces

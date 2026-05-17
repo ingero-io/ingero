@@ -1,6 +1,6 @@
 # `ingero fleet-push`
 
-The fleet-push command turns an ingero agent into a Fleet participant:
+The fleet-push command turns an ingero agent into a [Fleet](https://github.com/ingero-io/ingero-fleet) participant:
 it derives a health score from local eBPF telemetry (or synthetic
 signals in `--stub` mode), pushes it to a Fleet server via OTLP, reads
 the piggyback threshold from the response, and classifies the node as

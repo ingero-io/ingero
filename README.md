@@ -11,10 +11,13 @@
 [awesome-observability](https://github.com/adriannovegil/awesome-observability) ·
 [awesome-opentelemetry](https://github.com/magsther/awesome-opentelemetry) ·
 [awesome-sre-tools](https://github.com/SquadcastHub/awesome-sre-tools) ·
+[awesome-sre-agents](https://github.com/last9/awesome-sre-agents) ·
 [awesome-cloud-native](https://github.com/rootsongjc/awesome-cloud-native) ·
 [awesome-profiling](https://github.com/msaroufim/awesome-profiling) ·
 [Awesome-GPU](https://github.com/Jokeren/Awesome-GPU) ·
 [awesome-gpu-engineering](https://github.com/goabiaryan/awesome-gpu-engineering) ·
+[awesome-helm](https://github.com/cdwv/awesome-helm) ·
+[awesome-platform-engineering](https://github.com/shospodarets/awesome-platform-engineering) ·
 [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) ·
 [awesome-devops-mcp-servers](https://github.com/rohitg00/awesome-devops-mcp-servers) ·
 [MCP Registry](https://registry.modelcontextprotocol.io) ·

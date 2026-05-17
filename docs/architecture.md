@@ -2,7 +2,7 @@
 
 Ingero has two deployment modes: a single-node agent (the default; what
 you get from `curl install + sudo ingero trace`) and a multi-node fleet
-(agents pushing OTLP to a Fleet collector that classifies cluster-wide
+(agents pushing OTLP to a [Fleet collector](https://github.com/ingero-io/ingero-fleet) that classifies cluster-wide
 stragglers in real time). Both share the same agent binary and the same
 eBPF instrumentation; the cluster mode adds a Fleet collector and a
 threshold feedback loop.

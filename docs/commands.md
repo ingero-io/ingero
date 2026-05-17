@@ -205,7 +205,7 @@ ingero query --nodes host1:8080,host2:8080 "SELECT node, source, count(*) FROM e
 ingero query --nodes host1:8080,host2:8080,host3:8080 "SELECT node, count(*) FROM events GROUP BY node"
 ```
 
-Fleet queries fan out the SQL to each node's `/api/v1/query` endpoint,
+[Fleet](https://github.com/ingero-io/ingero-fleet) queries fan out the SQL to each node's `/api/v1/query` endpoint,
 concatenate results with a `node` column prepended, and display a
 unified table. Partial failures return results from reachable nodes
 with warnings for unreachable ones. Clock skew between nodes is
