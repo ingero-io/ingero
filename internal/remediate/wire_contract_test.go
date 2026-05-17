@@ -141,6 +141,16 @@ var Contract = []TypeContract{
 		},
 		goType: reflect.TypeOf(inferenceSamplerDegradedMessage{}),
 	},
+	{
+		Name:      "tcp_retransmit_storm",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "rate_per_sec", "sustained_ms",
+		},
+		Optional: []string{"event_id", "rank", "world_size"},
+		goType:   reflect.TypeOf(tcpRetransmitStormMessage{}),
+	},
 }
 
 // TestWireContract_FieldsDeclared fails the build if any type's struct

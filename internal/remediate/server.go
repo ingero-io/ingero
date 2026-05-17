@@ -665,6 +665,75 @@ func (s *Server) SendHardwareFault(fault nvml.HardwareFault, nodeID, clusterID s
 	return s.writeLocked(msg)
 }
 
+// tcpRetransmitStormMessage is the UDS envelope for a per-PID TCP
+// retransmit storm detected by internal/tcpretransmit's sustain
+// tracker. The tracker aggregates `tcp_retransmit_skb` BTF
+// tracepoint events (shipped in internal/ebpf/tcp) into a per-PID
+// rolling rate and emits one storm per episode.
+//
+// EE-side dispatch in `orchestrator/src/uds.rs` routes this through
+// the TcpRetransmitStorm chain (drain_lb_endpoint -> pod_drain):
+// shift traffic away first, then evict + reschedule if the
+// retransmit rate stays elevated.
+type tcpRetransmitStormMessage struct {
+	Type        string    `json:"type"`
+	NodeID      string    `json:"node_id"`
+	ClusterID   string    `json:"cluster_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	EventID     string    `json:"event_id,omitempty"`
+	PID         uint32    `json:"pid"`
+	RatePerSec  float64   `json:"rate_per_sec"`
+	SustainedMs uint64    `json:"sustained_ms"`
+	Rank        int       `json:"rank,omitempty"`
+	WorldSize   int       `json:"world_size,omitempty"`
+}
+
+// TcpRetransmitStorm is the producer-facing input for a per-PID
+// retransmit-storm publication. Mirrors the SustainTracker.Storm
+// output in internal/tcpretransmit but is kept structurally distinct
+// so that package can evolve its internal representation without
+// breaking the wire-facing contract here.
+type TcpRetransmitStorm struct {
+	PID         uint32
+	RatePerSec  float64
+	SustainedMs uint64
+}
+
+// SendTcpRetransmitStorm writes a per-PID retransmit-storm
+// notification to the UDS consumer. Non-blocking; same drop semantics
+// as SendInferenceOutlier. The agent's node/cluster identity is
+// passed separately because the tcpretransmit package is hardware /
+// kernel only and does not carry that identity.
+//
+// Wire-protocol-only contract: the FOSS agent classifies and
+// publishes; the orchestrator dispatches drain_lb_endpoint +
+// pod_drain (in chain) when configured to act.
+func (s *Server) SendTcpRetransmitStorm(storm TcpRetransmitStorm, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	msg := tcpRetransmitStormMessage{
+		Type:        "tcp_retransmit_storm",
+		NodeID:      nodeID,
+		ClusterID:   clusterID,
+		Timestamp:   time.Now().UTC(),
+		EventID:     uuid.NewString(),
+		PID:         storm.PID,
+		RatePerSec:  storm.RatePerSec,
+		SustainedMs: storm.SustainedMs,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
 // SendFleetStragglerResolved writes a straggler->healthy edge
 // notification. Same non-blocking semantics as SendFleetStragglerState.
 // eventID is per-recovery-edge; consumers may correlate it with the OTLP

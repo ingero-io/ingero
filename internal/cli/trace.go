@@ -1188,9 +1188,16 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		go ioTracer.Run(ctx)
 		extraChs = append(extraChs, ioTracer.Events())
 	}
+	// tcpEventCh is non-nil only when the TCP tracer is up. The
+	// extraChs append is deferred until after remediate wiring so
+	// the (optional) sustain-tracker tee can be inserted between
+	// the raw tracer and the merged stream consumers. When remediate
+	// is off, the variable carries tcpTracer.Events() unchanged and
+	// the append is a same-latency pass-through.
+	var tcpEventCh <-chan events.Event
 	if tcpTracer != nil {
 		go tcpTracer.Run(ctx)
-		extraChs = append(extraChs, tcpTracer.Events())
+		tcpEventCh = tcpTracer.Events()
 	}
 	if netTracer != nil {
 		go netTracer.Run(ctx)
@@ -1276,9 +1283,6 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		cudaCh = forkCUDAForBarrier(ctx, cudaCh)
 	}
 
-	// Fan-in: merge all event channels into one.
-	merged := mergeAllEventChannels(ctx, cudaCh, hostTracer, driverTracer, extraChs...)
-
 	// --- Begin remediate wiring ---
 	var tracker *memtrack.Tracker
 	var remediateSrv *remediate.Server
@@ -1319,6 +1323,24 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		log.Printf("INFO: straggler: detector_started config=%s", straggler.DefaultConfig())
 	}
 	// --- End straggler detector wiring ---
+
+	// TCP retransmit sustain tracker: tee the tcp event stream
+	// through the per-PID rate aggregator and publish storm signals
+	// over the remediate UDS for the orchestrator's
+	// TcpRetransmitStorm chain. Off when --remediate is disabled or
+	// the tcp tracer never attached; in either case tcpEventCh is
+	// appended to extraChs unchanged below.
+	if tcpEventCh != nil && traceRemediate && remediateSrv != nil {
+		tcpEventCh = startTcpRetransmitWatcher(ctx, tcpEventCh, remediateSrv, nodeIdentity, traceCluster)
+	}
+	if tcpEventCh != nil {
+		extraChs = append(extraChs, tcpEventCh)
+	}
+
+	// Fan-in: merge all event channels into one. Deferred until
+	// here so the (optional) tcp sustain tracker tee inserted above
+	// participates in the merged stream.
+	merged := mergeAllEventChannels(ctx, cudaCh, hostTracer, driverTracer, extraChs...)
 
 	// Start Prometheus server if configured.
 	if promSrv != nil {
