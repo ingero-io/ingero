@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ingero-io/ingero/internal/inferp99"
 	"github.com/ingero-io/ingero/internal/stats"
 )
 
@@ -48,9 +49,17 @@ type WorkloadKey struct {
 // workloadEntry is the LRU map's value cell. The list element pointer
 // is cached so MoveToFront / Remove operations are O(1) without a
 // linear search.
+//
+// p99 is the rolling-p99 SLO-breach tracker introduced alongside the
+// existing baseliner. Both are fed by the same sync hot path (one
+// step duration in, both trackers updated); the engine reads bl for
+// per-step outlier classification and the SLO watcher periodically
+// reads p99 for sustained-breach detection. Allocated lazily in
+// GetOrCreate and never replaced for the entry's lifetime.
 type workloadEntry struct {
 	key      WorkloadKey
 	bl       *WorkloadBaseliner
+	p99      *inferp99.Tracker
 	lastSync time.Time
 	elem     *list.Element
 }
@@ -94,12 +103,28 @@ func newWorkloadMap(capacity int) *workloadMap {
 // event hot path — by definition we just observed a sync for this
 // key and are about to record its duration.
 func (m *workloadMap) GetOrCreate(key WorkloadKey, now time.Time) *WorkloadBaseliner {
+	return m.getOrCreateEntry(key, now).bl
+}
+
+// GetOrCreateWithP99 is the dual-tracker form of GetOrCreate. Returns
+// both the per-step baseliner (existing InferenceOutlier classifier)
+// and the rolling-p99 SLO-breach tracker (new InferenceSloBreach
+// path). Both are populated lazily in one LRU touch so the sync hot
+// path stays at O(1) per event.
+func (m *workloadMap) GetOrCreateWithP99(key WorkloadKey, now time.Time) (*WorkloadBaseliner, *inferp99.Tracker) {
+	e := m.getOrCreateEntry(key, now)
+	return e.bl, e.p99
+}
+
+// getOrCreateEntry is the shared inner path. Holds the lock; performs
+// LRU eviction; lazily allocates both trackers.
+func (m *workloadMap) getOrCreateEntry(key WorkloadKey, now time.Time) *workloadEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if e, ok := m.entries[key]; ok {
 		e.lastSync = now
 		m.order.MoveToFront(e.elem)
-		return e.bl
+		return e
 	}
 	for m.order.Len() >= m.capacity {
 		oldest := m.order.Back()
@@ -114,11 +139,12 @@ func (m *workloadMap) GetOrCreate(key WorkloadKey, now time.Time) *WorkloadBasel
 	entry := &workloadEntry{
 		key:      key,
 		bl:       NewWorkloadBaseliner(),
+		p99:      inferp99.NewTracker(inferp99.DefaultConfig()),
 		lastSync: now,
 	}
 	entry.elem = m.order.PushFront(entry)
 	m.entries[key] = entry
-	return entry.bl
+	return entry
 }
 
 // Get returns the baseliner for key without bumping its position in
@@ -198,6 +224,38 @@ func (m *workloadMap) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.entries)
+}
+
+// SloBreach is the workload-keyed breach returned from
+// DrainSloBreaches. Wraps the metric-only inferp99.Breach with the
+// workload identity (PID is the only field the EE-side wire requires
+// today; the rest are carried for log context and future wire
+// extensions).
+type SloBreach struct {
+	Key    WorkloadKey
+	Breach inferp99.Breach
+}
+
+// DrainSloBreaches walks every workload entry, calls each tracker's
+// CheckAt(now), and returns the breaches that fired this tick. The
+// per-tracker state machine handles sustain + suppression internally
+// so two consecutive Drain calls in the same suppression window
+// return one breach for the workload, not two.
+//
+// Called from the SLO watcher goroutine on its 5s cadence.
+func (m *workloadMap) DrainSloBreaches(now time.Time) []SloBreach {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []SloBreach
+	for k, e := range m.entries {
+		if e.p99 == nil {
+			continue
+		}
+		if b, ok := e.p99.CheckAt(now); ok {
+			out = append(out, SloBreach{Key: k, Breach: b})
+		}
+	}
+	return out
 }
 
 // EvictedSinceLastClear returns true if at least one LRU eviction has

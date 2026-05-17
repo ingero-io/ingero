@@ -673,10 +673,18 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	}
 	e.mu.Unlock()
 
-	bl := e.wmap.GetOrCreate(key, now)
+	bl, p99 := e.wmap.GetOrCreateWithP99(key, now)
+
+	// Feed the rolling-p99 SLO tracker BEFORE the warmup/outlier
+	// branching: it wants every step (including outliers) so its
+	// rolling distribution is faithful. The InferenceOutlier
+	// classifier below uses a separate, baseliner-driven path that
+	// intentionally skips outliers from the baseline update.
+	stepNs := float64(step.Nanoseconds())
+	p99.Observe(stepNs, now)
 
 	if !bl.Warmed(e.cfg.WarmupSamples) {
-		bl.Update(float64(step.Nanoseconds()))
+		bl.Update(stepNs)
 		return
 	}
 
@@ -685,14 +693,14 @@ func (e *Engine) OnSyncEvent(evt events.Event, cgroupHash string) {
 	if p95 <= 0 {
 		// Baseliner finished P² fill but somehow returned 0 — defense
 		// in depth, treat as warming and fold the step.
-		bl.Update(float64(step.Nanoseconds()))
+		bl.Update(stepNs)
 		return
 	}
-	ratio := float64(step.Nanoseconds()) / p95
+	ratio := stepNs / p95
 	bucket := classify(ratio, e.cfg.OutlierThresholdRatio)
 	if bucket == BucketNone {
 		// Healthy step — fold into baseline.
-		bl.Update(float64(step.Nanoseconds()))
+		bl.Update(stepNs)
 		return
 	}
 
@@ -804,6 +812,22 @@ func (e *Engine) DrainSampler() []SamplerDegradedEvent {
 	out := e.samplerQueue
 	e.samplerQueue = nil
 	return out
+}
+
+// DrainSloBreaches walks every tracked workload's rolling-p99 tracker
+// and returns the SLO breaches that fired this tick. Called from the
+// InferenceSloBreach watcher goroutine on its own (5s) cadence,
+// independent of the snapshot tick — the per-tracker sustain + rearm
+// state machine handles re-emission throttling internally, so two
+// drains inside one rearm window return one breach for a workload,
+// not two.
+//
+// Unlike Drain/DrainSampler this method does NOT mutate any queue:
+// breaches are computed on demand from the per-workload tracker
+// state. Caller emits each breach over the remediate UDS via
+// SendInferenceSloBreach.
+func (e *Engine) DrainSloBreaches(now time.Time) []SloBreach {
+	return e.wmap.DrainSloBreaches(now)
 }
 
 // Snapshot returns the current baseline state for every tracked

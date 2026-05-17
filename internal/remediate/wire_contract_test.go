@@ -152,6 +152,16 @@ var Contract = []TypeContract{
 		goType:   reflect.TypeOf(tcpRetransmitStormMessage{}),
 	},
 	{
+		Name:      "inference_slo_breach",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "p99_latency_ns", "baseline_p99_ns",
+		},
+		Optional: []string{"event_id", "breach_ratio", "rank", "world_size"},
+		goType:   reflect.TypeOf(inferenceSloBreachMessage{}),
+	},
+	{
 		Name:      "inference_process_hang",
 		Stability: Experimental,
 		Required: []string{

@@ -1432,6 +1432,19 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		startXidReader(ctx, "", nvml.NewPciIndexRunner(), sink, slog.Default())
 	}
 
+	// Inference SLO breach watcher: per-workload rolling p99 against
+	// frozen baseline. Distinct from the per-step InferenceOutlier
+	// path that already feeds the EE-side InferenceOutlier chain;
+	// this one drives the InferenceSloBreach chain (drain_lb_endpoint
+	// then pod_drain then process_recycle) when the SLO drifts
+	// across a sustained window. Off when --remediate or --inference
+	// is disabled; in either case inferEngine or remediateSrv is nil
+	// and startInferenceSloWatcher returns without spawning.
+	if traceRemediate && remediateSrv != nil && inferEngine != nil {
+		startInferenceSloWatcher(ctx, inferEngine, remediateSrv,
+			nodeIdentity, traceCluster, slog.Default())
+	}
+
 	// Fan-in: merge all event channels into one. Deferred until
 	// here so the (optional) tee-wrapped channels above participate
 	// in the merged stream. Driver tracer is passed as nil because

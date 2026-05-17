@@ -665,6 +665,80 @@ func (s *Server) SendHardwareFault(fault nvml.HardwareFault, nodeID, clusterID s
 	return s.writeLocked(msg)
 }
 
+// inferenceSloBreachMessage is the UDS envelope for the rolling-p99
+// SLO-breach signal produced by internal/inferp99's per-workload
+// sustain tracker. Distinct from `inference_outlier` (which is
+// per-step classification at 1.5x/2x/3x baseline-p95): this fires
+// when the workload's ROLLING p99 drifts above its FROZEN baseline
+// across a sustained window, even if no individual step is an
+// outlier. The non-destructive remediation
+// (drain_lb_endpoint -> pod_drain -> process_recycle, Phase 15
+// chain) lets traffic shift to healthier replicas before any
+// individual request crosses its SLO budget visibly.
+//
+// EE-side dispatch parses this in `orchestrator/src/uds.rs` arm
+// `inference_slo_breach`; the InferenceSloBreach chain is shipped.
+type inferenceSloBreachMessage struct {
+	Type          string    `json:"type"`
+	NodeID        string    `json:"node_id"`
+	ClusterID     string    `json:"cluster_id"`
+	Timestamp     time.Time `json:"timestamp"`
+	EventID       string    `json:"event_id,omitempty"`
+	PID           uint32    `json:"pid"`
+	P99LatencyNs  uint64    `json:"p99_latency_ns"`
+	BaselineP99Ns uint64    `json:"baseline_p99_ns"`
+	BreachRatio   float64   `json:"breach_ratio,omitempty"`
+	Rank          int       `json:"rank,omitempty"`
+	WorldSize     int       `json:"world_size,omitempty"`
+}
+
+// InferenceSloBreach is the producer-facing input for one rolling-p99
+// SLO-breach publication. Mirrors the shape of inferp99.Breach but
+// adds the PID dimension (the inferp99 package is workload-key-
+// agnostic; the caller, internal/infer's workloadMap, layers PID on
+// top before publishing).
+type InferenceSloBreach struct {
+	PID           uint32
+	P99LatencyNs  uint64
+	BaselineP99Ns uint64
+	BreachRatio   float64
+}
+
+// SendInferenceSloBreach writes a rolling-p99 SLO-breach
+// notification to the UDS consumer. Non-blocking; same drop
+// semantics as SendInferenceOutlier. The agent's node/cluster
+// identity is passed separately because the inferp99 package is
+// workload-detection-only and does not carry that identity.
+//
+// Wire-protocol-only contract: the FOSS agent classifies and
+// publishes; the orchestrator's InferenceSloBreach chain dispatches
+// drain_lb_endpoint -> pod_drain -> process_recycle when configured
+// to act.
+func (s *Server) SendInferenceSloBreach(b InferenceSloBreach, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+	msg := inferenceSloBreachMessage{
+		Type:          "inference_slo_breach",
+		NodeID:        nodeID,
+		ClusterID:     clusterID,
+		Timestamp:     time.Now().UTC(),
+		EventID:       uuid.NewString(),
+		PID:           b.PID,
+		P99LatencyNs:  b.P99LatencyNs,
+		BaselineP99Ns: b.BaselineP99Ns,
+		BreachRatio:   b.BreachRatio,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
 // tcpRetransmitStormMessage is the UDS envelope for a per-PID TCP
 // retransmit storm detected by internal/tcpretransmit's sustain
 // tracker. The tracker aggregates `tcp_retransmit_skb` BTF
