@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/nvml"
 	"github.com/ingero-io/ingero/internal/straggler"
 )
 
@@ -575,6 +576,87 @@ func (s *Server) SendInferenceSamplerDegraded(d InferenceSamplerDegraded) error 
 		Bucket:         d.Bucket,
 		Cause:          d.Cause,
 		CooldownEnd:    d.CooldownEnd,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
+// hardwareFaultMessage is the UDS envelope for an NVML/Xid hardware
+// fault produced by the agent's nvml probes (e.g. ThermalSustainTracker
+// for kind=thermal_throttle, the Xid event reader for kind=xid). The
+// EE-side dispatch in `orchestrator/src/uds.rs` matches on `type` then
+// routes severity=critical events into the node_cordon + pod_drain
+// playbook (Phase 13); warnings are counter-only.
+//
+// Wire shape mirrors the EE-side `HardwareFaultState` deserializer.
+// Adding new optional fields is non-breaking because the EE side uses
+// serde defaults for unknown JSON fields. `throttle_reasons` is one
+// such forward-compat field: the agent emits it for log context, the
+// orchestrator currently ignores it and would consume it once a future
+// arm wants per-bitmask routing.
+type hardwareFaultMessage struct {
+	Type            string    `json:"type"`
+	NodeID          string    `json:"node_id"`
+	ClusterID       string    `json:"cluster_id"`
+	Timestamp       time.Time `json:"timestamp"`
+	EventID         string    `json:"event_id,omitempty"`
+	Kind            string    `json:"kind"`
+	Severity        string    `json:"severity"`
+	XidNumber       uint32    `json:"xid_number,omitempty"`
+	GPUID           uint32    `json:"gpu_id"`
+	PID             uint32    `json:"pid,omitempty"`
+	ThrottleReasons uint64    `json:"throttle_reasons,omitempty"`
+	Rank            int       `json:"rank,omitempty"`
+	WorldSize       int       `json:"world_size,omitempty"`
+}
+
+// SendHardwareFault writes an NVML/Xid hardware-fault notification to
+// the UDS consumer. Non-blocking; same drop semantics as
+// SendInferenceOutlier. The producer-facing input is `nvml.HardwareFault`
+// (e.g., the value emitted by ThermalSustainTracker.Observe); the agent's
+// node/cluster identity is passed separately because nvml is a
+// hardware-only package and does not carry that identity.
+//
+// If fault.Timestamp is zero, the current UTC time is stamped. If
+// fault.EventID is empty, a fresh UUIDv4 is generated so the matching
+// OTLP push (when one is added) can correlate channels by id.
+//
+// Wire-protocol-only contract: the FOSS agent classifies and publishes;
+// any auto-action lives in the consumer (notably the ingero-ee
+// orchestrator, which gates dispatch on severity == "critical").
+func (s *Server) SendHardwareFault(fault nvml.HardwareFault, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+
+	ts := fault.Timestamp
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	eventID := fault.EventID
+	if eventID == "" {
+		eventID = uuid.NewString()
+	}
+
+	msg := hardwareFaultMessage{
+		Type:            "hardware_fault",
+		NodeID:          nodeID,
+		ClusterID:       clusterID,
+		Timestamp:       ts,
+		EventID:         eventID,
+		Kind:            string(fault.Kind),
+		Severity:        string(fault.Severity),
+		XidNumber:       fault.XidNumber,
+		GPUID:           fault.GPUID,
+		PID:             fault.PID,
+		ThrottleReasons: fault.ThrottleReasons,
 	}
 	if s.worldSize > 0 {
 		msg.Rank = s.rank

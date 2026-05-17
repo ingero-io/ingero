@@ -117,6 +117,19 @@ var Contract = []TypeContract{
 		goType: reflect.TypeOf(inferenceOutlierMessage{}),
 	},
 	{
+		Name:      "hardware_fault",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"kind", "severity", "gpu_id",
+		},
+		Optional: []string{
+			"event_id", "xid_number", "pid", "throttle_reasons",
+			"rank", "world_size",
+		},
+		goType: reflect.TypeOf(hardwareFaultMessage{}),
+	},
+	{
 		Name:      "inference_sampler_degraded",
 		Stability: Experimental,
 		Required: []string{

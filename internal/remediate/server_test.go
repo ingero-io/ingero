@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/nvml"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/straggler"
 )
@@ -536,6 +537,130 @@ func TestServer(t *testing.T) {
 		// behavior of Go json. Document it explicitly so consumers know.
 		if v, present := raw["rank"]; present && v != float64(0) {
 			t.Errorf("rank=%v, want 0 or absent (omitempty)", v)
+		}
+	})
+
+	t.Run("send_hardware_fault_round_trips_thermal_throttle", func(t *testing.T) {
+		srv, path := startServer(t)
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		// What the ThermalSustainTracker emits at sustain: critical
+		// thermal_throttle with a non-zero throttle bitmask. PID and
+		// XidNumber stay at zero — NVML thermal events are device-wide.
+		fault := nvml.HardwareFault{
+			Kind:            nvml.FaultKindThermalThrottle,
+			Severity:        nvml.HardwareFaultCritical,
+			GPUID:           3,
+			ThrottleReasons: 0x80,
+			Timestamp:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
+		}
+		if err := srv.SendHardwareFault(fault, "gpu-host-3", "prod"); err != nil {
+			t.Fatalf("SendHardwareFault: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["type"] != "hardware_fault" {
+			t.Errorf("type=%v, want hardware_fault", raw["type"])
+		}
+		if raw["kind"] != string(nvml.FaultKindThermalThrottle) {
+			t.Errorf("kind=%v, want thermal_throttle", raw["kind"])
+		}
+		if raw["severity"] != string(nvml.HardwareFaultCritical) {
+			t.Errorf("severity=%v, want critical", raw["severity"])
+		}
+		if raw["gpu_id"] != float64(3) {
+			t.Errorf("gpu_id=%v, want 3", raw["gpu_id"])
+		}
+		if raw["throttle_reasons"] != float64(0x80) {
+			t.Errorf("throttle_reasons=%v, want 128", raw["throttle_reasons"])
+		}
+		// xid_number and pid are omitempty: thermal events leave them
+		// zero, so they must NOT appear on the wire (a Some(0) on the
+		// EE side would be a different semantic from absent).
+		if _, present := raw["xid_number"]; present {
+			t.Errorf("xid_number unexpectedly present for thermal fault: %v", raw["xid_number"])
+		}
+		if _, present := raw["pid"]; present {
+			t.Errorf("pid unexpectedly present for thermal fault: %v", raw["pid"])
+		}
+		// event_id must be auto-generated when caller leaves it empty
+		// so the matching OTLP push (when one lands) can correlate.
+		eid, ok := raw["event_id"].(string)
+		if !ok || eid == "" {
+			t.Errorf("event_id missing or empty: %v", raw["event_id"])
+		}
+	})
+
+	t.Run("send_hardware_fault_round_trips_xid_with_pid", func(t *testing.T) {
+		srv, path := startServer(t)
+		conn := dialUDS(t, path)
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+
+		// Xid 79 ("GPU off the bus") with a known offender PID.
+		fault := nvml.HardwareFault{
+			Kind:      nvml.FaultKindXid,
+			Severity:  nvml.HardwareFaultCritical,
+			GPUID:     2,
+			XidNumber: 79,
+			PID:       4321,
+			EventID:   "hf-fixed-1",
+		}
+		if err := srv.SendHardwareFault(fault, "gpu-host-2", "prod"); err != nil {
+			t.Fatalf("SendHardwareFault: %v", err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			t.Fatalf("expected line, got error: %v", scanner.Err())
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if raw["kind"] != "xid" {
+			t.Errorf("kind=%v, want xid", raw["kind"])
+		}
+		if raw["xid_number"] != float64(79) {
+			t.Errorf("xid_number=%v, want 79", raw["xid_number"])
+		}
+		if raw["pid"] != float64(4321) {
+			t.Errorf("pid=%v, want 4321", raw["pid"])
+		}
+		if raw["event_id"] != "hf-fixed-1" {
+			t.Errorf("event_id=%v, want hf-fixed-1 (preserved when caller supplied)", raw["event_id"])
+		}
+		// Zero timestamp must be filled in with now() so the EE side
+		// doesn't see "0001-01-01T00:00:00Z" on the wire.
+		ts, ok := raw["timestamp"].(string)
+		if !ok || ts == "" || ts[:4] == "0001" {
+			t.Errorf("timestamp not stamped at Send time: %v", raw["timestamp"])
+		}
+	})
+
+	t.Run("send_hardware_fault_without_client_returns_typed_error", func(t *testing.T) {
+		srv, _ := startServer(t)
+		err := srv.SendHardwareFault(nvml.HardwareFault{
+			Kind:     nvml.FaultKindThermalThrottle,
+			Severity: nvml.HardwareFaultCritical,
+		}, "n1", "c1")
+		if !errors.Is(err, remediate.ErrDropped) {
+			t.Errorf("errors.Is(err, ErrDropped)=false; err=%v", err)
+		}
+		var de *remediate.DroppedError
+		if errors.As(err, &de) && de.Reason != remediate.DropReasonNoClient {
+			t.Errorf("Reason=%q, want %q", de.Reason, remediate.DropReasonNoClient)
 		}
 	})
 }
