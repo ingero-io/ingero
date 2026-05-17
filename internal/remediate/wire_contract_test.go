@@ -171,6 +171,28 @@ var Contract = []TypeContract{
 		Optional: []string{"event_id", "rank", "world_size"},
 		goType:   reflect.TypeOf(zombieGpuAllocationMessage{}),
 	},
+	{
+		Name:      "nccl_hang",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "idle_ms",
+		},
+		Optional: []string{"event_id", "comm_id_hash", "rank", "world_size"},
+		goType:   reflect.TypeOf(ncclHangMessage{}),
+	},
+	{
+		Name:      "rank_divergence",
+		Stability: Experimental,
+		Required: []string{
+			"type", "node_id", "cluster_id", "timestamp",
+			"pid", "rank", "drift_sigma", "sustained_ms",
+		},
+		// rank_agent is the agent's own training rank (vs the NCCL
+		// rank in the required `rank` field).
+		Optional: []string{"event_id", "rank_agent", "world_size"},
+		goType:   reflect.TypeOf(rankDivergenceMessage{}),
+	},
 }
 
 // TestWireContract_FieldsDeclared fails the build if any type's struct

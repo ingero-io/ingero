@@ -851,6 +851,113 @@ func (s *Server) SendZombieGpuAllocation(zg ZombieGpuAllocation, nodeID, cluster
 	return s.writeLocked(msg)
 }
 
+// ncclHangMessage is the UDS envelope for a per-PID NCCL inactivity
+// signal from internal/ncclhang. Routed via the EE-side direct-
+// dispatch arm: first hit fires nccl_suspend; second hit within the
+// escalation window also fires emergency_checkpoint + process_recycle.
+type ncclHangMessage struct {
+	Type       string    `json:"type"`
+	NodeID     string    `json:"node_id"`
+	ClusterID  string    `json:"cluster_id"`
+	Timestamp  time.Time `json:"timestamp"`
+	EventID    string    `json:"event_id,omitempty"`
+	PID        uint32    `json:"pid"`
+	IdleMs     uint64    `json:"idle_ms"`
+	CommIDHash uint64    `json:"comm_id_hash,omitempty"`
+	Rank       int       `json:"rank,omitempty"`
+	WorldSize  int       `json:"world_size,omitempty"`
+}
+
+// NcclHang is the producer-facing input for an NCCL-hang publication.
+type NcclHang struct {
+	PID        uint32
+	IdleMs     uint64
+	CommIDHash uint64
+}
+
+// SendNcclHang writes a per-PID NCCL-hang notification to the UDS
+// consumer. Non-blocking; same drop semantics as the other Send*
+// paths.
+func (s *Server) SendNcclHang(hang NcclHang, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+	msg := ncclHangMessage{
+		Type:       "nccl_hang",
+		NodeID:     nodeID,
+		ClusterID:  clusterID,
+		Timestamp:  time.Now().UTC(),
+		EventID:    uuid.NewString(),
+		PID:        hang.PID,
+		IdleMs:     hang.IdleMs,
+		CommIDHash: hang.CommIDHash,
+	}
+	if s.worldSize > 0 {
+		msg.Rank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
+// rankDivergenceMessage is the UDS envelope for per-rank compute-time
+// divergence from internal/rankdivergence. Routed via the EE-side
+// chain-driven arm (RankDivergence -> [pod_drain]).
+type rankDivergenceMessage struct {
+	Type        string    `json:"type"`
+	NodeID      string    `json:"node_id"`
+	ClusterID   string    `json:"cluster_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	EventID     string    `json:"event_id,omitempty"`
+	PID         uint32    `json:"pid"`
+	Rank        uint32    `json:"rank"`
+	DriftSigma  float64   `json:"drift_sigma"`
+	SustainedMs uint64    `json:"sustained_ms"`
+	AgentRank   int       `json:"rank_agent,omitempty"`
+	WorldSize   int       `json:"world_size,omitempty"`
+}
+
+// RankDivergence is the producer-facing input. `Rank` is the
+// NCCL-collective rank of the divergent member (per-comm 0..NRanks-1);
+// the agent's own training-rank identity (rank within a multi-agent
+// deployment) is stamped separately by the server via SetRankWorldSize.
+type RankDivergence struct {
+	PID         uint32
+	Rank        uint32
+	DriftSigma  float64
+	SustainedMs uint64
+}
+
+// SendRankDivergence writes a per-rank divergence notification to
+// the UDS consumer. Non-blocking; same drop semantics as the other
+// Send* paths.
+func (s *Server) SendRankDivergence(div RankDivergence, nodeID, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		s.bumpDropLocked(DropReasonNoClient)
+		return newDropped(DropReasonNoClient)
+	}
+	msg := rankDivergenceMessage{
+		Type:        "rank_divergence",
+		NodeID:      nodeID,
+		ClusterID:   clusterID,
+		Timestamp:   time.Now().UTC(),
+		EventID:     uuid.NewString(),
+		PID:         div.PID,
+		Rank:        div.Rank,
+		DriftSigma:  div.DriftSigma,
+		SustainedMs: div.SustainedMs,
+	}
+	if s.worldSize > 0 {
+		msg.AgentRank = s.rank
+		msg.WorldSize = s.worldSize
+	}
+	return s.writeLocked(msg)
+}
+
 // SendFleetStragglerResolved writes a straggler->healthy edge
 // notification. Same non-blocking semantics as SendFleetStragglerState.
 // eventID is per-recovery-edge; consumers may correlate it with the OTLP

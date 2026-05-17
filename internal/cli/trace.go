@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,7 +46,9 @@ import (
 	"github.com/ingero-io/ingero/internal/export"
 	"github.com/ingero-io/ingero/internal/filter"
 	"github.com/ingero-io/ingero/internal/memtrack"
+	"github.com/ingero-io/ingero/internal/ncclhang"
 	"github.com/ingero-io/ingero/internal/nvml"
+	"github.com/ingero-io/ingero/internal/rankdivergence"
 	"github.com/ingero-io/ingero/internal/procpath"
 	"github.com/ingero-io/ingero/internal/remediate"
 	"github.com/ingero-io/ingero/internal/straggler"
@@ -1211,6 +1214,14 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	if driverTracer != nil {
 		driverEventCh = driverTracer.Events()
 	}
+	// Theme 4 NCCL trackers: lazy-activated by the remediate-wiring
+	// path below. The ncclTracer event loop loads these atomically per
+	// event; when remediate is off the loads return nil and the
+	// Observe calls are skipped. The pointer pair lives at function
+	// scope (not package) so concurrent test runs of the trace command
+	// don't share state.
+	theme4HangTracker := new(atomic.Pointer[ncclhang.Tracker])
+	theme4DivTracker := new(atomic.Pointer[rankdivergence.Tracker])
 	if netTracer != nil {
 		go netTracer.Run(ctx)
 		extraChs = append(extraChs, netTracer.Events())
@@ -1235,6 +1246,21 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 				}
 				if n%1000 == 0 {
 					debugf("nccl events seen: %d", n)
+				}
+				// Theme 4: feed the NCCL inactivity tracker and the
+				// per-rank divergence detector when remediate is on
+				// (the trackers are activated lazily by the
+				// remediate-wiring path below via atomic.Pointer
+				// Store). The Observe calls are cheap when the
+				// pointer is nil (single atomic load + nil check).
+				// Lifecycle ops (1=InitRank, 2=Destroy) are fed
+				// only to the hang tracker — they signal that the
+				// PID is alive but carry no DurationNs for MAD.
+				if t := theme4HangTracker.Load(); t != nil {
+					t.Observe(ev.PID, ev.CommIDHash, time.Unix(0, int64(ev.TimestampNs)))
+				}
+				if t := theme4DivTracker.Load(); t != nil && ev.Op != 1 && ev.Op != 2 {
+					t.Observe(ev.PID, ev.CommIDHash, ev.Rank, ev.NRanks, ev.DurationNs)
 				}
 				// Convert ncclprobe.Event into a stats.NCCLDataPoint and
 				// queue for the next snapshot tick. Skip the header-only
@@ -1370,6 +1396,23 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// — runs on a fixed ticker mirroring the memfrag poller cadence.
 	if traceRemediate && remediateSrv != nil {
 		startZombieGpuWatcher(ctx, 5*time.Second, nvml.NewComputeAppsRunner(), remediateSrv, nodeIdentity, traceCluster)
+	}
+
+	// Theme 4 NCCL watchers: per-PID inactivity (nccl_hang) +
+	// per-rank divergence (rank_divergence). Activates the atomic
+	// tracker pointers the ncclTracer event loop loads on every
+	// event; the watcher goroutines drain the trackers on their
+	// own tickers and publish over the remediate UDS. Off when
+	// --remediate is disabled or ncclTracer never attached; in
+	// either case the event-loop loads return nil and Observe is
+	// skipped.
+	if traceRemediate && remediateSrv != nil && ncclTracer != nil {
+		hang := ncclhang.New()
+		div := rankdivergence.New()
+		theme4HangTracker.Store(hang)
+		theme4DivTracker.Store(div)
+		startNcclHangWatcher(ctx, hang, remediateSrv, nodeIdentity, traceCluster)
+		startRankDivergenceWatcher(ctx, div, remediateSrv, nodeIdentity, traceCluster)
 	}
 
 	// Fan-in: merge all event channels into one. Deferred until
