@@ -34,7 +34,7 @@ func TestPoller_TwoGPUsLabeledByUUID(t *testing.T) {
 		return []byte("GPU-aaaaaaaa, 0x4\nGPU-bbbbbbbb, 0x40\n"), nil
 	}
 
-	pollOnce(context.Background(), run, silentLog())
+	pollOnce(context.Background(), run, silentLog(), nil)
 
 	got := drainThrottleBuf()
 	if len(got) != 2 {
@@ -67,7 +67,7 @@ func TestPoller_NotSupportedSkipsDevice(t *testing.T) {
 		return []byte("GPU-consumer, [Not Supported]\nGPU-datacenter, 0x4\n"), nil
 	}
 
-	pollOnce(context.Background(), run, silentLog())
+	pollOnce(context.Background(), run, silentLog(), nil)
 
 	got := drainThrottleBuf()
 	if len(got) != 1 {
@@ -94,7 +94,7 @@ func TestPoller_NotSupportedLogOnce(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		pollOnce(context.Background(), run, log)
+		pollOnce(context.Background(), run, log, nil)
 	}
 
 	if got := infoCount.Load(); got != 1 {
@@ -113,6 +113,7 @@ func TestPoller_RunErrorIsLogged(t *testing.T) {
 			return nil, errors.New("synthetic")
 		},
 		silentLog(),
+		nil,
 	)
 
 	if got := drainThrottleBuf(); got != nil {
@@ -129,7 +130,7 @@ func TestStartThrottlePoller_NilRunner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startThrottlePoller(ctx, time.Millisecond, nil, silentLog())
+	startThrottlePoller(ctx, time.Millisecond, nil, silentLog(), nil)
 
 	// Nothing should land in the buffer.
 	time.Sleep(20 * time.Millisecond)
@@ -154,7 +155,7 @@ func TestStartThrottlePoller_FiresImmediately(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startThrottlePoller(ctx, time.Hour, run, silentLog())
+	startThrottlePoller(ctx, time.Hour, run, silentLog(), nil)
 
 	// Wait briefly for the spawned goroutine to run pollOnce once. The
 	// ticker won't fire (1h interval), so anything in the buffer came
@@ -193,8 +194,8 @@ func TestDrainThrottleBuf_LastValueWins(t *testing.T) {
 		return []byte("GPU-x, 0x0\n"), nil
 	}
 
-	pollOnce(context.Background(), run, silentLog())
-	pollOnce(context.Background(), run, silentLog())
+	pollOnce(context.Background(), run, silentLog(), nil)
+	pollOnce(context.Background(), run, silentLog(), nil)
 
 	got := drainThrottleBuf()
 	if len(got) != 1 {
@@ -217,7 +218,7 @@ func TestPoller_VerifiesNvmlSubprocessRunnerCanBeNil(t *testing.T) {
 		// poller path tolerates it.
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // already cancelled; goroutine returns immediately
-		startThrottlePoller(ctx, time.Millisecond, r, silentLog())
+		startThrottlePoller(ctx, time.Millisecond, r, silentLog(), nil)
 		return
 	}
 	// nvidia-smi present: smoke-test that we got a function.
@@ -248,3 +249,140 @@ func (h infoCountingHandler) WithGroup(name string) slog.Handler        { return
 
 // Force-import for go-vet symmetry.
 var _ = fmt.Sprintf
+
+// Theme 1 second half: the sustain tracker fed inside pollOnce only
+// fires after `sustainPolls=2` consecutive thermal-true polls. A single
+// poll with the Thermal bucket set must NOT call the sink. Guards
+// against a "every observation emits" regression that would page
+// operators on transient thermal blips under power-cap workloads.
+func TestPollOnce_ThermalSinkBelowSustainDoesNotFire(t *testing.T) {
+	resetThrottleState()
+	defer resetThrottleState()
+
+	run := func(_ context.Context) ([]byte, error) {
+		// HwThermalSlowdown = thermal+hw bucket.
+		return []byte("GPU-A, 0x40\n"), nil
+	}
+	var sinkCalls atomic.Int64
+	sink := func(_ nvml.HardwareFault) { sinkCalls.Add(1) }
+
+	pollOnce(context.Background(), run, silentLog(), sink)
+
+	if got := sinkCalls.Load(); got != 0 {
+		t.Fatalf("sink fired on first thermal observation; want 0 calls, got %d", got)
+	}
+}
+
+// Two consecutive thermal-true polls cross sustainPolls=2 and emit
+// exactly one HardwareFault. The payload carries the GPU index
+// (slice position 0 here) and the raw throttle bitmask so the
+// orchestrator's log can correlate to the NVML reason code.
+func TestPollOnce_ThermalSinkFiresOnceAtSustain(t *testing.T) {
+	resetThrottleState()
+	defer resetThrottleState()
+
+	run := func(_ context.Context) ([]byte, error) {
+		return []byte("GPU-A, 0x40\n"), nil
+	}
+	var faults []nvml.HardwareFault
+	sink := func(f nvml.HardwareFault) { faults = append(faults, f) }
+
+	pollOnce(context.Background(), run, silentLog(), sink)
+	pollOnce(context.Background(), run, silentLog(), sink)
+	pollOnce(context.Background(), run, silentLog(), sink) // suppressed: already emitted
+
+	if len(faults) != 1 {
+		t.Fatalf("want exactly 1 emission across 3 sustained polls, got %d: %+v", len(faults), faults)
+	}
+	f := faults[0]
+	if f.Kind != nvml.FaultKindThermalThrottle {
+		t.Errorf("Kind=%q want %q", f.Kind, nvml.FaultKindThermalThrottle)
+	}
+	if f.Severity != nvml.HardwareFaultCritical {
+		t.Errorf("Severity=%q want %q", f.Severity, nvml.HardwareFaultCritical)
+	}
+	if f.GPUID != 0 {
+		t.Errorf("GPUID=%d want 0 (slice position 0)", f.GPUID)
+	}
+	if f.ThrottleReasons != 0x40 {
+		t.Errorf("ThrottleReasons=0x%x want 0x40", f.ThrottleReasons)
+	}
+}
+
+// gpuIndex must advance across [Not Supported] rows so the index
+// stays stable across polls. Without this, an [N/A] GPU 0 would
+// shift GPU 1's emission to be reported as index 0 -- mismatching
+// every other GPU-keyed metric.
+func TestPollOnce_ThermalSinkGPUIndexSkipsUnsupportedRow(t *testing.T) {
+	resetThrottleState()
+	defer resetThrottleState()
+
+	run := func(_ context.Context) ([]byte, error) {
+		return []byte("GPU-consumer, [Not Supported]\nGPU-datacenter, 0x40\n"), nil
+	}
+	var faults []nvml.HardwareFault
+	sink := func(f nvml.HardwareFault) { faults = append(faults, f) }
+
+	pollOnce(context.Background(), run, silentLog(), sink)
+	pollOnce(context.Background(), run, silentLog(), sink)
+
+	if len(faults) != 1 {
+		t.Fatalf("want 1 emission, got %d", len(faults))
+	}
+	if faults[0].GPUID != 1 {
+		t.Errorf("GPUID=%d want 1 (datacenter GPU is second in slice; unsupported row advances index)", faults[0].GPUID)
+	}
+}
+
+// A nil sink leaves the tracker unfed -- pollOnce must not panic and
+// the existing edge detector + buffer paths must still run cleanly.
+// Guards against accidentally tying the legacy throttle metrics path
+// to the new emitter path.
+func TestPollOnce_NilSinkLeavesOtherPathsRunning(t *testing.T) {
+	resetThrottleState()
+	defer resetThrottleState()
+
+	run := func(_ context.Context) ([]byte, error) {
+		return []byte("GPU-A, 0x40\n"), nil
+	}
+	pollOnce(context.Background(), run, silentLog(), nil)
+	pollOnce(context.Background(), run, silentLog(), nil)
+
+	if got := drainThrottleBuf(); len(got) != 1 || !got[0].ThermalActive {
+		t.Fatalf("legacy buffer path broken with nil sink: %+v", got)
+	}
+}
+
+// After the tracker emits and is then cleared (Thermal=false), a new
+// sustained run must emit again. Without this, a workload with
+// recurring thermal incidents would only page once. Mirrors the
+// per-tracker unit `TestThermalSustainTracker_ReEmitsAfterClearAndResustain`
+// at the wire level.
+func TestPollOnce_ThermalSinkReEmitsAfterClear(t *testing.T) {
+	resetThrottleState()
+	defer resetThrottleState()
+
+	step := 0
+	run := func(_ context.Context) ([]byte, error) {
+		step++
+		switch step {
+		case 1, 2:
+			return []byte("GPU-A, 0x40\n"), nil // sustained -> emit at step 2
+		case 3:
+			return []byte("GPU-A, 0x0\n"), nil // clear
+		case 4, 5:
+			return []byte("GPU-A, 0x40\n"), nil // re-sustain -> emit at step 5
+		}
+		return []byte("GPU-A, 0x0\n"), nil
+	}
+	var faults []nvml.HardwareFault
+	sink := func(f nvml.HardwareFault) { faults = append(faults, f) }
+
+	for i := 0; i < 5; i++ {
+		pollOnce(context.Background(), run, silentLog(), sink)
+	}
+
+	if len(faults) != 2 {
+		t.Fatalf("want 2 emissions (sustain then re-sustain after clear), got %d: %+v", len(faults), faults)
+	}
+}

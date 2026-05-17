@@ -1335,7 +1335,22 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 	// fill and never be drained. The poller is no-op when nvidia-smi is
 	// not on PATH (e.g. in dev containers without GPU drivers).
 	if (otlpExporter != nil || promSrv != nil) && traceThrottlePoll > 0 {
-		startThrottlePoller(ctx, traceThrottlePoll, nvml.NewSubprocessRunner(), slog.Default())
+		// Theme 1 second half: when --remediate is on, route sustained
+		// thermal throttling into the orchestrator's HardwareFault arm
+		// (Phase 13) via the remediate UDS. Drops are logged at debug;
+		// the orchestrator's own dispatch already counts them, and a
+		// transient drop is recoverable on the next sustained run.
+		var faultSink ThermalFaultSink
+		if remediateSrv != nil {
+			srv := remediateSrv
+			faultSink = func(fault nvml.HardwareFault) {
+				if err := srv.SendHardwareFault(fault, nodeIdentity, traceCluster); err != nil {
+					slog.Default().Debug("remediate: hardware_fault drop",
+						"kind", fault.Kind, "gpu_id", fault.GPUID, "err", err)
+				}
+			}
+		}
+		startThrottlePoller(ctx, traceThrottlePoll, nvml.NewSubprocessRunner(), slog.Default(), faultSink)
 	}
 
 	// Start libnccl process-discovery scanner (v0.14 item A). Same gate

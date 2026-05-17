@@ -40,9 +40,9 @@ func TestPollOnce_FeedsEdgeDetector(t *testing.T) {
 	}
 
 	// Drive 3 polls.
-	pollOnce(context.Background(), run, slog.Default())
-	pollOnce(context.Background(), run, slog.Default())
-	pollOnce(context.Background(), run, slog.Default())
+	pollOnce(context.Background(), run, slog.Default(), nil)
+	pollOnce(context.Background(), run, slog.Default(), nil)
+	pollOnce(context.Background(), run, slog.Default(), nil)
 
 	got := throttleEdgeDetector.Snapshot()
 	if got.PowerEvents != 1 {
@@ -62,7 +62,7 @@ func TestPollOnce_NotSupportedDoesNotIncrement(t *testing.T) {
 	run := func(_ context.Context) ([]byte, error) {
 		return []byte("GPU-A, [Not Supported]\n"), nil
 	}
-	pollOnce(context.Background(), run, slog.Default())
+	pollOnce(context.Background(), run, slog.Default(), nil)
 	got := throttleEdgeDetector.Snapshot()
 	if got.PowerEvents != 0 || got.ThermalEvents != 0 || got.SWEvents != 0 || got.HWEvents != 0 {
 		t.Errorf("not-supported reading should not increment any bucket; got %+v", got)
@@ -81,7 +81,7 @@ func TestPollOnce_FirstReadingNotCountedAsEdge(t *testing.T) {
 		// First poll already throttled.
 		return []byte("GPU-A, 0x4\n"), nil
 	}
-	pollOnce(context.Background(), run, slog.Default())
+	pollOnce(context.Background(), run, slog.Default(), nil)
 	got := throttleEdgeDetector.Snapshot()
 	if got.PowerEvents != 0 {
 		t.Errorf("first observation should not register an edge; got %d", got.PowerEvents)
