@@ -1415,6 +1415,23 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		startRankDivergenceWatcher(ctx, div, remediateSrv, nodeIdentity, traceCluster)
 	}
 
+	// NVRM Xid reader: follow /dev/kmsg for "NVRM: Xid (PCI:...): N, ..."
+	// driver emissions and publish hardware_fault signals. Event-driven
+	// (not poll-driven), so the runtime cost is one blocking read on a
+	// kernel-managed FIFO; the agent stays at <1% CPU at idle. Degrades
+	// gracefully on hosts without /dev/kmsg (non-Linux dev containers,
+	// permission failures) -- see startXidReader for the no-op path.
+	if traceRemediate && remediateSrv != nil {
+		srv := remediateSrv
+		sink := func(fault nvml.HardwareFault) {
+			if err := srv.SendHardwareFault(fault, nodeIdentity, traceCluster); err != nil {
+				slog.Default().Debug("remediate: hardware_fault drop",
+					"kind", fault.Kind, "gpu_id", fault.GPUID, "err", err)
+			}
+		}
+		startXidReader(ctx, "", nvml.NewPciIndexRunner(), sink, slog.Default())
+	}
+
 	// Fan-in: merge all event channels into one. Deferred until
 	// here so the (optional) tee-wrapped channels above participate
 	// in the merged stream. Driver tracer is passed as nil because
@@ -1452,6 +1469,24 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 			}
 		}
 		startThrottlePoller(ctx, traceThrottlePoll, nvml.NewSubprocessRunner(), slog.Default(), faultSink)
+	}
+
+	// NVLink error counters + PCIe link state probe. Shares the
+	// throttle poll cadence (both ride the same nvidia-smi subprocess
+	// budget) but is gated on --remediate alone -- the emissions
+	// feed only the UDS hardware_fault arm, not any OTel exporter.
+	// nvidia-smi missing -> the runner factories return nil and the
+	// poller silently no-ops the affected probe.
+	if traceRemediate && remediateSrv != nil && traceThrottlePoll > 0 {
+		srv := remediateSrv
+		sink := func(fault nvml.HardwareFault) {
+			if err := srv.SendHardwareFault(fault, nodeIdentity, traceCluster); err != nil {
+				slog.Default().Debug("remediate: hardware_fault drop",
+					"kind", fault.Kind, "gpu_id", fault.GPUID, "err", err)
+			}
+		}
+		startLinkPoller(ctx, traceThrottlePoll, nvml.NewNVLinkErrorRunner(),
+			nvml.NewPCIeLinkRunner(), sink, slog.Default())
 	}
 
 	// Start libnccl process-discovery scanner (v0.14 item A). Same gate
