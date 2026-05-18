@@ -108,11 +108,23 @@ func NewServer(sink Sink) *Server {
 	}
 }
 
-// SocketPath returns the agent-owned ingest socket path the server
-// binds and a client should dial. It resolves the same directory the
-// server uses, so the `ingero annotate` client never needs an
-// operator-supplied socket flag.
+// SocketPath returns the ingest socket path the `ingero annotate`
+// client should dial, so the client never needs an operator-supplied
+// socket flag.
+//
+// The client cannot just reuse the server's resolveSocketDir: that
+// picks a directory by what the caller can WRITE, and the trace
+// process (the server) normally runs as root while the client
+// (a Lightning callback, a Ray hook) runs unprivileged as the
+// training workload. They would resolve different paths. So the
+// client dials the canonical /run location when a socket is actually
+// bound there, and only falls back to resolveSocketDir for the
+// same-user / unprivileged-trace case.
 func SocketPath() string {
+	runPath := filepath.Join(contract.AnnotationSocketDir, contract.AnnotationSocketName)
+	if fi, err := os.Lstat(runPath); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		return runPath
+	}
 	return filepath.Join(resolveSocketDir(), contract.AnnotationSocketName)
 }
 
