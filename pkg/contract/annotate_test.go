@@ -62,11 +62,11 @@ func TestIsValidAnnotationLabelKey(t *testing.T) {
 		}
 	}
 	invalid := []string{
-		"",                // empty
-		"has space",       // space
-		"slash/key",       // slash
-		"emoji☃",     // non-ASCII
-		"colon:key",       // colon
+		"",          // empty
+		"has space", // space
+		"slash/key", // slash
+		"emoji☃",    // non-ASCII
+		"colon:key", // colon
 		strings.Repeat("a", AnnotationMaxLabelKeyLen+1), // too long
 	}
 	for _, k := range invalid {
