@@ -1,0 +1,39 @@
+# Ingero agent colocated with a vLLM inference server.
+# Both containers run on one host; the agent shares the host PID
+# namespace so its eBPF uprobes see vLLM's CUDA and NCCL activity.
+#
+#   docker compose up -d
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: ["--model", "facebook/opt-125m"]
+    ports:
+      - "8000:8000"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ingero:
+    image: ghcr.io/ingero-io/ingero:latest
+    # --record --record-all stores every CUDA op so `ingero explain`
+    # and `query` show the full trace. Both flags are needed:
+    # --record-all only disables selective storage when --record is
+    # explicit. For a long-running production deployment use
+    # `--inference` instead (the v0.16 inference daemon mode:
+    # selective storage, DB rollover, step-duration outlier
+    # detection).
+    command: ["trace", "--record", "--record-all", "--db", "/var/lib/ingero/vllm.db"]
+    privileged: true
+    pid: host
+    depends_on:
+      - vllm
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+      - ./data:/var/lib/ingero
