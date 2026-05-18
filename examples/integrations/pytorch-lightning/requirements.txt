@@ -1,0 +1,8 @@
+# Runtime dependencies for the example training script.
+# The annotation writer (ingero_annotate.py) needs none of these - it is
+# pure stdlib so the protocol logic stays testable without heavy deps.
+pytorch-lightning>=2.0
+torch>=2.0
+
+# Test-only:
+pytest>=7.0
