@@ -54,3 +54,8 @@ coverage.out
 
 # Asciinema recordings (large, used to generate GIFs)
 docs/assets/*.cast
+
+# Python bytecode cache from the examples/ integration test suites
+__pycache__/
+*.pyc
+.pytest_cache/
