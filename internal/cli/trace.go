@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/spf13/cobra"
 
+	annotate "github.com/ingero-io/ingero/internal/annotate"
 	"github.com/ingero-io/ingero/internal/cgroup"
 	"github.com/ingero-io/ingero/internal/config"
 	"github.com/ingero-io/ingero/internal/correlate"
@@ -101,6 +102,8 @@ var (
 	ncclBufMax = 4096
 	traceRemediate    bool          // Enable VRAM tracking and UDS remediation endpoint.
 	traceRemediateGid int           // Numeric GID for remediation socket group access. Mirrors fleet-push.
+	traceAnnotate     bool          // Enable the inbound annotation ingest socket.
+	traceAnnotateGid  int           // Numeric GID for annotation socket group access. < 0 = owner-only.
 	traceNode         string        // Node identity for multi-node correlation.
 	traceCluster      string        // Cluster identity (operator-supplied, shared across pods of one job).
 	traceCUDALib      string        // Explicit libcudart.so path (skip discovery).
@@ -256,6 +259,10 @@ func init() {
 	traceCmd.Flags().BoolVar(&traceRemediate, "remediate", false, "enable VRAM tracking and UDS remediation endpoint (requires an external consumer; see docs/remediation-protocol_fleet.md)")
 	traceCmd.Flags().IntVar(&traceRemediateGid, "remediate-gid", 65532,
 		"Numeric GID granted group access to the remediation socket (chown -1:gid + chmod 0770). Default 65532 matches distroless 'nonroot'. Set < 0 to keep the socket owner-only (0700).")
+	traceCmd.Flags().BoolVar(&traceAnnotate, "annotate", false,
+		"enable the inbound annotation ingest socket so external workloads (Lightning callback, Ray hook, 'ingero annotate') can inject step/epoch/task labels into the recorded trace. Requires --record. Socket is owner-only (0700) unless --annotate-socket-gid is set.")
+	traceCmd.Flags().IntVar(&traceAnnotateGid, "annotate-socket-gid", -1,
+		"Numeric GID granted group access to the annotation ingest socket (chown -1:gid + chmod 0770). Default -1 keeps the socket owner-only (0700); the legitimate writers run as the training workload, so group access is a deliberate opt-in.")
 	traceCmd.Flags().StringVar(&traceNode, "node", "", "node identity for multi-node correlation (default: os.Hostname())")
 	traceCmd.Flags().StringVar(&traceCluster, "cluster", "", "cluster identity shared across pods of one training/serving job. Emitted on every OTLP push as the ingero.cluster.id resource attribute so the Fleet processor can group cross-pod metrics by (cluster, model, phase) for peer-relative outlier detection. Empty leaves the attribute off the wire.")
 	traceCmd.Flags().StringVar(&traceCUDALib, "cuda-lib", "", "explicit path to libcudart.so (skip auto-discovery)")
@@ -1306,6 +1313,32 @@ func traceRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 	// --- End remediate wiring ---
+
+	// --- Begin annotation ingest wiring ---
+	// The annotation ingest socket lets external workloads (the
+	// Lightning callback, the Ray hook, `ingero annotate`) inject
+	// step/epoch/task labels into the recorded trace. Inbound trust
+	// boundary: owner-only socket by default, opt-in group access via
+	// --annotate-socket-gid. Requires --record because annotations are
+	// written to the SQLite store.
+	if traceAnnotate {
+		if eventStore == nil {
+			log.Printf("WARN: annotate: --annotate requires --record; annotation ingest disabled")
+		} else {
+			annSrv := annotate.NewServer(eventStore)
+			if traceAnnotateGid >= 0 {
+				annSrv.SetSocketGid(traceAnnotateGid)
+			}
+			if err := annSrv.Start(); err != nil {
+				log.Printf("ERROR: annotate: ingest_socket_bind_failed error=%v", err)
+				// Degrade gracefully — tracing continues without ingest.
+			} else {
+				defer annSrv.Close()
+				log.Printf("INFO: annotate: ingest enabled socket=%s", annSrv.SocketPath())
+			}
+		}
+	}
+	// --- End annotation ingest wiring ---
 
 	// --- Begin straggler detector wiring ---
 	var stragglerDetector *straggler.Detector
