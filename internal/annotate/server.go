@@ -69,6 +69,12 @@ type Server struct {
 	sink     Sink
 	resolver incarnationResolver
 
+	// pidUID resolves a PID to its real uid. Pulled behind a field,
+	// like resolver, so tests can supply a deterministic lookup
+	// without depending on live /proc state. NewServer defaults it to
+	// readPIDRealUID.
+	pidUID func(uint32) (uint32, bool)
+
 	listener net.Listener
 
 	mu     sync.Mutex
@@ -97,6 +103,7 @@ func NewServer(sink Sink) *Server {
 		socketGid:  -1,
 		sink:       sink,
 		resolver:   annotate.ResolveIncarnation,
+		pidUID:     readPIDRealUID,
 		conns:      make(map[net.Conn]struct{}),
 	}
 }
@@ -379,17 +386,25 @@ func (s *Server) processLine(line []byte, prov annotate.Provenance) {
 		// PeerPID 0 only occurs when peercred could not be read, and
 		// that path already drops the connection before processLine; a
 		// captured peer is therefore always present here.
-		if owner, ok := readPIDRealUID(w.PID); ok {
-			if uint32(owner) != prov.PeerUID {
-				s.rejected.Add(1)
-				log.Printf("WARN: annotate: pid_scope_rejected pid=%d pid_uid=%d peer_uid=%d",
-					w.PID, owner, prov.PeerUID)
-				return
-			}
+		//
+		// Fail closed: if the PID's real uid cannot be read (the
+		// process exited, or never existed), the scope cannot be
+		// verified, so the PID-scoped annotation is rejected. Accepting
+		// it would let a caller bypass the ownership check by naming a
+		// dead or about-to-exit PID.
+		owner, ok := s.pidUID(w.PID)
+		if !ok {
+			s.rejected.Add(1)
+			log.Printf("WARN: annotate: pid_scope_unverifiable pid=%d peer_uid=%d",
+				w.PID, prov.PeerUID)
+			return
 		}
-		// When the PID's uid cannot be read (process exited between the
-		// write and now), the incarnation simply resolves with whatever
-		// /proc returned; the join degrades conservatively for that row.
+		if owner != prov.PeerUID {
+			s.rejected.Add(1)
+			log.Printf("WARN: annotate: pid_scope_rejected pid=%d pid_uid=%d peer_uid=%d",
+				w.PID, owner, prov.PeerUID)
+			return
+		}
 		a.Process = resolved
 	}
 

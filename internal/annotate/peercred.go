@@ -59,7 +59,7 @@ func peerCred(conn net.Conn) (annotate.Provenance, error) {
 // confirm a caller can only annotate a PID it actually owns. Returns
 // (0, false) when the status file is unreadable (the PID exited) or the
 // line is missing or malformed.
-func readPIDRealUID(pid uint32) (int, bool) {
+func readPIDRealUID(pid uint32) (uint32, bool) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		return 0, false
@@ -75,11 +75,11 @@ func readPIDRealUID(pid uint32) (int, bool) {
 		if len(fields) == 0 {
 			return 0, false
 		}
-		uid, err := strconv.Atoi(fields[0])
+		uid, err := strconv.ParseUint(fields[0], 10, 32)
 		if err != nil {
 			return 0, false
 		}
-		return uid, true
+		return uint32(uid), true
 	}
 	return 0, false
 }

@@ -55,6 +55,7 @@ func startServer(t *testing.T, sink Sink) *Server {
 		socketGid:  -1,
 		sink:       sink,
 		resolver:   annotate.ResolveIncarnation,
+		pidUID:     func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
 		conns:      make(map[net.Conn]struct{}),
 	}
 	if err := s.Start(); err != nil {
@@ -278,6 +279,7 @@ func TestServer_SocketGidOptIn(t *testing.T) {
 		socketGid:  os.Getgid(), // chown to our own gid - always permitted
 		sink:       sink,
 		resolver:   annotate.ResolveIncarnation,
+		pidUID:     func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
 		conns:      make(map[net.Conn]struct{}),
 	}
 	if err := s.Start(); err != nil {
@@ -309,6 +311,7 @@ func TestServer_RejectsWorldWritableDir(t *testing.T) {
 		socketGid:  -1,
 		sink:       &memSink{},
 		resolver:   annotate.ResolveIncarnation,
+		pidUID:     func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
 		conns:      make(map[net.Conn]struct{}),
 	}
 	err := s.Start()
@@ -343,6 +346,7 @@ func TestServer_RejectsSymlinkSocketPath(t *testing.T) {
 		socketGid:  -1,
 		sink:       &memSink{},
 		resolver:   annotate.ResolveIncarnation,
+		pidUID:     func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
 		conns:      make(map[net.Conn]struct{}),
 	}
 	err := s.Start()
@@ -451,7 +455,11 @@ func TestServer_IncarnationResolution(t *testing.T) {
 		resolver: func(pid uint32) annotate.ProcessIncarnation {
 			return annotate.ProcessIncarnation{PID: pid, StartTime: 5000}
 		},
-		conns: make(map[net.Conn]struct{}),
+		// The test's dial connects from the test process, so the peer
+		// uid is os.Getuid(); the stub returns that so the PID-scope
+		// ownership check passes.
+		pidUID: func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
+		conns:  make(map[net.Conn]struct{}),
 	}
 	if err := s.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -491,7 +499,8 @@ func TestServer_StartTimeMismatchRejected(t *testing.T) {
 		resolver: func(pid uint32) annotate.ProcessIncarnation {
 			return annotate.ProcessIncarnation{PID: pid, StartTime: 5000}
 		},
-		conns: make(map[net.Conn]struct{}),
+		pidUID: func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
+		conns:  make(map[net.Conn]struct{}),
 	}
 	if err := s.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -508,6 +517,78 @@ func TestServer_StartTimeMismatchRejected(t *testing.T) {
 	waitFor(t, func() bool { return sink.count() == 1 }, "only the valid line ingested")
 	if r := s.ReadStats().Rejected; r < 1 {
 		t.Errorf("rejected = %d, want >= 1 for the start_time mismatch", r)
+	}
+}
+
+// TestServer_PidScopeUnverifiableRejected asserts a PID-scoped
+// annotation is rejected - fail closed - when the PID's real uid
+// cannot be resolved. A caller must not be able to bypass the
+// ownership check by naming a dead, exiting, or non-existent PID.
+func TestServer_PidScopeUnverifiableRejected(t *testing.T) {
+	sink := &memSink{}
+	dir := t.TempDir()
+	s := &Server{
+		socketDir:  dir,
+		socketPath: dir + "/" + contract.AnnotationSocketName,
+		socketGid:  -1,
+		sink:       sink,
+		resolver: func(pid uint32) annotate.ProcessIncarnation {
+			return annotate.ProcessIncarnation{PID: pid, StartTime: 5000}
+		},
+		// The PID's uid cannot be resolved (process exited or never
+		// existed). Fail closed: the annotation must be rejected.
+		pidUID: func(uint32) (uint32, bool) { return 0, false },
+		conns:  make(map[net.Conn]struct{}),
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	c := dial(t, s)
+	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321}` + "\n"))
+	c.Close()
+
+	waitFor(t, func() bool { return s.ReadStats().Rejected >= 1 },
+		"unverifiable PID-scoped annotation rejected")
+	if sink.count() != 0 {
+		t.Errorf("unverifiable PID-scoped annotation must not be ingested, got %d rows",
+			sink.count())
+	}
+}
+
+// TestServer_PidScopeMismatchRejected asserts a PID-scoped annotation
+// is rejected when the PID's real uid differs from the connecting
+// peer's uid - a caller can only annotate its own processes.
+func TestServer_PidScopeMismatchRejected(t *testing.T) {
+	sink := &memSink{}
+	dir := t.TempDir()
+	s := &Server{
+		socketDir:  dir,
+		socketPath: dir + "/" + contract.AnnotationSocketName,
+		socketGid:  -1,
+		sink:       sink,
+		resolver: func(pid uint32) annotate.ProcessIncarnation {
+			return annotate.ProcessIncarnation{PID: pid, StartTime: 5000}
+		},
+		// The PID is owned by a uid that differs from the peer uid.
+		pidUID: func(uint32) (uint32, bool) { return uint32(os.Getuid()) + 1, true },
+		conns:  make(map[net.Conn]struct{}),
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	c := dial(t, s)
+	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321}` + "\n"))
+	c.Close()
+
+	waitFor(t, func() bool { return s.ReadStats().Rejected >= 1 },
+		"PID-scope uid-mismatch annotation rejected")
+	if sink.count() != 0 {
+		t.Errorf("PID-scope uid-mismatch annotation must not be ingested, got %d rows",
+			sink.count())
 	}
 }
 
