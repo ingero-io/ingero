@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	intannotate "github.com/ingero-io/ingero/internal/annotate"
 	"github.com/ingero-io/ingero/pkg/annotate"
 	"github.com/ingero-io/ingero/pkg/contract"
 )
@@ -20,7 +21,6 @@ var (
 	annotateFromFile string
 	annotateLabels   []string
 	annotatePID      int
-	annotateSocket   string
 )
 
 var annotateCmd = &cobra.Command{
@@ -67,8 +67,6 @@ func init() {
 		"convenience key=value label (leaks via /proc/<pid>/cmdline; prefer stdin/--from-file)")
 	annotateCmd.Flags().IntVar(&annotatePID, "pid", 0,
 		"process scope for --label annotations (leaks via /proc/<pid>/cmdline)")
-	annotateCmd.Flags().StringVar(&annotateSocket, "socket", "",
-		"annotation ingest socket path (default: the agent-owned path)")
 
 	rootCmd.AddCommand(annotateCmd)
 }
@@ -78,11 +76,14 @@ func init() {
 // or stdin), connects to the agent's ingest socket, and writes them as
 // NDJSON. Exactly one source is used: --label takes precedence, then
 // --from-file, then stdin.
+// annotateDialPath is the ingest socket the client dials. It is the
+// fixed agent-owned path; there is deliberately no operator flag for
+// it. It is a package var only so tests can point at a hermetic
+// per-test socket.
+var annotateDialPath = intannotate.SocketPath
+
 func annotateRunE(cmd *cobra.Command, args []string) error {
-	socket := annotateSocket
-	if socket == "" {
-		socket = contract.AnnotationSocketDir + "/" + contract.AnnotationSocketName
-	}
+	socket := annotateDialPath()
 
 	lines, err := annotateCollectLines()
 	if err != nil {

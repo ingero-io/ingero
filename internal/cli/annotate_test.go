@@ -50,7 +50,6 @@ func resetAnnotateFlags() {
 	annotateFromFile = ""
 	annotateLabels = nil
 	annotatePID = 0
-	annotateSocket = ""
 }
 
 func TestAnnotateCollectLines_FromLabels(t *testing.T) {
@@ -173,17 +172,16 @@ func TestAnnotate_EndToEnd(t *testing.T) {
 
 	sink := &memSink{}
 	srv := intannotate.NewServer(sink)
-	// Point the server at a per-test socket via the exported NewServer
-	// default path is the shared contract path; override by binding our
-	// own listener is not exposed, so use the CLI --socket flag against
-	// the server's default path. To keep the test hermetic, start the
-	// server and read its socket path.
 	if err := srv.Start(); err != nil {
 		t.Skipf("ingest server start failed (shared socket path in use?): %v", err)
 	}
 	defer srv.Close()
 
-	annotateSocket = srv.SocketPath()
+	// Point the client at the server's actual socket. The client
+	// normally dials the fixed agent-owned path; the test seam keeps
+	// this hermetic.
+	annotateDialPath = func() string { return srv.SocketPath() }
+	defer func() { annotateDialPath = intannotate.SocketPath }()
 	annotateLabels = []string{"step=7"}
 
 	if err := annotateRunE(annotateCmd, nil); err != nil {
@@ -210,7 +208,6 @@ func TestAnnotate_NoSource(t *testing.T) {
 	w.Close()
 	defer func() { os.Stdin = orig }()
 
-	annotateSocket = filepath.Join(t.TempDir(), "nonexistent.sock")
 	err := annotateRunE(annotateCmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "no annotations") {
 		t.Errorf("expected a 'no annotations' error, got %v", err)
@@ -222,9 +219,28 @@ func TestAnnotate_SocketUnreachable(t *testing.T) {
 	defer resetAnnotateFlags()
 
 	annotateLabels = []string{"step=1"}
-	annotateSocket = filepath.Join(t.TempDir(), "nope.sock")
+	// Point at a missing per-test socket so the dial fails deterministically.
+	annotateDialPath = func() string { return filepath.Join(t.TempDir(), "nope.sock") }
+	defer func() { annotateDialPath = intannotate.SocketPath }()
 	err := annotateRunE(annotateCmd, nil)
 	if err == nil {
 		t.Error("expected an error connecting to a missing socket")
+	}
+}
+
+// TestExplainAnnotationsFlag_RolloverNote asserts the explain
+// --annotations flag help documents that it covers the live DB only
+// and points at 'query --include-rolled --annotations' for the
+// rollover-spanning path. explain joins only the live DB.
+func TestExplainAnnotationsFlag_RolloverNote(t *testing.T) {
+	f := explainCmd.Flags().Lookup("annotations")
+	if f == nil {
+		t.Fatal("explain has no --annotations flag")
+	}
+	if !strings.Contains(f.Usage, "live DB only") {
+		t.Errorf("--annotations help should state it covers the live DB only: %q", f.Usage)
+	}
+	if !strings.Contains(f.Usage, "--include-rolled") {
+		t.Errorf("--annotations help should point at query --include-rolled: %q", f.Usage)
 	}
 }

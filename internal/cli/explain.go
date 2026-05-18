@@ -81,7 +81,7 @@ func init() {
 	explainCmd.Flags().IntVar(&explainLast, "last", 0, "analyze the N most recent events (0 = use --since)")
 	explainCmd.Flags().BoolVar(&explainChains, "chains", false, "show stored causal chains from DB (skip re-analysis)")
 	explainCmd.Flags().BoolVar(&explainPerProcess, "per-process", false, "per-process CUDA API breakdown (RAG/multi-process contention)")
-	explainCmd.Flags().BoolVar(&explainAnnotations, "annotations", false, "after the incident report, summarize external annotations (step/epoch/task labels) that resolve to the analyzed events by process incarnation + time window")
+	explainCmd.Flags().BoolVar(&explainAnnotations, "annotations", false, "after the incident report, summarize external annotations (step/epoch/task labels) that resolve to the analyzed events by process incarnation + time window; covers the live DB only - use 'ingero query --include-rolled --annotations' to span rolled-over files")
 	explainCmd.Flags().StringVar(&explainNodes, "nodes", "", "comma-separated node addresses (host:port) for fleet fan-out query")
 	explainCmd.Flags().StringVar(&explainTimeout, "timeout", "5s", "per-node timeout for fleet queries")
 	explainCmd.Flags().StringVar(&explainCACert, "ca-cert", "", "CA certificate for mTLS (optional)")
