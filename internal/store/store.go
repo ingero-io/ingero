@@ -1396,6 +1396,8 @@ func (s *Store) pruneBySize() {
 				SELECT MIN(timestamp) AS lo, MAX(timestamp) AS hi FROM events
 				UNION ALL
 				SELECT MIN(bucket) AS lo, MAX(bucket) AS hi FROM event_aggregates
+				UNION ALL
+				SELECT MIN(timestamp) AS lo, MAX(timestamp) AS hi FROM annotations
 			)`).Scan(&minTS, &maxTS)
 		if err != nil || minTS == 0 || maxTS == 0 || minTS >= maxTS {
 			break // no data or single-point — nothing to prune
@@ -1426,6 +1428,11 @@ func (s *Store) pruneBySize() {
 			{"DELETE FROM causal_chains WHERE detected_at < ?", cutoff},
 			{"DELETE FROM sessions WHERE started_at < ?", cutoff},
 			{"DELETE FROM process_names WHERE seen_at < ?", cutoff},
+			// v0.17: annotations is externally writable and unbounded;
+			// it must be retention-bounded like events. Prune by the
+			// same time cutoff so a flood of annotations cannot exhaust
+			// the disk.
+			{"DELETE FROM annotations WHERE timestamp < ?", cutoff},
 		} {
 			if res, err := s.db.Exec(stmt.query, stmt.arg); err == nil {
 				if n, rerr := res.RowsAffected(); rerr == nil {
