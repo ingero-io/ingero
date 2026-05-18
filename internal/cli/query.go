@@ -33,6 +33,7 @@ var (
 	queryClockSkew     string
 	queryIncludeRolled bool
 	queryRequireTLS    bool
+	queryAnnotations   bool
 )
 
 var queryCmd = &cobra.Command{
@@ -68,6 +69,7 @@ func init() {
 	queryCmd.Flags().StringVar(&queryClientKey, "client-key", "", "client key for mTLS (optional)")
 	queryCmd.Flags().StringVar(&queryClockSkew, "clock-skew-threshold", "10ms", "clock skew warning threshold for fleet queries")
 	queryCmd.Flags().BoolVar(&queryIncludeRolled, "include-rolled", false, "also query rolled-over DB siblings (ingero.db.<TIMESTAMP>.db) of the live database. Useful when --since spans a rollover boundary. Cost: opens each rolled file briefly and runs the same Query, then merges + re-sorts in Go; expect linear time in the number of rolled files (default rollover keep-count is 6).")
+	queryCmd.Flags().BoolVar(&queryAnnotations, "annotations", false, "join external annotations (step/epoch/task labels injected via 'ingero annotate') to each event and print them. The join is by process incarnation + time window and is rollover-aware: with --include-rolled the join runs per-file before the merge.")
 	queryCmd.Flags().BoolVar(&queryRequireTLS, "fleet-require-tls", true, "refuse to fan out to a non-loopback node when no TLS material (--ca-cert / --client-cert) is configured. SQL bodies and row payloads include workload identity; plaintext on a multi-host fleet is a leak surface. Set false to permit plaintext (e.g. service-mesh-mTLS-fronted deployments).")
 
 	rootCmd.AddCommand(queryCmd)
@@ -118,6 +120,13 @@ func queryRunE(cmd *cobra.Command, args []string) error {
 		}
 		params.Source = uint8(source)
 		params.Op = op
+	}
+
+	// Annotation-join path: gather events plus their incarnation-joined
+	// annotation labels per DB file, then merge. Kept separate from the
+	// plain path so the non-annotated query is byte-identical to before.
+	if queryAnnotations {
+		return queryWithAnnotations(s, dbPath, params)
 	}
 
 	evts, err := s.Query(params)

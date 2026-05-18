@@ -171,8 +171,10 @@ func (s *Store) RolloverNow(reason string, cfg *RolloverConfig) error {
 			s.dbPath, rolledPath, err, openErr)
 	}
 
-	// (4) Open fresh DB at the original path.
-	newDB, err := sql.Open("sqlite", s.dbPath)
+	// (4) Open fresh DB at the original path. Use buildWriteDSN so the
+	// rolled-over pool gets busy_timeout on every connection, exactly as
+	// New() does — a post-open Exec would only set it on one connection.
+	newDB, err := sql.Open("sqlite", buildWriteDSN(s.dbPath))
 	if err != nil {
 		// The live DB is closed (oldDB.Close at line 131) and the on-disk
 		// file has already been renamed away. We cannot recover here; the
@@ -188,11 +190,11 @@ func (s *Store) RolloverNow(reason string, cfg *RolloverConfig) error {
 	// Replicate the PRAGMAs from New() so the rolled-over DB has the
 	// same operational characteristics. Errors here are non-fatal —
 	// the DB is functional without them, just slower or less safe.
+	// busy_timeout is carried by buildWriteDSN on every connection.
 	newDB.Exec("PRAGMA auto_vacuum = INCREMENTAL")
 	if _, err := newDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		s.rolloverLog().Warn("rollover: WAL mode not set on fresh DB", "err", err.Error())
 	}
-	newDB.Exec("PRAGMA busy_timeout = 5000")
 
 	// Publish the new handle BEFORE schema-apply so a schema failure
 	// leaves a functional (if partially migrated) handle attached to

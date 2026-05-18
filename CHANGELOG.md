@@ -8,6 +8,25 @@ Fleet-side changes (the OTel Collector distribution) live in the
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-05-19
+
+External annotation ingest: a recorded trace can be sliced by labels
+that external workloads inject while it records.
+
+### Added
+
+- **`ingero annotate` and the `trace --annotate` ingest socket.**
+  External workloads (training-loop callbacks, schedulers) write
+  step / epoch / task labels into a live recorded trace over a local
+  Unix-domain socket. The socket is owner-only by default;
+  `trace --annotate-socket-gid` opts a group in. Input is taken from
+  stdin or `--from-file`.
+- **`query --annotations` and `explain --annotations`.** Join the
+  injected labels to events by process incarnation and time window,
+  so a recorded trace can be read or filtered per step / epoch / task.
+- `examples/integrations/vllm/` - a docker-compose example that runs
+  the agent colocated with a vLLM inference server.
+
 ## [0.16.0] - 2026-05-11
 
 The inference release. `ingero trace --inference` adds an observability

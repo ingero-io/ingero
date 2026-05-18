@@ -136,6 +136,13 @@ func applyAgentSchema(db *sql.DB, onDiskVersion int) error {
 		return fmt.Errorf("creating cgroup_schedstat table: %w", err)
 	}
 
+	// v0.17: Create annotations table for external annotation ingest.
+	// Created here (not only in New) so a rolled-over fresh DB carries
+	// it. Idempotent — CREATE TABLE IF NOT EXISTS.
+	if _, err := db.Exec(annotationsSchema); err != nil {
+		return fmt.Errorf("creating annotations table: %w", err)
+	}
+
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '0.8')")
 	db.Exec("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('cgroup_metadata_note', 'cgroup_id -> container_id mapping. Populated during K8s tracing. JOIN with events.cgroup_id for container context.')")
 
