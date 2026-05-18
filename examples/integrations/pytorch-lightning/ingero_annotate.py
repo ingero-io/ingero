@@ -140,6 +140,11 @@ def default_socket_path() -> str:
     """
     run_path = os.path.join(ANNOTATION_SOCKET_DIR, ANNOTATION_SOCKET_NAME)
     try:
+        # This exists/is-socket check is advisory only - it just picks the
+        # more likely path. The real guard is _connect's OSError handling,
+        # which copes with the socket vanishing between here and connect.
+        # Do not "harden" this into a stricter pre-flight check: that would
+        # introduce a TOCTOU race for no gain.
         if os.path.exists(run_path) and _is_socket(run_path):
             return run_path
     except OSError:
@@ -161,10 +166,17 @@ class AnnotationWriter:
 
     The writer opens the Unix-domain socket once and reuses it for every
     annotation. It is graceful by design: if the socket does not exist
-    (the agent is not running with `--annotate`) or the connection drops,
-    the writer degrades to a silent no-op after one log line. It never
-    raises into the caller's hot path - a contract violation is the only
-    thing surfaced, and only from the explicit `write` call.
+    (the agent is not running with `--annotate`) the writer starts as a
+    silent no-op after one log line. It never raises into the caller's
+    hot path - a contract violation is the only thing surfaced, and only
+    from the explicit `write` call.
+
+    On a write failure (the agent restarted mid-run, the peer closed) the
+    writer makes exactly one bounded reconnect attempt: it closes the
+    dead socket, reconnects once, and retries the write. If the reconnect
+    or the retried write also fails it goes inert for the rest of the
+    run. One attempt only - no retry loop, no backoff, no retry storm in
+    a training hot path.
 
     Typical use from a framework hook:
 
@@ -219,8 +231,10 @@ class AnnotationWriter:
 
         A contract violation raises AnnotationError - that is a caller
         bug, surfaced loudly. A transport failure (socket gone, peer
-        closed) is swallowed: the writer flips to no-op and returns False
-        so a training loop is never interrupted by agent unavailability.
+        closed) is swallowed: the writer makes one bounded reconnect
+        attempt and retries the write; if that also fails it flips to
+        no-op and returns False so a training loop is never interrupted
+        by agent unavailability.
         """
         line = encode_annotation(labels, pid=pid, ts_ns=ts_ns)
         with self._lock:
@@ -232,10 +246,29 @@ class AnnotationWriter:
             except OSError as exc:
                 logger.info(
                     "ingero annotation socket write failed (%s); "
-                    "annotations disabled for the rest of this run.", exc,
+                    "attempting one reconnect.", exc,
                 )
                 self._close_locked()
-                return False
+                # One bounded reconnect attempt - the agent may have
+                # restarted mid-run. No loop, no backoff.
+                self._connect()
+                if not self._active or self._sock is None:
+                    logger.info(
+                        "ingero annotation reconnect failed; annotations "
+                        "disabled for the rest of this run.",
+                    )
+                    return False
+                try:
+                    self._sock.sendall(line)
+                    return True
+                except OSError as exc2:
+                    logger.info(
+                        "ingero annotation write failed after reconnect "
+                        "(%s); annotations disabled for the rest of this "
+                        "run.", exc2,
+                    )
+                    self._close_locked()
+                    return False
 
     def _close_locked(self) -> None:
         if self._sock is not None:

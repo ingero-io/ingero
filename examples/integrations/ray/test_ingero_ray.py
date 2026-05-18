@@ -120,3 +120,64 @@ def test_emit_skips_when_no_labels(fake_server):
         pass
     time.sleep(0.2)
     assert fake_server.received() == []
+
+
+def test_decorator_annotates_worker_pid(fake_server):
+    # The decorator runs _emit inside the function body, i.e. in whatever
+    # process executes the task. The annotation's pid must be that
+    # process's pid - the slicing key the agent joins on. Here the test
+    # process stands in for the Ray worker.
+    ir.configure_socket_path(fake_server.path)
+
+    @ir.annotate_task(task_name="scoped")
+    def work():
+        return os.getpid()
+
+    worker_pid = work()
+    obj = json.loads(_drain(fake_server, 1)[0])
+    assert obj["pid"] == worker_pid == os.getpid()
+
+
+def test_helper_survives_agent_vanishing_mid_run(fake_server):
+    # The agent restarts mid-job: the socket disappears between two
+    # annotated task calls. The task must still run, must not raise, and
+    # the integration must degrade to a no-op.
+    ir.configure_socket_path(fake_server.path)
+
+    @ir.annotate_task(task_name="midrun")
+    def work(x):
+        return x * 10
+
+    # First call while the agent is up.
+    assert work(1) == 10
+    assert len(_drain(fake_server, 1)) == 1
+
+    # Agent vanishes mid-run.
+    fake_server.stop()
+    time.sleep(0.1)
+
+    # Second call after the drop: the task still runs and returns its
+    # real result, and no transport error escapes into the caller.
+    assert work(2) == 20
+    # A few more calls to confirm the degraded path is stable.
+    for i in range(5):
+        assert work(i) == i * 10
+
+
+def test_fork_rebuilds_writer(fake_server, monkeypatch):
+    # A forked Ray worker must not share its parent's socket fd. The
+    # writer cache is keyed by PID; when os.getpid() changes the cache
+    # must build a fresh writer rather than hand back the stale one.
+    ir.configure_socket_path(fake_server.path)
+
+    first = ir._get_writer()
+    assert first is ir._get_writer()  # same PID -> cached, reused
+
+    # Simulate a fork: the same process now reports a different PID.
+    fake_pid = os.getpid() + 100000
+    monkeypatch.setattr(os, "getpid", lambda: fake_pid)
+
+    second = ir._get_writer()
+    assert second is not first  # PID changed -> fresh writer built
+    assert ir._writer_pid == fake_pid
+    assert second is ir._get_writer()  # and the new one is now cached

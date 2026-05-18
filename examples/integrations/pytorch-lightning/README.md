@@ -29,6 +29,17 @@ If it is not, the callback degrades to a no-op: it logs one line and
 every annotation call returns without sending. It never crashes or slows
 a training run.
 
+## Rate cap
+
+The agent enforces a per-connection annotation rate cap
+(`AnnotationConnRateLimit`, see `pkg/contract/annotate.go`): a fixed
+number of annotations per connection per window. A training loop that
+emits step boundaries faster than that cap will have some step labels
+dropped server-side - the connection and the agent stay healthy, but
+those steps will not appear in the sliced trace. For very fast loops,
+annotate at a coarser boundary (for example, every Nth step or per
+epoch) so every emitted label is recorded.
+
 ## Run the example
 
     pip install -r requirements.txt

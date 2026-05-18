@@ -20,10 +20,16 @@ slice the trace by task.
 
 Two entry points:
 
-- `annotate_task(...)` - a decorator. Apply it under `@ray.remote`; the
-  task is annotated automatically each time it runs.
+- `annotate_task(...)` - a decorator, and the recommended path. Apply it
+  under `@ray.remote`; the task is annotated automatically each time it
+  runs, always inside the worker process, so the annotation is correctly
+  scoped to the worker PID.
 - `task_annotation(...)` - a context manager, for annotating from inside
-  an existing task body.
+  an existing task body. It MUST be opened inside a running Ray task,
+  never on the driver: the annotation is scoped to `os.getpid()`, so
+  opening it on the driver would mis-scope the annotation to the driver
+  PID and the recorded trace would not slice correctly. When in doubt,
+  use the `annotate_task` decorator, which cannot be misused this way.
 
 ## Requirements
 

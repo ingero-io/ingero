@@ -20,7 +20,7 @@ Design:
   - If the agent is not running with `--annotate`, the writer is inert;
     the helper becomes a no-op and never crashes or slows a task.
 
-Usage - decorator:
+Usage - decorator (the primary, recommended path):
 
     import ray
     from ingero_ray import annotate_task
@@ -30,12 +30,21 @@ Usage - decorator:
     def preprocess(shard):
         ...
 
-Usage - context manager (inside an existing task):
+`annotate_task` always runs `_emit` inside the worker that runs the task,
+so the annotation is correctly scoped to the worker PID. Prefer it.
+
+Usage - context manager (only inside a running task body):
 
     @ray.remote
     def train(shard):
         with task_annotation(task_name="train"):
             ...
+
+`task_annotation` MUST be opened inside a running Ray task, never on the
+driver. The annotation is scoped to os.getpid(); opening the context on
+the driver would mis-scope it to the driver PID and the recorded trace
+would not slice correctly. When in doubt, use the `annotate_task`
+decorator, which cannot be misused this way.
 """
 
 from __future__ import annotations
@@ -141,6 +150,12 @@ def _emit(task_name: str | None, extra: dict | None) -> None:
 
 class task_annotation:  # noqa: N801 - context-manager naming, lowercase by convention
     """Context manager that annotates a Ray task on entry.
+
+    MUST be used inside a running Ray task, not on the driver. The
+    annotation is scoped to os.getpid(); opening this context on the
+    driver mis-scopes it to the driver PID and the trace will not slice
+    per task. Prefer the `annotate_task` decorator, which always runs in
+    the worker and cannot be misused this way.
 
     Args:
         task_name: a stable name for the task, used as the `task_id`
