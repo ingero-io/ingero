@@ -183,86 +183,32 @@ func TestAnnotation_PruneBound(t *testing.T) {
 	}
 }
 
-func TestJoinAnnotations_IncarnationAndWindow(t *testing.T) {
-	now := int64(1_000_000_000)
-	evts := []EventWithMeta{
-		{TimestampNs: now + 10, PID: 100, StartTime: 1},
-		{TimestampNs: now + 10, PID: 100, StartTime: 2}, // reused PID, new incarnation
-		{TimestampNs: now - 10, PID: 100, StartTime: 1}, // before the annotation
+// TestAnnotationAppliesViaIncarnation_Conservative covers the
+// degradation rule: the join only matches when both sides resolve to
+// the same incarnation interval, or when neither resolves. It must NOT
+// bare-PID match when exactly one side resolves.
+func TestAnnotationAppliesViaIncarnation_Conservative(t *testing.T) {
+	a := annotate.Annotation{
+		TimestampNs: 100,
+		Labels:      map[string]string{"step": "1"},
+		Process:     annotate.ProcessIncarnation{PID: 42},
 	}
-	anns := []annotate.Annotation{
-		{
-			TimestampNs: now,
-			Labels:      map[string]string{"step": "5"},
-			Process:     annotate.ProcessIncarnation{PID: 100, StartTime: 1},
-		},
-	}
-	out := JoinAnnotations(evts, anns)
-	if out[0].Labels["step"] != "5" {
-		t.Error("event 0 (same incarnation, after annotation) should carry the label")
-	}
-	if out[1].MatchedAnnotations != 0 {
-		t.Error("event 1 (reused PID, different start_time) must NOT match - PID reuse cross-attribution")
-	}
-	if out[2].MatchedAnnotations != 0 {
-		t.Error("event 2 (before the annotation instant) must NOT match")
-	}
-}
+	e := EventWithMeta{TimestampNs: 200, PID: 42}
 
-func TestJoinAnnotations_Span(t *testing.T) {
-	anns := []annotate.Annotation{
-		{
-			Labels:      map[string]string{"phase": "train"},
-			SpanStartNs: 100,
-			SpanEndNs:   200,
-		},
+	cases := []struct {
+		name        string
+		annIv, evIv int
+		want        bool
+	}{
+		{"both unresolved (pre-trace process)", -1, -1, true},
+		{"both resolved, same interval", 0, 0, true},
+		{"both resolved, different interval", 0, 1, false},
+		{"annotation resolved, event unresolved", 0, -1, false},
+		{"event resolved, annotation unresolved", -1, 0, false},
 	}
-	evts := []EventWithMeta{
-		{TimestampNs: 50},  // before span
-		{TimestampNs: 150}, // inside span
-		{TimestampNs: 250}, // after span
-	}
-	out := JoinAnnotations(evts, anns)
-	if out[0].MatchedAnnotations != 0 || out[2].MatchedAnnotations != 0 {
-		t.Error("events outside the span must not match")
-	}
-	if out[1].Labels["phase"] != "train" {
-		t.Error("event inside the span must carry the phase label")
-	}
-}
-
-func TestJoinAnnotations_Unscoped(t *testing.T) {
-	anns := []annotate.Annotation{
-		{TimestampNs: 0, Labels: map[string]string{"run_id": "abc"}}, // unscoped, instant at 0
-	}
-	evts := []EventWithMeta{
-		{TimestampNs: 10, PID: 7, StartTime: 1},
-		{TimestampNs: 20, PID: 9, StartTime: 2},
-	}
-	out := JoinAnnotations(evts, anns)
-	for i, ae := range out {
-		if ae.Labels["run_id"] != "abc" {
-			t.Errorf("event %d should carry the unscoped label", i)
+	for _, tc := range cases {
+		if got := annotationAppliesViaIncarnation(a, e, tc.annIv, tc.evIv); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-func TestJoinAnnotations_UnresolvedIncarnation(t *testing.T) {
-	// start_time 0 means the agent could not resolve the incarnation;
-	// the annotation falls back to PID-only matching.
-	anns := []annotate.Annotation{
-		{TimestampNs: 0, Labels: map[string]string{"task_id": "t1"},
-			Process: annotate.ProcessIncarnation{PID: 55, StartTime: 0}},
-	}
-	evts := []EventWithMeta{
-		{TimestampNs: 10, PID: 55, StartTime: 12345},
-		{TimestampNs: 10, PID: 66, StartTime: 12345},
-	}
-	out := JoinAnnotations(evts, anns)
-	if out[0].Labels["task_id"] != "t1" {
-		t.Error("PID-only fallback should match the same PID")
-	}
-	if out[1].MatchedAnnotations != 0 {
-		t.Error("a different PID must not match even with unresolved incarnation")
 	}
 }

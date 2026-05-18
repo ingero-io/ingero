@@ -16,9 +16,14 @@ import (
 // id). The events table is untouched; annotations are a separate table
 // joined at query time.
 //
-// Process scope is stored as the (pid, process_start_time) incarnation
-// key, NOT a raw PID, so PID reuse cannot mis-attribute a row. pid 0
-// means an unscoped (trace-wide) annotation.
+// Process scope is stored as the pid plus the process start_time
+// (/proc field 22) the agent resolved at ingest. The query-time join
+// does NOT key on start_time directly: events carry no start_time
+// column, so both the annotation and the event are mapped to a
+// process incarnation interval bounded by process_exec / process_exit
+// events, and the join is on that interval. The stored start_time is
+// retained as provenance. pid 0 means an unscoped (trace-wide)
+// annotation.
 //
 // labels is a JSON object string. Storing the bag as JSON keeps the
 // schema stable as the label vocabulary grows; the validation cap on
@@ -190,94 +195,16 @@ func scanAnnotations(rows *sql.Rows) ([]annotate.Annotation, error) {
 	return out, rows.Err()
 }
 
-// AnnotatedEvent pairs an events.Event with the annotation labels that
-// resolve to it. Labels is the merged label set of every annotation
-// whose process incarnation matches the event and whose time window
-// (instant or span) contains the event timestamp.
-//
-// MatchedAnnotations is the count of distinct annotation rows that
-// contributed, so a caller can tell "one annotation, three labels"
-// apart from "three annotations".
-type AnnotatedEvent struct {
-	Event              EventWithMeta
-	Labels             map[string]string
-	MatchedAnnotations int
-}
-
 // EventWithMeta is the minimal event projection the annotation join
-// needs: identity, time, and the process incarnation. Kept narrow so
-// the join does not depend on the full RichEvent shape.
+// needs: identity, time, and the op/source tags. The event has no
+// process start-time of its own; its incarnation is resolved from
+// process_exec / process_exit events at join time (see AnnotateEvents).
+// Kept narrow so the join does not depend on the full RichEvent shape.
 type EventWithMeta struct {
 	TimestampNs int64
 	PID         uint32
-	StartTime   uint64
 	Source      uint8
 	Op          uint8
-}
-
-// JoinAnnotations attaches annotation labels to a set of events by
-// process incarnation and time window. The join key is the process
-// incarnation (pid + start_time) plus the time window, NOT pid + time
-// alone, so a reused PID cannot pull in a prior incarnation's labels.
-//
-// An annotation matches an event when:
-//   - the annotation is unscoped (pid 0), OR the annotation's
-//     (pid, start_time) equals the event's incarnation; AND
-//   - the event timestamp falls in the annotation's window: for an
-//     instant annotation the window is a point so the join is on the
-//     span enclosing the event for span annotations, and for instant
-//     annotations the event is matched when it shares the incarnation
-//     and the annotation timestamp is at or before the event (the
-//     annotation marks a moment in the run from that point on).
-//
-// When an annotation has a start_time of 0 (the writer gave a PID but
-// the agent could not resolve the incarnation), it matches any event
-// with the same PID regardless of start_time - the row is still useful,
-// it just cannot benefit from reuse protection.
-//
-// This is an in-Go join over the supplied events and a one-shot
-// annotation read, so a caller doing a rollover-aware merge runs it
-// per-file before merging (see the query/explain CLI path).
-func JoinAnnotations(evts []EventWithMeta, anns []annotate.Annotation) []AnnotatedEvent {
-	out := make([]AnnotatedEvent, len(evts))
-	for i, e := range evts {
-		ae := AnnotatedEvent{Event: e, Labels: map[string]string{}}
-		for _, a := range anns {
-			if !annotationMatchesEvent(a, e) {
-				continue
-			}
-			ae.MatchedAnnotations++
-			for k, v := range a.Labels {
-				ae.Labels[k] = v
-			}
-		}
-		out[i] = ae
-	}
-	return out
-}
-
-// annotationMatchesEvent reports whether annotation a applies to event
-// e under the incarnation + time-window rule documented on
-// JoinAnnotations.
-func annotationMatchesEvent(a annotate.Annotation, e EventWithMeta) bool {
-	// Incarnation check.
-	if a.Process.Scoped() {
-		if a.Process.PID != e.PID {
-			return false
-		}
-		// start_time 0 on the annotation means the incarnation was not
-		// resolved; fall back to PID-only matching for that row.
-		if a.Process.StartTime != 0 && a.Process.StartTime != e.StartTime {
-			return false
-		}
-	}
-	// Time-window check.
-	if a.IsSpan() {
-		return e.TimestampNs >= a.SpanStartNs && e.TimestampNs <= a.SpanEndNs
-	}
-	// Instant annotation: it marks a moment in the run. An event at or
-	// after the annotation instant carries the label.
-	return e.TimestampNs >= a.TimestampNs
 }
 
 // incarnationInterval is one [start, exit) lifetime of a PID, derived
@@ -447,7 +374,13 @@ func (s *Store) AnnotateEvents(evts []EventWithMeta, from, to int64) ([]EventAnn
 
 	for i, e := range evts {
 		evInterval := idx.incarnationAt(e.PID, e.TimestampNs)
-		for j, a := range anns {
+		// Collect the matching annotations for this event, then merge
+		// them OLDEST-first so that on a same-key collision (an
+		// advancing step/epoch counter) the most recent annotation
+		// at-or-before the event wins. anns is QueryAnnotations'
+		// newest-first order, so iterating it in reverse is oldest-first.
+		for j := len(anns) - 1; j >= 0; j-- {
+			a := anns[j]
 			if !annotationAppliesViaIncarnation(a, e, annInterval[j], evInterval) {
 				continue
 			}
@@ -469,12 +402,23 @@ func annotationAppliesViaIncarnation(a annotate.Annotation, e EventWithMeta, ann
 		if a.Process.PID != e.PID {
 			return false
 		}
-		// When both the annotation and the event resolve to an
-		// incarnation interval, they must be the SAME interval - this
-		// is the PID-reuse guard. When either cannot be located (no
-		// process_exec/exit observed), fall back to PID + time-window
-		// matching so the row is still useful.
-		if annIv >= 0 && evIv >= 0 && annIv != evIv {
+		// Incarnation guard. The join only matches when both sides
+		// resolve to the SAME incarnation interval, OR neither side
+		// resolves (a pre-trace process with no observed exec/exit -
+		// both are PID-only and conservatively treated as the same
+		// run). It must NOT match when exactly one side resolves: a
+		// resolved annotation paired with an unresolved event (or vice
+		// versa) could be different incarnations of a reused PID, and a
+		// bare PID==PID match would cross-attribute.
+		switch {
+		case annIv >= 0 && evIv >= 0:
+			if annIv != evIv {
+				return false
+			}
+		case annIv < 0 && evIv < 0:
+			// Both unresolved: conservative same-run fallback, allowed.
+		default:
+			// Exactly one side resolved: ambiguous, refuse to match.
 			return false
 		}
 	}

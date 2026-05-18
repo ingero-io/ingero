@@ -271,6 +271,48 @@ func TestAnnotateEvents_LabelValueNoInjection(t *testing.T) {
 	}
 }
 
+// TestAnnotateEvents_SequentialSameKey asserts that for a same-key
+// collision the most recent annotation at-or-before the event wins.
+// Two sequential step annotations (step=1@T1, step=2@T2) must leave an
+// event at T3 carrying step=2, not the oldest value.
+func TestAnnotateEvents_SequentialSameKey(t *testing.T) {
+	s, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	base := time.Now().Add(-time.Hour).UnixNano()
+	t1 := base + 100
+	t2 := base + 200
+	t3 := base + 300
+
+	// Two unscoped instant annotations advancing the step counter.
+	if err := s.RecordAnnotation(annotate.Annotation{
+		TimestampNs: t1, Labels: map[string]string{"step": "1"},
+	}); err != nil {
+		t.Fatalf("RecordAnnotation step=1: %v", err)
+	}
+	if err := s.RecordAnnotation(annotate.Annotation{
+		TimestampNs: t2, Labels: map[string]string{"step": "2"},
+	}); err != nil {
+		t.Fatalf("RecordAnnotation step=2: %v", err)
+	}
+
+	// An event at T3 - after both annotations.
+	metas := []EventWithMeta{{TimestampNs: t3, PID: 0}}
+	anns, err := s.AnnotateEvents(metas, base-1000, time.Now().UnixNano())
+	if err != nil {
+		t.Fatalf("AnnotateEvents: %v", err)
+	}
+	if got := anns[0].Labels["step"]; got != "2" {
+		t.Errorf("event at T3 has step=%q, want the most recent value 2", got)
+	}
+	if anns[0].MatchedAnnotations != 2 {
+		t.Errorf("MatchedAnnotations = %d, want 2 (both instant annotations apply)", anns[0].MatchedAnnotations)
+	}
+}
+
 // TestBuildIncarnationIndex covers the exec/exit interval construction
 // including an open-ended (no exit) incarnation.
 func TestBuildIncarnationIndex(t *testing.T) {
