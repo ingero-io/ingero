@@ -730,10 +730,7 @@ func New(dbPath string) (*Store, error) {
 	// database/sql pool share the same database.  Without this, each pooled
 	// connection gets its own empty in-memory DB and won't see the schema
 	// created by another connection (causes "no such table" under -race).
-	dsn := dbPath
-	if dsn == ":memory:" {
-		dsn = "file::memory:?cache=shared"
-	}
+	dsn := buildWriteDSN(dbPath)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -752,9 +749,10 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("setting WAL mode: %w", err)
 	}
 
-	// Set busy timeout so concurrent writers (event batch flush + aggregate
-	// flush) retry instead of failing immediately with SQLITE_BUSY.
-	db.Exec("PRAGMA busy_timeout = 5000")
+	// busy_timeout is applied per-connection via the DSN _pragma parameter
+	// (see buildWriteDSN). A post-open db.Exec would only set it on one
+	// pooled connection, leaving every other connection at busy_timeout=0
+	// and failing instantly with SQLITE_BUSY under write contention.
 
 	// Reject DBs written by a newer binary before we create any tables or
 	// run migrations. A brand-new DB reads back user_version = 0; existing
@@ -820,6 +818,34 @@ func New(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// busyTimeoutMillis is the SQLITE busy_timeout applied to every pooled
+// connection. With WAL, concurrent writers (event-batch flush, aggregate
+// flush, RecordAnnotation) briefly contend for the single WAL write lock;
+// the timeout makes the loser retry for up to this long instead of
+// failing immediately with SQLITE_BUSY.
+const busyTimeoutMillis = 5000
+
+// buildWriteDSN returns the DSN for the main writable connection pool.
+//
+// busy_timeout is a PER-CONNECTION pragma that does not persist to the
+// database file. *sql.DB is a connection pool, so a post-open
+// db.Exec("PRAGMA busy_timeout=...") only sets it on whichever single
+// connection happened to serve that Exec; every other pooled connection
+// is left at busy_timeout=0 and fails instantly with SQLITE_BUSY on any
+// write contention. modernc.org/sqlite applies _pragma query parameters
+// to every new connection it opens, so putting busy_timeout in the DSN
+// is the correct fix. journal_mode=WAL persists to the file and does not
+// need DSN treatment, but is harmless to include.
+func buildWriteDSN(dbPath string) string {
+	pragmas := "_pragma=busy_timeout(" + strconv.Itoa(busyTimeoutMillis) + ")"
+	if dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:") {
+		// Shared cache so all pooled connections see the same in-memory
+		// DB (schema created by one connection is visible to the rest).
+		return "file::memory:?cache=shared&" + pragmas
+	}
+	return "file:" + dbPath + "?" + pragmas
+}
+
 // buildReadOnlyDSN returns the DSN to use for the sibling read-only
 // connection pool, tailored to handle the in-memory shared-cache mode
 // the same way the main connection in New does.
@@ -831,14 +857,15 @@ func buildReadOnlyDSN(dbPath string) string {
 	if dbPath == "" {
 		return ""
 	}
+	pragmas := "_query_only=1&_pragma=busy_timeout(" + strconv.Itoa(busyTimeoutMillis) + ")"
 	if dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:") {
 		// Share the cache so this read-only pool sees the same
 		// schema + rows as the writable pool. Without cache=shared,
 		// the second sql.Open creates a brand-new in-memory DB with
 		// no tables.
-		return "file::memory:?cache=shared&_query_only=1"
+		return "file::memory:?cache=shared&" + pragmas
 	}
-	return "file:" + dbPath + "?_query_only=1"
+	return "file:" + dbPath + "?" + pragmas
 }
 
 // openReadOnlyDB initialises s.roDB with a read-only SQLite pool
