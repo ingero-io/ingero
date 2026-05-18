@@ -85,3 +85,28 @@ func TestAnnotation_Validate_TooManyLabels(t *testing.T) {
 		t.Error("expected too-many-labels annotation to fail validation")
 	}
 }
+
+// TestAnnotation_Validate_ControlCharInValue asserts a label value
+// containing a control character is rejected: values are rendered
+// verbatim into terminal tables, so an embedded ESC/CR/NUL is a
+// terminal-injection vector.
+func TestAnnotation_Validate_ControlCharInValue(t *testing.T) {
+	bad := []string{
+		"esc\x1b[31m",   // ANSI escape
+		"carriage\rret", // CR row-forging
+		"null\x00byte",  // NUL
+		"tab\there",     // TAB (byte < 0x20)
+		"del\x7f",       // DEL
+	}
+	for _, v := range bad {
+		a := Annotation{Labels: map[string]string{"k": v}}
+		if err := a.Validate(); err == nil {
+			t.Errorf("value %q with a control character should be rejected", v)
+		}
+	}
+	// A plain printable value still validates.
+	ok := Annotation{Labels: map[string]string{"k": "step-42_run.id"}}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("printable value rejected: %v", err)
+	}
+}

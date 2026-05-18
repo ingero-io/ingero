@@ -119,6 +119,15 @@ func (a Annotation) Validate() error {
 			return fmt.Errorf("label %q value is %d bytes, max %d",
 				k, len(v), contract.AnnotationMaxLabelValueLen)
 		}
+		// Reject control characters in the value. Label values are
+		// rendered verbatim into terminal tables by `ingero query` /
+		// `ingero explain`; an embedded ESC, CR, or NUL would allow
+		// terminal-injection or row-forging in that output.
+		for i := 0; i < len(v); i++ {
+			if c := v[i]; c < 0x20 || c == 0x7f {
+				return fmt.Errorf("label %q value contains a control character (byte 0x%02x)", k, c)
+			}
+		}
 	}
 	if a.IsSpan() {
 		if a.SpanStartNs == 0 || a.SpanEndNs == 0 {
