@@ -21,8 +21,9 @@ import (
 // process even when group access is enabled.
 //
 // Returns a zero Provenance and an error when the connection is not a
-// *net.UnixConn or the getsockopt fails. The caller continues with zero
-// provenance rather than dropping the connection.
+// *net.UnixConn or the getsockopt fails. On error the caller drops the
+// connection; it does not ingest annotations without a traceable
+// writer identity.
 func peerCred(conn net.Conn) (annotate.Provenance, error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
