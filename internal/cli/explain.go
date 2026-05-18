@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,24 +30,26 @@ import (
 	"github.com/ingero-io/ingero/internal/stats"
 	"github.com/ingero-io/ingero/internal/store"
 	"github.com/ingero-io/ingero/internal/sysinfo"
+	"github.com/ingero-io/ingero/pkg/events"
 )
 
 var (
-	explainDBPath     string
-	explainPIDs       []int
-	explainSince      string
-	explainFrom       string
-	explainTo         string
-	explainJSON       bool
-	explainLast       int
-	explainChains     bool
-	explainPerProcess bool
-	explainNodes      string
-	explainTimeout    string
-	explainCACert     string
-	explainClientCert string
-	explainClientKey  string
-	explainClockSkew  string
+	explainDBPath      string
+	explainPIDs        []int
+	explainSince       string
+	explainFrom        string
+	explainTo          string
+	explainJSON        bool
+	explainLast        int
+	explainChains      bool
+	explainPerProcess  bool
+	explainAnnotations bool
+	explainNodes       string
+	explainTimeout     string
+	explainCACert      string
+	explainClientCert  string
+	explainClientKey   string
+	explainClockSkew   string
 )
 
 var explainCmd = &cobra.Command{
@@ -78,6 +81,7 @@ func init() {
 	explainCmd.Flags().IntVar(&explainLast, "last", 0, "analyze the N most recent events (0 = use --since)")
 	explainCmd.Flags().BoolVar(&explainChains, "chains", false, "show stored causal chains from DB (skip re-analysis)")
 	explainCmd.Flags().BoolVar(&explainPerProcess, "per-process", false, "per-process CUDA API breakdown (RAG/multi-process contention)")
+	explainCmd.Flags().BoolVar(&explainAnnotations, "annotations", false, "after the incident report, summarize external annotations (step/epoch/task labels) that resolve to the analyzed events by process incarnation + time window")
 	explainCmd.Flags().StringVar(&explainNodes, "nodes", "", "comma-separated node addresses (host:port) for fleet fan-out query")
 	explainCmd.Flags().StringVar(&explainTimeout, "timeout", "5s", "per-node timeout for fleet queries")
 	explainCmd.Flags().StringVar(&explainCACert, "ca-cert", "", "CA certificate for mTLS (optional)")
@@ -224,7 +228,62 @@ func explainRunE(cmd *cobra.Command, args []string) error {
 		return renderChainsJSON(chains)
 	}
 	renderIncidentReport(chains, snap, nil, procCache, toUint32Slice(explainPIDs), &aggTotals)
+
+	if explainAnnotations {
+		renderAnnotationSummary(s, evts, params)
+	}
 	return nil
+}
+
+// renderAnnotationSummary prints the external annotations that resolve
+// to the analyzed events, joined by process incarnation + time window.
+// Best-effort: a join failure is logged at debug and the section is
+// skipped rather than failing the whole explain run.
+func renderAnnotationSummary(s *store.Store, evts []events.Event, params store.QueryParams) {
+	if len(evts) == 0 {
+		return
+	}
+	from, to := annotationScanWindow(params)
+	metas := make([]store.EventWithMeta, len(evts))
+	for i, e := range evts {
+		metas[i] = store.EventWithMeta{
+			TimestampNs: e.Timestamp.UnixNano(),
+			PID:         e.PID,
+			Source:      uint8(e.Source),
+			Op:          e.Op,
+		}
+	}
+	anns, err := s.AnnotateEvents(metas, from, to)
+	if err != nil {
+		debugf("explain: annotation join failed: %v", err)
+		return
+	}
+	// Aggregate: distinct label sets and how many events each covers.
+	coverage := map[string]int{}
+	annotatedEvents := 0
+	for _, a := range anns {
+		if len(a.Labels) == 0 {
+			continue
+		}
+		annotatedEvents++
+		coverage[formatLabels(a.Labels)]++
+	}
+	fmt.Println()
+	fmt.Println("  External annotations")
+	fmt.Println("  --------------------")
+	if annotatedEvents == 0 {
+		fmt.Println("  No annotations resolve to the analyzed events.")
+		return
+	}
+	fmt.Printf("  %d of %d events carry annotations.\n", annotatedEvents, len(evts))
+	labelSets := make([]string, 0, len(coverage))
+	for ls := range coverage {
+		labelSets = append(labelSets, ls)
+	}
+	sort.Strings(labelSets)
+	for _, ls := range labelSets {
+		fmt.Printf("    %-50s %d events\n", ls, coverage[ls])
+	}
 }
 
 // explainStoredChains renders pre-computed causal chains from the DB

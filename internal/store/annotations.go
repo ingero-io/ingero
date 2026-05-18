@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ingero-io/ingero/pkg/annotate"
+	"github.com/ingero-io/ingero/pkg/events"
 )
 
 // annotationsSchema is the table for external annotation rows (agent
@@ -276,5 +277,209 @@ func annotationMatchesEvent(a annotate.Annotation, e EventWithMeta) bool {
 	}
 	// Instant annotation: it marks a moment in the run. An event at or
 	// after the annotation instant carries the label.
+	return e.TimestampNs >= a.TimestampNs
+}
+
+// incarnationInterval is one [start, exit) lifetime of a PID, derived
+// from a process_exec / process_exit event pair. ExitNs is math.MaxInt64
+// when no process_exit was observed (the process was still running at
+// trace end), so the interval is open-ended.
+type incarnationInterval struct {
+	PID     uint32
+	StartNs int64
+	ExitNs  int64
+}
+
+// IncarnationIndex maps a timestamp to the PID incarnation that was
+// alive at that moment, using process_exec / process_exit events as the
+// incarnation boundaries. It is the bridge between an annotation
+// (scoped by a /proc start-time key) and an event (which has no
+// start-time column): both are mapped to an incarnation interval, and
+// the join is on the interval.
+type IncarnationIndex struct {
+	// byPID holds intervals per PID, kept in exec-time order.
+	byPID map[uint32][]incarnationInterval
+}
+
+// incarnationAt returns the index of the interval covering tsNs for
+// pid, or -1 when no incarnation was alive then.
+func (idx *IncarnationIndex) incarnationAt(pid uint32, tsNs int64) int {
+	for i, iv := range idx.byPID[pid] {
+		if tsNs >= iv.StartNs && tsNs < iv.ExitNs {
+			return i
+		}
+	}
+	return -1
+}
+
+// buildIncarnationIndex scans the events table for process_exec /
+// process_exit events in [from, to] and builds the per-PID incarnation
+// intervals. A process_exec opens an interval; the next process_exit
+// for the same PID closes it. An interval with no matching exit stays
+// open (ExitNs = math.MaxInt64).
+//
+// rolloverMu is RLock'd by the caller (QueryAnnotatedEvents).
+func (s *Store) buildIncarnationIndex(from, to int64) (*IncarnationIndex, error) {
+	rows, err := s.db.Query(`
+		SELECT timestamp, pid, op
+		FROM events
+		WHERE source = ? AND op IN (?, ?)
+		  AND timestamp >= ? AND timestamp <= ?
+		ORDER BY timestamp ASC`,
+		uint8(events.SourceHost),
+		uint8(events.HostProcessExec),
+		uint8(events.HostProcessExit),
+		from, to)
+	if err != nil {
+		return nil, fmt.Errorf("scanning process lifecycle events: %w", err)
+	}
+	defer rows.Close()
+
+	idx := &IncarnationIndex{byPID: map[uint32][]incarnationInterval{}}
+	for rows.Next() {
+		var ts int64
+		var pid uint32
+		var op uint8
+		if err := rows.Scan(&ts, &pid, &op); err != nil {
+			return nil, fmt.Errorf("scanning lifecycle row: %w", err)
+		}
+		switch events.HostOp(op) {
+		case events.HostProcessExec:
+			idx.byPID[pid] = append(idx.byPID[pid], incarnationInterval{
+				PID:     pid,
+				StartNs: ts,
+				ExitNs:  maxInt64,
+			})
+		case events.HostProcessExit:
+			ivs := idx.byPID[pid]
+			// Close the most recent still-open interval for this PID.
+			for i := len(ivs) - 1; i >= 0; i-- {
+				if ivs[i].ExitNs == maxInt64 {
+					ivs[i].ExitNs = ts
+					break
+				}
+			}
+			idx.byPID[pid] = ivs
+		}
+	}
+	return idx, rows.Err()
+}
+
+const maxInt64 = int64(^uint64(0) >> 1)
+
+// EventAnnotations is the per-event annotation result of an
+// incarnation-aware join: the merged label set plus the count of
+// annotation rows that contributed.
+type EventAnnotations struct {
+	Labels             map[string]string
+	MatchedAnnotations int
+}
+
+// AnnotateEvents resolves the annotations that apply to each event in
+// evts and returns a parallel slice of EventAnnotations (one per input
+// event, same order). It is the query-time join used by `ingero query`
+// and `ingero explain`.
+//
+// The join key is the process incarnation plus the time window, NOT pid
+// + time alone:
+//
+//  1. process_exec / process_exit events in the scan window bound each
+//     PID's incarnation intervals.
+//  2. Each scoped annotation is mapped to the incarnation interval its
+//     timestamp falls in. A reused PID therefore cannot pull a prior
+//     incarnation's labels - the annotation and the event must land in
+//     the SAME interval.
+//  3. An unscoped annotation (pid 0) applies trace-wide; a span
+//     annotation matches by its explicit [span_start, span_end].
+//
+// This runs over one DB file's events + annotations. The rollover-aware
+// caller invokes it once per file before merging, so an annotation and
+// an event split across a rollover boundary still resolve within their
+// own file. Parameterized SQL only on the read paths it calls.
+//
+// from / to bound the process-lifecycle scan; pass the same range as
+// the event query so every relevant exec/exit row is seen.
+func (s *Store) AnnotateEvents(evts []EventWithMeta, from, to int64) ([]EventAnnotations, error) {
+	out := make([]EventAnnotations, len(evts))
+	for i := range out {
+		out[i] = EventAnnotations{Labels: map[string]string{}}
+	}
+	if len(evts) == 0 {
+		return out, nil
+	}
+
+	anns, err := s.QueryAnnotations(AnnotationQuery{
+		From:  time.Unix(0, from),
+		To:    time.Unix(0, to),
+		Limit: -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(anns) == 0 {
+		return out, nil
+	}
+
+	s.rolloverMu.RLock()
+	idx, err := s.buildIncarnationIndex(from, to)
+	s.rolloverMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve every scoped annotation to an incarnation interval index.
+	// annInterval[j] is the interval index for anns[j], or -1 when the
+	// annotation is unscoped or its incarnation cannot be located.
+	annInterval := make([]int, len(anns))
+	for j, a := range anns {
+		annInterval[j] = -1
+		if !a.Process.Scoped() {
+			continue
+		}
+		// An annotation's own instant locates its incarnation. A span
+		// annotation uses its span start.
+		probe := a.TimestampNs
+		if a.IsSpan() {
+			probe = a.SpanStartNs
+		}
+		annInterval[j] = idx.incarnationAt(a.Process.PID, probe)
+	}
+
+	for i, e := range evts {
+		evInterval := idx.incarnationAt(e.PID, e.TimestampNs)
+		for j, a := range anns {
+			if !annotationAppliesViaIncarnation(a, e, annInterval[j], evInterval) {
+				continue
+			}
+			out[i].MatchedAnnotations++
+			for k, v := range a.Labels {
+				out[i].Labels[k] = v
+			}
+		}
+	}
+	return out, nil
+}
+
+// annotationAppliesViaIncarnation is the incarnation-aware match used
+// by AnnotateEvents. annIv / evIv are the incarnation interval indices
+// resolved for the annotation and the event respectively (-1 = not
+// located).
+func annotationAppliesViaIncarnation(a annotate.Annotation, e EventWithMeta, annIv, evIv int) bool {
+	if a.Process.Scoped() {
+		if a.Process.PID != e.PID {
+			return false
+		}
+		// When both the annotation and the event resolve to an
+		// incarnation interval, they must be the SAME interval - this
+		// is the PID-reuse guard. When either cannot be located (no
+		// process_exec/exit observed), fall back to PID + time-window
+		// matching so the row is still useful.
+		if annIv >= 0 && evIv >= 0 && annIv != evIv {
+			return false
+		}
+	}
+	if a.IsSpan() {
+		return e.TimestampNs >= a.SpanStartNs && e.TimestampNs <= a.SpanEndNs
+	}
 	return e.TimestampNs >= a.TimestampNs
 }
