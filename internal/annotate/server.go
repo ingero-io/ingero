@@ -189,6 +189,26 @@ func (s *Server) Start() error {
 		return fmt.Errorf("annotation socket dir %s is unsafe: %w", s.socketDir, err)
 	}
 
+	// Normalise the socket directory's mode. A group member needs
+	// search (execute) permission on the directory to reach the socket
+	// inside it - without it, widening the socket file to 0o770 is
+	// pointless. With a gid configured: chown the directory's group and
+	// set 0o710 (group gets execute only, never write, so the directory
+	// still cannot be used to hijack the socket). Without a gid: force
+	// 0o700 so a directory left group-traversable by a previous run
+	// does not stay that way.
+	if s.socketGid >= 0 {
+		if err := os.Chown(s.socketDir, -1, s.socketGid); err != nil {
+			log.Printf("WARN: annotate: dir_chown_failed dir=%s gid=%d error=%v",
+				s.socketDir, s.socketGid, err)
+		}
+		if err := os.Chmod(s.socketDir, 0o710); err != nil {
+			log.Printf("WARN: annotate: dir_chmod_failed dir=%s error=%v", s.socketDir, err)
+		}
+	} else {
+		os.Chmod(s.socketDir, 0o700)
+	}
+
 	// Remove a stale socket from a previous run. Lstat (not Stat) so a
 	// symlink planted at the socket path is detected instead of
 	// followed: removing a followed symlink deletes the symlink target,

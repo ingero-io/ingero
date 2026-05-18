@@ -324,6 +324,35 @@ func TestServer_RejectsWorldWritableDir(t *testing.T) {
 	}
 }
 
+// TestServer_SocketGidDirTraversable asserts that with a socket gid
+// configured, Start gives the socket directory group-execute (0o710)
+// so a group member can traverse it to reach the socket - and no
+// group-write, so the directory still cannot be used to hijack it.
+func TestServer_SocketGidDirTraversable(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{
+		socketDir:  dir,
+		socketPath: dir + "/" + contract.AnnotationSocketName,
+		socketGid:  os.Getgid(),
+		sink:       &memSink{},
+		resolver:   annotate.ResolveIncarnation,
+		pidUID:     func(uint32) (uint32, bool) { return uint32(os.Getuid()), true },
+		conns:      make(map[net.Conn]struct{}),
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat socket dir: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o710 {
+		t.Errorf("socket dir mode = %#o, want 0710 (group-traversable, not group-writable)", got)
+	}
+}
+
 // TestServer_RejectsSymlinkSocketPath asserts Start refuses to bind
 // when a symlink is planted at the socket path - the pre-bind cleanup
 // must not follow it and delete the target.
