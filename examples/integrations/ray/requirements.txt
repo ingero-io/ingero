@@ -1,0 +1,7 @@
+# Runtime dependency for the example Ray job.
+# The annotation writer (ingero_annotate.py) needs none of these - it is
+# pure stdlib so the protocol logic stays testable without heavy deps.
+ray>=2.0
+
+# Test-only:
+pytest>=7.0
