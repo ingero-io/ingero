@@ -32,9 +32,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/ingero-io/ingero/pkg/annotate"
 	"github.com/ingero-io/ingero/pkg/contract"
@@ -80,17 +84,79 @@ type Server struct {
 }
 
 // NewServer creates an ingest server writing accepted annotations to
-// sink. The socket lives at contract.AnnotationSocketDir /
-// contract.AnnotationSocketName - a fixed, agent-owned path.
+// sink. The socket lives in an agent-owned directory: contract.
+// AnnotationSocketDir (/run/ingero) when /run is writable, otherwise a
+// 0o700 directory the agent owns under the user's home. Either way the
+// directory is off the world-writable /tmp so a local attacker cannot
+// pre-create it and hijack the socket.
 func NewServer(sink Sink) *Server {
+	dir := resolveSocketDir()
 	return &Server{
-		socketDir:  contract.AnnotationSocketDir,
-		socketPath: contract.AnnotationSocketDir + "/" + contract.AnnotationSocketName,
+		socketDir:  dir,
+		socketPath: filepath.Join(dir, contract.AnnotationSocketName),
 		socketGid:  -1,
 		sink:       sink,
 		resolver:   annotate.ResolveIncarnation,
 		conns:      make(map[net.Conn]struct{}),
 	}
+}
+
+// SocketPath returns the agent-owned ingest socket path the server
+// binds and a client should dial. It resolves the same directory the
+// server uses, so the `ingero annotate` client never needs an
+// operator-supplied socket flag.
+func SocketPath() string {
+	return filepath.Join(resolveSocketDir(), contract.AnnotationSocketName)
+}
+
+// resolveSocketDir picks the agent-owned directory for the ingest
+// socket. It prefers contract.AnnotationSocketDir (under /run, not
+// /tmp); when /run is not writable - an unprivileged trace, a
+// distroless image with a read-only /run - it falls back to a 0o700
+// directory under the user's home. Both roots are off the
+// world-writable /tmp.
+func resolveSocketDir() string {
+	parent := filepath.Dir(contract.AnnotationSocketDir) // "/run"
+	if fi, err := os.Stat(parent); err == nil && fi.IsDir() {
+		if unix.Access(parent, unix.W_OK) == nil {
+			return contract.AnnotationSocketDir
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".ingero", "annotate")
+	}
+	// Last resort: a uid-qualified path under /run owned by the agent.
+	return fmt.Sprintf("%s-%d", contract.AnnotationSocketDir, os.Geteuid())
+}
+
+// verifyAgentOwnedDir asserts that dir is a directory the agent can
+// safely own the ingest socket inside: it must be a real directory
+// (not a symlink), owned by the agent's effective uid, and carry no
+// group- or other-write bits. os.MkdirAll no-ops on an existing path,
+// so this is the only thing standing between the agent and a
+// pre-created world-writable directory used to hijack the socket.
+func verifyAgentOwnedDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("lstat: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("path is a symlink")
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("path is not a directory")
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot read directory ownership")
+	}
+	if int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("directory is owned by uid %d, not the agent uid %d", st.Uid, os.Geteuid())
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("directory is group- or other-writable (mode %#o)", fi.Mode().Perm())
+	}
+	return nil
 }
 
 // SetSocketGid configures a numeric GID to chown the socket to at bind
@@ -103,18 +169,33 @@ func (s *Server) SetSocketGid(gid int) { s.socketGid = gid }
 // Start creates the agent-owned socket directory, binds the listener,
 // applies the socket permissions, and begins accepting connections.
 func (s *Server) Start() error {
-	// Create the agent-owned dir 0o700. Because the bind-time unlink
-	// below only ever touches a path inside this agent-owned dir, the
-	// agent never removes an operator-supplied arbitrary path.
+	// Create the agent-owned dir 0o700. MkdirAll is a no-op when the
+	// directory already exists, so creation alone does not prove the
+	// directory is safe: a local attacker could have pre-created it
+	// world-writable to hijack the socket. verifyAgentOwnedDir below
+	// asserts the post-condition (real directory, agent-owned, no
+	// group/other write) and refuses to start otherwise.
 	if err := os.MkdirAll(s.socketDir, 0o700); err != nil {
 		return fmt.Errorf("creating annotation socket dir %s: %w", s.socketDir, err)
 	}
+	if err := verifyAgentOwnedDir(s.socketDir); err != nil {
+		return fmt.Errorf("annotation socket dir %s is unsafe: %w", s.socketDir, err)
+	}
 
-	// Remove a stale socket from a previous run. Scoped to the fixed
-	// agent-owned path.
-	if _, err := os.Stat(s.socketPath); err == nil {
-		if err := os.Remove(s.socketPath); err != nil {
-			return fmt.Errorf("removing stale annotation socket %s: %w", s.socketPath, err)
+	// Remove a stale socket from a previous run. Lstat (not Stat) so a
+	// symlink planted at the socket path is detected instead of
+	// followed: removing a followed symlink deletes the symlink target,
+	// an arbitrary-path delete. Only an actual socket is removed.
+	if fi, err := os.Lstat(s.socketPath); err == nil {
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("annotation socket path %s is a symlink; refusing to start", s.socketPath)
+		case fi.Mode()&os.ModeSocket != 0:
+			if err := os.Remove(s.socketPath); err != nil {
+				return fmt.Errorf("removing stale annotation socket %s: %w", s.socketPath, err)
+			}
+		default:
+			return fmt.Errorf("annotation socket path %s exists and is not a socket; refusing to start", s.socketPath)
 		}
 	}
 
@@ -188,12 +269,17 @@ func (s *Server) handleConn(conn net.Conn) {
 	// are fixed for the life of the connection, so a single read is
 	// enough; every annotation on this connection gets the same
 	// provenance.
+	//
+	// A peercred failure is fatal to the connection: a zero Provenance
+	// is indistinguishable from a legitimate "uid 0 wrote this" row, so
+	// ingesting it would silently launder an unattributed annotation.
+	// Drop the connection instead - the writer can retry and the
+	// listener is unaffected.
 	prov, err := peerCred(conn)
 	if err != nil {
-		log.Printf("WARN: annotate: peercred_failed error=%v", err)
-		// Continue with zero provenance rather than dropping the
-		// connection; the row is still recorded, just without a
-		// traceable writer identity.
+		s.rejected.Add(1)
+		log.Printf("WARN: annotate: peercred_failed error=%v conn dropped", err)
+		return
 	}
 
 	rl := newRateLimiter(contract.AnnotationConnRateLimit,
@@ -272,17 +358,39 @@ func (s *Server) processLine(line []byte, prov annotate.Provenance) {
 		a.TimestampNs = time.Now().UnixNano()
 	}
 
-	// Resolve the process incarnation. A writer that supplies a PID and
-	// a start_time is trusted to have read them as a pair; a writer
-	// that supplies only a PID gets the incarnation resolved from
-	// /proc here. start_time without a PID is ignored.
-	switch {
-	case w.PID != 0 && w.StartTime != 0:
-		a.Process = annotate.ProcessIncarnation{PID: w.PID, StartTime: w.StartTime}
-	case w.PID != 0:
-		a.Process = s.resolver(w.PID)
-	default:
-		a.Process = annotate.ProcessIncarnation{}
+	// Resolve the process incarnation. The annotated PID and any
+	// caller-supplied start_time are NOT trusted: a caller can name any
+	// PID, including one it does not own. So:
+	//   - the incarnation start_time is always re-resolved from /proc,
+	//     never taken from the wire; a caller value that disagrees with
+	//     /proc means the caller is lying or racing PID reuse - reject.
+	//   - the annotated PID's real uid must match the connecting peer's
+	//     uid, so a caller can only annotate its own processes.
+	// start_time without a PID is ignored (unscoped).
+	if w.PID != 0 {
+		resolved := s.resolver(w.PID)
+		if w.StartTime != 0 && resolved.StartTime != 0 && w.StartTime != resolved.StartTime {
+			s.rejected.Add(1)
+			log.Printf("WARN: annotate: start_time_mismatch pid=%d caller=%d resolved=%d",
+				w.PID, w.StartTime, resolved.StartTime)
+			return
+		}
+		// Verify the annotated PID is owned by the connecting peer.
+		// PeerPID 0 only occurs when peercred could not be read, and
+		// that path already drops the connection before processLine; a
+		// captured peer is therefore always present here.
+		if owner, ok := readPIDRealUID(w.PID); ok {
+			if uint32(owner) != prov.PeerUID {
+				s.rejected.Add(1)
+				log.Printf("WARN: annotate: pid_scope_rejected pid=%d pid_uid=%d peer_uid=%d",
+					w.PID, owner, prov.PeerUID)
+				return
+			}
+		}
+		// When the PID's uid cannot be read (process exited between the
+		// write and now), the incarnation simply resolves with whatever
+		// /proc returned; the join degrades conservatively for that row.
+		a.Process = resolved
 	}
 
 	if err := a.Validate(); err != nil {

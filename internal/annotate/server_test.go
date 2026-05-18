@@ -295,15 +295,94 @@ func TestServer_SocketGidOptIn(t *testing.T) {
 	}
 }
 
+// TestServer_RejectsWorldWritableDir asserts Start refuses to bind when
+// the socket directory carries group/other write bits - the scenario
+// where a local attacker pre-created it to hijack the socket.
+func TestServer_RejectsWorldWritableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	s := &Server{
+		socketDir:  dir,
+		socketPath: dir + "/" + contract.AnnotationSocketName,
+		socketGid:  -1,
+		sink:       &memSink{},
+		resolver:   annotate.ResolveIncarnation,
+		conns:      make(map[net.Conn]struct{}),
+	}
+	err := s.Start()
+	if err == nil {
+		s.Close()
+		t.Fatal("Start should refuse a group/other-writable socket dir")
+	}
+	if !strings.Contains(err.Error(), "writable") {
+		t.Errorf("error should name the writable-dir problem: %v", err)
+	}
+}
+
+// TestServer_RejectsSymlinkSocketPath asserts Start refuses to bind
+// when a symlink is planted at the socket path - the pre-bind cleanup
+// must not follow it and delete the target.
+func TestServer_RejectsSymlinkSocketPath(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := dir + "/" + contract.AnnotationSocketName
+
+	// A file the symlink points at; it must survive.
+	victim := dir + "/victim"
+	if err := os.WriteFile(victim, []byte("keep me"), 0o600); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	if err := os.Symlink(victim, sockPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	s := &Server{
+		socketDir:  dir,
+		socketPath: sockPath,
+		socketGid:  -1,
+		sink:       &memSink{},
+		resolver:   annotate.ResolveIncarnation,
+		conns:      make(map[net.Conn]struct{}),
+	}
+	err := s.Start()
+	if err == nil {
+		s.Close()
+		t.Fatal("Start should refuse a symlink at the socket path")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("error should name the symlink problem: %v", err)
+	}
+	// The symlink target must NOT have been removed.
+	if _, err := os.Stat(victim); err != nil {
+		t.Errorf("symlink target was deleted - unsafe unlink followed the link: %v", err)
+	}
+}
+
 func TestServer_ValidationRejections(t *testing.T) {
 	sink := &memSink{}
 	s := startServer(t, sink)
 
+	oversizedValue := strings.Repeat("v", contract.AnnotationMaxLabelValueLen+1)
+	tooManyLabels := func() string {
+		var b strings.Builder
+		b.WriteString(`{"labels":{`)
+		for i := 0; i <= contract.AnnotationMaxLabelsPerAnnotation; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `"k%d":"v"`, i)
+		}
+		b.WriteString(`}}`)
+		return b.String()
+	}()
 	bad := []string{
 		`{"labels":{}}`,                                    // no labels
 		`{"labels":{"bad key":"v"}}`,                       // invalid key charset
 		`{"labels":{"k":"v"},"span_start":9,"span_end":2}`, // reversed span
 		`{}`, // no labels field at all
+		`{"labels":{"k":"` + oversizedValue + `"}}`, // oversized label value
+		tooManyLabels, // more than the per-annotation label cap
 	}
 	c := dial(t, s)
 	for _, b := range bad {
@@ -380,28 +459,55 @@ func TestServer_IncarnationResolution(t *testing.T) {
 	defer s.Close()
 
 	c := dial(t, s)
-	// PID only - the server resolves the start time.
+	// PID only - the server resolves the start time from /proc.
 	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321}` + "\n"))
-	// PID + explicit start_time - the server trusts the pair.
-	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321,"start_time":777}` + "\n"))
+	// PID + a caller start_time that AGREES with the resolver (5000).
+	// The caller value is not trusted; it is only allowed when it
+	// matches the re-resolved value.
+	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321,"start_time":5000}` + "\n"))
 	c.Close()
 
 	waitFor(t, func() bool { return sink.count() == 2 }, "both ingested")
 	rows := sink.snapshot()
-	var resolved, explicit bool
 	for _, r := range rows {
-		if r.Process.PID == 4321 && r.Process.StartTime == 5000 {
-			resolved = true
-		}
-		if r.Process.PID == 4321 && r.Process.StartTime == 777 {
-			explicit = true
+		// The resolver always wins: every row carries start_time 5000.
+		if r.Process.PID != 4321 || r.Process.StartTime != 5000 {
+			t.Errorf("incarnation = %v, want pid=4321/start=5000 (resolver wins)", r.Process)
 		}
 	}
-	if !resolved {
-		t.Error("PID-only annotation should get its start_time resolved")
+}
+
+// TestServer_StartTimeMismatchRejected asserts a caller-supplied
+// start_time that disagrees with the /proc-resolved value is rejected
+// rather than trusted.
+func TestServer_StartTimeMismatchRejected(t *testing.T) {
+	sink := &memSink{}
+	dir := t.TempDir()
+	s := &Server{
+		socketDir:  dir,
+		socketPath: dir + "/" + contract.AnnotationSocketName,
+		socketGid:  -1,
+		sink:       sink,
+		resolver: func(pid uint32) annotate.ProcessIncarnation {
+			return annotate.ProcessIncarnation{PID: pid, StartTime: 5000}
+		},
+		conns: make(map[net.Conn]struct{}),
 	}
-	if !explicit {
-		t.Error("PID+start_time annotation should keep the explicit pair")
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	c := dial(t, s)
+	// Caller claims start_time 777 but the resolver says 5000.
+	c.Write([]byte(`{"labels":{"k":"v"},"pid":4321,"start_time":777}` + "\n"))
+	// A valid line so we can wait for the connection to drain.
+	c.Write([]byte(`{"labels":{"ok":"1"}}` + "\n"))
+	c.Close()
+
+	waitFor(t, func() bool { return sink.count() == 1 }, "only the valid line ingested")
+	if r := s.ReadStats().Rejected; r < 1 {
+		t.Errorf("rejected = %d, want >= 1 for the start_time mismatch", r)
 	}
 }
 

@@ -30,7 +30,7 @@ func TestAnnotationConstants_Pinned(t *testing.T) {
 
 	strPins := map[string]struct{ got, want string }{
 		"AnnotationSocketName":      {AnnotationSocketName, "annotate.sock"},
-		"AnnotationSocketDir":       {AnnotationSocketDir, "/tmp/ingero-annotate"},
+		"AnnotationSocketDir":       {AnnotationSocketDir, "/run/ingero"},
 		"AnnotationLabelKeyCharset": {AnnotationLabelKeyCharset, "A-Za-z0-9_.-"},
 		"AnnotationFieldTimestamp":  {AnnotationFieldTimestamp, "ts"},
 		"AnnotationFieldLabels":     {AnnotationFieldLabels, "labels"},

@@ -53,10 +53,17 @@ const (
 	AnnotationSocketName = "annotate.sock"
 
 	// AnnotationSocketDir is the agent-owned directory that holds the
-	// ingest socket. Created 0o700 (owner-only) by the agent at trace
-	// start. A fixed, agent-owned directory keeps the bind-time unlink
-	// scoped to a path the agent controls.
-	AnnotationSocketDir = "/tmp/ingero-annotate"
+	// ingest socket when the agent runs with a writable /run (the
+	// common privileged-trace case). It lives under /run, not the
+	// world-writable /tmp, so a local attacker cannot pre-create the
+	// directory and hijack the socket. The agent verifies at bind that
+	// the directory is a real directory it owns with no group/other
+	// write bits; it refuses to start otherwise.
+	//
+	// When /run is not writable, the agent falls back to a 0o700
+	// directory it creates and owns under the user's home; the path is
+	// derived at runtime, not pinned here.
+	AnnotationSocketDir = "/run/ingero"
 )
 
 // Annotation NDJSON object field names. Pinned so a writer cannot
